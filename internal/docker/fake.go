@@ -75,6 +75,14 @@ type FakeClient struct {
 	// credential archive was streamed to the right container with the right
 	// command.
 	Execs []ExecRecord
+
+	// CreateHook, when non-nil, is invoked at the very start of every
+	// ContainerCreate — before the name-uniqueness check and before f.mu is
+	// taken — so a test can model a concurrent CreateInstance that occupied a
+	// container name in the window between another caller's duplicate check and
+	// its own create (NEW-2). It must not re-enter this same ContainerCreate
+	// call reentrantly without guarding (it runs without f.mu held).
+	CreateHook func()
 }
 
 // ExecRecord captures one ExecStream call for test assertions.
@@ -120,8 +128,15 @@ func (f *FakeClient) find(idOrName string) *fakeContainer {
 	if c, ok := f.containers[idOrName]; ok {
 		return c
 	}
+	return f.findByName(idOrName)
+}
+
+// findByName resolves a container by its exact (case-sensitive) Docker name.
+// Returns nil when none matches. Callers hold f.mu. Used both by find and by
+// ContainerCreate's name-uniqueness check (NEW-5).
+func (f *FakeClient) findByName(name string) *fakeContainer {
 	for _, c := range f.containers {
-		if c.name == idOrName {
+		if c.name == name {
 			return c
 		}
 	}
@@ -158,10 +173,13 @@ func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (typ
 }
 
 // ExecStream models docker exec with stdin streaming (the credential
-// delivery channel, ADR-002 F1). It records the call, and on success
-// extracts the streamed tar into the container's tmpfs model — modeling
-// that a process started by docker exec runs in the container's own mount
-// namespace, so files it writes into the tmpfs ARE visible.
+// delivery channel, ADR-002 F1). It records the call, validates the modeled
+// command shape (a `tar -x … -C /run/garm` extraction), and — on a well-
+// formed archive — extracts the streamed tar into the container's tmpfs model,
+// modeling that a process started by docker exec runs in the container's own
+// mount namespace, so files it writes into the tmpfs ARE visible. A malformed
+// archive reports a non-zero exit like `tar -x` itself would, instead of
+// silently succeeding (NEW-5).
 //
 // Regression note: this is deliberately the ONLY way the fake writes into a
 // container's tmpfs. There is no CopyToContainer: docker cp CANNOT write
@@ -201,28 +219,74 @@ func (f *FakeClient) ExecStream(_ context.Context, containerID string, cmd []str
 		Stdin:       data,
 	})
 
-	if f.ExecExitCode == 0 {
-		extractTarIntoTmpfs(c, data)
+	// A test that forces a specific exit code models a command that ran but
+	// failed (e.g. tar exiting non-zero); honor it and write nothing.
+	if f.ExecExitCode != 0 {
+		return f.ExecExitCode, nil
 	}
-	return f.ExecExitCode, nil
+
+	// The only command this fake models is the credential-delivery
+	// `tar -x … -C /run/garm`. A different shape is a caller/contract bug the
+	// fake should surface loudly rather than pretend to run.
+	if !isCredentialTarExtract(cmd) {
+		return 0, fmt.Errorf("fake ExecStream only models `tar -x -C %s`, got %v", credentialTarTargetDir, cmd)
+	}
+
+	// A malformed archive makes real `tar -x` exit non-zero; model that
+	// instead of silently succeeding (NEW-5).
+	if err := extractTarIntoTmpfs(c, data); err != nil {
+		return tarFailureExitCode, nil
+	}
+	return 0, nil
+}
+
+// credentialTarTargetDir mirrors spec.CredentialDir (ADR-002's credential
+// tmpfs). It is duplicated here rather than imported to keep package docker
+// free of a dependency on package spec. The provider's CreateInstance happy-
+// path tests drive the real delivery command (spec.CredentialDir) through
+// this fake end to end, so a drift between the two would fail those tests.
+const credentialTarTargetDir = "/run/garm"
+
+// tarFailureExitCode is the non-zero code the fake reports when the streamed
+// archive is not a valid tar, modeling `tar -x` failing.
+const tarFailureExitCode = 2
+
+// isCredentialTarExtract reports whether cmd is the modeled credential-
+// delivery command: a `tar -x` extraction targeting `-C /run/garm`.
+func isCredentialTarExtract(cmd []string) bool {
+	if len(cmd) == 0 || cmd[0] != "tar" {
+		return false
+	}
+	var extract, targetOK bool
+	for i, a := range cmd {
+		switch a {
+		case "-x":
+			extract = true
+		case "-C":
+			if i+1 < len(cmd) && cmd[i+1] == credentialTarTargetDir {
+				targetOK = true
+			}
+		}
+	}
+	return extract && targetOK
 }
 
 // extractTarIntoTmpfs decodes the streamed tar and records each entry in the
-// container's tmpfs model. Decode errors are ignored: a non-tar exec stdin
-// simply writes nothing, which is fine for the fake's purposes.
-func extractTarIntoTmpfs(c *fakeContainer, data []byte) {
-	if len(data) == 0 {
-		return
-	}
+// container's tmpfs model. It returns an error when the archive is malformed
+// so ExecStream can report a non-zero exit, matching `tar -x`'s own behavior.
+func extractTarIntoTmpfs(c *fakeContainer, data []byte) error {
 	tr := tar.NewReader(bytes.NewReader(data))
 	for {
 		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
 		if err != nil {
-			return
+			return err // malformed archive
 		}
 		var buf bytes.Buffer
 		if _, err := io.Copy(&buf, tr); err != nil { //nolint:gosec // bounded test input
-			return
+			return err
 		}
 		if c.tmpfs == nil {
 			c.tmpfs = map[string]string{}
@@ -251,12 +315,26 @@ func (f *FakeClient) Tmpfs(containerID string) map[string]string {
 // ContainerCreate creates an in-memory container record in the "created,
 // not started" state.
 func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+	// Fire the concurrency hook (if any) before taking the lock, so a test can
+	// inject a same-name "winner" container that this call then collides with
+	// (NEW-2). It runs without f.mu held to avoid a re-entrant deadlock.
+	if f.CreateHook != nil {
+		f.CreateHook()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	// Clean create failure: nothing is recorded.
 	if f.CreateErr != nil && !f.CreateErrLeaksContainer {
 		return container.CreateResponse{}, f.CreateErr
+	}
+
+	// Docker-name uniqueness: the real daemon rejects a create whose name is
+	// already in use with a 409 Conflict (NEW-5). Model that here, unless an
+	// explicit CreateErr is already dictating this call's outcome.
+	if f.CreateErr == nil && containerName != "" && f.findByName(containerName) != nil {
+		return container.CreateResponse{}, conflictf("Conflict. The container name %q is already in use", "/"+containerName)
 	}
 
 	f.nextID++
@@ -428,4 +506,12 @@ func cloneLabels(labels map[string]string) map[string]string {
 // talking to this fake or the real MobyClient.
 func notFoundf(format string, a ...any) error {
 	return errdefs.NotFound(fmt.Errorf(format, a...))
+}
+
+// conflictf builds an error that satisfies errdefs.IsConflict, matching what
+// the real moby SDK returns for a 409 name-conflict from the daemon. The
+// ambiguous-create resolver (ADR-004 F6) and the fake's own name-uniqueness
+// check (NEW-5) both rely on this shape.
+func conflictf(format string, a ...any) error {
+	return errdefs.Conflict(fmt.Errorf(format, a...))
 }

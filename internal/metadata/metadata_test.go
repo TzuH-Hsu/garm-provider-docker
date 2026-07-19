@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -310,6 +311,71 @@ func TestNewClientCABundleTrustsAdditionalCA(t *testing.T) {
 	// Sanity: the cert really is a parseable x509 certificate.
 	if _, err := x509.ParseCertificate(srv.Certificate().Raw); err != nil {
 		t.Fatalf("server certificate did not parse: %v", err)
+	}
+}
+
+// TestRedirectSameOriginHTTPSFollowed proves a bounded same-origin https
+// redirect IS followed: the token-bearing client may follow a redirect that
+// stays on the metadata service's own origin.
+func TestRedirectSameOriginHTTPSFollowed(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/dest", http.StatusFound)
+		case "/dest":
+			_, _ = w.Write([]byte("redirected-body"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
+	body, err := c.get(context.Background(), "redirect")
+	if err != nil {
+		t.Fatalf("same-origin https redirect should be followed, got error: %v", err)
+	}
+	if string(body) != "redirected-body" {
+		t.Errorf("body = %q, want redirected-body", body)
+	}
+}
+
+// TestRedirectHTTPSDowngradeRejected proves an https→http (scheme-downgrade)
+// redirect is refused: it would forward the Bearer instance token over
+// cleartext. The target shares the server's host:port and differs only in
+// scheme, isolating the downgrade as the reason for rejection.
+func TestRedirectHTTPSDowngradeRejected(t *testing.T) {
+	var target string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	defer srv.Close()
+	// Same host:port as the TLS server, but plain http — a scheme downgrade.
+	target = strings.Replace(srv.URL, "https://", "http://", 1) + "/dest"
+
+	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
+	if _, err := c.get(context.Background(), "redirect"); err == nil {
+		t.Fatal("expected an https→http downgrade redirect to be rejected, got nil")
+	}
+}
+
+// TestRedirectCrossOriginRejected proves a redirect to a different https
+// origin is refused outright, even though both hops are https: a token-bearing
+// client must never follow a cross-origin redirect.
+func TestRedirectCrossOriginRejected(t *testing.T) {
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("should-never-be-reached"))
+	}))
+	defer other.Close()
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/dest", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
+	if _, err := c.get(context.Background(), "redirect"); err == nil {
+		t.Fatal("expected a cross-origin https redirect to be rejected, got nil")
 	}
 }
 

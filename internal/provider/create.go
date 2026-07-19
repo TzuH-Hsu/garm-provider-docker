@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -122,6 +124,15 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	labels[spec.LabelOSType] = string(bootstrap.OSType)
 	labels[spec.LabelOSArch] = string(bootstrap.OSArch)
 
+	// Per-attempt nonce (ADR-004 F6 / NEW-2): tags the container THIS attempt
+	// creates, so the ambiguous-create cleanup below can distinguish it from a
+	// container a concurrent same-name CreateInstance won the race for.
+	nonce, err := newCreateNonce()
+	if err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("failed to generate create nonce for %q: %w", instanceName, err)
+	}
+	labels[spec.LabelCreateNonce] = nonce
+
 	env, err := buildRunnerEnv(bootstrap)
 	if err != nil {
 		return params.ProviderInstance{}, err
@@ -137,10 +148,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.RunnerContainerName(instanceName))
 	if err != nil {
 		// A ContainerCreate error is ambiguous: the daemon may have created
-		// the container before failing. Resolve it by its deterministic
-		// name, validate it is ours, and remove it so a failed create leaves
-		// nothing behind (ADR-004 F6).
-		if cerr := p.cleanupAmbiguousCreate(ctx, instanceName); cerr != nil {
+		// the container before failing, OR a concurrent same-name
+		// CreateInstance may already own the name (the non-atomic
+		// duplicate-check window). Resolve by deterministic name and this
+		// attempt's nonce (ADR-004 F6 / NEW-2).
+		dupErr, cerr := p.cleanupAmbiguousCreate(ctx, instanceName, nonce)
+		if dupErr != nil {
+			// A concurrent CreateInstance for the same name won the create
+			// race: this is a genuine duplicate (exit 31), and its container
+			// is not ours to remove.
+			return params.ProviderInstance{}, dupErr
+		}
+		if cerr != nil {
 			err = errors.Join(err, cerr)
 		}
 		return params.ProviderInstance{}, fmt.Errorf("failed to create container for %q: %w", instanceName, err)
@@ -274,14 +293,26 @@ func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) err
 	return nil
 }
 
-// cleanupAmbiguousCreate handles the case where ContainerCreate returned an
-// error but may still have created the container (ADR-004 F6). It resolves
-// the container by its deterministic name, validates that it is an owned
-// in-flight runner for exactly this instance, and removes it. A foreign or
-// unrelated container that happens to share the name is deliberately left
-// untouched. Cleanup runs on a context detached from the caller's, with its
-// own timeout.
-func (p *Provider) cleanupAmbiguousCreate(ctx context.Context, instanceName string) error {
+// cleanupAmbiguousCreate resolves a failed ContainerCreate that may or may not
+// have left a container behind (ADR-004 F6 / NEW-2). It looks the container up
+// by its deterministic name and classifies it against this attempt's nonce:
+//
+//   - not found → the create left nothing behind; nothing to do.
+//   - an owned in-flight runner for this instance whose create-nonce MATCHES
+//     this attempt's → THIS attempt created it (the ambiguous daemon case);
+//     remove it so the failed create leaves nothing behind.
+//   - an owned in-flight runner for this instance whose create-nonce DIFFERS →
+//     a concurrent, same-instance-name CreateInstance won the create race; it
+//     is a genuine duplicate (exit 31) and NOT ours to remove. Return a
+//     duplicate error as dupErr; removing it would delete the winner's
+//     container out from under it.
+//   - anything else (foreign, wrong role/controller) → left untouched.
+//
+// It returns (dupErr, cleanupErr): dupErr is non-nil only for the concurrent-
+// winner case and maps to exit 31; cleanupErr carries any resolution/removal
+// failure to be joined onto the primary create error. Cleanup runs on a
+// context detached from the caller's, with its own timeout.
+func (p *Provider) cleanupAmbiguousCreate(ctx context.Context, instanceName, nonce string) (dupErr error, cleanupErr error) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 
@@ -289,9 +320,9 @@ func (p *Provider) cleanupAmbiguousCreate(ctx context.Context, instanceName stri
 	inspected, err := p.cli.ContainerInspect(cleanupCtx, name)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return nil // the create really did leave nothing behind
+			return nil, nil // the create really did leave nothing behind
 		}
-		return fmt.Errorf("failed to resolve possibly-created container %q for cleanup: %w", name, err)
+		return nil, fmt.Errorf("failed to resolve possibly-created container %q for cleanup: %w", name, err)
 	}
 
 	labels := map[string]string{}
@@ -299,13 +330,33 @@ func (p *Provider) cleanupAmbiguousCreate(ctx context.Context, instanceName stri
 		labels = inspected.Config.Labels
 	}
 	if !spec.IsManagedRunner(labels, p.controllerID) || labels[spec.LabelInstanceName] != instanceName {
-		return fmt.Errorf("container %q exists but is not an owned in-flight runner for %q; leaving it untouched", inspected.ID, instanceName)
+		return nil, fmt.Errorf("container %q exists but is not an owned in-flight runner for %q; leaving it untouched", inspected.ID, instanceName)
+	}
+
+	// An owned in-flight runner for this instance whose nonce is NOT ours: a
+	// concurrent CreateInstance for the same name won the create race. Treat it
+	// as a genuine duplicate (exit 31) and do not touch the winner's container.
+	if labels[spec.LabelCreateNonce] != nonce {
+		return gErrors.NewDuplicateUserError(fmt.Sprintf("instance %q already exists", instanceName)), nil
 	}
 
 	if err := p.bestEffortRemoveContainer(cleanupCtx, inspected.ID); err != nil {
-		return fmt.Errorf("failed to remove ambiguously-created container %s for %q: %w", inspected.ID, instanceName, err)
+		return nil, fmt.Errorf("failed to remove ambiguously-created container %s for %q: %w", inspected.ID, instanceName, err)
 	}
-	return nil
+	return nil, nil
+}
+
+// newCreateNonce returns a random hex nonce for one CreateInstance attempt
+// (NEW-2). crypto/rand makes collisions between two concurrent attempts for
+// the same instance name effectively impossible, which is what lets the
+// ambiguous-create cleanup safely distinguish "the container I created" from
+// "the container a concurrent winner created."
+func newCreateNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // validatePlatform rejects bootstrap payloads outside the M0 target

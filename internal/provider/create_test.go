@@ -450,6 +450,71 @@ func TestCreateInstanceAmbiguousCreateLeavesForeignUntouched(t *testing.T) {
 	}
 }
 
+// TestCreateInstanceOverlappingCreateReturnsDuplicate models two same-instance-
+// name CreateInstance calls racing through the non-atomic duplicate check
+// (NEW-2). The "winner" occupies the deterministic Docker name in the window
+// between this (losing) call's duplicate check and its own ContainerCreate. The
+// loser must NOT delete the winner's container: it must recognize the differing
+// create-nonce as a genuine duplicate and return exit 31, leaving the winner
+// intact.
+func TestCreateInstanceOverlappingCreateReturnsDuplicate(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+
+	// Inject the concurrent winner the first time this call reaches
+	// ContainerCreate: a managed runner for the SAME instance, occupying the
+	// same Docker name, but tagged with a DIFFERENT create-nonce.
+	var injected bool
+	var winnerID string
+	fake.CreateHook = func() {
+		if injected {
+			return
+		}
+		injected = true
+		resp, err := fake.ContainerCreate(context.Background(), &container.Config{
+			Labels: map[string]string{
+				spec.LabelManaged:      "true",
+				spec.LabelControllerID: "controller-abc",
+				spec.LabelInstanceName: "Test-Instance-01",
+				spec.LabelRole:         spec.RoleRunner,
+				spec.LabelCreateNonce:  "winner-nonce-differs",
+			},
+		}, nil, nil, nil, spec.RunnerContainerName("Test-Instance-01"))
+		if err != nil {
+			t.Errorf("seeding the concurrent winner failed: %v", err)
+			return
+		}
+		winnerID = resp.ID
+		fake.SetState(resp.ID, "running", false)
+	}
+
+	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	if err == nil {
+		t.Fatal("expected a duplicate error from the losing overlapping create, got nil")
+	}
+	if !errors.Is(err, gErrors.ErrDuplicateEntity) {
+		t.Errorf("error is not a duplicate error: %v", err)
+	}
+	if code := execcommon.ResolveErrorToExitCode(err); code != execcommon.ExitCodeDuplicate {
+		t.Errorf("exit code = %d, want %d (duplicate)", code, execcommon.ExitCodeDuplicate)
+	}
+
+	// The winner's container must survive: the loser must not have removed it.
+	if _, err := fake.ContainerInspect(context.Background(), winnerID); err != nil {
+		t.Errorf("the concurrent winner's container was removed by the loser: %v", err)
+	}
+	// Exactly one container exists — the winner — and no credentials were
+	// delivered by the loser.
+	if n := listAll(t, p); n != 1 {
+		t.Errorf("container count = %d, want 1 (only the winner)", n)
+	}
+	if len(fake.Execs) != 0 {
+		t.Errorf("the losing create must not deliver credentials, got %d execs", len(fake.Execs))
+	}
+}
+
 func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
 	tests := []struct {
 		name   string

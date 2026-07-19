@@ -83,7 +83,8 @@ func (c *Client) FetchJITCredentials(ctx context.Context) ([]CredentialFileConte
 // FetchRegistrationToken fetches the classic (non-JIT) runner registration
 // token. It is returned as a single CredentialFileContent so the delivery
 // path into the container is byte-for-byte identical to the JIT path
-// (ADR-002: one uniform create → start → poll → docker cp mechanism).
+// (ADR-002: one uniform fetch → create → start → exec-deliver mechanism,
+// streaming an in-memory tar into a `docker exec`-run `tar -x`).
 func (c *Client) FetchRegistrationToken(ctx context.Context) (CredentialFileContent, error) {
 	b, err := c.get(ctx, registrationTokenPath)
 	if err != nil {
@@ -95,10 +96,11 @@ func (c *Client) FetchRegistrationToken(ctx context.Context) (CredentialFileCont
 	return CredentialFileContent{Name: RegistrationTokenFile, Bytes: bytes.TrimSpace(b)}, nil
 }
 
-// TarArchive packs credential files into an in-memory tar stream suitable
-// for docker cp (CopyToContainer). Entry names are the plain LocalName with
-// no leading path, so extracting the archive at the tmpfs mount point (the
-// CopyToContainer dstPath) lands each file directly in that directory.
+// TarArchive packs credential files into an in-memory tar stream that the
+// provider streams into a `docker exec`-run `tar -x -C /run/garm` (ADR-002's
+// exec-based delivery; `docker cp` cannot write a running container's user
+// tmpfs). Entry names are the plain LocalName with no leading path, so
+// `tar -x` at the credential tmpfs lands each file directly in that directory.
 //
 // The archive is built entirely in memory — no host-side temp file is ever
 // created — which is the ADR-002 invariant that keeps credentials off host

@@ -34,6 +34,12 @@ const (
 	// into the provider's memory. A JIT credential file is a few KiB; 1
 	// MiB is comfortably above that and well below anything alarming.
 	maxCredentialBytes = 1 << 20
+
+	// maxRedirects caps how many redirect hops the metadata client follows
+	// before giving up. GARM's metadata service has no legitimate reason to
+	// redirect at all, so this is deliberately small; it exists only so a
+	// redirect loop cannot spin.
+	maxRedirects = 3
 )
 
 // Client talks to one instance's GARM metadata service. Construct it with
@@ -42,6 +48,10 @@ type Client struct {
 	baseURL       string
 	instanceToken string
 	httpClient    *http.Client
+
+	// origin is the scheme+host+port of baseURL, used by checkRedirect to
+	// reject any redirect that would leave the metadata service's own origin.
+	origin string
 
 	maxRetries   int
 	retryBackoff time.Duration
@@ -102,17 +112,69 @@ func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Optio
 		}
 	}
 
+	// baseURL already passed validateMetadataURL, so it re-parses cleanly;
+	// capture its origin so checkRedirect can reject any cross-origin hop.
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid metadata-url %q: %w", baseURL, err)
+	}
+
 	c := &Client{
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		instanceToken: instanceToken,
 		httpClient:    &http.Client{Timeout: defaultRequestTimeout, Transport: transport},
+		origin:        originKey(base),
 		maxRetries:    defaultMaxRetries,
 		retryBackoff:  defaultRetryBackoff,
 	}
+	// Guard every redirect hop: the Bearer instance token must never be
+	// forwarded to a downgraded (http) or cross-origin target. Go's default
+	// CheckRedirect would forward the Authorization header to a same-host
+	// redirect regardless of scheme downgrade, so this is not optional
+	// (ADR-002 F5).
+	c.httpClient.CheckRedirect = c.checkRedirect
+
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c, nil
+}
+
+// checkRedirect is the http.Client redirect policy: it re-applies the
+// initial-URL transport-security invariant (https required; plain http only
+// for a loopback host; no userinfo) on every hop AND rejects any redirect
+// that leaves the original metadata origin (scheme+host+port). Cross-origin
+// redirects are refused outright: GARM's metadata service has no legitimate
+// cross-origin redirect, and a token-bearing client must never follow one.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects fetching metadata", maxRedirects)
+	}
+	if err := validateMetadataURL(req.URL.String()); err != nil {
+		return fmt.Errorf("refusing metadata redirect: %w", err)
+	}
+	if got := originKey(req.URL); got != c.origin {
+		return fmt.Errorf("refusing cross-origin metadata redirect from %s to %s", c.origin, got)
+	}
+	return nil
+}
+
+// originKey returns a scheme+host+port key for u with default ports resolved,
+// so two URLs compare as the same origin iff their scheme, host, and
+// effective port all match. A scheme downgrade (https→http) therefore yields
+// a different key, which is exactly what the cross-origin redirect check
+// relies on.
+func originKey(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return u.Scheme + "://" + u.Hostname() + ":" + port
 }
 
 // validateMetadataURL enforces the transport-security invariant on the

@@ -237,6 +237,94 @@ func TestFakeClientExecStream(t *testing.T) {
 	}
 }
 
+// TestFakeClientContainerCreateNameConflict proves the fake models the
+// daemon's Docker-name uniqueness: a second create with an in-use name is
+// rejected with an errdefs.IsConflict error, and no second container is
+// recorded (NEW-5).
+func TestFakeClientContainerCreateNameConflict(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	if _, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "dupe"); err != nil {
+		t.Fatalf("first ContainerCreate returned unexpected error: %v", err)
+	}
+
+	_, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "dupe")
+	if err == nil {
+		t.Fatal("expected a name-conflict error on the second create, got nil")
+	}
+	if !errdefs.IsConflict(err) {
+		t.Errorf("second create err = %v, want errdefs.IsConflict", err)
+	}
+
+	// Only the first container exists.
+	out, err := f.ContainerList(ctx, container.ListOptions{})
+	if err != nil {
+		t.Fatalf("ContainerList returned unexpected error: %v", err)
+	}
+	if len(out) != 1 {
+		t.Errorf("container count = %d, want 1 (the conflicting create recorded nothing)", len(out))
+	}
+
+	// A distinct name still creates fine.
+	if _, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "other"); err != nil {
+		t.Errorf("create with a distinct name returned unexpected error: %v", err)
+	}
+}
+
+// TestFakeClientExecStreamMalformedTar proves a malformed archive reports a
+// non-zero exit (like `tar -x` failing) rather than silently succeeding, and
+// writes nothing into the tmpfs (NEW-5).
+func TestFakeClientExecStreamMalformedTar(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	created, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "c1")
+	if err != nil {
+		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
+	}
+	if err := f.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart returned unexpected error: %v", err)
+	}
+
+	cmd := []string{"tar", "-x", "-p", "-C", "/run/garm"}
+	code, err := f.ExecStream(ctx, created.ID, cmd, strings.NewReader("this is not a tar archive"))
+	if err != nil {
+		t.Fatalf("ExecStream returned unexpected transport error: %v", err)
+	}
+	if code == 0 {
+		t.Error("a malformed tar must report a non-zero exit, got 0")
+	}
+	if len(f.Tmpfs(created.ID)) != 0 {
+		t.Errorf("a malformed tar must write nothing, got tmpfs %v", f.Tmpfs(created.ID))
+	}
+}
+
+// TestFakeClientExecStreamRejectsWrongCommand proves the fake only models the
+// credential-delivery `tar -x … -C /run/garm` command and surfaces a wrong
+// command shape as an error rather than pretending to run it (NEW-5).
+func TestFakeClientExecStreamRejectsWrongCommand(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	created, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "c1")
+	if err != nil {
+		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
+	}
+	if err := f.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart returned unexpected error: %v", err)
+	}
+
+	// A command that is not a `tar -x -C /run/garm` extraction is rejected.
+	if _, err := f.ExecStream(ctx, created.ID, []string{"sh", "-c", "rm -rf /"}, strings.NewReader("")); err == nil {
+		t.Fatal("expected ExecStream to reject a non-tar command, got nil")
+	}
+	// A tar extraction into the wrong directory is likewise rejected.
+	if _, err := f.ExecStream(ctx, created.ID, []string{"tar", "-x", "-C", "/tmp"}, strings.NewReader("")); err == nil {
+		t.Fatal("expected ExecStream to reject a tar extraction into the wrong directory, got nil")
+	}
+}
+
 // tarBytes builds a tar archive from a name→contents map for exec-stdin
 // tests.
 func tarBytes(t *testing.T, files map[string]string) []byte {
