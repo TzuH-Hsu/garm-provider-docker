@@ -24,24 +24,35 @@ runner.
 
 ## How the provider delivers credentials
 
-Because a Docker `tmpfs` mount only materializes once its container is
-running, delivery is a four-step, create-then-populate sequence (see
-ADR-002 for the full description):
+Delivery is **fetch-first**, then create/start/exec-deliver (see ADR-002
+for the full description and rationale):
 
-1. The provider **creates** the runner container with a `tmpfs` mount at
-   `/run/garm` (`mode=0700`, memory-backed) — empty at this point.
-2. The provider **starts** the container. This entrypoint's first action
-   is to poll `/run/garm` for the expected files, bounded by a timeout.
-3. The provider **streams** the fetched credential files into the
-   now-running container via `docker cp` of an in-memory tar stream — the
-   credentials are never written to a host-side temp file or environment
-   variable at any point.
-4. This entrypoint's poll loop detects the files, installs them into
-   `/actions-runner`, and execs the runner.
+1. The provider **fetches** the credential files (over HTTPS; a cleartext
+   `http` metadata-url is rejected unless the host is loopback) before
+   anything is created, bounded by an aggregate deadline, and builds an
+   in-memory tar with an atomic `.delivered` marker as its last entry.
+2. The provider **creates** the runner container with a `tmpfs` mount at
+   `/run/garm` (`mode=0700`, memory-backed, owned by the runner user's
+   uid/gid `1001` so this entrypoint's unprivileged runner can read the
+   files) — empty at this point.
+3. The provider **starts** the container. This entrypoint's first action
+   is to wait for `/run/garm/.delivered`, bounded by a timeout.
+4. The provider **delivers** the tar by streaming it into a
+   `docker exec`-run `tar -x -C /run/garm`. `docker cp` is deliberately
+   **not** used: it cannot write into a running container's user tmpfs,
+   because Docker resolves archive paths in a separate filesystem view
+   that excludes user tmpfs mounts (moby v27.5.1
+   `daemon/containerfs_linux.go`); a process started by `docker exec` runs
+   in the container's own mount namespace where the tmpfs is visible.
+5. This entrypoint sees the `.delivered` marker and installs the
+   credentials by **symlinking** them from `/run/garm` into
+   `/actions-runner` — never copying them onto the disk-backed writable
+   layer — then execs the runner.
 
 The credential files live only in the container's memory-backed tmpfs:
-never in the image rootfs, never in `docker inspect`-visible environment
-or mounts, never on host disk.
+never in the image rootfs, never on the disk-backed writable layer, never
+in `docker inspect`-visible environment or mounts, never on host disk.
+They are reached from `/actions-runner` only through symlinks.
 
 ## Environment contract
 
@@ -78,9 +89,9 @@ overridable for local testing):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GARM_CRED_WAIT_SECONDS` | `120` | Timeout for step 1 (credential-file poll). |
+| `GARM_CRED_WAIT_SECONDS` | `120` | Timeout for step 1 (waiting for the `.delivered` marker). |
 | `WAIT_FOR_DOCKER_SECONDS` | `120` | Timeout for step 2 (Docker daemon readiness poll), DinD modes only. |
-| `RUN_AS_ROOT` | unset (falls back to dropping privileges) | Set to `true` to keep the runner process running as root instead of dropping to the `runner` user via `gosu`. |
+| `RUN_AS_ROOT` | unset (drops privileges via `gosu`) | Set to `true` to run the runner (and `config.sh`, with `RUNNER_ALLOW_RUNASROOT=1`) as root instead of dropping to the `runner` user. When unset and `gosu` is unavailable, the entrypoint fails closed rather than running as root. |
 
 Deliberately absent, under any circumstance: the instance/bearer token,
 the metadata URL, the callback URL. There is no field or code path here
@@ -88,19 +99,30 @@ that could emit any of them.
 
 ## Entrypoint contract
 
-1. **Credential wait** — poll `/run/garm` for `runner`, `credentials`,
-   `credentials_rsaparams` (JIT) or `registration-token` (non-JIT),
+1. **Delivery-marker wait** — wait for the single atomic marker
+   `/run/garm/.delivered` (the provider writes it as the last entry of the
+   credential tar, so it appears only once every file is fully delivered),
    bounded by `GARM_CRED_WAIT_SECONDS`.
 2. **Docker readiness** (DinD modes only) — if `DOCKER_HOST` is set, poll
    `docker info` until ready, bounded by `WAIT_FOR_DOCKER_SECONDS`,
    independently of and concurrently with step 1. Skipped entirely when
    `DOCKER_HOST` is unset.
-3. **Install & exec** — JIT: copy the three files into `/actions-runner`
-   as `.runner`/`.credentials`/`.credentials_rsaparams`, then `exec
-   ./run.sh` directly (no `config.sh`, no `--jitconfig`). Non-JIT: run
-   `./config.sh --unattended --ephemeral --url … --token … --name …`
-   first, then `exec ./run.sh`. Both paths drop root via `gosu runner`
-   unless `RUN_AS_ROOT=true`.
+3. **Install & exec** —
+   - **JIT**: symlink `/actions-runner/.runner`,
+     `.credentials`, `.credentials_rsaparams` at the tmpfs files under
+     `/run/garm` (credentials stay on tmpfs, never copied onto the
+     writable layer), then `exec ./run.sh` directly (no `config.sh`, no
+     `--jitconfig`).
+   - **Non-JIT**: run `./config.sh --unattended --ephemeral
+     --disableupdate --url … --token … --name …` as the runner user via
+     `gosu` (so the base image's own root guard is satisfied), then move
+     the generated `.runner`/`.credentials`/`.credentials_rsaparams` onto
+     `/run/garm` and symlink them back so the credentials are tmpfs-
+     resident too, then `exec ./run.sh`.
+   - Both paths drop root via `gosu runner` unless `RUN_AS_ROOT=true`, and
+     **fail closed**: if `gosu` is missing and `RUN_AS_ROOT` is not set,
+     the entrypoint exits with an error rather than silently running as
+     root.
 
 The script never echoes credential file contents.
 
