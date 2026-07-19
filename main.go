@@ -14,6 +14,8 @@ import (
 	"github.com/cloudbase/garm-provider-common/execution"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
 
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/provider"
 )
 
@@ -30,7 +32,19 @@ func run() int {
 		return 1
 	}
 
-	prov := provider.New()
+	cfg, err := config.Load(env.ProviderConfigFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load provider config: %s\n", err)
+		return 1
+	}
+
+	cli, err := docker.NewMobyClient(cfg.DockerHost)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create docker client: %s\n", err)
+		return 1
+	}
+
+	prov := provider.New(cli, cfg, env.ControllerID)
 
 	result, err := env.Run(ctx, prov)
 	if err != nil {

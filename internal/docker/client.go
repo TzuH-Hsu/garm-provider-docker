@@ -31,6 +31,14 @@ type Client interface {
 	// it rather than blocking until the pull is done.
 	ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error)
 
+	// ImageInspectWithRaw inspects a local image by reference. It returns
+	// an errdefs.IsNotFound-satisfying error when the image is not present
+	// locally, which is how CreateInstance decides whether it must pull
+	// (ADR-002: pull-if-missing). The raw []byte return of the underlying
+	// SDK method is unused by this provider but kept in the signature so
+	// the real *client.Client satisfies this interface unchanged.
+	ImageInspectWithRaw(ctx context.Context, imageID string) (types.ImageInspect, []byte, error)
+
 	// ContainerCreate creates (but does not start) a container.
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 
@@ -50,4 +58,11 @@ type Client interface {
 	// ContainerList lists containers, filtered by options.Filters — used
 	// with a "label" filter for every managed-resource lookup (ADR-004).
 	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
+
+	// CopyToContainer streams a tar archive (content) into a running
+	// container, extracting it at dstPath. This is the docker-cp half of
+	// ADR-002's create → start → poll → cp credential delivery: the
+	// credential tmpfs only materializes once the container is running, so
+	// credentials are streamed in after start rather than pre-populated.
+	CopyToContainer(ctx context.Context, containerID, dstPath string, content io.Reader, options container.CopyToContainerOptions) error
 }

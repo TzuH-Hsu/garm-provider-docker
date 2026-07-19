@@ -2,6 +2,8 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
@@ -98,6 +100,71 @@ func TestFakeClientNotFoundErrors(t *testing.T) {
 	}
 	if err := f.ContainerRemove(ctx, "does-not-exist", container.RemoveOptions{}); !errdefs.IsNotFound(err) {
 		t.Errorf("ContainerRemove: err = %v, want errdefs.IsNotFound", err)
+	}
+}
+
+func TestFakeClientImageInspectAndPull(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	// Absent image -> NotFound.
+	if _, _, err := f.ImageInspectWithRaw(ctx, "ghcr.io/example/runner:latest"); !errdefs.IsNotFound(err) {
+		t.Fatalf("ImageInspectWithRaw on absent image: err = %v, want NotFound", err)
+	}
+
+	// After pull, it is present.
+	rc, err := f.ImagePull(ctx, "ghcr.io/example/runner:latest", image.PullOptions{})
+	if err != nil {
+		t.Fatalf("ImagePull returned unexpected error: %v", err)
+	}
+	_ = rc.Close()
+	if _, _, err := f.ImageInspectWithRaw(ctx, "ghcr.io/example/runner:latest"); err != nil {
+		t.Fatalf("ImageInspectWithRaw after pull: unexpected error %v", err)
+	}
+
+	// PullErr short-circuits and leaves the image absent.
+	f2 := NewFakeClient()
+	f2.PullErr = errors.New("pull boom")
+	if _, err := f2.ImagePull(ctx, "ghcr.io/example/x:1", image.PullOptions{}); err == nil {
+		t.Fatal("expected ImagePull to fail when PullErr is set")
+	}
+	if _, _, err := f2.ImageInspectWithRaw(ctx, "ghcr.io/example/x:1"); !errdefs.IsNotFound(err) {
+		t.Fatalf("image should remain absent after failed pull: err = %v", err)
+	}
+}
+
+func TestFakeClientCopyToContainer(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	created, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "c1")
+	if err != nil {
+		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
+	}
+
+	// Copy into a not-yet-started container fails (mirrors a real tmpfs
+	// only materializing after start).
+	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("x"), container.CopyToContainerOptions{}); err == nil {
+		t.Fatal("expected CopyToContainer into a stopped container to fail")
+	}
+
+	if err := f.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart returned unexpected error: %v", err)
+	}
+	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("archive-bytes"), container.CopyToContainerOptions{}); err != nil {
+		t.Fatalf("CopyToContainer returned unexpected error: %v", err)
+	}
+	if len(f.Copies) != 1 {
+		t.Fatalf("Copies = %d, want 1", len(f.Copies))
+	}
+	if f.Copies[0].ContainerID != created.ID || f.Copies[0].DstPath != "/run/garm" || string(f.Copies[0].Content) != "archive-bytes" {
+		t.Errorf("unexpected copy record: %+v", f.Copies[0])
+	}
+
+	// CopyErr forces failure regardless of container state.
+	f.CopyErr = errors.New("copy boom")
+	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("y"), container.CopyToContainerOptions{}); err == nil {
+		t.Fatal("expected CopyToContainer to fail when CopyErr is set")
 	}
 }
 

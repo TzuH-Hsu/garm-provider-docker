@@ -27,6 +27,14 @@ const (
 	// label builders themselves belong to the ADR-003 (M2) work package,
 	// not this one.
 	LabelCache = "garm.docker/cache"
+
+	// LabelOSType and LabelOSArch are informational labels carrying the
+	// bootstrap OS type/arch. They are NOT part of the ADR-004 teardown
+	// predicate; they exist so GetInstance/ListInstances can reconstruct a
+	// ProviderInstance's os fields directly from labels, mirroring the
+	// reference k8s and werdnum providers (research.md §2.A, §2.B).
+	LabelOSType = "garm.docker/os-type"
+	LabelOSArch = "garm.docker/os-arch"
 )
 
 // Role values for LabelRole. Containers only.
