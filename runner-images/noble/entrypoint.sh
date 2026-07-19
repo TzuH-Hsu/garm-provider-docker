@@ -2,25 +2,37 @@
 # entrypoint.sh - garm-provider-docker runner image entrypoint.
 #
 # Replaces the myoung34/github-runner base image's own config.sh-based
-# entrypoint entirely (ADR-002). This script never fetches JIT config or
-# a registration token itself: the provider fetches those out-of-band and
-# streams them into this container's tmpfs via `docker cp` after start
-# (ADR-002 step 2). The contract implemented here is:
+# entrypoint entirely (ADR-002). This script never fetches JIT config or a
+# registration token itself: the provider fetches those out-of-band and
+# streams them into this container's memory-backed tmpfs (/run/garm) via a
+# `docker exec`-run `tar -x` after start (ADR-002 F1). The contract
+# implemented here is:
 #
-#   1. Wait for the provider to deliver credential files under /run/garm.
-#   2. In DinD modes (DOCKER_HOST set), wait for the Docker daemon to
-#      answer, independently of and concurrently with step 1.
-#   3. Install the credentials and exec the runner: JIT mode execs
-#      run.sh directly (no config.sh, no --jitconfig); non-JIT mode runs
-#      config.sh with a registration token first.
+#   1. Wait for the provider's atomic delivery marker (/run/garm/.delivered).
+#   2. In DinD modes (DOCKER_HOST set), wait for the Docker daemon to answer,
+#      independently of and concurrently with step 1.
+#   3. Install the credentials and exec the runner:
+#      - JIT: symlink the tmpfs files into the install dir and exec run.sh
+#        directly (no config.sh, no --jitconfig).
+#      - non-JIT: run config.sh (as the runner user via gosu) to register,
+#        then relocate the generated credential files onto the tmpfs and
+#        symlink them back, so credentials live only on tmpfs at steady state.
 #
-# Never echo/log credential file contents.
+# Credentials never land on the container's disk-backed writable layer: they
+# stay resident on the memory-backed tmpfs, reached from the install dir only
+# through symlinks (ADR-002 F2). Never echo/log credential file contents.
 
 set -euo pipefail
 
 readonly CRED_DIR="/run/garm"
 readonly RUNNER_DIR="/actions-runner"
 readonly RUNNER_USER="runner"
+
+# ReadyMarker: the provider writes this file as the LAST entry of the
+# credential tar, so it appears only once every credential file is fully
+# delivered (ADR-002 F1). Waiting for it — instead of the individual files —
+# means this entrypoint never observes a partial credential set.
+readonly READY_MARKER=".delivered"
 
 readonly CRED_WAIT_SECONDS="${GARM_CRED_WAIT_SECONDS:-120}"
 readonly DOCKER_WAIT_SECONDS="${WAIT_FOR_DOCKER_SECONDS:-120}"
@@ -35,8 +47,8 @@ fail() {
   exit 1
 }
 
-# wait_for_files polls CRED_DIR, bounded by $1 seconds, until every
-# filename in the remaining arguments exists there.
+# wait_for_files polls CRED_DIR, bounded by $1 seconds, until every filename
+# in the remaining arguments exists there.
 wait_for_files() {
   local timeout="$1"
   shift
@@ -47,7 +59,7 @@ wait_for_files() {
   while true; do
     all_present=true
     for f in "$@"; do
-      [[ -f "${CRED_DIR}/${f}" ]] || { all_present=false; break; }
+      [[ -e "${CRED_DIR}/${f}" ]] || { all_present=false; break; }
     done
     [[ "${all_present}" == "true" ]] && return 0
     (( elapsed >= timeout )) && return 1
@@ -56,8 +68,8 @@ wait_for_files() {
   done
 }
 
-# wait_for_docker_ready polls `docker info`, bounded by $1 seconds, until
-# the daemon reachable via DOCKER_HOST answers successfully.
+# wait_for_docker_ready polls `docker info`, bounded by $1 seconds, until the
+# daemon reachable via DOCKER_HOST answers successfully.
 wait_for_docker_ready() {
   local timeout="$1"
   local elapsed=0
@@ -70,18 +82,19 @@ wait_for_docker_ready() {
   return 0
 }
 
-# Step 1: credential wait. JIT mode waits for the three files the
-# provider docker-cp's in; non-JIT waits for a single registration token.
+# require_gosu fails CLOSED: if gosu is not on PATH we cannot drop privileges,
+# so we refuse to run rather than silently continue as root (ADR-002 F11).
+require_gosu() {
+  command -v gosu >/dev/null 2>&1 && return 0
+  fail "gosu is required to drop privileges to ${RUNNER_USER} but was not found on PATH; refusing to run as root (set RUN_AS_ROOT=true to override deliberately)"
+}
+
+# Step 1: credential wait. Both modes wait for the single atomic delivery
+# marker the provider writes last (ADR-002 F1).
 wait_for_credentials() {
-  if [[ "${JIT_CONFIG_ENABLED:-false}" == "true" ]]; then
-    log "waiting up to ${CRED_WAIT_SECONDS}s for JIT credential files under ${CRED_DIR}"
-    wait_for_files "${CRED_WAIT_SECONDS}" runner credentials credentials_rsaparams \
-      || fail "timed out waiting for JIT credential files (runner, credentials, credentials_rsaparams) under ${CRED_DIR}"
-  else
-    log "waiting up to ${CRED_WAIT_SECONDS}s for registration token under ${CRED_DIR}"
-    wait_for_files "${CRED_WAIT_SECONDS}" registration-token \
-      || fail "timed out waiting for registration-token under ${CRED_DIR}"
-  fi
+  log "waiting up to ${CRED_WAIT_SECONDS}s for the delivery marker ${CRED_DIR}/${READY_MARKER}"
+  wait_for_files "${CRED_WAIT_SECONDS}" "${READY_MARKER}" \
+    || fail "timed out waiting for credential delivery marker ${READY_MARKER} under ${CRED_DIR}"
 }
 
 # Step 2: Docker readiness, DinD modes only. Independent of, and run
@@ -99,8 +112,8 @@ maybe_wait_for_docker() {
 }
 
 # run_concurrent_waits backgrounds both waits and fails fast: as soon as
-# either job fails, the other is killed rather than left to run out its
-# own timeout.
+# either job fails, the other is killed rather than left to run out its own
+# timeout.
 run_concurrent_waits() {
   wait_for_credentials &
   local cred_pid=$!
@@ -131,10 +144,10 @@ resolve_workdir() {
   esac
 }
 
-# prepare_workdir honors RUNNER_WORKDIR (always set per ADR-002) by
-# ensuring the directory exists and is owned by the runner user, even in
-# JIT mode where the actual job workdir is baked into the JIT config
-# rather than read from this env var at run.sh startup.
+# prepare_workdir honors RUNNER_WORKDIR (always set per ADR-002) by ensuring
+# the directory exists and is owned by the runner user, even in JIT mode where
+# the actual job workdir is baked into the JIT config rather than read from
+# this env var at run.sh startup.
 prepare_workdir() {
   local workdir
   workdir="$(resolve_workdir)"
@@ -142,24 +155,26 @@ prepare_workdir() {
   chown "${RUNNER_USER}:${RUNNER_USER}" "${workdir}"
 }
 
-# install_jit_credentials copies the three provider-delivered credential
-# files into the runner's install dir under the filenames run.sh expects,
-# owned by the runner user. No config.sh, no --jitconfig (ADR-002).
+# install_jit_credentials points the runner install dir at the provider-
+# delivered credential files via SYMLINKS. The credential files themselves
+# stay resident on the memory-backed tmpfs — only the symlinks live on the
+# container's writable layer, so no credential ever lands on host-backed disk
+# (ADR-002 F2). No config.sh, no --jitconfig. run.sh reads .runner /
+# .credentials / .credentials_rsaparams and follows the symlinks; the tmpfs
+# files are owned by (and readable by) the runner user the provider's delivery
+# exec created them as.
 install_jit_credentials() {
-  log "installing JIT credential files into ${RUNNER_DIR}"
-  install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0600 \
-    "${CRED_DIR}/runner" "${RUNNER_DIR}/.runner"
-  install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0600 \
-    "${CRED_DIR}/credentials" "${RUNNER_DIR}/.credentials"
-  install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0600 \
-    "${CRED_DIR}/credentials_rsaparams" "${RUNNER_DIR}/.credentials_rsaparams"
+  log "linking JIT credential files from ${CRED_DIR} into ${RUNNER_DIR}"
+  ln -sfn "${CRED_DIR}/runner" "${RUNNER_DIR}/.runner"
+  ln -sfn "${CRED_DIR}/credentials" "${RUNNER_DIR}/.credentials"
+  ln -sfn "${CRED_DIR}/credentials_rsaparams" "${RUNNER_DIR}/.credentials_rsaparams"
   prepare_workdir
 }
 
-# build_non_jit_url reconstructs the GitHub scope URL config.sh expects
-# from GITHUB_URL (host only, per internal/spec/env.go's BuildRunnerEnv)
-# plus whichever of RUNNER_ENTERPRISE / RUNNER_ORG+RUNNER_REPO / RUNNER_ORG
-# the provider set for this entity scope.
+# build_non_jit_url reconstructs the GitHub scope URL config.sh expects from
+# GITHUB_URL (host only, per internal/spec/env.go's BuildRunnerEnv) plus
+# whichever of RUNNER_ENTERPRISE / RUNNER_ORG+RUNNER_REPO / RUNNER_ORG the
+# provider set for this entity scope.
 build_non_jit_url() {
   local host="${GITHUB_URL:?GITHUB_URL is required}"
   host="${host%/}"
@@ -175,10 +190,12 @@ build_non_jit_url() {
   fi
 }
 
-# own_runner_dir_as_runner chowns the install dir's top-level entries,
-# skipping the large image-shipped bin/externals trees that already ship
-# runner-owned (mirrors the base image's own optimization: recursing over
-# those defeats overlay copy-up performance for no ownership benefit).
+# own_runner_dir_as_runner chowns the install dir's top-level entries, skipping
+# the large image-shipped bin/externals trees that already ship runner-owned
+# (mirrors the base image's own optimization: recursing over those defeats
+# overlay copy-up performance for no ownership benefit). It runs before
+# config.sh so the runner user (via gosu) can write .runner/.credentials* into
+# the install dir.
 own_runner_dir_as_runner() {
   chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}"
   find "${RUNNER_DIR}" -mindepth 1 -maxdepth 1 \
@@ -186,9 +203,40 @@ own_runner_dir_as_runner() {
     -exec chown -R "${RUNNER_USER}:${RUNNER_USER}" {} +
 }
 
-# install_non_jit_registration runs config.sh with a registration token
-# fetched the same provider-side, never-a-host-temp-file way as JIT mode
-# (ADR-002's non-JIT fallback), then execs run.sh.
+# run_config_sh runs config.sh with privilege handling that satisfies the base
+# runner's own root guard (ADR-002 F4): by default it drops to the runner user
+# via gosu (config.sh refuses to run as root without RUNNER_ALLOW_RUNASROOT);
+# only when RUN_AS_ROOT=true is set deliberately does it run as root with
+# RUNNER_ALLOW_RUNASROOT=1. Fails CLOSED when gosu is missing (F11).
+run_config_sh() {
+  if [[ "${RUN_AS_ROOT:-false}" == "true" ]]; then
+    log "RUN_AS_ROOT=true: running config.sh as $(id -un) with RUNNER_ALLOW_RUNASROOT=1"
+    RUNNER_ALLOW_RUNASROOT=1 ./config.sh "$@"
+    return
+  fi
+  require_gosu
+  log "running config.sh as ${RUNNER_USER} via gosu"
+  gosu "${RUNNER_USER}" ./config.sh "$@"
+}
+
+# relocate_non_jit_credentials moves the credential files config.sh generated
+# on the writable layer onto the memory-backed tmpfs and symlinks them back,
+# so at steady state the non-JIT credentials — like the JIT ones — live only
+# on tmpfs, never on host-backed disk (ADR-002 F2).
+relocate_non_jit_credentials() {
+  local f
+  for f in .runner .credentials .credentials_rsaparams; do
+    if [[ -e "${RUNNER_DIR}/${f}" ]]; then
+      mv -f "${RUNNER_DIR}/${f}" "${CRED_DIR}/${f}"
+      ln -sfn "${CRED_DIR}/${f}" "${RUNNER_DIR}/${f}"
+    fi
+  done
+}
+
+# install_non_jit_registration registers the runner with config.sh (as the
+# runner user via gosu by default, ADR-002 F4), appending --disableupdate
+# unconditionally because the image is digest-managed (ADR-002 F9), then
+# relocates the generated credentials onto the tmpfs.
 install_non_jit_registration() {
   local token url
   token="$(cat "${CRED_DIR}/registration-token")"
@@ -200,38 +248,33 @@ install_non_jit_registration() {
     --token "${token}"
     --name "${RUNNER_NAME:?RUNNER_NAME is required}"
     --work "${RUNNER_WORKDIR:-_work}"
+    --disableupdate
   )
   [[ -n "${RUNNER_GROUP:-}" ]] && args+=(--runnergroup "${RUNNER_GROUP}")
   [[ -n "${RUNNER_LABELS:-}" ]] && args+=(--labels "${RUNNER_LABELS}")
   [[ "${RUNNER_NO_DEFAULT_LABELS:-false}" == "true" ]] && args+=(--no-default-labels)
   [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]] && args+=(--ephemeral)
 
-  log "registering runner via config.sh (non-JIT)"
-  ./config.sh "${args[@]}"
-
   own_runner_dir_as_runner
+  log "registering runner via config.sh (non-JIT)"
+  run_config_sh "${args[@]}"
+
+  relocate_non_jit_credentials
   prepare_workdir
 }
 
 # exec_as_runner drops root via gosu (mirroring the base image's own
-# convention) unless RUN_AS_ROOT=true, then execs the runner in the
-# foreground so it receives signals directly.
+# convention) unless RUN_AS_ROOT=true, then execs the runner in the foreground
+# so it receives signals directly. Fails CLOSED when gosu is missing (F11).
 exec_as_runner() {
   if [[ "${RUN_AS_ROOT:-false}" == "true" ]]; then
     log "RUN_AS_ROOT=true: running as $(id -un)"
     exec "$@"
   fi
 
-  if command -v gosu >/dev/null 2>&1; then
-    log "dropping privileges to ${RUNNER_USER} via gosu"
-    exec gosu "${RUNNER_USER}" "$@"
-  fi
-
-  # TODO(M0): gosu not found on PATH; falling back to root rather than
-  # failing the runner outright. Revisit before release - every other
-  # code path assumes gosu is present (it ships in the base image).
-  log "WARNING: gosu unavailable, running as $(id -un) (TODO(M0): fix before release)"
-  exec "$@"
+  require_gosu
+  log "dropping privileges to ${RUNNER_USER} via gosu"
+  exec gosu "${RUNNER_USER}" "$@"
 }
 
 main() {

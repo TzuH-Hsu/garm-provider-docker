@@ -110,6 +110,25 @@ func decodeTar(t *testing.T, data []byte) map[string]string {
 	return out
 }
 
+// tarEntryOrder returns the tar entry names in archive order, so a test can
+// assert the ready marker is delivered last.
+func tarEntryOrder(t *testing.T, data []byte) []string {
+	t.Helper()
+	var order []string
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading tar: %v", err)
+		}
+		order = append(order, hdr.Name)
+	}
+	return order
+}
+
 func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -174,15 +193,19 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Errorf("JIT mode must not set RUNNER_EPHEMERAL, got %v", got.Config.Env)
 	}
 
-	// Credentials were streamed to the tmpfs via docker cp.
-	if len(fake.Copies) != 1 {
-		t.Fatalf("Copies = %d, want 1", len(fake.Copies))
+	// Credentials were streamed into the tmpfs via a docker-exec'd tar.
+	if len(fake.Execs) != 1 {
+		t.Fatalf("Execs = %d, want 1", len(fake.Execs))
 	}
-	cp := fake.Copies[0]
-	if cp.ContainerID != inst.ProviderID || cp.DstPath != spec.CredentialDir {
-		t.Errorf("copy target = %s:%s, want %s:%s", cp.ContainerID, cp.DstPath, inst.ProviderID, spec.CredentialDir)
+	ex := fake.Execs[0]
+	if ex.ContainerID != inst.ProviderID {
+		t.Errorf("exec target = %s, want %s", ex.ContainerID, inst.ProviderID)
 	}
-	files := decodeTar(t, cp.Content)
+	// The delivery command must extract the tar into the credential tmpfs.
+	if strings.Join(ex.Cmd, " ") != strings.Join(credentialDeliverCmd, " ") {
+		t.Errorf("exec cmd = %v, want %v", ex.Cmd, credentialDeliverCmd)
+	}
+	files := decodeTar(t, ex.Stdin)
 	for name, want := range map[string]string{
 		"runner":                "RUNNER-FILE",
 		"credentials":           "CREDENTIALS-FILE",
@@ -191,6 +214,14 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		if files[name] != want {
 			t.Errorf("credential %q = %q, want %q", name, files[name], want)
 		}
+	}
+	// The atomic ready marker is delivered as the archive's last entry.
+	if _, ok := files[spec.ReadyMarker]; !ok {
+		t.Errorf("credential archive missing the %q ready marker (files: %v)", spec.ReadyMarker, files)
+	}
+	names := tarEntryOrder(t, ex.Stdin)
+	if len(names) == 0 || names[len(names)-1] != spec.ReadyMarker {
+		t.Errorf("ready marker must be the LAST tar entry, got order %v", names)
 	}
 }
 
@@ -228,13 +259,17 @@ func TestCreateInstanceHappyPathNonJIT(t *testing.T) {
 		}
 	}
 
-	// The registration token is delivered as the single credential file.
-	if len(fake.Copies) != 1 {
-		t.Fatalf("Copies = %d, want 1", len(fake.Copies))
+	// The registration token is delivered as the single credential file,
+	// alongside the ready marker.
+	if len(fake.Execs) != 1 {
+		t.Fatalf("Execs = %d, want 1", len(fake.Execs))
 	}
-	files := decodeTar(t, fake.Copies[0].Content)
+	files := decodeTar(t, fake.Execs[0].Stdin)
 	if files["registration-token"] != "REG-TOKEN" {
 		t.Errorf("registration token file = %q, want REG-TOKEN (files: %v)", files["registration-token"], files)
+	}
+	if _, ok := files[spec.ReadyMarker]; !ok {
+		t.Errorf("credential archive missing the %q ready marker (files: %v)", spec.ReadyMarker, files)
 	}
 }
 
@@ -251,8 +286,8 @@ func TestCreateInstancePullFailureLeavesNoLeftovers(t *testing.T) {
 	if n := listAll(t, p); n != 0 {
 		t.Errorf("pull failure left %d containers behind, want 0", n)
 	}
-	if len(fake.Copies) != 0 {
-		t.Errorf("no credentials should have been delivered, got %d copies", len(fake.Copies))
+	if len(fake.Execs) != 0 {
+		t.Errorf("no credentials should have been delivered, got %d execs", len(fake.Execs))
 	}
 }
 
@@ -327,19 +362,34 @@ func TestCreateInstanceNonJITBadRepoURLFailsCleanly(t *testing.T) {
 	}
 }
 
-func TestCreateInstanceCopyFailureCleansUp(t *testing.T) {
+func TestCreateInstanceExecDeliveryFailureCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
 	p, fake := newTestProvider(t)
-	fake.CopyErr = errors.New("cp into container failed")
+	fake.ExecErr = errors.New("exec into container failed")
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on credential delivery, got nil")
 	}
 	// The creation guard must have removed the container it created.
 	if n := listAll(t, p); n != 0 {
-		t.Errorf("copy failure left %d containers behind, want 0 (guard should clean up)", n)
+		t.Errorf("exec-delivery failure left %d containers behind, want 0 (guard should clean up)", n)
+	}
+}
+
+func TestCreateInstanceExecNonZeroExitCleansUp(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	fake.ExecExitCode = 2 // tar ran but failed
+
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
+		t.Fatal("expected CreateInstance to fail on a non-zero delivery exit, got nil")
+	}
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("non-zero delivery exit left %d containers behind, want 0 (guard should clean up)", n)
 	}
 }
 

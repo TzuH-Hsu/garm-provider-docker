@@ -24,6 +24,18 @@ func TestCredentialTmpfsMount(t *testing.T) {
 	if m.TmpfsOptions.Mode != os.FileMode(0o700) {
 		t.Errorf("tmpfs Mode = %o, want 0700", m.TmpfsOptions.Mode)
 	}
+	// The tmpfs must be owned by the runner uid/gid so the unprivileged
+	// delivery exec can write into it and the runner can read it back
+	// (ADR-002 F2).
+	opts := map[string]string{}
+	for _, o := range m.TmpfsOptions.Options {
+		if len(o) == 2 {
+			opts[o[0]] = o[1]
+		}
+	}
+	if opts["uid"] != RunnerUID || opts["gid"] != RunnerGID {
+		t.Errorf("tmpfs uid/gid options = %v, want uid=%s gid=%s", m.TmpfsOptions.Options, RunnerUID, RunnerGID)
+	}
 }
 
 func TestWorkspaceMountIsAnonymousVolume(t *testing.T) {

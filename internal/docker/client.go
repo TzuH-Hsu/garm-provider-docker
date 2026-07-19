@@ -65,10 +65,19 @@ type Client interface {
 	// with a "label" filter for every managed-resource lookup (ADR-004).
 	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
 
-	// CopyToContainer streams a tar archive (content) into a running
-	// container, extracting it at dstPath. This is the docker-cp half of
-	// ADR-002's create → start → poll → cp credential delivery: the
-	// credential tmpfs only materializes once the container is running, so
-	// credentials are streamed in after start rather than pre-populated.
-	CopyToContainer(ctx context.Context, containerID, dstPath string, content io.Reader, options container.CopyToContainerOptions) error
+	// ExecStream runs cmd inside a running container, streaming stdin to the
+	// exec's standard input, and returns the command's exit code once it has
+	// finished. It is how the provider delivers credentials into the
+	// runner's memory-backed credential tmpfs (ADR-002): a `tar -x` fed the
+	// in-memory credential archive over its stdin.
+	//
+	// docker exec — not docker cp (CopyToContainer) — is used deliberately.
+	// Docker's archive endpoints resolve the destination path in a separate
+	// filesystem view that does not include the container's user tmpfs
+	// mounts (moby v27.5.1 daemon/containerfs_linux.go), so a `docker cp`
+	// into a running container's tmpfs cannot land there. A process started
+	// by `docker exec` runs in the container's own mount namespace, where
+	// the tmpfs is visible, so the extracted files reach the real tmpfs.
+	// This is why CopyToContainer was removed from this interface entirely.
+	ExecStream(ctx context.Context, containerID string, cmd []string, stdin io.Reader) (exitCode int, err error)
 }

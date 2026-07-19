@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -40,10 +42,14 @@ type FakeClient struct {
 	// used to exercise the pull-failure creation-guard path.
 	PullErr error
 
-	// CopyErr, when non-nil, is returned by CopyToContainer instead of
-	// recording the copy — used to exercise the copy-failure creation
-	// guard path.
-	CopyErr error
+	// ExecErr, when non-nil, is returned by ExecStream instead of running —
+	// used to exercise the exec-delivery-failure creation-guard path.
+	ExecErr error
+
+	// ExecExitCode is the exit code ExecStream reports (default 0). A
+	// non-zero value models a credential-delivery command that ran but
+	// failed, and suppresses the tmpfs write.
+	ExecExitCode int
 
 	// InspectErr, when non-nil, is returned by ContainerInspect instead of
 	// inspecting — used to exercise the resolver's non-NotFound error path.
@@ -53,17 +59,17 @@ type FakeClient struct {
 	// removing — used to exercise delete/teardown error handling.
 	RemoveErr error
 
-	// Copies records every CopyToContainer call, in order, so tests can
-	// assert the credential archive was streamed to the right container
-	// and destination.
-	Copies []CopyRecord
+	// Execs records every ExecStream call, in order, so tests can assert the
+	// credential archive was streamed to the right container with the right
+	// command.
+	Execs []ExecRecord
 }
 
-// CopyRecord captures one CopyToContainer call for test assertions.
-type CopyRecord struct {
+// ExecRecord captures one ExecStream call for test assertions.
+type ExecRecord struct {
 	ContainerID string
-	DstPath     string
-	Content     []byte
+	Cmd         []string
+	Stdin       []byte
 }
 
 type fakeContainer struct {
@@ -72,6 +78,12 @@ type fakeContainer struct {
 	image  string
 	labels map[string]string
 	env    []string
+
+	// tmpfs models the container's credential tmpfs, keyed by the filename
+	// extracted into it. Only ExecStream (docker exec) writes here —
+	// modeling that exec-delivered writes ARE visible inside the container,
+	// unlike docker cp (see ExecStream's regression note).
+	tmpfs map[string]string
 
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
@@ -118,29 +130,95 @@ func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (typ
 	return types.ImageInspect{ID: imageID}, nil, nil
 }
 
-// CopyToContainer records the streamed archive (or fails when CopyErr is
-// set). The container must exist and be started, matching the real daemon,
-// which rejects a copy into a non-running container's tmpfs.
-func (f *FakeClient) CopyToContainer(_ context.Context, containerID, dstPath string, content io.Reader, _ container.CopyToContainerOptions) error {
+// ExecStream models docker exec with stdin streaming (the credential
+// delivery channel, ADR-002 F1). It records the call, and on success
+// extracts the streamed tar into the container's tmpfs model — modeling
+// that a process started by docker exec runs in the container's own mount
+// namespace, so files it writes into the tmpfs ARE visible.
+//
+// Regression note: this is deliberately the ONLY way the fake writes into a
+// container's tmpfs. There is no CopyToContainer: docker cp CANNOT write
+// into a running container's user tmpfs, because Docker resolves archive
+// paths in a separate filesystem view that excludes user tmpfs mounts
+// (moby v27.5.1 daemon/containerfs_linux.go). Modeling cp as working here is
+// exactly the bug (F1) that shipped green unit tests but would fail on a
+// real daemon, so cp is not modeled at all.
+func (f *FakeClient) ExecStream(_ context.Context, containerID string, cmd []string, stdin io.Reader) (int, error) {
+	var data []byte
+	if stdin != nil {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return 0, err
+		}
+		data = b
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.CopyErr != nil {
-		return f.CopyErr
+	if f.ExecErr != nil {
+		return 0, f.ExecErr
 	}
 	c, ok := f.containers[containerID]
 	if !ok {
-		return notFoundf("container %s not found", containerID)
+		return 0, notFoundf("container %s not found", containerID)
 	}
+	// exec, like the real daemon, requires a running container.
 	if c.state != "running" {
-		return fmt.Errorf("cannot copy into container %s: not running", containerID)
+		return 0, fmt.Errorf("cannot exec in container %s: not running", containerID)
 	}
-	data, err := io.ReadAll(content)
-	if err != nil {
-		return err
+
+	f.Execs = append(f.Execs, ExecRecord{
+		ContainerID: c.id,
+		Cmd:         append([]string(nil), cmd...),
+		Stdin:       data,
+	})
+
+	if f.ExecExitCode == 0 {
+		extractTarIntoTmpfs(c, data)
 	}
-	f.Copies = append(f.Copies, CopyRecord{ContainerID: containerID, DstPath: dstPath, Content: data})
-	return nil
+	return f.ExecExitCode, nil
+}
+
+// extractTarIntoTmpfs decodes the streamed tar and records each entry in the
+// container's tmpfs model. Decode errors are ignored: a non-tar exec stdin
+// simply writes nothing, which is fine for the fake's purposes.
+func extractTarIntoTmpfs(c *fakeContainer, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			return
+		}
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, tr); err != nil { //nolint:gosec // bounded test input
+			return
+		}
+		if c.tmpfs == nil {
+			c.tmpfs = map[string]string{}
+		}
+		c.tmpfs[hdr.Name] = buf.String()
+	}
+}
+
+// Tmpfs returns a copy of a container's modeled credential-tmpfs contents,
+// keyed by filename, so tests can assert what a docker-exec delivery wrote.
+func (f *FakeClient) Tmpfs(containerID string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c, ok := f.containers[containerID]
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(c.tmpfs))
+	for k, v := range c.tmpfs {
+		out[k] = v
+	}
+	return out
 }
 
 // ContainerCreate creates an in-memory container record in the "created,

@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -169,7 +171,7 @@ func TestFakeClientImageInspectAndPull(t *testing.T) {
 	}
 }
 
-func TestFakeClientCopyToContainer(t *testing.T) {
+func TestFakeClientExecStream(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
 
@@ -178,30 +180,81 @@ func TestFakeClientCopyToContainer(t *testing.T) {
 		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
 	}
 
-	// Copy into a not-yet-started container fails (mirrors a real tmpfs
-	// only materializing after start).
-	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("x"), container.CopyToContainerOptions{}); err == nil {
-		t.Fatal("expected CopyToContainer into a stopped container to fail")
+	// Exec into a not-yet-started container fails (exec requires a running
+	// container, matching the real daemon).
+	if _, err := f.ExecStream(ctx, created.ID, []string{"tar", "-x"}, strings.NewReader("x")); err == nil {
+		t.Fatal("expected ExecStream into a stopped container to fail")
 	}
 
 	if err := f.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
 		t.Fatalf("ContainerStart returned unexpected error: %v", err)
 	}
-	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("archive-bytes"), container.CopyToContainerOptions{}); err != nil {
-		t.Fatalf("CopyToContainer returned unexpected error: %v", err)
+
+	// A successful exec of a tar records the call and makes the extracted
+	// files visible in the container's tmpfs model.
+	archive := tarBytes(t, map[string]string{"runner": "R", ".delivered": ""})
+	cmd := []string{"tar", "-x", "-p", "-C", "/run/garm"}
+	code, err := f.ExecStream(ctx, created.ID, cmd, bytes.NewReader(archive))
+	if err != nil {
+		t.Fatalf("ExecStream returned unexpected error: %v", err)
 	}
-	if len(f.Copies) != 1 {
-		t.Fatalf("Copies = %d, want 1", len(f.Copies))
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
 	}
-	if f.Copies[0].ContainerID != created.ID || f.Copies[0].DstPath != "/run/garm" || string(f.Copies[0].Content) != "archive-bytes" {
-		t.Errorf("unexpected copy record: %+v", f.Copies[0])
+	if len(f.Execs) != 1 {
+		t.Fatalf("Execs = %d, want 1", len(f.Execs))
+	}
+	if f.Execs[0].ContainerID != created.ID || strings.Join(f.Execs[0].Cmd, " ") != strings.Join(cmd, " ") {
+		t.Errorf("unexpected exec record: %+v", f.Execs[0])
+	}
+	// Exec writes ARE visible in the tmpfs (the F1 regression model).
+	tmpfs := f.Tmpfs(created.ID)
+	if tmpfs["runner"] != "R" {
+		t.Errorf("tmpfs[runner] = %q, want R (exec write must be visible)", tmpfs["runner"])
+	}
+	if _, ok := tmpfs[".delivered"]; !ok {
+		t.Error("tmpfs missing the .delivered marker")
 	}
 
-	// CopyErr forces failure regardless of container state.
-	f.CopyErr = errors.New("copy boom")
-	if err := f.CopyToContainer(ctx, created.ID, "/run/garm", strings.NewReader("y"), container.CopyToContainerOptions{}); err == nil {
-		t.Fatal("expected CopyToContainer to fail when CopyErr is set")
+	// A non-zero exit is reported and suppresses the tmpfs write.
+	f.ExecExitCode = 2
+	code, err = f.ExecStream(ctx, created.ID, cmd, bytes.NewReader(tarBytes(t, map[string]string{"other": "X"})))
+	if err != nil {
+		t.Fatalf("ExecStream returned unexpected error: %v", err)
 	}
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if _, ok := f.Tmpfs(created.ID)["other"]; ok {
+		t.Error("a non-zero exec must not write into the tmpfs")
+	}
+	f.ExecExitCode = 0
+
+	// ExecErr forces a plumbing failure regardless of container state.
+	f.ExecErr = errors.New("exec boom")
+	if _, err := f.ExecStream(ctx, created.ID, cmd, strings.NewReader("y")); err == nil {
+		t.Fatal("expected ExecStream to fail when ExecErr is set")
+	}
+}
+
+// tarBytes builds a tar archive from a name→contents map for exec-stdin
+// tests.
+func tarBytes(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, body := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("tar header: %v", err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatalf("tar body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func TestFakeClientContainerListLabelFilter(t *testing.T) {

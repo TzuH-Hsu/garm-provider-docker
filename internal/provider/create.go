@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -17,17 +18,33 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
+// credentialFetchDeadline is the aggregate bound on fetching all credential
+// files from the metadata service (ADR-002 F7). JIT config is valid ~60 min,
+// so this is comfortable headroom; the metadata client keeps its bounded
+// per-request retries within this deadline.
+const credentialFetchDeadline = 60 * time.Second
+
+// credentialDeliverCmd is the command run inside the started container to
+// extract the streamed credential tar into the credential tmpfs. `-p`
+// preserves the archive's 0600 file modes; `-C` targets the tmpfs mount.
+var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
+
 // CreateInstance provisions a runner container in "none" mode (ADR-001) and
 // delivers its credentials without ever exposing them to the container's
-// environment or to host disk (ADR-002). The sequence is exactly ADR-002's
-// create → start → poll → docker cp:
+// environment or to host disk (ADR-002). The sequence is fetch-first
+// (ADR-002 F7) with exec-based delivery (ADR-002 F1):
 //
 //  1. duplicate check (exit 31 on collision)
-//  2. pull the runner image if missing
-//  3. create the container with a credential tmpfs and workspace volume
-//  4. start it (its entrypoint blocks polling the tmpfs for credentials)
-//  5. fetch the credentials provider-side (WP5)
-//  6. stream them into the running container's tmpfs via an in-memory tar
+//  2. fetch the credentials provider-side, before the container exists, so a
+//     slow fetch can never outlive the entrypoint's credential wait
+//  3. pull the runner image if missing
+//  4. create the container with a credential tmpfs and workspace volume
+//  5. start it (its entrypoint blocks waiting for the delivery marker)
+//  6. deliver the credentials by streaming an in-memory tar into a
+//     `docker exec`-run `tar -x` (docker cp cannot write a running
+//     container's user tmpfs — see docker.Client.ExecStream), with an atomic
+//     .delivered marker as the tar's last entry
+//  7. verify the container is still running before reporting success
 //
 // Any failure after the container exists triggers a best-effort teardown of
 // what was created for this instance (ADR-004 creation guard), so a failed
@@ -59,7 +76,20 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, gErrors.NewDuplicateUserError(fmt.Sprintf("instance %q already exists", instanceName))
 	}
 
-	// Pull the image if missing. No resources exist yet, so a failure here
+	// Fetch credentials FIRST, before the container exists (ADR-002 F7).
+	// They never enter the container env, and nothing has been created yet,
+	// so a fetch failure leaves nothing to clean up. The in-memory tar is
+	// built here too, with the atomic ready marker as its last entry.
+	creds, err := p.fetchCredentials(ctx, bootstrap)
+	if err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("failed to fetch credentials for %q: %w", instanceName, err)
+	}
+	archive, err := metadata.TarArchive(withReadyMarker(creds))
+	if err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("failed to build credential archive for %q: %w", instanceName, err)
+	}
+
+	// Pull the image if missing. Still nothing created, so a failure here
 	// leaves nothing to clean up.
 	if err := p.ensureImage(ctx, p.cfg.RunnerImage); err != nil {
 		return params.ProviderInstance{}, err
@@ -96,36 +126,47 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	}
 
 	// Creation guard: from here, any error best-effort removes the container
-	// and its anonymous volumes before returning (ADR-004).
+	// and its anonymous volumes before returning, joining a cleanup failure
+	// onto the primary error rather than swallowing it (ADR-004).
 	guarded := func(retErr error) (params.ProviderInstance, error) {
-		p.bestEffortRemoveContainer(ctx, created.ID)
+		if cerr := p.bestEffortRemoveContainer(ctx, created.ID); cerr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("cleanup of container %s for %q failed: %w", created.ID, instanceName, cerr))
+		}
 		return params.ProviderInstance{}, retErr
 	}
 
-	// Start it; the entrypoint now blocks polling the credential tmpfs.
+	// Start it; the entrypoint now blocks waiting for the delivery marker.
 	if err := p.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
 		return guarded(fmt.Errorf("failed to start container for %q: %w", instanceName, err))
 	}
 
-	// Fetch credentials provider-side. They never enter the container env.
-	creds, err := p.fetchCredentials(ctx, bootstrap)
+	// Deliver the credentials into the running container's tmpfs by
+	// streaming the in-memory tar into a `docker exec`-run `tar -x`. This is
+	// the only moment the credential files exist inside the container, and
+	// the path is memory → exec stdin → tmpfs, never touching host disk
+	// (ADR-002 F1). docker cp is deliberately not used: it cannot write into
+	// a running container's user tmpfs (see docker.Client.ExecStream).
+	code, err := p.cli.ExecStream(ctx, created.ID, credentialDeliverCmd, archive)
 	if err != nil {
-		return guarded(fmt.Errorf("failed to fetch credentials for %q: %w", instanceName, err))
-	}
-
-	// Stream them into the running container's tmpfs via an in-memory tar.
-	// This is the only moment the credential files exist anywhere, and the
-	// path is memory → container, never touching host disk (ADR-002).
-	archive, err := metadata.TarArchive(creds)
-	if err != nil {
-		return guarded(fmt.Errorf("failed to build credential archive for %q: %w", instanceName, err))
-	}
-	if err := p.cli.CopyToContainer(ctx, created.ID, spec.CredentialDir, archive, container.CopyToContainerOptions{}); err != nil {
 		return guarded(fmt.Errorf("failed to deliver credentials to %q: %w", instanceName, err))
 	}
+	if code != 0 {
+		return guarded(fmt.Errorf("credential delivery exec for %q exited with code %d", instanceName, code))
+	}
 
-	// CreateInstance reports running immediately, as the reference providers
-	// do (research.md §2.A): the container is up and the runner will register
+	// Verify the container is still running before reporting success
+	// (ADR-002 F7): a container that exited during or right after delivery
+	// must not be reported to GARM as a healthy running instance.
+	inspected, err := p.cli.ContainerInspect(ctx, created.ID)
+	if err != nil {
+		return guarded(fmt.Errorf("failed to verify container state for %q: %w", instanceName, err))
+	}
+	if inspected.State == nil || !inspected.State.Running {
+		return guarded(fmt.Errorf("container for %q is not running after credential delivery", instanceName))
+	}
+
+	// CreateInstance reports running, as the reference providers do
+	// (research.md §2.A): the container is up and the runner will register
 	// once its entrypoint consumes the delivered credentials.
 	return params.ProviderInstance{
 		ProviderID: created.ID,
@@ -134,6 +175,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		OSArch:     bootstrap.OSArch,
 		Status:     params.InstanceRunning,
 	}, nil
+}
+
+// withReadyMarker appends the atomic ready marker (spec.ReadyMarker) as the
+// LAST credential entry, so `tar -x` creates it only after every real
+// credential file is fully written. The entrypoint waits for exactly this
+// marker instead of polling the individual files, closing the window in
+// which it could observe a partial credential set (ADR-002 F1).
+func withReadyMarker(files []metadata.CredentialFileContent) []metadata.CredentialFileContent {
+	out := make([]metadata.CredentialFileContent, 0, len(files)+1)
+	out = append(out, files...)
+	out = append(out, metadata.CredentialFileContent{Name: spec.ReadyMarker, Bytes: nil})
+	return out
 }
 
 // ensureImage pulls imageRef if it is not already present locally (ADR-002:
@@ -160,16 +213,23 @@ func (p *Provider) ensureImage(ctx context.Context, imageRef string) error {
 }
 
 // fetchCredentials fetches the runner's credentials from GARM's metadata
-// service (WP5): the three JIT files, or the non-JIT registration token.
+// service (WP5): the three JIT files, or the non-JIT registration token. The
+// whole fetch is bounded by an aggregate deadline (ADR-002 F7) so a stalled
+// metadata service fails the create cleanly rather than delaying delivery
+// past the entrypoint's own credential wait.
 func (p *Provider) fetchCredentials(ctx context.Context, b params.BootstrapInstance) ([]metadata.CredentialFileContent, error) {
 	mc, err := metadata.NewClient(b.MetadataURL, b.InstanceToken, b.CACertBundle)
 	if err != nil {
 		return nil, err
 	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, credentialFetchDeadline)
+	defer cancel()
+
 	if b.JitConfigEnabled {
-		return mc.FetchJITCredentials(ctx)
+		return mc.FetchJITCredentials(fetchCtx)
 	}
-	tok, err := mc.FetchRegistrationToken(ctx)
+	tok, err := mc.FetchRegistrationToken(fetchCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -177,11 +237,14 @@ func (p *Provider) fetchCredentials(ctx context.Context, b params.BootstrapInsta
 }
 
 // bestEffortRemoveContainer force-removes a container and its anonymous
-// volumes, swallowing every error. It is only called from the creation
-// guard, where the goal is to leave nothing behind, not to surface a
-// secondary cleanup failure over the primary error being returned.
-func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
-	_ = p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
+// volumes. It tolerates a NotFound (the container may already be gone) but
+// returns any other error so the creation guard can join it onto the primary
+// error rather than swallow it (ADR-004 F6).
+func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) error {
+	if err := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // buildRunnerEnv computes the runner container's environment per ADR-002's

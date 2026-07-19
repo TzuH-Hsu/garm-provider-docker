@@ -10,11 +10,11 @@ import (
 // with them.
 const (
 	// CredentialDir is the memory-backed tmpfs mount the provider streams
-	// the JIT credential files into after the container has started
-	// (ADR-002's create → start → poll → docker cp sequence). The
-	// entrypoint polls this directory, then moves the files into the
-	// runner working directory before exec'ing run.sh. mode 0700 keeps the
-	// secrets readable only by their owner.
+	// the credential files into after the container has started, via a
+	// `docker exec`-fed `tar -x` (ADR-002's fetch → create → start →
+	// exec-deliver sequence). The entrypoint waits for the ReadyMarker, then
+	// symlinks the files into the runner install dir. mode 0700 keeps the
+	// secrets readable only by their owner (RunnerUID).
 	CredentialDir = "/run/garm"
 
 	// RunnerWorkDir is the runner's working directory, backed by a per-job
@@ -23,6 +23,23 @@ const (
 	// checkout lands on the dedicated volume rather than the container
 	// rootfs.
 	RunnerWorkDir = "/actions-runner/_work"
+
+	// RunnerUID and RunnerGID are the myoung34 base image's runner user's
+	// numeric uid/gid. The credential tmpfs is owned by this uid/gid so the
+	// unprivileged runner user — which run.sh drops to — can read the
+	// credential files (through the entrypoint's symlinks), while the
+	// credential-delivery `docker exec` runs the `tar -x` as this same
+	// uid/gid so the extracted files are runner-owned (ADR-002 F1/F2).
+	RunnerUID = "1001"
+	RunnerGID = "1001"
+
+	// ReadyMarker is the atomic delivery marker the provider writes as the
+	// LAST entry of the credential tar (ADR-002 F1). Because `tar -x`
+	// creates entries in archive order, the marker appears only after every
+	// real credential file is fully written, so the entrypoint — which waits
+	// for exactly this file rather than polling the individual files — never
+	// observes a partially delivered credential set.
+	ReadyMarker = ".delivered"
 
 	// credentialDirMode is the tmpfs mode: owner-only. The credential files
 	// are secrets; no other UID inside the container may read them.
@@ -33,12 +50,22 @@ const (
 // the provider delivers credential files into (ADR-002). It is per-container
 // and not visible to any other container on the host; it is destroyed with
 // the container at teardown, taking the credentials with it.
+//
+// The mount is owned by the runner uid/gid (RunnerUID/RunnerGID) via the
+// tmpfs uid/gid options: the credential-delivery exec runs as that same
+// unprivileged user, so it must be able to write into the tmpfs, and the
+// runner process must be able to read the files back (ADR-002 F2). mode 0700
+// still excludes every other in-container UID.
 func CredentialTmpfsMount() mount.Mount {
 	return mount.Mount{
 		Type:   mount.TypeTmpfs,
 		Target: CredentialDir,
 		TmpfsOptions: &mount.TmpfsOptions{
 			Mode: credentialDirMode,
+			Options: [][]string{
+				{"uid", RunnerUID},
+				{"gid", RunnerGID},
+			},
 		},
 	}
 }
