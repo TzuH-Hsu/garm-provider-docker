@@ -104,9 +104,9 @@ func TestFetchJITCredentialsHappyPath(t *testing.T) {
 	}
 
 	want := []CredentialFileContent{
-		{Name: ".runner", Bytes: []byte("runner-file-contents")},
-		{Name: ".credentials", Bytes: []byte("credentials-file-contents")},
-		{Name: ".credentials_rsaparams", Bytes: []byte("rsaparams-file-contents")},
+		{Name: "runner", Bytes: []byte("runner-file-contents")},
+		{Name: "credentials", Bytes: []byte("credentials-file-contents")},
+		{Name: "credentials_rsaparams", Bytes: []byte("rsaparams-file-contents")},
 	}
 	if len(files) != len(want) {
 		t.Fatalf("got %d files, want %d", len(files), len(want))
@@ -269,8 +269,8 @@ func TestNewClientCABundleTrustsAdditionalCA(t *testing.T) {
 
 func TestTarArchiveRoundTrips(t *testing.T) {
 	files := []CredentialFileContent{
-		{Name: ".runner", Bytes: []byte("aaa")},
-		{Name: ".credentials", Bytes: []byte("bbb")},
+		{Name: "runner", Bytes: []byte("aaa")},
+		{Name: "credentials", Bytes: []byte("bbb")},
 	}
 	buf, err := TarArchive(files)
 	if err != nil {
@@ -280,7 +280,7 @@ func TestTarArchiveRoundTrips(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("archive has %d entries, want 2", len(got))
 	}
-	if got[".runner"] != "aaa" || got[".credentials"] != "bbb" {
-		t.Errorf("archive contents = %v, want .runner=aaa .credentials=bbb", got)
+	if got["runner"] != "aaa" || got["credentials"] != "bbb" {
+		t.Errorf("archive contents = %v, want runner=aaa credentials=bbb", got)
 	}
 }

@@ -9,15 +9,20 @@ import (
 )
 
 // CredentialFile pairs the metadata-service path segment used to fetch a
-// JIT credential file with the on-disk filename the runner expects for it.
+// JIT credential file with the tmpfs filename the runner image entrypoint
+// polls for.
 type CredentialFile struct {
 	// RemoteName is the path segment after "credentials/" in the request
 	// GET {metadata-url}/credentials/{RemoteName}. Note: no leading dot.
 	RemoteName string
 	// LocalName is the filename the bytes are written to inside the
-	// runner's credential tmpfs. Note the leading dot: run.sh reads
-	// .runner / .credentials / .credentials_rsaparams straight from the
-	// working directory the entrypoint moves them into (ADR-002).
+	// runner's credential tmpfs (/run/garm). Note: no leading dot — these
+	// are bare transport filenames. The runner image entrypoint
+	// (runner-images/noble/entrypoint.sh) polls the tmpfs for exactly
+	// these bare names and, once present, installs them into the runner
+	// install dir as .runner / .credentials / .credentials_rsaparams
+	// (ADR-002). The dotting happens at install time, not at delivery
+	// time.
 	LocalName string
 }
 
@@ -27,23 +32,27 @@ type CredentialFile struct {
 // map key) and the reference k8s provider's entrypoint, which fetches
 // exactly credentials/runner, credentials/credentials, and
 // credentials/credentials_rsaparams and writes them to .runner,
-// .credentials, and .credentials_rsaparams (research.md §1.C, §2.A).
+// .credentials, and .credentials_rsaparams (research.md §1.C, §2.A). The
+// reference provider's entrypoint performs that dotting itself after
+// receiving the bare-named files; garm-provider-docker's own runner image
+// entrypoint does the same, so the tmpfs transport names here must stay
+// bare to match what it polls for.
 //
 // Keeping the remote→local mapping in exactly one place is deliberate: a
-// mismatch between the fetch path segment and the on-disk filename would
+// mismatch between the fetch path segment and the tmpfs filename would
 // silently break run.sh's direct (config.sh-less) boot.
 var JITCredentialFiles = []CredentialFile{
-	{RemoteName: "runner", LocalName: ".runner"},
-	{RemoteName: "credentials", LocalName: ".credentials"},
-	{RemoteName: "credentials_rsaparams", LocalName: ".credentials_rsaparams"},
+	{RemoteName: "runner", LocalName: "runner"},
+	{RemoteName: "credentials", LocalName: "credentials"},
+	{RemoteName: "credentials_rsaparams", LocalName: "credentials_rsaparams"},
 }
 
-// RegistrationTokenFile is the on-disk filename the non-JIT registration
-// token is delivered as inside the credential tmpfs. The entrypoint reads
-// it and runs `config.sh --token "$(cat …)"` (ADR-002 non-JIT fallback).
-// It is a leading-dot name for consistency with the JIT files and to keep
-// it out of casual directory listings inside the runner.
-const RegistrationTokenFile = ".registration-token"
+// RegistrationTokenFile is the tmpfs filename the non-JIT registration
+// token is delivered as inside the credential tmpfs. The runner image
+// entrypoint polls for this bare name, reads it, and runs
+// `config.sh --token "$(cat …)"` (ADR-002 non-JIT fallback). No leading
+// dot: this is a tmpfs transport filename, not the install-dir name.
+const RegistrationTokenFile = "registration-token"
 
 // registrationTokenPath is the metadata path for the classic, non-JIT
 // runner registration token (research.md §1.C metadata router).

@@ -184,9 +184,9 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	}
 	files := decodeTar(t, cp.Content)
 	for name, want := range map[string]string{
-		".runner":                "RUNNER-FILE",
-		".credentials":           "CREDENTIALS-FILE",
-		".credentials_rsaparams": "RSAPARAMS-FILE",
+		"runner":                "RUNNER-FILE",
+		"credentials":           "CREDENTIALS-FILE",
+		"credentials_rsaparams": "RSAPARAMS-FILE",
 	} {
 		if files[name] != want {
 			t.Errorf("credential %q = %q, want %q", name, files[name], want)
@@ -233,8 +233,8 @@ func TestCreateInstanceHappyPathNonJIT(t *testing.T) {
 		t.Fatalf("Copies = %d, want 1", len(fake.Copies))
 	}
 	files := decodeTar(t, fake.Copies[0].Content)
-	if files[".registration-token"] != "REG-TOKEN" {
-		t.Errorf("registration token file = %q, want REG-TOKEN (files: %v)", files[".registration-token"], files)
+	if files["registration-token"] != "REG-TOKEN" {
+		t.Errorf("registration token file = %q, want REG-TOKEN (files: %v)", files["registration-token"], files)
 	}
 }
 
