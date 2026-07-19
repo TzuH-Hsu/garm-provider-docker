@@ -2,7 +2,10 @@ module github.com/TzuH-Hsu/garm-provider-docker
 
 go 1.25.0
 
-require github.com/cloudbase/garm-provider-common v0.1.9
+require (
+	github.com/BurntSushi/toml v1.6.0
+	github.com/cloudbase/garm-provider-common v0.1.9
+)
 
 require (
 	github.com/mattn/go-isatty v0.0.20 // indirect

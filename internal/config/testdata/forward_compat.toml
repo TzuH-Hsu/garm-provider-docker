@@ -1,0 +1,23 @@
+docker_host = "unix:///var/run/docker.sock"
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:0000000000000000000000000000000000000000000000000000000000aa"
+dind_image = "docker:dind@sha256:0000000000000000000000000000000000000000000000000000000000bb"
+dind_mode = "privileged-sidecar"
+allowed_dind_modes = ["none", "privileged-sidecar", "sysbox-runc"]
+storage_driver = "overlay2"
+enable_runner_callbacks = false
+
+[resources]
+runner_memory = "8GiB"
+dind_memory = "4GiB"
+
+[cache]
+enabled = true
+generation = "1"
+
+[network]
+enable_job_network = true
+internal = true
+
+[flavors.default]
+runner_memory = "8GiB"
+dind_memory = "4GiB"
