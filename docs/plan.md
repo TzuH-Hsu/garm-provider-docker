@@ -38,7 +38,7 @@ Scope: pool mode only, `dind_mode = "none"` (ADR-001), `linux/amd64` only, manua
 2. Minimal `internal/config` package (parse, defaults, no schema validation yet).
 3. `DockerClient` interface plus a moby SDK implementation.
 4. `internal/spec` env/label/name builders, covered by table tests.
-5. Provider-side JIT credential-file fetch and delivery (ADR-002): the create → start → entrypoint-poll → `docker cp` sequence into a job-scoped tmpfs mount, tested against a fake metadata HTTPS server that asserts the `Bearer` token and the `ca-cert-bundle` are presented/trusted correctly by the provider and never leak past it — no host-side temp file, no environment variable.
+5. Provider-side JIT credential-file fetch and delivery (ADR-002): the create → start → entrypoint-poll → `docker exec`-run `tar -x` streaming sequence into a job-scoped tmpfs mount, gated by an atomic `.delivered` marker (the tar's last entry) so the entrypoint never observes a partial credential set, tested against a fake metadata HTTPS server that asserts the `Bearer` token and the `ca-cert-bundle` are presented/trusted correctly by the provider and never leak past it — no host-side temp file, no environment variable.
 6. Runner image v0: digest-pinned `myoung34` base plus custom entrypoint (ADR-002), `linux/amd64` build only.
 7. `CreateInstance` in `none` mode (ADR-001).
 8. `DeleteInstance`/`GetInstance`/`ListInstances`: idempotent, exit code 30 on already-gone, ID-or-name resolver, label-filter-based lookup (ADR-004).
