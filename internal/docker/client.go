@@ -71,6 +71,14 @@ type Client interface {
 	// runner's memory-backed credential tmpfs (ADR-002): a `tar -x` fed the
 	// in-memory credential archive over its stdin.
 	//
+	// stdin must be a finite, in-memory reader (e.g. *bytes.Buffer) whose
+	// Read never blocks — every current caller passes the credential tar
+	// built entirely in memory. Cancelling ctx force-closes the underlying
+	// connection to unblock output draining, but that does not interrupt a
+	// concurrent stdin.Read(); a reader that can block indefinitely (a live
+	// network stream, say) would defeat the cancellation guarantee. See
+	// streamExec's doc comment in moby.go for the full explanation.
+	//
 	// docker exec — not docker cp (CopyToContainer) — is used deliberately.
 	// Docker's archive endpoints resolve the destination path in a separate
 	// filesystem view that does not include the container's user tmpfs

@@ -126,6 +126,17 @@ func (s sdkHijack) Close()                      { s.att.Close() }
 // and leaks no goroutine or fd on any path (success, exec error, or cancel):
 // the watcher is always stopped via the stop channel, and the connection is
 // always closed exactly once via a sync.Once.
+//
+// Contract on stdin: it must be a finite, in-memory reader whose Read never
+// blocks (e.g. the *bytes.Buffer ExecStream's only caller, provider.
+// CreateInstance, builds from the credential tar). Force-closing conn on ctx
+// cancellation unblocks the StdCopy drain and any pending Write, but it does
+// NOT unblock a concurrent stdin.Read() — that call is independent of conn.
+// A reader that can block indefinitely (e.g. a live network stream) would
+// leave the `werr := <-copyDone` receive below hung on that Read even after
+// cancellation, defeating the cancellation guarantee this function otherwise
+// provides. This is documentation of an existing invariant every current
+// caller already satisfies, not a behavior change.
 func streamExec(ctx context.Context, containerID string, conn execConn, stdin io.Reader) error {
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(conn.Close) }

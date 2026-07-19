@@ -301,8 +301,11 @@ func TestFakeClientExecStreamMalformedTar(t *testing.T) {
 }
 
 // TestFakeClientExecStreamRejectsWrongCommand proves the fake only models the
-// credential-delivery `tar -x … -C /run/garm` command and surfaces a wrong
-// command shape as an error rather than pretending to run it (NEW-5).
+// EXACT credential-delivery argv (`tar -x -p -C /run/garm`) and surfaces any
+// other command shape as an error rather than pretending to run it (NEW-5).
+// This includes degenerate shapes a looser "-x and -C <dir> appear somewhere"
+// scan would have wrongly accepted: isCredentialTarExtract requires an exact
+// argv match, not a scan.
 func TestFakeClientExecStreamRejectsWrongCommand(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -315,13 +318,17 @@ func TestFakeClientExecStreamRejectsWrongCommand(t *testing.T) {
 		t.Fatalf("ContainerStart returned unexpected error: %v", err)
 	}
 
-	// A command that is not a `tar -x -C /run/garm` extraction is rejected.
-	if _, err := f.ExecStream(ctx, created.ID, []string{"sh", "-c", "rm -rf /"}, strings.NewReader("")); err == nil {
-		t.Fatal("expected ExecStream to reject a non-tar command, got nil")
+	cases := map[string][]string{
+		"non-tar command entirely":             {"sh", "-c", "rm -rf /"},
+		"tar extraction into the wrong dir":    {"tar", "-x", "-C", "/tmp"},
+		"missing -p (old loose scan accepted)": {"tar", "-x", "-C", "/run/garm"},
+		"extra trailing argument":              {"tar", "-x", "-p", "-C", "/run/garm", "--checkpoint-action=exec=sh -c evil"},
+		"reordered flags":                      {"tar", "-C", "/run/garm", "-x", "-p"},
 	}
-	// A tar extraction into the wrong directory is likewise rejected.
-	if _, err := f.ExecStream(ctx, created.ID, []string{"tar", "-x", "-C", "/tmp"}, strings.NewReader("")); err == nil {
-		t.Fatal("expected ExecStream to reject a tar extraction into the wrong directory, got nil")
+	for name, cmd := range cases {
+		if _, err := f.ExecStream(ctx, created.ID, cmd, strings.NewReader("")); err == nil {
+			t.Errorf("%s: expected ExecStream to reject %v, got nil", name, cmd)
+		}
 	}
 }
 

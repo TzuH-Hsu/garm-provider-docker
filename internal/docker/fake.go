@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,24 +252,20 @@ const credentialTarTargetDir = "/run/garm"
 // archive is not a valid tar, modeling `tar -x` failing.
 const tarFailureExitCode = 2
 
-// isCredentialTarExtract reports whether cmd is the modeled credential-
-// delivery command: a `tar -x` extraction targeting `-C /run/garm`.
+// expectedCredentialTarExtractCmd is the exact argv the provider's
+// credentialDeliverCmd (internal/provider/create.go) builds for credential
+// delivery: `tar -x -p -C /run/garm`.
+var expectedCredentialTarExtractCmd = []string{"tar", "-x", "-p", "-C", credentialTarTargetDir}
+
+// isCredentialTarExtract reports whether cmd is EXACTLY the modeled
+// credential-delivery command. This is an exact-argv match rather than a
+// "contains -x and -C <dir> somewhere" scan: a looser check would also
+// accept degenerate shapes it was never meant to (extra/reordered
+// arguments, a missing `-p`, or a `-C /run/garm` that just happens to
+// appear alongside an unrelated `-x` flag elsewhere in the argv), silently
+// modeling something other than what the provider actually runs (NEW-5).
 func isCredentialTarExtract(cmd []string) bool {
-	if len(cmd) == 0 || cmd[0] != "tar" {
-		return false
-	}
-	var extract, targetOK bool
-	for i, a := range cmd {
-		switch a {
-		case "-x":
-			extract = true
-		case "-C":
-			if i+1 < len(cmd) && cmd[i+1] == credentialTarTargetDir {
-				targetOK = true
-			}
-		}
-	}
-	return extract && targetOK
+	return slices.Equal(cmd, expectedCredentialTarExtractCmd)
 }
 
 // extractTarIntoTmpfs decodes the streamed tar and records each entry in the

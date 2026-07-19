@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -376,6 +377,26 @@ func TestRedirectCrossOriginRejected(t *testing.T) {
 	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
 	if _, err := c.get(context.Background(), "redirect"); err == nil {
 		t.Fatal("expected a cross-origin https redirect to be rejected, got nil")
+	}
+}
+
+// TestOriginKeyCaseInsensitiveHost proves originKey lowercases the hostname
+// before building the comparison key, so a redirect target that differs from
+// the original URL only in host letter-casing (DNS hostnames are
+// case-insensitive) still compares as the same origin. Without this,
+// checkRedirect would fail closed and reject a legitimate same-origin
+// redirect purely because of casing.
+func TestOriginKeyCaseInsensitiveHost(t *testing.T) {
+	upper, err := url.Parse("https://Example.COM:8443/foo")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	lower, err := url.Parse("https://example.com:8443/bar")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if got, want := originKey(upper), originKey(lower); got != want {
+		t.Errorf("originKey(%q) = %q, originKey(%q) = %q, want equal (case-insensitive host)", upper, got, lower, want)
 	}
 }
 

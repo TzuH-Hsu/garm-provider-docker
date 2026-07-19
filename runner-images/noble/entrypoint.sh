@@ -210,15 +210,30 @@ own_runner_dir_as_runner() {
 # via gosu (config.sh refuses to run as root without RUNNER_ALLOW_RUNASROOT);
 # only when RUN_AS_ROOT=true is set deliberately does it run as root with
 # RUNNER_ALLOW_RUNASROOT=1. Fails CLOSED when gosu is missing (F11).
+#
+# config.sh runs BACKGROUNDED, with the function then `wait`-ing on it,
+# rather than as a plain foreground command — deliberately: bash only acts on
+# a trapped signal (the HUP/INT/TERM traps install_non_jit_registration sets
+# around this call) once it regains control between commands. A signal
+# arriving while bash is synchronously blocked on a *foreground* child is not
+# acted on until that child exits on its own; `wait` is the one bash builtin
+# that IS interrupted immediately by a trapped signal, returning early so the
+# trap runs promptly instead of only after config.sh finishes (verified
+# empirically against bash 3.2 and 5.3 — this is not version-specific).
+# `wait`'s own exit status becomes run_config_sh's return value unchanged.
 run_config_sh() {
+  local pid
   if [[ "${RUN_AS_ROOT:-false}" == "true" ]]; then
     log "RUN_AS_ROOT=true: running config.sh as $(id -un) with RUNNER_ALLOW_RUNASROOT=1"
-    RUNNER_ALLOW_RUNASROOT=1 ./config.sh "$@"
-    return
+    RUNNER_ALLOW_RUNASROOT=1 ./config.sh "$@" &
+    pid=$!
+  else
+    require_gosu
+    log "running config.sh as ${RUNNER_USER} via gosu"
+    gosu "${RUNNER_USER}" ./config.sh "$@" &
+    pid=$!
   fi
-  require_gosu
-  log "running config.sh as ${RUNNER_USER} via gosu"
-  gosu "${RUNNER_USER}" ./config.sh "$@"
+  wait "${pid}"
 }
 
 # prelink_non_jit_credentials pre-creates the dotted-name credential symlinks
@@ -242,24 +257,54 @@ prelink_non_jit_credentials() {
   ln -sfn "${CRED_DIR}/credentials_rsaparams" "${RUNNER_DIR}/.credentials_rsaparams"
 }
 
-# scrub_non_jit_credentials_on_failure is the EXIT-trap belt-and-braces for the
-# non-JIT config phase: if config.sh fails or is interrupted, it removes any
-# credential-pattern files — the dotted install-dir names AND their tmpfs
-# bare-name counterparts — so no failure path leaves credentials on the
-# container's disk-backed writable layer (ADR-002 F2). It preserves the
-# triggering exit code so a failed config still exits non-zero for GARM.
-scrub_non_jit_credentials_on_failure() {
-  local code=$?
-  if (( code == 0 )); then
-    return 0
-  fi
+# scrub_non_jit_credentials unconditionally removes the credential-pattern
+# files — the dotted install-dir names AND their tmpfs bare-name
+# counterparts — so no failure path leaves credentials on the container's
+# disk-backed writable layer (ADR-002 F2). Shared by the EXIT-trap and
+# signal-trap handlers below.
+scrub_non_jit_credentials() {
   local f
   for f in .runner .credentials .credentials_rsaparams; do
     # ${f#.} strips the leading dot to the tmpfs bare name (runner, etc.).
     rm -f "${RUNNER_DIR}/${f}" "${CRED_DIR}/${f#.}"
   done
+}
+
+# scrub_non_jit_credentials_on_failure is the EXIT-trap belt-and-braces for the
+# non-JIT config phase: if config.sh fails, it removes any credential-pattern
+# files so no failure path leaves credentials on the container's disk-backed
+# writable layer (ADR-002 F2). It preserves the triggering exit code so a
+# failed config still exits non-zero for GARM.
+#
+# This does NOT cover an unhandled TERM/INT/HUP: bash only runs the EXIT trap
+# on normal exit (including the `exit` builtin), never when the process is
+# killed by a signal it has no trap for — that terminates the shell
+# immediately (exit 143/130/129) without running EXIT-trap commands at all.
+# scrub_non_jit_credentials_on_signal below covers that case explicitly.
+scrub_non_jit_credentials_on_failure() {
+  local code=$?
+  if (( code == 0 )); then
+    return 0
+  fi
+  scrub_non_jit_credentials
   log "config.sh failed (exit ${code}); scrubbed credential-pattern files from the writable layer"
   return "${code}"
+}
+
+# scrub_non_jit_credentials_on_signal is the HUP/INT/TERM-trap handler for the
+# non-JIT config phase: it scrubs the same credential-pattern files as the
+# EXIT trap above, then exits with the conventional 128+signum status
+# (143/130/129) so the container's exit code still reports "killed by
+# signal" to GARM/the container runtime. It clears every trap this phase set
+# first, so the `exit` call below triggers the EXIT trap only once (as a
+# no-op — the scrub already ran) rather than re-running
+# scrub_non_jit_credentials_on_failure with a stale $?.
+scrub_non_jit_credentials_on_signal() {
+  local signum="$1"
+  trap - EXIT HUP INT TERM
+  scrub_non_jit_credentials
+  log "received signal ${signum} during config.sh; scrubbed credential-pattern files from the writable layer"
+  exit "$(( 128 + signum ))"
 }
 
 # install_non_jit_registration registers the runner with config.sh (as the
@@ -267,8 +312,9 @@ scrub_non_jit_credentials_on_failure() {
 # unconditionally because the image is digest-managed (ADR-002 F9). It
 # pre-links the credential paths onto the tmpfs BEFORE config.sh so the
 # generated credentials are written through onto tmpfs directly (never
-# relocated after the fact), and guards the config phase with a scrub-on-failure
-# trap so no failure path leaves credentials on the writable layer.
+# relocated after the fact), and guards the config phase with an EXIT trap
+# plus HUP/INT/TERM traps so no failure path — including an unhandled signal
+# — leaves credentials on the writable layer.
 install_non_jit_registration() {
   local token url
   token="$(cat "${CRED_DIR}/registration-token")"
@@ -291,12 +337,17 @@ install_non_jit_registration() {
   prelink_non_jit_credentials
 
   # Scrub credential-pattern files from the writable layer (and tmpfs) if
-  # config.sh fails or is interrupted, then clear the trap on success so the
-  # tmpfs-resident credentials are kept.
+  # config.sh fails, or if the container receives HUP/INT/TERM while it is
+  # running (an unhandled signal would otherwise bypass the EXIT trap
+  # entirely — see scrub_non_jit_credentials_on_signal above), then clear
+  # every trap on success so the tmpfs-resident credentials are kept.
   trap scrub_non_jit_credentials_on_failure EXIT
+  trap 'scrub_non_jit_credentials_on_signal 1' HUP
+  trap 'scrub_non_jit_credentials_on_signal 2' INT
+  trap 'scrub_non_jit_credentials_on_signal 15' TERM
   log "registering runner via config.sh (non-JIT)"
   run_config_sh "${args[@]}"
-  trap - EXIT
+  trap - EXIT HUP INT TERM
 
   prepare_workdir
 }

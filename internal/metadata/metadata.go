@@ -163,7 +163,10 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 // so two URLs compare as the same origin iff their scheme, host, and
 // effective port all match. A scheme downgrade (https→http) therefore yields
 // a different key, which is exactly what the cross-origin redirect check
-// relies on.
+// relies on. The hostname is lowercased before comparison: DNS hostnames are
+// case-insensitive, so a redirect target that differs from the original only
+// in host letter-casing is still the same origin — without this, checkRedirect
+// would fail closed and reject a legitimate same-origin redirect.
 func originKey(u *url.URL) string {
 	port := u.Port()
 	if port == "" {
@@ -174,7 +177,7 @@ func originKey(u *url.URL) string {
 			port = "80"
 		}
 	}
-	return u.Scheme + "://" + u.Hostname() + ":" + port
+	return u.Scheme + "://" + strings.ToLower(u.Hostname()) + ":" + port
 }
 
 // validateMetadataURL enforces the transport-security invariant on the
