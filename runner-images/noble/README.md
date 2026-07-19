@@ -113,12 +113,16 @@ that could emit any of them.
      `/run/garm` (credentials stay on tmpfs, never copied onto the
      writable layer), then `exec ./run.sh` directly (no `config.sh`, no
      `--jitconfig`).
-   - **Non-JIT**: run `./config.sh --unattended --ephemeral
-     --disableupdate --url … --token … --name …` as the runner user via
-     `gosu` (so the base image's own root guard is satisfied), then move
-     the generated `.runner`/`.credentials`/`.credentials_rsaparams` onto
-     `/run/garm` and symlink them back so the credentials are tmpfs-
-     resident too, then `exec ./run.sh`.
+   - **Non-JIT**: pre-create the `.runner`/`.credentials`/
+     `.credentials_rsaparams` symlinks pointing at `/run/garm` **before**
+     running `./config.sh --unattended --ephemeral --disableupdate --url …
+     --token … --name …` (as the runner user via `gosu`, so the base image's
+     own root guard is satisfied), so `config.sh` writes the generated
+     credentials through the symlinks directly onto the tmpfs. A
+     scrub-on-failure trap removes any credential-pattern files from the
+     writable layer if `config.sh` fails, then `exec ./run.sh`. (Whether the
+     runner writes these files in place through the symlink is an M0-demo
+     verification item, alongside the JIT symlink-compatibility check.)
    - Both paths drop root via `gosu runner` unless `RUN_AS_ROOT=true`, and
      **fail closed**: if `gosu` is missing and `RUN_AS_ROOT` is not set,
      the entrypoint exits with an error rather than silently running as
