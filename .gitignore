@@ -1,0 +1,24 @@
+# Local scratch notes (not version controlled)
+*.local.md
+
+# Go build artifacts
+/garm-provider-docker
+*.test
+*.out
+
+# Coverage reports
+coverage.*
+
+# Build output directories
+dist/
+bin/
+
+# IDE and editors
+.idea/
+.vscode/
+
+# OS specific
+.DS_Store
+
+# Local tool settings
+.claude/settings.local.json
