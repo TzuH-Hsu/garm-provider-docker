@@ -45,6 +45,14 @@ type FakeClient struct {
 	// guard path.
 	CopyErr error
 
+	// InspectErr, when non-nil, is returned by ContainerInspect instead of
+	// inspecting — used to exercise the resolver's non-NotFound error path.
+	InspectErr error
+
+	// RemoveErr, when non-nil, is returned by ContainerRemove instead of
+	// removing — used to exercise delete/teardown error handling.
+	RemoveErr error
+
 	// Copies records every CopyToContainer call, in order, so tests can
 	// assert the credential archive was streamed to the right container
 	// and destination.
@@ -59,12 +67,16 @@ type CopyRecord struct {
 }
 
 type fakeContainer struct {
-	id      string
-	name    string
-	image   string
-	labels  map[string]string
-	env     []string
-	started bool
+	id     string
+	name   string
+	image  string
+	labels map[string]string
+	env    []string
+
+	// state is the Docker state string: created, running, exited, or dead.
+	// It drives both the Running bool and the status a caller maps from.
+	state     string
+	oomKilled bool
 }
 
 // NewFakeClient constructs an empty FakeClient.
@@ -120,7 +132,7 @@ func (f *FakeClient) CopyToContainer(_ context.Context, containerID, dstPath str
 	if !ok {
 		return notFoundf("container %s not found", containerID)
 	}
-	if !c.started {
+	if c.state != "running" {
 		return fmt.Errorf("cannot copy into container %s: not running", containerID)
 	}
 	data, err := io.ReadAll(content)
@@ -149,6 +161,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _
 		id:     id,
 		name:   name,
 		labels: map[string]string{},
+		state:  "created",
 	}
 	if cfg != nil {
 		c.image = cfg.Image
@@ -162,7 +175,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _
 	return container.CreateResponse{ID: id}, nil
 }
 
-// ContainerStart marks a previously created container as started.
+// ContainerStart marks a previously created container as running.
 func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ container.StartOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -171,8 +184,34 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	if !ok {
 		return notFoundf("container %s not found", containerID)
 	}
-	c.started = true
+	c.state = "running"
 	return nil
+}
+
+// ContainerStop marks a container as exited.
+func (f *FakeClient) ContainerStop(_ context.Context, containerID string, _ container.StopOptions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c, ok := f.containers[containerID]
+	if !ok {
+		return notFoundf("container %s not found", containerID)
+	}
+	c.state = "exited"
+	return nil
+}
+
+// SetState forces a container's Docker state (created, running, exited,
+// dead) and OOMKilled flag, so status-mapping paths that a plain
+// start/stop cannot reach (dead, OOM-killed) are testable end-to-end.
+func (f *FakeClient) SetState(containerID, state string, oomKilled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if c, ok := f.containers[containerID]; ok {
+		c.state = state
+		c.oomKilled = oomKilled
+	}
 }
 
 // ContainerInspect returns the recorded state of containerID.
@@ -180,6 +219,9 @@ func (f *FakeClient) ContainerInspect(_ context.Context, containerID string) (ty
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.InspectErr != nil {
+		return types.ContainerJSON{}, f.InspectErr
+	}
 	c, ok := f.containers[containerID]
 	if !ok {
 		return types.ContainerJSON{}, notFoundf("container %s not found", containerID)
@@ -192,6 +234,9 @@ func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ co
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.RemoveErr != nil {
+		return f.RemoveErr
+	}
 	if _, ok := f.containers[containerID]; !ok {
 		return notFoundf("container %s not found", containerID)
 	}
@@ -216,11 +261,11 @@ func (f *FakeClient) ContainerList(_ context.Context, options container.ListOpti
 }
 
 func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
-	state := &types.ContainerState{Running: c.started}
-	if !c.started {
-		state.Status = "created"
-	} else {
-		state.Status = "running"
+	state := &types.ContainerState{
+		Status:    c.state,
+		Running:   c.state == "running",
+		Dead:      c.state == "dead",
+		OOMKilled: c.oomKilled,
 	}
 	return types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{
@@ -237,17 +282,13 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 }
 
 func (c *fakeContainer) toContainerSummary() types.Container {
-	status := "created"
-	if c.started {
-		status = "running"
-	}
 	return types.Container{
 		ID:     c.id,
 		Names:  []string{"/" + c.name},
 		Image:  c.image,
 		Labels: cloneLabels(c.labels),
-		Status: status,
-		State:  status,
+		Status: c.state,
+		State:  c.state,
 	}
 }
 

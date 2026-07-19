@@ -45,6 +45,12 @@ type Client interface {
 	// ContainerStart starts a previously created container.
 	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
 
+	// ContainerStop stops a running container, looked up by ID or name. It
+	// returns an errdefs.IsNotFound-satisfying error when no such container
+	// exists. Used by Stop and, best-effort, by the delete ordering
+	// (ADR-004).
+	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
+
 	// ContainerInspect returns the full state of one container, looked up
 	// by ID or name. It returns an errdefs.IsNotFound-satisfying error
 	// when no such container exists.

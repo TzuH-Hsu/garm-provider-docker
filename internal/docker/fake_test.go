@@ -103,6 +103,42 @@ func TestFakeClientNotFoundErrors(t *testing.T) {
 	}
 }
 
+func TestFakeClientContainerStopAndSetState(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	created, err := f.ContainerCreate(ctx, &container.Config{}, nil, nil, nil, "c1")
+	if err != nil {
+		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
+	}
+	if err := f.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart returned unexpected error: %v", err)
+	}
+
+	if err := f.ContainerStop(ctx, created.ID, container.StopOptions{}); err != nil {
+		t.Fatalf("ContainerStop returned unexpected error: %v", err)
+	}
+	got, err := f.ContainerInspect(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("ContainerInspect returned unexpected error: %v", err)
+	}
+	if got.State.Running || got.State.Status != "exited" {
+		t.Errorf("after stop: state = %+v, want exited/not-running", got.State)
+	}
+
+	// SetState reaches states start/stop cannot.
+	f.SetState(created.ID, "dead", true)
+	got, _ = f.ContainerInspect(ctx, created.ID)
+	if !got.State.Dead || !got.State.OOMKilled {
+		t.Errorf("after SetState(dead, oom): state = %+v", got.State)
+	}
+
+	// Stop on a missing container is NotFound.
+	if err := f.ContainerStop(ctx, "nope", container.StopOptions{}); !errdefs.IsNotFound(err) {
+		t.Errorf("ContainerStop(missing): err = %v, want NotFound", err)
+	}
+}
+
 func TestFakeClientImageInspectAndPull(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
