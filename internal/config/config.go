@@ -3,9 +3,16 @@
 package config
 
 import (
+	// crypto/sha256 is imported for its side effect: it registers the sha256
+	// algorithm with opencontainers/go-digest, so runner_image digest
+	// validation works even in a build (e.g. this package's isolated unit
+	// test binary) that would not otherwise link a sha256 implementation.
+	_ "crypto/sha256"
 	"fmt"
 
 	"github.com/BurntSushi/toml"
+	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 )
 
 // defaultDockerHost is used when the config file omits docker_host.
@@ -28,8 +35,17 @@ type Config struct {
 
 	// RunnerImage is the image reference used for CreateInstance. It is
 	// required and has no default: image provenance must always be an
-	// explicit operator choice (ADR-002), never an implicit one.
+	// explicit operator choice (ADR-002), never an implicit one. It must be
+	// pinned by a sha256 digest (name@sha256:<64-hex>) unless
+	// AllowUnpinnedRunnerImage is set.
 	RunnerImage string `toml:"runner_image"`
+
+	// AllowUnpinnedRunnerImage is a dev-only escape hatch. When false (the
+	// default) runner_image MUST be digest-pinned, so image provenance is
+	// reproducible and cannot drift under a mutable tag (ADR-002/ADR-005
+	// F10). Set it true ONLY for local development against a tag; never in a
+	// real deployment.
+	AllowUnpinnedRunnerImage bool `toml:"allow_unpinned_runner_image"`
 }
 
 // Load reads the TOML config file at path, applies defaults, and validates
@@ -62,6 +78,32 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.RunnerImage == "" {
 		return fmt.Errorf("runner_image is required")
+	}
+	if err := validateRunnerImage(c.RunnerImage, c.AllowUnpinnedRunnerImage); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRunnerImage requires runner_image to be a canonical, digest-pinned
+// image reference (name@sha256:<64-hex>), so the exact image bytes are
+// reproducible (ADR-002/ADR-005 F10). A malformed reference is always
+// rejected. A valid tag-only reference is rejected unless allowUnpinned is
+// set (the dev-only escape hatch).
+func validateRunnerImage(ref string, allowUnpinned bool) error {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return fmt.Errorf("runner_image %q is not a valid image reference: %w", ref, err)
+	}
+	canonical, ok := named.(reference.Canonical)
+	if !ok {
+		if allowUnpinned {
+			return nil
+		}
+		return fmt.Errorf("runner_image %q must be pinned by digest (name@sha256:<64-hex>); set allow_unpinned_runner_image = true to override in development", ref)
+	}
+	if d := canonical.Digest(); d.Algorithm() != digest.SHA256 || len(d.Encoded()) != 64 {
+		return fmt.Errorf("runner_image %q must be pinned by a sha256 digest", ref)
 	}
 	return nil
 }

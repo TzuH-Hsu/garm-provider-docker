@@ -12,7 +12,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -72,6 +74,15 @@ func WithRetry(maxRetries int, backoff time.Duration) Option {
 // deployments fronted by a private CA verify correctly (ADR-002 F16). An
 // empty bundle uses the system roots alone.
 func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Option) (*Client, error) {
+	// The instance token is sent as a Bearer header on every request, so the
+	// transport must not be cleartext: require https, permitting plain http
+	// only to a loopback host (which keeps httptest-based tests working and
+	// covers a co-located metadata service), and reject any userinfo in the
+	// URL (ADR-002 F5).
+	if err := validateMetadataURL(baseURL); err != nil {
+		return nil, err
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 
 	if len(caCertBundle) > 0 {
@@ -102,6 +113,45 @@ func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Optio
 		opt(c)
 	}
 	return c, nil
+}
+
+// validateMetadataURL enforces the transport-security invariant on the
+// metadata-url (ADR-002 F5): https is required to protect the Bearer instance
+// token, with a loopback-only exception for plain http, and no userinfo
+// credentials embedded in the URL.
+func validateMetadataURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid metadata-url %q: %w", raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("metadata-url %q has no host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("metadata-url %q must not embed userinfo credentials", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("metadata-url %q uses cleartext http to a non-loopback host; https is required to protect the instance token", raw)
+	default:
+		return fmt.Errorf("metadata-url %q must use https (or http to a loopback host), got scheme %q", raw, u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether host is a loopback address or "localhost".
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // get fetches {baseURL}/{path} with the Bearer instance token, retrying

@@ -1,0 +1,2 @@
+# A tag-only runner_image without the escape hatch: rejected (F10).
+runner_image = "ghcr.io/example/garm-runner-noble:dev"

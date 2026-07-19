@@ -1,0 +1,3 @@
+# A tag-only runner_image accepted via the dev-only escape hatch (F10).
+runner_image = "ghcr.io/example/garm-runner-noble:dev"
+allow_unpinned_runner_image = true

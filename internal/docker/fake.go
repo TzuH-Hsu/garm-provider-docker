@@ -46,10 +46,22 @@ type FakeClient struct {
 	// used to exercise the exec-delivery-failure creation-guard path.
 	ExecErr error
 
+	// CreateErr, when non-nil, is returned by ContainerCreate. By default no
+	// container is recorded (a clean create failure). When
+	// CreateErrLeaksContainer is also true, the container IS recorded before
+	// the error is returned, modeling the ambiguous daemon case where a
+	// create errors but a container may nonetheless exist (ADR-004 F6).
+	CreateErr               error
+	CreateErrLeaksContainer bool
+
 	// ExecExitCode is the exit code ExecStream reports (default 0). A
 	// non-zero value models a credential-delivery command that ran but
 	// failed, and suppresses the tmpfs write.
 	ExecExitCode int
+
+	// StartErr, when non-nil, is returned by ContainerStart instead of
+	// starting — used to exercise the start-failure creation-guard path.
+	StartErr error
 
 	// InspectErr, when non-nil, is returned by ContainerInspect instead of
 	// inspecting — used to exercise the resolver's non-NotFound error path.
@@ -100,6 +112,21 @@ func NewFakeClient() *FakeClient {
 }
 
 var _ Client = (*FakeClient)(nil)
+
+// find resolves a container by ID first, then by exact (case-sensitive)
+// Docker name, mirroring how the real daemon's by-ID endpoints also accept a
+// container name. Returns nil when neither matches. Callers hold f.mu.
+func (f *FakeClient) find(idOrName string) *fakeContainer {
+	if c, ok := f.containers[idOrName]; ok {
+		return c
+	}
+	for _, c := range f.containers {
+		if c.name == idOrName {
+			return c
+		}
+	}
+	return nil
+}
 
 // ImagePull records refStr and returns an already-closed empty reader —
 // there is no real image content to stream in the fake. When PullErr is
@@ -159,8 +186,8 @@ func (f *FakeClient) ExecStream(_ context.Context, containerID string, cmd []str
 	if f.ExecErr != nil {
 		return 0, f.ExecErr
 	}
-	c, ok := f.containers[containerID]
-	if !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return 0, notFoundf("container %s not found", containerID)
 	}
 	// exec, like the real daemon, requires a running container.
@@ -227,6 +254,11 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Clean create failure: nothing is recorded.
+	if f.CreateErr != nil && !f.CreateErrLeaksContainer {
+		return container.CreateResponse{}, f.CreateErr
+	}
+
 	f.nextID++
 	id := "fake-" + strconv.Itoa(f.nextID)
 
@@ -250,6 +282,12 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _
 	}
 	f.containers[id] = c
 
+	// Ambiguous create failure: the container was recorded, but the call
+	// still reports an error (ADR-004 F6).
+	if f.CreateErr != nil {
+		return container.CreateResponse{ID: id}, f.CreateErr
+	}
+
 	return container.CreateResponse{ID: id}, nil
 }
 
@@ -258,8 +296,11 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	c, ok := f.containers[containerID]
-	if !ok {
+	if f.StartErr != nil {
+		return f.StartErr
+	}
+	c := f.find(containerID)
+	if c == nil {
 		return notFoundf("container %s not found", containerID)
 	}
 	c.state = "running"
@@ -271,8 +312,8 @@ func (f *FakeClient) ContainerStop(_ context.Context, containerID string, _ cont
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	c, ok := f.containers[containerID]
-	if !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return notFoundf("container %s not found", containerID)
 	}
 	c.state = "exited"
@@ -300,14 +341,15 @@ func (f *FakeClient) ContainerInspect(_ context.Context, containerID string) (ty
 	if f.InspectErr != nil {
 		return types.ContainerJSON{}, f.InspectErr
 	}
-	c, ok := f.containers[containerID]
-	if !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return types.ContainerJSON{}, notFoundf("container %s not found", containerID)
 	}
 	return c.toContainerJSON(), nil
 }
 
-// ContainerRemove deletes containerID from the fake's in-memory store.
+// ContainerRemove deletes containerID (by ID or name) from the fake's
+// in-memory store.
 func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ container.RemoveOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -315,10 +357,11 @@ func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ co
 	if f.RemoveErr != nil {
 		return f.RemoveErr
 	}
-	if _, ok := f.containers[containerID]; !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return notFoundf("container %s not found", containerID)
 	}
-	delete(f.containers, containerID)
+	delete(f.containers, c.id)
 	return nil
 }
 

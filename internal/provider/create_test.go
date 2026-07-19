@@ -393,6 +393,99 @@ func TestCreateInstanceExecNonZeroExitCleansUp(t *testing.T) {
 	}
 }
 
+func TestCreateInstanceStartFailureCleansUp(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	fake.StartErr = errors.New("start boom")
+
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
+		t.Fatal("expected CreateInstance to fail on start, got nil")
+	}
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("start failure left %d containers behind, want 0 (guard should clean up)", n)
+	}
+	if len(fake.Execs) != 0 {
+		t.Errorf("a start failure must not deliver credentials, got %d execs", len(fake.Execs))
+	}
+}
+
+func TestCreateInstanceAmbiguousCreateRemovesLeakedContainer(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	// ContainerCreate errors but the daemon still created the container
+	// (ADR-004 F6): the guard must resolve it by name and remove it.
+	fake.CreateErr = errors.New("transient daemon error")
+	fake.CreateErrLeaksContainer = true
+
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
+		t.Fatal("expected CreateInstance to fail on create, got nil")
+	}
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("ambiguous create leaked %d containers, want 0 (guard should clean up)", n)
+	}
+}
+
+func TestCreateInstanceAmbiguousCreateLeavesForeignUntouched(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	// A foreign container occupies the deterministic Docker name our create
+	// would use (RunnerContainerName lowercases to "test-instance-01").
+	foreignID := seedRunner(t, fake, "Test-Instance-01", "p1", "different-controller", "running")
+
+	// A clean create failure: the ambiguous-cleanup resolver must validate
+	// ownership and refuse to remove the foreign container.
+	fake.CreateErr = errors.New("name conflict")
+
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
+		t.Fatal("expected CreateInstance to fail on create, got nil")
+	}
+	if _, err := fake.ContainerInspect(context.Background(), foreignID); err != nil {
+		t.Errorf("ambiguous-create cleanup removed a foreign container: %v", err)
+	}
+}
+
+func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
+	tests := []struct {
+		name   string
+		osType params.OSType
+		osArch params.OSArch
+	}{
+		{"windows rejected", params.Windows, params.Amd64},
+		{"arm64 rejected in M0", params.Linux, params.Arm64},
+		{"empty os rejected", "", params.Amd64},
+		{"empty arch rejected", params.Linux, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, fake := newTestProvider(t)
+			// Metadata URL is deliberately never contacted: platform
+			// validation runs before any Docker op or credential fetch.
+			b := jitBootstrap("https://metadata.invalid/")
+			b.OSType = tt.osType
+			b.OSArch = tt.osArch
+
+			if _, err := p.CreateInstance(context.Background(), b); err == nil {
+				t.Fatal("expected an unsupported-platform error, got nil")
+			}
+			if n := listAll(t, p); n != 0 {
+				t.Errorf("platform rejection left %d containers behind, want 0", n)
+			}
+			if len(fake.PulledImages) != 0 {
+				t.Errorf("platform rejection must not pull an image, got %v", fake.PulledImages)
+			}
+			if len(fake.Execs) != 0 {
+				t.Errorf("platform rejection must not deliver credentials, got %d execs", len(fake.Execs))
+			}
+		})
+	}
+}
+
 // hasEnv reports whether env contains an exact entry.
 func hasEnv(env []string, want string) bool {
 	for _, e := range env {

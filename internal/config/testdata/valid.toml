@@ -1,2 +1,2 @@
 docker_host = "unix:///var/run/docker-custom.sock"
-runner_image = "ghcr.io/example/garm-runner-noble@sha256:0000000000000000000000000000000000000000000000000000000000aa"
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"

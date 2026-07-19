@@ -252,6 +252,52 @@ func TestNewClientRejectsBadCABundle(t *testing.T) {
 	}
 }
 
+func TestNewClientMetadataURLValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"https accepted", "https://garm.example.com/api/v1/metadata", false},
+		{"http to a non-loopback host rejected", "http://garm.example.com/api/v1/metadata", true},
+		{"http to 127.0.0.1 (loopback) accepted", "http://127.0.0.1:9998/metadata", false},
+		{"http to a 127.0.0.0/8 address accepted", "http://127.9.9.9:9998/metadata", false},
+		{"http to ::1 (loopback) accepted", "http://[::1]:9998/metadata", false},
+		{"http to localhost accepted", "http://localhost:9998/metadata", false},
+		{"userinfo in the URL rejected", "https://user:pass@garm.example.com/metadata", true},
+		{"non-http(s) scheme rejected", "ftp://garm.example.com/metadata", true},
+		{"missing host rejected", "https:///metadata", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewClient(tt.url, testToken, nil, WithRetry(0, time.Millisecond))
+			if tt.wantErr && err == nil {
+				t.Fatalf("NewClient(%q) succeeded, want a validation error", tt.url)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("NewClient(%q) returned unexpected error: %v", tt.url, err)
+			}
+		})
+	}
+}
+
+// TestFetchOverTLSEndToEnd exercises the full https + ca-cert-bundle fetch
+// path against a real TLS server, proving the URL validation permits https
+// and the private-CA trust path works end to end.
+func TestFetchOverTLSEndToEnd(t *testing.T) {
+	srv := httptest.NewTLSServer(jitHandler(t, map[string]bool{}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, fastRetry)
+	files, err := c.FetchJITCredentials(context.Background())
+	if err != nil {
+		t.Fatalf("FetchJITCredentials over TLS returned unexpected error: %v", err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("got %d credential files over TLS, want 3", len(files))
+	}
+}
+
 func TestNewClientCABundleTrustsAdditionalCA(t *testing.T) {
 	// A well-formed CA PEM must parse (AppendCertsFromPEM succeeds),
 	// proving the bundle is added rather than rejected.

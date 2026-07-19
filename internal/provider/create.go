@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"time"
 
@@ -23,6 +24,12 @@ import (
 // so this is comfortable headroom; the metadata client keeps its bounded
 // per-request retries within this deadline.
 const credentialFetchDeadline = 60 * time.Second
+
+// cleanupTimeout bounds the creation guard's best-effort teardown. Cleanup
+// runs under a context detached from the caller's (context.WithoutCancel), so
+// a caller cancellation cannot abort a partial-allocation cleanup; this
+// timeout keeps that detached cleanup from hanging (ADR-004 F6).
+const cleanupTimeout = 30 * time.Second
 
 // credentialDeliverCmd is the command run inside the started container to
 // extract the streamed credential tar into the credential tmpfs. `-p`
@@ -53,6 +60,13 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	instanceName := bootstrap.Name
 	if instanceName == "" {
 		return params.ProviderInstance{}, fmt.Errorf("bootstrap instance name is empty")
+	}
+
+	// Reject unsupported platforms before ANY Docker operation (ADR F8), so
+	// an out-of-scope OS/arch surfaces as a clean provider_fault rather than
+	// a partially-created container.
+	if err := validatePlatform(bootstrap); err != nil {
+		return params.ProviderInstance{}, err
 	}
 
 	// TODO(M1): run the opportunistic orphan sweep here (ADR-004). M0 "none"
@@ -122,15 +136,28 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// Create (status created, not yet started).
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.RunnerContainerName(instanceName))
 	if err != nil {
+		// A ContainerCreate error is ambiguous: the daemon may have created
+		// the container before failing. Resolve it by its deterministic
+		// name, validate it is ours, and remove it so a failed create leaves
+		// nothing behind (ADR-004 F6).
+		if cerr := p.cleanupAmbiguousCreate(ctx, instanceName); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
 		return params.ProviderInstance{}, fmt.Errorf("failed to create container for %q: %w", instanceName, err)
 	}
 
 	// Creation guard: from here, any error best-effort removes the container
-	// and its anonymous volumes before returning, joining a cleanup failure
-	// onto the primary error rather than swallowing it (ADR-004).
+	// and its anonymous volumes before returning. Cleanup runs under a
+	// context detached from the caller's (context.WithoutCancel) with its own
+	// timeout, so a caller cancellation cannot abort it; a cleanup failure is
+	// logged and joined onto the primary error rather than swallowed
+	// (ADR-004 F6).
 	guarded := func(retErr error) (params.ProviderInstance, error) {
-		if cerr := p.bestEffortRemoveContainer(ctx, created.ID); cerr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("cleanup of container %s for %q failed: %w", created.ID, instanceName, cerr))
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		if cerr := p.bestEffortRemoveContainer(cleanupCtx, created.ID); cerr != nil {
+			log.Printf("garm-provider-docker: CreateInstance: cleanup of container %s for %q failed: %v", created.ID, instanceName, cerr)
+			retErr = errors.Join(retErr, fmt.Errorf("cleanup of container %s failed: %w", created.ID, cerr))
 		}
 		return params.ProviderInstance{}, retErr
 	}
@@ -243,6 +270,57 @@ func (p *Provider) fetchCredentials(ctx context.Context, b params.BootstrapInsta
 func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) error {
 	if err := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
 		return err
+	}
+	return nil
+}
+
+// cleanupAmbiguousCreate handles the case where ContainerCreate returned an
+// error but may still have created the container (ADR-004 F6). It resolves
+// the container by its deterministic name, validates that it is an owned
+// in-flight runner for exactly this instance, and removes it. A foreign or
+// unrelated container that happens to share the name is deliberately left
+// untouched. Cleanup runs on a context detached from the caller's, with its
+// own timeout.
+func (p *Provider) cleanupAmbiguousCreate(ctx context.Context, instanceName string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+
+	name := spec.RunnerContainerName(instanceName)
+	inspected, err := p.cli.ContainerInspect(cleanupCtx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil // the create really did leave nothing behind
+		}
+		return fmt.Errorf("failed to resolve possibly-created container %q for cleanup: %w", name, err)
+	}
+
+	labels := map[string]string{}
+	if inspected.Config != nil {
+		labels = inspected.Config.Labels
+	}
+	if !spec.IsManagedRunner(labels, p.controllerID) || labels[spec.LabelInstanceName] != instanceName {
+		return fmt.Errorf("container %q exists but is not an owned in-flight runner for %q; leaving it untouched", inspected.ID, instanceName)
+	}
+
+	if err := p.bestEffortRemoveContainer(cleanupCtx, inspected.ID); err != nil {
+		return fmt.Errorf("failed to remove ambiguously-created container %s for %q: %w", inspected.ID, instanceName, err)
+	}
+	return nil
+}
+
+// validatePlatform rejects bootstrap payloads outside the M0 target
+// (linux/amd64) before any Docker operation, so an unsupported platform
+// surfaces as a provider_fault rather than a partially-created container
+// (ADR F8).
+//
+// TODO(M4): accept params.Arm64 once the runner image ships a linux/arm64
+// manifest (ADR-002 multi-arch release).
+func validatePlatform(b params.BootstrapInstance) error {
+	if b.OSType != params.Linux {
+		return fmt.Errorf("unsupported OS type %q for instance %q: M0 supports only %q", b.OSType, b.Name, params.Linux)
+	}
+	if b.OSArch != params.Amd64 {
+		return fmt.Errorf("unsupported architecture %q for instance %q: M0 supports only %q", b.OSArch, b.Name, params.Amd64)
 	}
 	return nil
 }

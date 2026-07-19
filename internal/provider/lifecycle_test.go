@@ -102,6 +102,75 @@ func TestResolveNotFound(t *testing.T) {
 	}
 }
 
+// assertForeignUntouched asserts that every lifecycle method treats ref as
+// not-found and that the container foreignID is never removed.
+func assertForeignUntouched(t *testing.T, p *Provider, fake *docker.FakeClient, ref, foreignID string) {
+	t.Helper()
+	if _, err := p.GetInstance(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("GetInstance(%q) err = %v, want not-found (foreign container)", ref, err)
+	}
+	if err := p.Stop(context.Background(), ref, false); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("Stop(%q) err = %v, want not-found (foreign container)", ref, err)
+	}
+	if err := p.Start(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("Start(%q) err = %v, want not-found (foreign container)", ref, err)
+	}
+	if err := p.DeleteInstance(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("DeleteInstance(%q) err = %v, want not-found (foreign container)", ref, err)
+	}
+	if _, err := fake.ContainerInspect(context.Background(), foreignID); err != nil {
+		t.Errorf("foreign container %s was touched/removed: %v", foreignID, err)
+	}
+}
+
+func TestResolveRejectsForeignController(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// A managed runner owned by a DIFFERENT controller, whose Docker name and
+	// container ID both collide with what a lookup might resolve (ADR-004 F3).
+	foreignID := seedRunner(t, fake, "runner-foreign", "p1", "different-controller", "running")
+
+	// By GARM Name and by container ID: both must be not-found and untouched.
+	assertForeignUntouched(t, p, fake, "runner-foreign", foreignID)
+	assertForeignUntouched(t, p, fake, foreignID, foreignID)
+}
+
+func TestResolveRejectsWrongRole(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// A container this controller owns, but with a non-runner role (e.g. a
+	// future DinD sidecar): it must not be resolvable as a runner instance.
+	resp, err := fake.ContainerCreate(context.Background(), &container.Config{
+		Labels: map[string]string{
+			spec.LabelManaged:      "true",
+			spec.LabelControllerID: "controller-abc",
+			spec.LabelInstanceName: "sidecar-1",
+			spec.LabelRole:         spec.RoleDind,
+		},
+	}, nil, nil, nil, spec.RunnerContainerName("sidecar-1"))
+	if err != nil {
+		t.Fatalf("seed sidecar ContainerCreate returned unexpected error: %v", err)
+	}
+	fake.SetState(resp.ID, "running", false)
+
+	// By ID and by name.
+	assertForeignUntouched(t, p, fake, resp.ID, resp.ID)
+	assertForeignUntouched(t, p, fake, "sidecar-1", resp.ID)
+}
+
+func TestResolveRejectsUnmanaged(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// A completely unmanaged container whose Docker name collides.
+	resp, err := fake.ContainerCreate(context.Background(), &container.Config{
+		Labels: map[string]string{"some.other/label": "true"},
+	}, nil, nil, nil, "runner-x")
+	if err != nil {
+		t.Fatalf("seed unmanaged ContainerCreate returned unexpected error: %v", err)
+	}
+	fake.SetState(resp.ID, "running", false)
+
+	assertForeignUntouched(t, p, fake, "runner-x", resp.ID)
+	assertForeignUntouched(t, p, fake, resp.ID, resp.ID)
+}
+
 func TestGetInstanceStatusMapping(t *testing.T) {
 	tests := []struct {
 		state     string

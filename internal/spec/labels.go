@@ -143,3 +143,13 @@ func MatchesPredicate(labels map[string]string, controllerID string) bool {
 	}
 	return true
 }
+
+// IsManagedRunner reports whether labels identify a runner container this
+// controller owns: the full ADR-004 ownership predicate (MatchesPredicate)
+// AND role=runner. The resolver and creation guard use it to validate any
+// inspected container before acting on it, so a foreign or wrong-role
+// container that happens to collide on a Docker ID or name is never touched
+// (ADR-004 F3).
+func IsManagedRunner(labels map[string]string, controllerID string) bool {
+	return MatchesPredicate(labels, controllerID) && labels[LabelRole] == RoleRunner
+}

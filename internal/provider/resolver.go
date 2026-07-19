@@ -21,9 +21,23 @@ import (
 // daemon also matches against container names), then falls back to a label
 // filter on garm.docker/instance-name. The bool reports whether a container
 // was found; a genuine "gone" is (zero, false, nil), distinct from an error.
+//
+// Every successful inspect is validated for ownership (spec.IsManagedRunner):
+// a container that does not carry this controller's managed/runner labels is
+// treated as not-found, so a foreign or wrong-role container that happens to
+// collide on a Docker ID or name is never returned to a mutating caller
+// (Delete/Stop/Start), which could otherwise touch a container this provider
+// does not own (ADR-004 F3).
 func (p *Provider) resolve(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
 	inspected, err := p.cli.ContainerInspect(ctx, instanceID)
 	if err == nil {
+		if !p.ownsRunner(inspected) {
+			// A container exists under this ID/name but is not ours. Do NOT
+			// return it; fall through to the owned-label lookup, which can
+			// still find our container when instanceID was a GARM Name whose
+			// Docker name is taken by a foreign container.
+			return p.resolveByOwnedLabel(ctx, instanceID)
+		}
 		return inspected, true, nil
 	}
 	if !errdefs.IsNotFound(err) {
@@ -33,6 +47,14 @@ func (p *Provider) resolve(ctx context.Context, instanceID string) (types.Contai
 	// The id was likely a GARM instance Name that differs from the
 	// container's (lowercased) Docker name. Look it up by the instance-name
 	// label instead.
+	return p.resolveByOwnedLabel(ctx, instanceID)
+}
+
+// resolveByOwnedLabel finds this controller's runner container by the
+// garm.docker/instance-name label (the label filter already scopes to
+// managed=true + this controller-id), re-validating ownership defense-in-
+// depth before returning it.
+func (p *Provider) resolveByOwnedLabel(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
 	list, err := p.cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: p.managedByInstanceNameFilter(instanceID),
@@ -44,7 +66,7 @@ func (p *Provider) resolve(ctx context.Context, instanceID string) (types.Contai
 		return types.ContainerJSON{}, false, nil
 	}
 
-	inspected, err = p.cli.ContainerInspect(ctx, list[0].ID)
+	inspected, err := p.cli.ContainerInspect(ctx, list[0].ID)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			// Raced with a concurrent delete between list and inspect;
@@ -53,7 +75,19 @@ func (p *Provider) resolve(ctx context.Context, instanceID string) (types.Contai
 		}
 		return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", list[0].ID, err)
 	}
+	if !p.ownsRunner(inspected) {
+		return types.ContainerJSON{}, false, nil
+	}
 	return inspected, true, nil
+}
+
+// ownsRunner reports whether an inspected container carries this controller's
+// managed-runner ownership labels (ADR-004 F3).
+func (p *Provider) ownsRunner(c types.ContainerJSON) bool {
+	if c.Config == nil {
+		return false
+	}
+	return spec.IsManagedRunner(c.Config.Labels, p.controllerID)
 }
 
 // removeContainer stops (best-effort) then force-removes a container along
