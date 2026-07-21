@@ -157,16 +157,15 @@ func TestFakeVolumeRemoveRejectsInUse(t *testing.T) {
 	}
 }
 
-// TestFakeContainerStartRejectsMissingNetworkOrVolume is the F5 fake-fidelity
-// guard: ContainerStart fails when the attached user-defined network or a
-// required named volume has been removed out from under the container (e.g. by
-// a concurrent sweep), matching the real daemon — so that class of bug can no
-// longer pass a unit test.
-func TestFakeContainerStartRejectsMissingNetworkOrVolume(t *testing.T) {
+// TestFakeContainerStartRejectsMissingNetwork is the F5 fake-fidelity guard:
+// ContainerStart fails when the attached user-defined network has been removed
+// out from under the container (e.g. by a concurrent sweep), matching the real
+// daemon — networks are NOT auto-created — so that class of bug can no longer
+// pass a unit test.
+func TestFakeContainerStartRejectsMissingNetwork(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
 
-	// Attached network missing.
 	if _, err := f.VolumeCreate(ctx, volume.CreateOptions{Name: "j-workspace"}); err != nil {
 		t.Fatalf("VolumeCreate returned unexpected error: %v", err)
 	}
@@ -180,19 +179,40 @@ func TestFakeContainerStartRejectsMissingNetworkOrVolume(t *testing.T) {
 	if err := f.ContainerStart(ctx, respA.ID, container.StartOptions{}); err == nil {
 		t.Error("ContainerStart with a missing attached network succeeded, want an error")
 	}
+}
 
-	// Required named volume missing (network present).
+// TestFakeContainerCreateAutoCreatesMissingNamedVolume is the M2-W2 H3
+// fake-fidelity guard: referencing a NAMED volume that does not exist must make
+// ContainerCreate AUTO-CREATE it UNLABELED, matching the real daemon (verified on
+// Docker Engine 29.6.1: `docker create -v missing:/x …` materializes `missing`
+// with empty labels). This is the exact failure mode a concurrent GC-during-create
+// triggers — the provider must be able to detect the unlabeled replacement and
+// fail closed, which it can only test if the fake models the auto-create rather
+// than pretending the start fails.
+func TestFakeContainerCreateAutoCreatesMissingNamedVolume(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
 	if _, err := f.NetworkCreate(ctx, "j-net", network.CreateOptions{}); err != nil {
 		t.Fatalf("NetworkCreate returned unexpected error: %v", err)
 	}
-	respB, err := f.ContainerCreate(ctx, &container.Config{}, &container.HostConfig{
+	resp, err := f.ContainerCreate(ctx, &container.Config{}, &container.HostConfig{
 		NetworkMode: container.NetworkMode("j-net"),
 		Mounts:      []mount.Mount{{Type: mount.TypeVolume, Source: "j-vol-gone", Target: "/w"}},
-	}, nil, nil, "start-no-vol")
+	}, nil, nil, "auto-create-vol")
 	if err != nil {
 		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
 	}
-	if err := f.ContainerStart(ctx, respB.ID, container.StartOptions{}); err == nil {
-		t.Error("ContainerStart with a missing named volume succeeded, want an error")
+	// The missing named volume was auto-created, UNLABELED.
+	v, err := f.VolumeInspect(ctx, "j-vol-gone")
+	if err != nil {
+		t.Fatalf("referenced named volume was not auto-created by ContainerCreate: %v", err)
+	}
+	if len(v.Labels) != 0 {
+		t.Errorf("auto-created volume must be UNLABELED (real Moby copies no labels), got %v", v.Labels)
+	}
+	// And with the volume now present, start succeeds (no spurious not-found).
+	if err := f.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		t.Errorf("ContainerStart after auto-create failed: %v", err)
 	}
 }

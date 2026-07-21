@@ -137,6 +137,16 @@ type Client interface {
 	// VolumeCreate itself will catch it.
 	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
 
+	// VolumeInspect returns one volume by name, including its Labels. It
+	// returns an errdefs.IsNotFound-satisfying error when no such volume
+	// exists. Used to RE-VALIDATE a cache volume's ownership+identity labels
+	// against a snapshot immediately before the GC removes it by name, and to
+	// confirm — after the runner container is created — that a referenced cache
+	// volume is still the labeled one this provider ensured, not an UNLABELED
+	// volume the daemon auto-created because a concurrent GC evicted the
+	// original in the ensure→mount window (ADR-003 W2, H3).
+	VolumeInspect(ctx context.Context, volumeID string) (volume.Volume, error)
+
 	// VolumeRemove removes a volume by name. force=true also removes a
 	// volume still referenced by a stopped container (teardown ordering
 	// removes containers before volumes, so force is a defense-in-depth

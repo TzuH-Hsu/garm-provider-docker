@@ -157,6 +157,18 @@ type FakeClient struct {
 	// and must guard against re-entrancy/once-ness itself.
 	VolumeListHook func()
 
+	// VolumeInspectHook, when non-nil, is invoked at the very start of every
+	// VolumeInspect — before f.mu is taken — with the volume NAME being inspected.
+	// It is the seam for the M2-W2 H3 stale-name TOCTOU: a test can model a
+	// concurrent remove/recreate-under-the-same-name landing exactly BETWEEN a
+	// GC's label-scoped VolumeList snapshot and its RE-INSPECT-before-remove of a
+	// candidate, then assert the re-inspect sees the replacement's (foreign) labels
+	// and skips the removal — proving the GC never deletes a same-name volume that
+	// is no longer the stale cache it snapshotted. Like the other hooks it runs
+	// without f.mu held (so it may call back into the fake's own locked methods)
+	// and must guard re-entrancy/once-ness itself.
+	VolumeInspectHook func(name string)
+
 	// VolumeRemoveHook, when non-nil, is invoked at the very start of every
 	// VolumeRemove — before f.mu is taken — with the volume NAME the caller is
 	// about to remove. It is the destructive-boundary seam for the F4
@@ -630,6 +642,22 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.rawRuntime = hostConfig.Runtime
 		c.groupAdd = append([]string(nil), hostConfig.GroupAdd...)
 	}
+	// Model the real daemon AUTO-CREATING any referenced NAMED volume that does
+	// not exist (verified on Docker Engine 29.6.1: `docker create -v missing:/x`
+	// creates `missing` as an UNLABELED local volume). This is the M2-W2 H3
+	// failure mode: if a concurrent GC evicted a cache volume in the window
+	// between the provider ensuring/seeding it and this create referencing it, the
+	// daemon silently materializes an EMPTY, UNLABELED replacement here rather than
+	// failing — so the runner would mount an empty (read-only externals) tree and a
+	// GC-invisible orphan is left behind. Modeling it UNLABELED is what lets the
+	// provider's post-create revalidation detect and fail closed in unit tests.
+	for _, m := range c.mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			if _, ok := f.volumes[m.Source]; !ok {
+				f.volumes[m.Source] = &fakeVolume{name: m.Source, labels: map[string]string{}}
+			}
+		}
+	}
 	f.containers[id] = c
 
 	// Record the create SHAPE, retained across a later removal, so a test can
@@ -955,6 +983,31 @@ func (f *FakeClient) VolumeCreate(_ context.Context, options volume.CreateOption
 
 	v := &fakeVolume{name: name, labels: cloneLabels(options.Labels)}
 	f.volumes[name] = v
+	return volume.Volume{Name: v.name, Labels: cloneLabels(v.labels)}, nil
+}
+
+// VolumeInspect returns one volume by name (including its labels), or an
+// errdefs.IsNotFound-satisfying error when it is absent — mirroring the real
+// SDK. It is how the GC re-validates a volume's ownership+identity labels
+// immediately before removing it by name, and how the create path confirms a
+// referenced cache volume is still the labeled one it ensured rather than an
+// UNLABELED auto-created replacement (M2-W2 H3).
+func (f *FakeClient) VolumeInspect(_ context.Context, volumeID string) (volume.Volume, error) {
+	// Fire the re-inspect seam (if any) before taking the lock, so a test can
+	// model a concurrent same-name replacement landing between a GC's snapshot
+	// list and this re-inspect (H3). It runs without f.mu held so it may call
+	// back into the fake's own locked methods.
+	if f.VolumeInspectHook != nil {
+		f.VolumeInspectHook(volumeID)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	v, ok := f.volumes[volumeID]
+	if !ok {
+		return volume.Volume{}, notFoundf("volume %s not found", volumeID)
+	}
 	return volume.Volume{Name: v.name, Labels: cloneLabels(v.labels)}, nil
 }
 
