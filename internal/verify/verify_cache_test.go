@@ -192,10 +192,11 @@ allow_org_shared = false
 		t.Logf("[cache-hit] job B read the marker job A wrote into the SAME toolcache volume: %q", marker)
 	}
 
-	// Exactly one toolcache + one pnpm volume for this repokey (job B reused
-	// job A's; it did not create a second).
-	if n := len(lines(dockerOut(t, "volume", "ls", "-q", "--filter", "label=garm.docker/repo="+repoKey))); n != 2 {
-		t.Errorf("repo has %d cache volumes, want 2 (one toolcache + one pnpm, reused across both jobs)", n)
+	// Exactly one toolcache + one pnpm + one diag volume for this repokey (job B
+	// reused job A's; it did not create a second of any repo-keyed kind). The
+	// shared externals volume carries no repo label, so it is not counted here.
+	if n := len(lines(dockerOut(t, "volume", "ls", "-q", "--filter", "label=garm.docker/repo="+repoKey))); n != 3 {
+		t.Errorf("repo has %d repo-keyed cache volumes, want 3 (toolcache + pnpm + diag, reused across both jobs)", n)
 	}
 
 	// =========================================================================
