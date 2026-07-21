@@ -39,6 +39,16 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/pnpm; \
     pnpm --version
 
+# Create the default pnpm store mount point OWNED BY THE RUNNER USER (uid/gid
+# 1001) so a fresh named volume mounted here inherits runner ownership: Moby
+# copies an image directory's ownership onto an empty volume ONLY when the target
+# path already EXISTS in the image. Without this the mount point is absent, the
+# fresh volume mounts root-owned 0755, and a real `pnpm install` as the non-root
+# runner fails EACCES (H4 — verified on Docker Engine 29.6.1). The entrypoint
+# additionally chowns the CONFIGURED store path before the gosu drop, covering an
+# operator's custom [cache].pnpm_store_path; this handles the default path lean.
+RUN mkdir -p /opt/pnpm-store && chown 1001:1001 /opt/pnpm-store
+
 # Bypass the base image's config.sh-based entrypoint entirely (ADR-002):
 # this entrypoint never fetches JIT config itself, it only waits for
 # provider-delivered credential files (and, in DinD modes, Docker

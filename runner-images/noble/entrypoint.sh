@@ -196,6 +196,30 @@ prepare_diag() {
   log "prepared diagnostic-logs dir ${dir} (owned by ${RUNNER_USER})"
 }
 
+# prepare_cache_dirs ensures the mounted persistent-cache directories exist and
+# are owned by the runner user BEFORE privileges are dropped (ADR-003 W2, H4). A
+# fresh named volume mounts ROOT-owned 0755 whenever its target path is absent
+# from the image (Moby copies image ownership onto an empty volume only when the
+# path already exists), so without this a real `pnpm install` as the unprivileged
+# runner (uid 1001) fails EACCES on the pnpm store. It is driven by the env the
+# provider sets — npm_config_store_dir (the pnpm store, set ONLY when a persistent
+# store volume is actually mounted) and RUNNER_TOOL_CACHE (the toolcache) — so it
+# honors the OPERATOR-CONFIGURED store path, not a hardcoded one. This is
+# directory OWNERSHIP setup only; retention/pruning is never done in this
+# untrusted entrypoint (ADR-003 F14). The chown is non-recursive: a fresh volume
+# is empty and a warm one's contents are already runner-owned from prior jobs, so
+# recursing a full cache every job would be needless. No-op for any dir whose env
+# is unset (cache disabled or ineligible).
+prepare_cache_dirs() {
+  local dir
+  for dir in "${npm_config_store_dir:-}" "${RUNNER_TOOL_CACHE:-}"; do
+    [[ -z "${dir}" ]] && continue
+    mkdir -p "${dir}"
+    chown "${RUNNER_USER}:${RUNNER_USER}" "${dir}"
+    log "prepared cache dir ${dir} (owned by ${RUNNER_USER})"
+  done
+}
+
 # resolve_workdir mirrors the base image's own convention: an absolute
 # RUNNER_WORKDIR is used as-is, a relative one is relative to RUNNER_DIR
 # (which is also the entrypoint's cwd by the time this runs).
@@ -459,6 +483,11 @@ main() {
   # W2: own the mounted diagnostic-logs dir (if any) so the unprivileged runner
   # can write into the persistent diag volume (ADR-003; no-op when unset).
   prepare_diag
+
+  # H4: own the mounted pnpm store / toolcache dirs (if any) so the unprivileged
+  # runner can write into a fresh, root-owned persistent-cache volume (ADR-003;
+  # no-op when the corresponding env is unset).
+  prepare_cache_dirs
 
   if [[ "${JIT_CONFIG_ENABLED:-false}" == "true" ]]; then
     install_jit_credentials
