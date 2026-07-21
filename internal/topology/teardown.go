@@ -62,19 +62,48 @@ func (m *Manager) TeardownAllocation(ctx context.Context, instanceName string) (
 // runner containers, DinD sidecars (WP3), job-scoped volumes, and job networks —
 // in the ADR-004 (network-last) order (all containers first, then all volumes,
 // then all networks last, so no network is removed while it still has active
-// endpoints and each allocation's claim marker is held until its volumes are
-// gone). It is the manual-rescue teardown behind RemoveAllInstances (ADR-004):
-// label-scoped to this controller, never a global wipe, and it never touches
-// cache or diagnostic volumes (they carry no instance-name, so the predicate
-// excludes them structurally). Best-effort: per-resource errors are joined and
-// the teardown continues.
+// endpoints). It is the manual-rescue teardown behind RemoveAllInstances
+// (ADR-004): label-scoped to this controller, never a global wipe, and it
+// never touches cache or diagnostic volumes (they carry no instance-name, so
+// the predicate excludes them structurally). Best-effort: per-resource errors
+// are joined and the teardown continues.
 //
-// It is GENERATION-scoped PER INSTANCE (F4): the create-nonce each instance's
-// claim network currently holds is captured up front, and every removal is
-// scoped to its own instance's captured generation, so a concurrent create that
-// claims a new generation of some instance mid-rescue is never destroyed.
+// UNLIKE TeardownAllocation/the orphan sweep, TeardownAll is NOT
+// generation-nonce-scoped: it removes every resource matching the ownership
+// predicate at teardown start, regardless of which generation's create-nonce
+// it carries. This is deliberate (the rescue-path fix, post F4): a
+// generation-scoped rescue could leave an OLDER generation's residue behind
+// forever — e.g. a crashed generation A whose volume removal previously
+// failed, but whose claim network was already gone, coexisting with a live
+// generation B under a new nonce. Scoping removal to "whichever generation
+// each instance's claim network currently names" (as TeardownAllocation does)
+// makes a single rescue pass see and remove only generation B, silently
+// skipping A's leftover volume forever. RemoveAllInstances is a manual,
+// operator-invoked rescue whose whole point is "clean up everything this
+// controller owns" (ADR-004): it is safe to also remove a currently-live
+// generation's resources, and doing so is what actually reclaims A's
+// residue.
+//
+// This is now SAFE to do unconditionally because job-scoped volume names are
+// GENERATION-UNIQUE (F4, ADR-004 amendment 2026-07-21): each generation's
+// volume is discovered by its own managed+controller+instance-name label set
+// and removed by its own unique <instance>-<nonce>-<suffix> name, so a rescue
+// that enumerates and removes every managed volume for the controller can
+// never remove the WRONG generation's volume under another generation's
+// name — there is no shared name to collide on. The only nonce-STABLE
+// resource, the claim network, has no such collision risk here either: a
+// rescue pass legitimately reclaims whatever currently holds the name.
+//
+// The per-instance DeleteInstance/orphan-sweep paths (TeardownAllocation) are
+// UNCHANGED and remain generation-scoped (F4): those run automatically,
+// without an operator watching, so they must never delete a concurrent
+// peer's in-flight generation out from under it. TeardownAll's contract is
+// different by design — an operator invoking the manual rescue command
+// accepts that it removes everything, live or not.
 func (m *Manager) TeardownAll(ctx context.Context) error {
-	_, err := m.teardownGeneration(ctx, spec.MatchPredicateFilters(m.controllerID))
+	f := spec.MatchPredicateFilters(m.controllerID)
+	scope := &teardownScope{m: m, mode: teardownModeAll}
+	_, err := m.runTeardown(ctx, f, scope)
 	return err
 }
 
@@ -97,6 +126,9 @@ func (m *Manager) Rollback(ctx context.Context, instanceName, nonce string) erro
 // network currently holds ONCE at the start (the authorized generation to
 // remove) and passes it to a teardownScope, so only that generation's resources
 // are removed and a generation that claims the name mid-teardown is protected.
+// It backs TeardownAllocation (DeleteInstance and the orphan sweep) only —
+// TeardownAll (the RemoveAllInstances rescue path) deliberately does NOT go
+// through this generation-scoped helper; see TeardownAll's doc for why.
 func (m *Manager) teardownGeneration(ctx context.Context, f filters.Args) (bool, error) {
 	captured, err := m.claimNoncesByInstance(ctx, f)
 	if err != nil {
@@ -260,7 +292,16 @@ const (
 	teardownModeExact teardownMode = iota
 	// teardownModeGeneration removes each instance's CURRENT generation only:
 	// the create-nonce its claim-marker network held at teardown start (F4).
+	// Used by TeardownAllocation (DeleteInstance/orphan sweep).
 	teardownModeGeneration
+	// teardownModeAll removes every resource satisfying the ownership predicate
+	// regardless of its create-nonce — no generation gating at all. Used ONLY
+	// by TeardownAll (the RemoveAllInstances manual rescue path): see
+	// TeardownAll's doc for why dropping generation-scoping there is both safe
+	// (F4's generation-unique volume names) and necessary (an older, residual
+	// generation must not be left behind forever by a rescue that only ever
+	// sees each instance's CURRENT generation).
+	teardownModeAll
 )
 
 // teardownScope is the single gate every teardown removal passes through. It
@@ -288,17 +329,23 @@ type teardownScope struct {
 }
 
 // mayRemove reports whether a teardown may remove a resource with these labels,
-// applying the ADR-004 ownership predicate plus the F4 generation-nonce guard.
-// It takes ctx because the generation-mode fallback re-reads the live claim
-// nonce fresh, so the read that gates a removal is as current as possible.
+// applying the ADR-004 ownership predicate plus (in generation mode) the F4
+// generation-nonce guard. It takes ctx because the generation-mode fallback
+// re-reads the live claim nonce fresh, so the read that gates a removal is as
+// current as possible.
 func (s *teardownScope) mayRemove(ctx context.Context, labels map[string]string) (bool, error) {
 	if !spec.MatchesPredicate(labels, s.m.controllerID) {
 		return false, nil
 	}
 	nonce := labels[spec.LabelCreateNonce]
 
-	if s.mode == teardownModeExact {
+	switch s.mode {
+	case teardownModeExact:
 		return nonce == s.exact, nil
+	case teardownModeAll:
+		// The RESCUE path (TeardownAll): no generation gating at all — the
+		// ownership predicate above is the only gate. See TeardownAll's doc.
+		return true, nil
 	}
 
 	// teardownModeGeneration.

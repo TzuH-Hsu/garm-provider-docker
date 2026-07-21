@@ -1001,6 +1001,67 @@ func TestTeardownAllRemovesEveryControllerAllocationButNotCacheOrForeign(t *test
 	findVolume(t, fake, "toolcache-generation-1")
 }
 
+// TestTeardownAllRemovesOlderGenerationResidueAlongsideLiveGeneration is the
+// MEDIUM rescue-path fix: unlike TeardownAllocation/the orphan sweep,
+// TeardownAll (RemoveAllInstances) must NOT be generation-nonce-scoped, or an
+// older generation's residue — left behind by, e.g., a volume removal that
+// failed after its claim network had already been removed — is invisible to a
+// rescue pass that only ever sees "whichever generation currently holds the
+// claim network." This reproduces exactly that: generation A's workspace
+// volume survives with NO claim network at all (modeling that prior partial
+// failure directly), while generation B is a fully live allocation (network +
+// volume + running runner) under a DIFFERENT nonce. A single
+// RemoveAllInstances/TeardownAll pass must remove BOTH: A's residue (it still
+// satisfies the ADR-004 ownership predicate; scoping is now
+// generation-agnostic for this path) AND B's live allocation
+// (RemoveAllInstances's documented contract is "everything this controller
+// owns," ADR-004) — leaving zero managed resources for the controller.
+func TestTeardownAllRemovesOlderGenerationResidueAlongsideLiveGeneration(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+
+	// Generation A residue: only a stale workspace volume survives — its claim
+	// network is already gone (a previously-failed volume removal after a
+	// successful network removal). Its name embeds gen-a's own nonce.
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "gen-a")
+
+	// Generation B: a fully live allocation of the SAME instance name, under a
+	// DIFFERENT nonce — the current generation a naively generation-scoped
+	// rescue would see, while never noticing A's residue above.
+	seedAllocation(t, fake, "job-1", now, "gen-b", "running")
+
+	if countVolumes(t, fake) != 2 {
+		t.Fatalf("seeded volume count = %d, want 2 (gen-A residue + gen-B workspace)", countVolumes(t, fake))
+	}
+
+	if err := m.TeardownAll(context.Background()); err != nil {
+		t.Fatalf("TeardownAll returned unexpected error: %v", err)
+	}
+
+	if countContainers(t, fake) != 0 {
+		t.Errorf("container count = %d, want 0 (gen-B's live runner must also be removed by the rescue)", countContainers(t, fake))
+	}
+	if countNetworks(t, fake) != 0 {
+		t.Errorf("network count = %d, want 0 (gen-B's claim network must also be removed)", countNetworks(t, fake))
+	}
+	if countVolumes(t, fake) != 0 {
+		t.Errorf("volume count = %d, want 0 (both gen-A's residue AND gen-B's live volume must be removed — no residue left behind)", countVolumes(t, fake))
+	}
+}
+
+// TestTeardownAllJoinsRemovalError guards the teardownModeAll path the same
+// way the other teardown-error tests guard teardownModeGeneration/Exact: a
+// per-resource removal failure must be surfaced, not swallowed.
+func TestTeardownAllJoinsRemovalError(t *testing.T) {
+	m, fake := newManager(t)
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", time.Now(), "n1")
+	fake.VolumeRemoveErr = errors.New("volume busy")
+
+	if err := m.TeardownAll(context.Background()); err == nil {
+		t.Fatal("expected TeardownAll to surface the volume removal error, got nil")
+	}
+}
+
 // --- Rollback (creation guard) -----------------------------------------------
 
 func TestRollbackIsNonceKeyed(t *testing.T) {

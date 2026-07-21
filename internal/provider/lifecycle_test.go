@@ -500,17 +500,22 @@ func TestDeleteInstanceRemoveErrorSurfaces(t *testing.T) {
 	}
 }
 
-func TestRemoveAllInstancesToleratesRemoveError(t *testing.T) {
+func TestRemoveAllInstancesSurfacesRemoveErrorButDoesNotFailFast(t *testing.T) {
 	p, fake := newTestProvider(t)
 	seedRunner(t, fake, "job-a", "p1", "controller-abc", "running")
+	seedRunner(t, fake, "job-b", "p1", "controller-abc", "running")
 	fake.RemoveErr = errors.New("remove failed")
 
-	// Best-effort: a removal failure is logged, not returned.
-	if err := p.RemoveAllInstances(context.Background()); err != nil {
-		t.Errorf("RemoveAllInstances should not fail fast on a removal error, got %v", err)
+	// Best-effort (does not fail fast: BOTH containers are still attempted,
+	// not just the first), but no longer silent: the aggregated error is now
+	// surfaced to the caller instead of only logged, so an operator running
+	// this rescue command can tell an incomplete sweep apart from a clean one.
+	err := p.RemoveAllInstances(context.Background())
+	if err == nil {
+		t.Fatal("expected RemoveAllInstances to surface the removal error, got nil")
 	}
-	if n := listAll(t, p); n != 1 {
-		t.Errorf("container count = %d, want 1 (removal failed so it stays)", n)
+	if n := listAll(t, p); n != 2 {
+		t.Errorf("container count = %d, want 2 (both removals failed so both stay)", n)
 	}
 }
 
