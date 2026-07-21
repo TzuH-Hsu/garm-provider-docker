@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -158,10 +159,24 @@ type fakeContainer struct {
 	networkMode string
 
 	// mounts models HostConfig.Mounts — the named/anonymous workspace volume
-	// (ADR-001). Recorded at ContainerCreate so ContainerInspect reports them
-	// under .Mounts, letting a test assert the workspace volume is mounted at
-	// the runner workdir (the WP9-flagged JIT-workdir contract).
+	// (ADR-001), plus WP3's shared socket volume and the DinD sidecar's
+	// dind-state volume. Recorded at ContainerCreate so ContainerInspect
+	// reports them under .Mounts, letting a test assert the workspace volume
+	// is mounted at the runner workdir (the WP9-flagged JIT-workdir contract)
+	// and the socket/dind-state volumes at their DinD paths.
 	mounts []mount.Mount
+
+	// cmd, privileged, and runtime model the container.Config.Cmd and the two
+	// HostConfig fields the DinD sidecar sets (ADR-001): the `dockerd
+	// --host=... --storage-driver=...` argv, Privileged (true for
+	// privileged-sidecar, false for sysbox-runc), and Runtime ("" default, or
+	// "sysbox-runc"). Recorded at ContainerCreate and surfaced by
+	// ContainerInspect so a test can assert the sidecar was built with the
+	// right storage driver, privilege, and runtime — the exact real-daemon
+	// contract WP3's live verification also checks.
+	cmd        []string
+	privileged bool
+	runtime    string
 
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
@@ -484,6 +499,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	if cfg != nil {
 		c.image = cfg.Image
 		c.env = append([]string(nil), cfg.Env...)
+		c.cmd = append([]string(nil), cfg.Cmd...)
 		for k, v := range cfg.Labels {
 			c.labels[k] = v
 		}
@@ -503,6 +519,8 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	if hostConfig != nil {
 		c.networkMode = string(hostConfig.NetworkMode)
 		c.mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
+		c.privileged = hostConfig.Privileged
+		c.runtime = hostConfig.Runtime
 	}
 	f.containers[id] = c
 
@@ -790,10 +808,14 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		OOMKilled: c.oomKilled,
 	}
 	base := &types.ContainerJSONBase{
-		ID:         c.id,
-		Name:       "/" + c.name,
-		State:      state,
-		HostConfig: &container.HostConfig{Tmpfs: cloneLabels(c.tmpfsMounts)},
+		ID:    c.id,
+		Name:  "/" + c.name,
+		State: state,
+		HostConfig: &container.HostConfig{
+			Tmpfs:      cloneLabels(c.tmpfsMounts),
+			Privileged: c.privileged,
+			Runtime:    c.runtime,
+		},
 	}
 	if c.networkMode != "" {
 		base.HostConfig.NetworkMode = container.NetworkMode(c.networkMode)
@@ -804,6 +826,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		Config: &container.Config{
 			Image:  c.image,
 			Env:    append([]string(nil), c.env...),
+			Cmd:    strslice.StrSlice(append([]string(nil), c.cmd...)),
 			Labels: cloneLabels(c.labels),
 		},
 		Mounts: c.mountPoints(),
