@@ -10,7 +10,7 @@ import (
 
 func TestDindCommand(t *testing.T) {
 	got := DindCommand("overlay2")
-	want := []string{"dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"}
+	want := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("DindCommand(overlay2) = %v, want %v", got, want)
 	}
@@ -19,8 +19,8 @@ func TestDindCommand(t *testing.T) {
 		t.Errorf("DindCommand(vfs) storage arg = %q, want --storage-driver=vfs", got[2])
 	}
 	// DindDockerHost is the exact socket the runner's DOCKER_HOST must match.
-	if DindDockerHost != "unix:///var/run/docker.sock" {
-		t.Errorf("DindDockerHost = %q, want unix:///var/run/docker.sock", DindDockerHost)
+	if DindDockerHost != "unix:///run/docker.sock" {
+		t.Errorf("DindDockerHost = %q, want unix:///run/docker.sock", DindDockerHost)
 	}
 }
 
@@ -44,7 +44,7 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 
 	// dockerd argv listens ONLY on the shared unix socket, with the explicit
 	// storage driver.
-	wantCmd := []string{"dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"}
+	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
 	if !slices.Equal([]string(cfg.Cmd), wantCmd) {
 		t.Errorf("Cmd = %v, want %v", cfg.Cmd, wantCmd)
 	}
@@ -78,7 +78,7 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 		t.Errorf("Memory = %d, want %d", host.Resources.Memory, 4<<30)
 	}
 
-	// Exactly two mounts: socket at /var/run, dind-state at /var/lib/docker.
+	// Exactly two mounts: socket at /run, dind-state at /var/lib/docker.
 	assertMount(t, host.Mounts, "job-1-socket", DindSocketDir)
 	assertMount(t, host.Mounts, "job-1-dind-state", DindStateDir)
 	if len(host.Mounts) != 2 {
@@ -143,7 +143,7 @@ func TestBuildRunnerContainerDinDSocketMountAndNoHostSocket(t *testing.T) {
 		SocketVolumeName:    "job-1-socket",
 	})
 
-	// The runner mounts the SHARED socket volume at /var/run (the sole
+	// The runner mounts the SHARED socket volume at /run (the sole
 	// runner→daemon channel) plus its workspace — and nothing else.
 	assertMount(t, host.Mounts, "job-1-socket", DindSocketDir)
 	assertMount(t, host.Mounts, "job-1-workspace", RunnerWorkDir)
@@ -182,7 +182,7 @@ func TestBuildRunnerEnvEmitsDockerHostOnlyInDinDModes(t *testing.T) {
 		RunnerWorkDir:    RunnerWorkDir,
 		DockerHost:       DindDockerHost,
 	})
-	if !hasExactEnv(jit, "DOCKER_HOST=unix:///var/run/docker.sock") {
+	if !hasExactEnv(jit, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("JIT DinD env = %v, want DOCKER_HOST set", jit)
 	}
 
@@ -195,7 +195,7 @@ func TestBuildRunnerEnvEmitsDockerHostOnlyInDinDModes(t *testing.T) {
 		Entity:           Entity{Scope: EntityOrg, Org: "acme"},
 		DockerHost:       DindDockerHost,
 	})
-	if !hasExactEnv(nonJIT, "DOCKER_HOST=unix:///var/run/docker.sock") {
+	if !hasExactEnv(nonJIT, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("non-JIT DinD env = %v, want DOCKER_HOST set", nonJIT)
 	}
 

@@ -32,7 +32,7 @@ func (p *Provider) effectiveDindMode() string {
 // container ID. It is called ONLY in DinD modes (dindMode != "none").
 //
 // The sidecar joins the same per-job network as the runner, mounts the shared
-// socket volume at /var/run (where dockerd exposes its unix socket) and the
+// socket volume at /run (where dockerd exposes its unix socket) and the
 // dind-state volume at /var/lib/docker, runs `dockerd --host=unix://...
 // --storage-driver=<config>` with TLS off, and carries this attempt's
 // create-nonce so the creation-guard rollback (nonce-keyed) reclaims it on any

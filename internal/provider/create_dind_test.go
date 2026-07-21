@@ -105,7 +105,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		t.Errorf("sidecar Runtime = %q, want empty (default runtime)", dind.HostConfig.Runtime)
 	}
 	// dockerd argv carries the explicit storage driver from config.
-	wantCmd := []string{"dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"}
+	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
 	if !slices.Equal([]string(dind.Config.Cmd), wantCmd) {
 		t.Errorf("sidecar Cmd = %v, want %v", dind.Config.Cmd, wantCmd)
 	}
@@ -117,7 +117,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if string(dind.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
 		t.Errorf("sidecar NetworkMode = %q, want the job network", dind.HostConfig.NetworkMode)
 	}
-	// Socket at /var/run and dind-state at /var/lib/docker; no host docker.sock.
+	// Socket at /run and dind-state at /var/lib/docker; no host docker.sock.
 	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
 	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name), spec.DindStateDir)
 	assertNoHostSocketMount(t, dind.Mounts)
@@ -131,8 +131,8 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		t.Errorf("provider_id container role = %q, want runner", runner.Config.Labels[spec.LabelRole])
 	}
 	// DOCKER_HOST points at the sidecar socket.
-	if !hasEnv(runner.Config.Env, "DOCKER_HOST=unix:///var/run/docker.sock") {
-		t.Errorf("runner env = %v, want DOCKER_HOST=unix:///var/run/docker.sock", runner.Config.Env)
+	if !hasEnv(runner.Config.Env, "DOCKER_HOST=unix:///run/docker.sock") {
+		t.Errorf("runner env = %v, want DOCKER_HOST=unix:///run/docker.sock", runner.Config.Env)
 	}
 	// No credential leak (M0 invariant preserved in DinD mode).
 	for _, e := range runner.Config.Env {
@@ -140,7 +140,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 			t.Errorf("runner env leaks the token or metadata URL: %q", e)
 		}
 	}
-	// Runner shares the SAME socket volume (at /var/run) + its workspace; no host socket.
+	// Runner shares the SAME socket volume (at /run) + its workspace; no host socket.
 	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
 	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, runner.Mounts)

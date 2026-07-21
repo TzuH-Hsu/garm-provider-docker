@@ -17,7 +17,7 @@ import (
 func TestFakeModelsDindSidecarFields(t *testing.T) {
 	f := NewFakeClient()
 
-	cmd := []string{"dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"}
+	cmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
 	resp, err := f.ContainerCreate(context.Background(),
 		&container.Config{
 			Image: "docker:dind@sha256:abc",
@@ -27,7 +27,7 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 		&container.HostConfig{
 			Privileged: true,
 			Mounts: []mount.Mount{
-				{Type: mount.TypeVolume, Source: "job-1-socket", Target: "/var/run"},
+				{Type: mount.TypeVolume, Source: "job-1-socket", Target: "/run"},
 				{Type: mount.TypeVolume, Source: "job-1-dind-state", Target: "/var/lib/docker"},
 			},
 			NetworkMode: container.NetworkMode("job-1-net"),
@@ -56,7 +56,7 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 	// Both DinD mounts surface under .Mounts.
 	haveSocket, haveState := false, false
 	for _, m := range got.Mounts {
-		if m.Name == "job-1-socket" && m.Destination == "/var/run" {
+		if m.Name == "job-1-socket" && m.Destination == "/run" {
 			haveSocket = true
 		}
 		if m.Name == "job-1-dind-state" && m.Destination == "/var/lib/docker" {
@@ -64,7 +64,7 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 		}
 	}
 	if !haveSocket || !haveState {
-		t.Errorf("Mounts = %+v, want socket at /var/run and dind-state at /var/lib/docker", got.Mounts)
+		t.Errorf("Mounts = %+v, want socket at /run and dind-state at /var/lib/docker", got.Mounts)
 	}
 }
 

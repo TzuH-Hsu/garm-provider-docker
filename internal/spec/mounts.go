@@ -158,7 +158,7 @@ type RunnerContainerSpec struct {
 	NetworkName string
 
 	// SocketVolumeName, when non-empty (DinD modes only, WP3), mounts the
-	// shared DinD socket volume at DindSocketDir (/var/run) so the runner
+	// shared DinD socket volume at DindSocketDir (/run) so the runner
 	// sees ONLY the sidecar's daemon socket there. It is the same named
 	// volume the DinD sidecar mounts at the same path
 	// (DindContainerSpec.SocketVolumeName), the sole runner→daemon channel —
@@ -274,7 +274,7 @@ type DindContainerSpec struct {
 	NetworkName string
 
 	// SocketVolumeName backs the shared DinD socket mount at DindSocketDir
-	// (/var/run): dockerd creates its unix socket there and the runner,
+	// (/run): dockerd creates its unix socket there and the runner,
 	// mounting the SAME named volume, reaches it. It is the ONLY channel
 	// between the runner and the daemon — never a host socket, never TCP
 	// (ADR-001). Required for a DinD sidecar.

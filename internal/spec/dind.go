@@ -12,15 +12,27 @@ import (
 // gha-runner-scale-set DinD values.
 const (
 	// DindSocketDir is where the shared socket volume is mounted in BOTH the
-	// DinD sidecar and the runner (/var/run). dockerd creates its unix
-	// socket here; the runner, mounting the same named volume at this path,
-	// reaches ONLY that socket. This is the sole runner→daemon channel —
-	// there is no host docker.sock mount and no TCP listener anywhere.
-	DindSocketDir = "/var/run"
+	// DinD sidecar and the runner (/run). dockerd creates its unix socket
+	// here; the runner, mounting the same named volume at this path, reaches
+	// ONLY that socket. This is the sole runner→daemon channel — there is no
+	// host docker.sock mount and no TCP listener anywhere.
+	//
+	// It is /run, NOT /var/run, deliberately (a real-daemon correction to
+	// ADR-001's literal "/var/run/docker.sock"): on Debian/Ubuntu/Alpine —
+	// the myoung34 runner base and docker:dind alike — /var/run is a symlink
+	// to /run, so mounting the socket volume at /var/run resolves to /run and
+	// SHADOWS the credential tmpfs at /run/garm (ADR-002), making credential
+	// delivery fail on the real daemon. Mounting at /run (the volume being the
+	// PARENT of /run/garm) lets Docker mount /run first and the /run/garm
+	// tmpfs on top, so both coexist. This is also ARC's actual
+	// gha-runner-scale-set pattern — which ADR-001 says it mirrors — where the
+	// shared var-run volume is mounted at /run with DOCKER_HOST=
+	// unix:///run/docker.sock. See the WP3 report; ADR-001 should be amended.
+	DindSocketDir = "/run"
 
 	// DindSocketPath is the unix socket dockerd listens on inside
 	// DindSocketDir, and the path the runner's DOCKER_HOST points at.
-	DindSocketPath = "/var/run/docker.sock"
+	DindSocketPath = "/run/docker.sock"
 
 	// DindDockerHost is the DOCKER_HOST value the runner uses (and the
 	// --host dockerd listens on): the unix socket on the shared volume. The
