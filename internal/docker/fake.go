@@ -83,6 +83,29 @@ type FakeClient struct {
 	// removing — used to exercise delete/teardown error handling.
 	RemoveErr error
 
+	// NetworkCreateErr, when non-nil, is returned by NetworkCreate instead of
+	// creating — used to exercise the claim-marker create-failure path. By
+	// default no network is recorded (a clean failure). When
+	// NetworkCreateErrLeaks is also true, the network IS recorded before the
+	// error is returned, modeling the ambiguous daemon case where a create
+	// errors but a network may nonetheless exist (mirroring
+	// CreateErr/CreateErrLeaksContainer for containers).
+	NetworkCreateErr      error
+	NetworkCreateErrLeaks bool
+
+	// NetworkRemoveErr, when non-nil, is returned by NetworkRemove instead of
+	// removing — used to exercise teardown error joining for networks.
+	NetworkRemoveErr error
+
+	// VolumeCreateErr, when non-nil, is returned by VolumeCreate instead of
+	// creating — used to exercise the workspace-volume create-failure path of
+	// the creation guard (net-created-then-vol-fails).
+	VolumeCreateErr error
+
+	// VolumeRemoveErr, when non-nil, is returned by VolumeRemove instead of
+	// removing — used to exercise teardown error joining for volumes.
+	VolumeRemoveErr error
+
 	// Execs records every ExecStream call, in order, so tests can assert the
 	// credential archive was streamed to the right container with the right
 	// command.
@@ -616,6 +639,11 @@ func (f *FakeClient) NetworkCreate(_ context.Context, name string, options netwo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Clean injected failure: nothing is recorded.
+	if f.NetworkCreateErr != nil && !f.NetworkCreateErrLeaks {
+		return network.CreateResponse{}, f.NetworkCreateErr
+	}
+
 	if f.findNetworkByName(name) != nil {
 		return network.CreateResponse{}, conflictf("network with name %q already exists", name)
 	}
@@ -623,6 +651,12 @@ func (f *FakeClient) NetworkCreate(_ context.Context, name string, options netwo
 	f.nextID++
 	id := "fake-net-" + strconv.Itoa(f.nextID)
 	f.networks[id] = &fakeNetwork{id: id, name: name, labels: cloneLabels(options.Labels)}
+
+	// Ambiguous injected failure: the network was recorded, but the call still
+	// reports an error (mirrors ContainerCreate's CreateErrLeaksContainer).
+	if f.NetworkCreateErr != nil {
+		return network.CreateResponse{ID: id}, f.NetworkCreateErr
+	}
 	return network.CreateResponse{ID: id}, nil
 }
 
@@ -640,6 +674,9 @@ func (f *FakeClient) NetworkRemove(_ context.Context, networkID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.NetworkRemoveErr != nil {
+		return f.NetworkRemoveErr
+	}
 	n := f.findNetwork(networkID)
 	if n == nil {
 		return notFoundf("network %s not found", networkID)
@@ -690,6 +727,10 @@ func (f *FakeClient) VolumeCreate(_ context.Context, options volume.CreateOption
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.VolumeCreateErr != nil {
+		return volume.Volume{}, f.VolumeCreateErr
+	}
+
 	name := options.Name
 	if name == "" {
 		f.nextID++
@@ -715,6 +756,9 @@ func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.VolumeRemoveErr != nil {
+		return f.VolumeRemoveErr
+	}
 	if _, ok := f.volumes[volumeID]; !ok {
 		return notFoundf("volume %s not found", volumeID)
 	}
