@@ -42,7 +42,11 @@ allow_org_shared = false  # operator opt-in for org/enterprise-keyed shared cach
 
 [network]
 enable_job_network = true
-internal = true  # per-job bridge networks deny external routes by default — see ADR-001
+internal = false  # default (2026-07-21 owner ruling, ADR-001 Amendment): the runner needs
+# egress to reach GitHub and DinD needs it for registry pulls; per-job isolation comes from
+# each allocation's own separate network, not this flag. Set true only for a fully airgapped
+# job (reserved building block for a future proxy-sidecar egress-allowlist opt-in — ADR-001).
+# Also see ADR-001: the host Docker daemon must not be configured to listen on TCP.
 
 # Note: the reserved-name denylist for extra_specs env (RUNNER_*, DOCKER_*, JIT_CONFIG_ENABLED,
 # GITHUB_URL, ACTIONS_RUNNER_INPUT_*, ...) is fixed by the provider itself and is not an
