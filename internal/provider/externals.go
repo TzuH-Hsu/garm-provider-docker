@@ -27,30 +27,34 @@ const externalsSeedTimeout = 10 * time.Minute
 // isolation risk (the read-only mount and privileged-only seeding are what make
 // that sharing safe). It is called AFTER the runner image is ensured present, so
 // the image is available both as the digest source and as the seed's copy source.
-func (p *Provider) planExternals(ctx context.Context, runnerImage string) (string, error) {
+func (p *Provider) planExternals(ctx context.Context, runnerImage string) (string, map[string]string, error) {
 	digest, err := p.imageDigestHex(ctx, runnerImage)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	name := spec.ExternalsVolumeName(digest)
 	if err := spec.ValidateDerivedName("externals cache volume", name); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	id := spec.ExternalsVolumeIdentity{ControllerID: p.controllerID, ImageDigest: digest}
-	if _, err := p.topo.EnsureCacheVolume(ctx, name, id.ExternalsLabels(time.Now())); err != nil {
-		return "", fmt.Errorf("failed to ensure externals volume %q: %w", name, err)
+	wantLabels := id.ExternalsLabels(time.Now())
+	if _, err := p.topo.EnsureCacheVolume(ctx, name, wantLabels); err != nil {
+		return "", nil, fmt.Errorf("failed to ensure externals volume %q: %w", name, err)
 	}
 
 	// Seed to completion BEFORE the runner mounts it read-only. Idempotent and
 	// concurrency-safe via the in-volume flock + atomic marker: a warm volume is
 	// a fast no-op, a fresh one is populated by exactly one seeder even under a
-	// first-job race for the same digest.
-	if err := p.seedExternals(ctx, runnerImage, name); err != nil {
-		return "", err
+	// first-job race for the same digest. A SUCCESSFUL seed proves the atomic
+	// `.garm-seeded` marker is present (the script exits 0 only after the marker
+	// exists), so a runner started after this returns can never mount a
+	// half-populated externals tree (H3b).
+	if err := p.seedExternals(ctx, runnerImage, name, wantLabels); err != nil {
+		return "", nil, err
 	}
-	return name, nil
+	return name, wantLabels, nil
 }
 
 // seedExternals runs the dedicated, short-lived externals SEED container to
@@ -62,7 +66,15 @@ func (p *Provider) planExternals(ctx context.Context, runnerImage string) (strin
 // The seed container is uniquely named per invocation (a create-nonce suffix),
 // so two concurrent provider processes seeding the same digest do not collide on
 // the container NAME — the in-volume flock, not the name, is the seeding mutex.
-func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName string) error {
+//
+// Pin-then-validate (H3c): the seed helper's ContainerCreate PINS the externals
+// volume; if a concurrent GC evicted it in the ensure→seed window, real Moby
+// AUTO-CREATES it UNLABELED and the seeder would otherwise copy ~380MB into an
+// unlabeled volume that M6 adoption then rejects forever (a wedge). An afterCreate
+// hook re-inspects the pinned volume and, only if a SUCCESSFUL inspect PROVES it is
+// no longer our seeded cache, marks it for reaping and aborts the seed BEFORE the
+// copy. An inspect FAILURE aborts closed WITHOUT authorizing any delete (NEW-H1).
+func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName string, wantLabels map[string]string) error {
 	nonce, err := newCreateNonce()
 	if err != nil {
 		return fmt.Errorf("failed to generate externals seed nonce: %w", err)
@@ -72,7 +84,28 @@ func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName st
 		VolumeName: volumeName,
 		Labels:     p.helperLabels(),
 	})
-	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-seed-"+nonce, externalsSeedTimeout)
+
+	var orphan string
+	afterCreate := func(vctx context.Context) error {
+		v, err := p.cli.VolumeInspect(vctx, volumeName)
+		if err != nil {
+			// inspect failed → don't know → don't delete, fail closed (NEW-H1).
+			return fmt.Errorf("externals seed target %q could not be re-inspected before seeding: %w", volumeName, err)
+		}
+		if verr := spec.ValidateAdoptedCacheVolume(volumeName, v.Labels, wantLabels); verr != nil {
+			// A SUCCESSFUL inspect proves this is an unlabeled auto-created
+			// replacement (or a foreign squatter): reap this specific orphan by
+			// name rather than seed into it and wedge future adoption.
+			orphan = volumeName
+			return fmt.Errorf("externals seed target %q is not our seeded cache (a GC/create race auto-created it): %w", volumeName, verr)
+		}
+		return nil
+	}
+
+	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-seed-"+nonce, externalsSeedTimeout, afterCreate)
+	if orphan != "" {
+		p.bestEffortRemoveOrphanVolumes(ctx, []string{orphan})
+	}
 	if err != nil {
 		return fmt.Errorf("externals seed for %q failed: %w", volumeName, err)
 	}

@@ -118,6 +118,58 @@ func TestEvictCachesReInspectsBeforeRemove(t *testing.T) {
 	}
 }
 
+// TestEvictCachesReInspectRequiresManaged is the H3(c) full-ownership-tuple guard
+// at the destructive boundary: a snapshot candidate is replaced under the same name
+// by a volume carrying cache=true + this controller-id + a matching repo label but
+// MISSING managed=true — the shape an UNLABELED auto-created replacement that later
+// acquired a stray cache label could take. Re-checking only cache/controller-id
+// would let the eviction decision re-fire and delete it; asserting the FULL
+// ownership tuple (managed AND cache AND controller-id) skips it.
+func TestEvictCachesReInspectRequiresManaged(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	name := spec.ToolcacheVolumeName("evict", "1")
+	victim := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
+	seedRawCacheVolume(t, fake, name, victim.ToolcacheLabels("1", gcTime()))
+
+	// Between the snapshot and the re-inspect, the stale cache is replaced by a
+	// same-name volume that carries cache=true + this controller-id + repo=evict
+	// but NO managed=true.
+	var once sync.Once
+	fake.VolumeInspectHook = func(n string) {
+		if n != name {
+			return
+		}
+		once.Do(func() {
+			if err := fake.VolumeRemove(ctx, name, true); err != nil {
+				t.Errorf("swap remove: %v", err)
+			}
+			if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{
+				spec.LabelCache:        "true",
+				spec.LabelControllerID: testControllerID,
+				spec.LabelRepo:         "evict",
+				// deliberately NO managed=true — the destructive-boundary conjunct
+				// H3(c) adds must be what protects this volume.
+			}}); err != nil {
+				t.Errorf("swap create: %v", err)
+			}
+		})
+	}
+
+	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
+	if err != nil {
+		t.Fatalf("EvictCaches: %v", err)
+	}
+	if len(evicted) != 0 {
+		t.Errorf("EvictCaches evicted %+v, want none — the same-name replacement lacks managed=true", evicted)
+	}
+	fake.VolumeInspectHook = nil // stop the swap on this final inspect
+	if _, err := fake.VolumeInspect(ctx, name); err != nil {
+		t.Fatalf("the unmanaged same-name replacement %q was wrongly deleted at the destructive boundary: %v", name, err)
+	}
+}
+
 // TestEvictCachesSkipsInUse: a cache volume mounted into a container returns a
 // Conflict on removal, which EvictCaches SKIPS (never yanks a warm cache from a
 // live job) without erroring.

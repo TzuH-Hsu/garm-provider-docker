@@ -169,6 +169,17 @@ type FakeClient struct {
 	// and must guard re-entrancy/once-ness itself.
 	VolumeInspectHook func(name string)
 
+	// VolumeInspectErrHook, when non-nil, is consulted at the start of every
+	// VolumeInspect (after VolumeInspectHook) with the volume NAME; if it returns
+	// a non-nil error, VolumeInspect returns that error WITHOUT touching the store.
+	// It models a TRANSIENT inspect failure on a specific volume — a context
+	// cancellation or a transient daemon error — targeted by name, so a test can
+	// prove the create path's post-create cache revalidation fails CLOSED without
+	// authorizing deletion of the still-present warm cache (NEW-H1). Distinct from
+	// removing the volume (which would be a NotFound, i.e. genuinely gone) — this
+	// leaves the volume in the store while making its inspect fail transiently.
+	VolumeInspectErrHook func(name string) error
+
 	// VolumeRemoveHook, when non-nil, is invoked at the very start of every
 	// VolumeRemove — before f.mu is taken — with the volume NAME the caller is
 	// about to remove. It is the destructive-boundary seam for the F4
@@ -1001,6 +1012,13 @@ func (f *FakeClient) VolumeInspect(_ context.Context, volumeID string) (volume.V
 	// back into the fake's own locked methods.
 	if f.VolumeInspectHook != nil {
 		f.VolumeInspectHook(volumeID)
+	}
+	// A targeted transient inspect failure (NEW-H1), consulted BEFORE the store is
+	// read so the volume stays present while its inspect fails.
+	if f.VolumeInspectErrHook != nil {
+		if err := f.VolumeInspectErrHook(volumeID); err != nil {
+			return volume.Volume{}, err
+		}
 	}
 
 	f.mu.Lock()

@@ -55,21 +55,40 @@ type cachePlan struct {
 	// separately from planCaches (planExternals), after the runner image is
 	// present, and mounted READ-ONLY.
 	externalsVolume string
+
+	// cacheRefs pairs every persistent cache volume this plan mounts into the
+	// runner with the FULL identity labels the provider ensured it with (NEW-H1 /
+	// H3b). revalidateReferencedCaches re-inspects each AFTER ContainerCreate and
+	// validates the LIVE volume's labels still match this expected identity via
+	// spec.ValidateAdoptedCacheVolume — not merely cache=true — so an UNLABELED
+	// auto-created replacement (a GC/create race), a foreign same-name squatter, or
+	// a wrong-digest externals volume is caught and the allocation fails CLOSED.
+	// Carrying the want labels here (rather than re-deriving them at revalidation)
+	// keeps the expected identity single-sourced from the ensure call.
+	cacheRefs []cacheVolumeRef
 }
 
-// referencedCacheVolumeNames returns the non-empty persistent cache volume names
-// this plan mounts into the runner. The create path revalidates each of these
-// AFTER ContainerCreate (H3): a concurrent GC could have evicted a still-current
-// cache in the ensure→mount gap, and real Moby then auto-creates the missing named
-// volume UNLABELED during ContainerCreate — an empty externals tree plus an orphan.
-func (c cachePlan) referencedCacheVolumeNames() []string {
-	var names []string
-	for _, n := range []string{c.toolcacheVolume, c.pnpmVolume, c.diagVolume, c.externalsVolume} {
-		if n != "" {
-			names = append(names, n)
-		}
+// cacheVolumeRef pairs a referenced cache volume's name with the identity labels
+// the provider ensured it with, so revalidateReferencedCaches can re-validate the
+// LIVE volume's full identity at the destructive boundary (NEW-H1 / H3b).
+type cacheVolumeRef struct {
+	name string
+	want map[string]string
+}
+
+// addCacheRef records a referenced cache volume and the identity labels it was
+// ensured with, for the post-create revalidation (NEW-H1 / H3b). A cloned copy of
+// the labels is stored so a later mutation of the caller's map cannot alter the
+// expected identity.
+func (c *cachePlan) addCacheRef(name string, want map[string]string) {
+	if name == "" {
+		return
 	}
-	return names
+	cp := make(map[string]string, len(want))
+	for k, v := range want {
+		cp[k] = v
+	}
+	c.cacheRefs = append(c.cacheRefs, cacheVolumeRef{name: name, want: cp})
 }
 
 // planCaches resolves ADR-003's per-allocation cache decision and, when the
@@ -129,22 +148,26 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	if err := spec.ValidateDerivedName("toolcache cache volume", toolName); err != nil {
 		return cachePlan{}, err
 	}
-	toolRes, err := p.topo.EnsureCacheVolume(ctx, toolName, id.ToolcacheLabels(p.cfg.Cache.Generation, lastUsed))
+	toolLabels := id.ToolcacheLabels(p.cfg.Cache.Generation, lastUsed)
+	toolRes, err := p.topo.EnsureCacheVolume(ctx, toolName, toolLabels)
 	if err != nil {
 		return cachePlan{}, fmt.Errorf("failed to ensure toolcache volume for %q: %w", bootstrap.Name, err)
 	}
 	plan.toolcacheVolume = toolRes.Name
+	plan.addCacheRef(toolRes.Name, toolLabels)
 
 	pnpmName := spec.PnpmVolumeName(repoKey, p.cfg.Cache.PnpmMajor)
 	if err := spec.ValidateDerivedName("pnpm store cache volume", pnpmName); err != nil {
 		return cachePlan{}, err
 	}
-	pnpmRes, err := p.topo.EnsureCacheVolume(ctx, pnpmName, id.PnpmLabels(p.cfg.Cache.PnpmMajor, lastUsed))
+	pnpmLabels := id.PnpmLabels(p.cfg.Cache.PnpmMajor, lastUsed)
+	pnpmRes, err := p.topo.EnsureCacheVolume(ctx, pnpmName, pnpmLabels)
 	if err != nil {
 		return cachePlan{}, fmt.Errorf("failed to ensure pnpm store volume for %q: %w", bootstrap.Name, err)
 	}
 	plan.pnpmVolume = pnpmRes.Name
 	plan.pnpmPath = p.cfg.Cache.PnpmStorePath
+	plan.addCacheRef(pnpmRes.Name, pnpmLabels)
 
 	// Per-repo diagnostic-logs volume (ADR-003 W2): same repo-scope eligibility as
 	// the toolcache/pnpm volumes. Its file-level retention is pruned provider-side
@@ -153,12 +176,14 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	if err := spec.ValidateDerivedName("diag cache volume", diagName); err != nil {
 		return cachePlan{}, err
 	}
-	diagRes, err := p.topo.EnsureCacheVolume(ctx, diagName, id.DiagLabels(lastUsed))
+	diagLabels := id.DiagLabels(lastUsed)
+	diagRes, err := p.topo.EnsureCacheVolume(ctx, diagName, diagLabels)
 	if err != nil {
 		return cachePlan{}, fmt.Errorf("failed to ensure diag volume for %q: %w", bootstrap.Name, err)
 	}
 	plan.diagVolume = diagRes.Name
 	plan.diagDir = spec.RunnerDiagDir
+	plan.addCacheRef(diagRes.Name, diagLabels)
 
 	log.Printf("garm-provider-docker: CreateInstance: %q repo-scoped caches (repokey=%s): toolcache=%s hit=%v, pnpm=%s hit=%v, diag=%s hit=%v",
 		bootstrap.Name, repoKey, toolName, toolRes.Hit, pnpmName, pnpmRes.Hit, diagName, diagRes.Hit)

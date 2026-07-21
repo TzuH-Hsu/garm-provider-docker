@@ -130,25 +130,20 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 // pruneDiagVolume runs one diagnostic-log prune helper to completion against a
 // single diag volume (best-effort: a prune failure is logged, never fatal).
 //
-// H3: it RE-VALIDATES the volume is STILL this controller's diag volume
-// immediately before mounting it into the age-scoped `find -delete` helper. The
-// name came from a ListDiagVolumes snapshot; a remove/recreate-under-the-same-name
-// since then could have replaced it with a foreign volume the prune would
-// otherwise wrongly delete files from. If it is no longer our diag volume (or is
-// gone), the prune is skipped.
+// H3c (pin-then-validate): the volume NAME came from a ListDiagVolumes snapshot; a
+// concurrent GC could remove it in the gap before this runs, and the OLD flow —
+// inspect, THEN create the helper — left a wedge window: between that inspect and
+// the helper's ContainerCreate the volume could be removed, Moby would AUTO-CREATE
+// an UNLABELED volume of the same name, the helper would prune it (harmlessly) and
+// be removed, but the unlabeled (GC-invisible) volume would PERSIST — and M6's
+// adoption guard then REJECTS that deterministic name on every future CreateInstance
+// for that repo, a permanent wedge. Instead we now create the helper FIRST (pinning
+// the volume, or pinning the unlabeled auto-created replacement), then validate the
+// pinned volume's identity in the afterCreate hook BEFORE the prune runs. If it is
+// an unlabeled auto-created replacement (or a foreign same-name volume), the prune
+// is aborted, the helper removed, and that specific orphan reaped by name — never
+// wedging future adoption. An inspect FAILURE aborts closed WITHOUT deleting (NEW-H1).
 func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName string) {
-	v, err := p.cli.VolumeInspect(ctx, volumeName)
-	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: skipping diag prune of %q (re-inspect failed): %v", volumeName, err)
-		return
-	}
-	if v.Labels[spec.LabelCache] != "true" ||
-		v.Labels[spec.LabelControllerID] != p.controllerID ||
-		v.Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) {
-		log.Printf("garm-provider-docker: cache GC: skipping diag prune of %q — it is no longer this controller's diag volume (a same-name replacement since the snapshot)", volumeName)
-		return
-	}
-
 	nonce, err := newCreateNonce()
 	if err != nil {
 		log.Printf("garm-provider-docker: cache GC: failed to name diag-prune helper for %q: %v", volumeName, err)
@@ -160,9 +155,34 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName 
 		RetentionDays: p.cfg.Cache.DiagnosticLogRetentionDays,
 		Labels:        p.helperLabels(),
 	})
-	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-diagprune-"+nonce, diagPruneTimeout)
+
+	var orphan string
+	afterCreate := func(vctx context.Context) error {
+		v, err := p.cli.VolumeInspect(vctx, volumeName)
+		if err != nil {
+			// inspect failed → don't know → don't delete, skip closed (NEW-H1).
+			return fmt.Errorf("diag prune target %q could not be re-inspected: %w", volumeName, err)
+		}
+		if v.Labels[spec.LabelManaged] != "true" ||
+			v.Labels[spec.LabelCache] != "true" ||
+			v.Labels[spec.LabelControllerID] != p.controllerID ||
+			v.Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) {
+			// A SUCCESSFUL inspect proves this is no longer this controller's diag
+			// volume — an unlabeled auto-created replacement (a remove/create race
+			// since the snapshot) or a foreign same-name volume. Reap the specific
+			// orphan rather than wedge future adoption of the deterministic name.
+			orphan = volumeName
+			return fmt.Errorf("diag prune target %q is no longer this controller's diag volume (a same-name replacement since the snapshot)", volumeName)
+		}
+		return nil
+	}
+
+	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-diagprune-"+nonce, diagPruneTimeout, afterCreate)
+	if orphan != "" {
+		p.bestEffortRemoveOrphanVolumes(ctx, []string{orphan})
+	}
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: diag prune of %q failed (continuing): %v", volumeName, err)
+		log.Printf("garm-provider-docker: cache GC: skipping/failed diag prune of %q (continuing): %v", volumeName, err)
 		return
 	}
 	if code != 0 {
@@ -283,7 +303,18 @@ func (p *Provider) helperLabels() map[string]string {
 // and the diag pruner. The removal runs in a defer under a context detached from
 // the caller's (so a caller cancellation cannot strand the helper), and NotFound
 // on removal is tolerated. A per-helper timeout bounds the run.
-func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, name string, timeout time.Duration) (int, error) {
+//
+// Pin-then-validate (H3c): the ContainerCreate PINS every named volume the helper
+// references — or, if a concurrent GC removed a referenced cache volume since the
+// caller's snapshot, real Moby AUTO-CREATES it UNLABELED and the helper pins THAT
+// empty replacement. afterCreate, when non-nil, runs AFTER the create but BEFORE
+// the start: it inspects the now-pinned target and returns an error to abort the
+// run WITHOUT executing the helper's payload (the seed's copy, the prune's
+// `find -delete`). On that abort the deferred removal still runs, UNPINNING the
+// orphan so the caller can reap it by name — never leaving a wedging, GC-invisible
+// unlabeled volume behind. A nil afterCreate keeps the plain create→start→wait
+// behavior.
+func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, name string, timeout time.Duration, afterCreate func(ctx context.Context) error) (int, error) {
 	runCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -302,6 +333,12 @@ func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config
 			log.Printf("garm-provider-docker: failed to remove helper %q (continuing): %v", name, rerr)
 		}
 	}()
+
+	if afterCreate != nil {
+		if err := afterCreate(runCtx); err != nil {
+			return 0, err
+		}
+	}
 
 	if err := p.cli.ContainerStart(runCtx, created.ID, container.StartOptions{}); err != nil {
 		return 0, fmt.Errorf("failed to start helper %q: %w", name, err)

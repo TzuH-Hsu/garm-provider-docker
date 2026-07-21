@@ -245,11 +245,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// and the seed's copy source. A seed failure fails the allocation (guarded);
 	// the externals volume itself is never rolled back (it is a cache).
 	if p.cfg.Cache.Enabled {
-		externalsVolume, err := p.planExternals(ctx, runnerImage)
+		externalsVolume, externalsLabels, err := p.planExternals(ctx, runnerImage)
 		if err != nil {
 			return guarded(fmt.Errorf("failed to prepare externals cache for %q: %w", instanceName, err))
 		}
 		plan.externalsVolume = externalsVolume
+		plan.addCacheRef(externalsVolume, externalsLabels)
 	}
 
 	// One timestamp for both containers' created-at labels this allocation.
@@ -401,33 +402,48 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 }
 
 // revalidateReferencedCaches confirms every persistent cache volume the runner
-// container now references still carries our cache labels (ADR-003 W2, H3). A
-// volume that lost its cache label was AUTO-CREATED empty by the daemon during
-// ContainerCreate because a concurrent GC evicted the original in the ensure→mount
-// window. It returns the names of any such empty replacements (for a best-effort
-// by-name reclaim) alongside a non-nil error, so the caller fails the allocation
-// closed rather than running the runner against an empty externals tree.
+// container now references is STILL the fully-identified cache the provider
+// ensured+seeded (ADR-003 W2; NEW-H1 / H3b). After ContainerCreate pins the
+// volumes, each is re-inspected and its LIVE labels validated against the expected
+// identity via spec.ValidateAdoptedCacheVolume — the full cache-kind/repo/digest/
+// salt tuple, NOT merely cache=true — so a wrong-digest externals volume or a
+// foreign same-name squatter is caught as well as an UNLABELED auto-created
+// replacement (a concurrent GC evicted the original in the ensure→mount window and
+// Moby recreated it empty). It returns two distinct outcomes, both fail-closed:
+//
+//   - inspect SUCCEEDED and the volume is NOT ours → the volume name is returned
+//     as a reap-able orphan (the SUCCESSFUL inspect PROVES it is the unlabeled/
+//     wrong replacement, safe to reclaim by name);
+//   - inspect FAILED (context cancellation, a transient daemon error, NotFound) →
+//     the allocation fails closed, but the volume is NOT authorized for deletion
+//     ("don't know → don't delete"): a transient post-create inspect error must
+//     never delete a valid warm cache (NEW-H1). Such names are omitted from the
+//     returned orphan list entirely.
+//
+// A non-nil error (fail closed) is returned whenever ANY referenced cache could
+// not be confirmed, so the caller never starts the runner against an unverified
+// (possibly empty) cache tree.
 func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePlan) ([]string, error) {
 	var orphans, bad []string
-	for _, name := range plan.referencedCacheVolumeNames() {
-		v, err := p.cli.VolumeInspect(ctx, name)
+	for _, ref := range plan.cacheRefs {
+		v, err := p.cli.VolumeInspect(ctx, ref.name)
 		if err != nil {
-			// The referenced volume cannot be inspected at all — treat it as a
-			// failed allocation and record it for a best-effort reclaim (which
-			// tolerates NotFound if it is genuinely gone).
-			orphans = append(orphans, name)
-			bad = append(bad, fmt.Sprintf("%s (inspect failed: %v)", name, err))
+			// inspect failed → don't know → don't delete, fail closed (NEW-H1). Do
+			// NOT record it as an orphan: a transient inspect error must not
+			// authorize deleting a valid warm cache.
+			bad = append(bad, fmt.Sprintf("%s (inspect failed, not deleting: %v)", ref.name, err))
 			continue
 		}
-		if v.Labels[spec.LabelCache] != "true" {
-			// An UNLABELED auto-created replacement: a concurrent GC evicted the
-			// original cache in the ensure→mount gap and Moby recreated it empty.
-			orphans = append(orphans, name)
-			bad = append(bad, name+" (auto-created empty, not our seeded cache)")
+		if verr := spec.ValidateAdoptedCacheVolume(ref.name, v.Labels, ref.want); verr != nil {
+			// A SUCCESSFUL inspect PROVES this is not our seeded cache — an
+			// unlabeled auto-created replacement or a foreign/wrong-digest volume.
+			// Safe to reap THIS specific orphan by name.
+			orphans = append(orphans, ref.name)
+			bad = append(bad, ref.name+" ("+verr.Error()+")")
 		}
 	}
 	if len(bad) > 0 {
-		return orphans, fmt.Errorf("cache volume(s) were evicted and auto-recreated empty during create (a GC/create race); refusing to run the runner against an empty cache: %s", strings.Join(bad, ", "))
+		return orphans, fmt.Errorf("cache volume(s) could not be confirmed as our seeded cache during create (a GC/create race or a transient inspect failure); refusing to run the runner against an unverified cache: %s", strings.Join(bad, ", "))
 	}
 	return nil, nil
 }
@@ -446,13 +462,32 @@ func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 
 // bestEffortRemoveOrphanVolumes reaps the empty, unlabeled cache volumes the
 // daemon auto-created during a GC/create race, by name, under a detached context
-// (H3). It tolerates NotFound (already gone) and Conflict (a concurrent peer's
-// create still references the same auto-created name) so it never turns a
-// best-effort cleanup into a hard failure.
+// (H3). Every name here was proven an orphan by a SUCCESSFUL inspect at the call
+// site, but it RE-CHECKS ownership at this destructive boundary immediately before
+// each delete (NEW-H1): only a volume a fresh inspect STILL shows is NOT a cache
+// (no cache=true — an unlabeled auto-created replacement) is removed. If a peer has
+// since recreated/reseeded a labeled cache under this name, it is SKIPPED rather
+// than yanked out from under a live job. It tolerates NotFound (already gone) and
+// Conflict (a peer's create still references the auto-created name) so it never
+// turns a best-effort cleanup into a hard failure.
 func (p *Provider) bestEffortRemoveOrphanVolumes(ctx context.Context, names []string) {
 	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 	for _, name := range names {
+		// Destructive-boundary ownership re-check: never delete a volume a fresh
+		// inspect shows is a labeled cache. A NotFound means it is already gone;
+		// any other inspect error means "don't know → don't delete".
+		v, err := p.cli.VolumeInspect(rmCtx, name)
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				log.Printf("garm-provider-docker: cache-revalidation rollback: skipping reap of %q (re-inspect failed, not deleting): %v", name, err)
+			}
+			continue
+		}
+		if v.Labels[spec.LabelCache] == "true" {
+			log.Printf("garm-provider-docker: cache-revalidation rollback: %q now carries cache=true (a peer reseeded it); not reaping a labeled cache", name)
+			continue
+		}
 		if err := p.cli.VolumeRemove(rmCtx, name, false); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsConflict(err) {
 			log.Printf("garm-provider-docker: cache-revalidation rollback: failed to reap empty auto-created cache volume %q (continuing): %v", name, err)
 		}

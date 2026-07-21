@@ -101,9 +101,15 @@ func (m *Manager) EvictCaches(ctx context.Context, decide func(labels map[string
 			errs = append(errs, fmt.Errorf("cache GC: failed to re-inspect %q before eviction: %w", v.Name, err))
 			continue
 		}
-		if fresh.Labels[spec.LabelCache] != "true" || fresh.Labels[spec.LabelControllerID] != m.controllerID {
+		if fresh.Labels[spec.LabelManaged] != "true" || fresh.Labels[spec.LabelCache] != "true" || fresh.Labels[spec.LabelControllerID] != m.controllerID {
 			// A different/foreign volume now holds this name (remove+recreate since
-			// the snapshot); do NOT delete it.
+			// the snapshot); do NOT delete it. The full ownership tuple is asserted
+			// at this destructive boundary — managed=true AND cache=true AND this
+			// controller-id (H3c): an UNLABELED auto-created replacement (a
+			// concurrent evict+ContainerCreate race that stripped the labels) is
+			// missing managed=true, so re-checking only cache/controller-id here
+			// would let an auto-created volume that somehow carried a stray
+			// cache=true slip through — the managed conjunct closes that.
 			continue
 		}
 		evict, reason := decide(fresh.Labels)

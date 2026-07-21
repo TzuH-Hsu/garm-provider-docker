@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -240,6 +241,54 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	}
 	if len(pruneMounts) != 1 || pruneMounts[0] != diag[0] {
 		t.Errorf("diag-prune mounts = %v, want just the diag volume %q", pruneMounts, diag[0])
+	}
+}
+
+// TestPruneDiagVolumePinThenValidateReapsAutoCreatedOrphan is the H3(c) guard for
+// the diag-prune path: a concurrent GC removes the diag volume in the window
+// between the prune helper's ContainerCreate pinning it and the prune running.
+// Real Moby then AUTO-CREATES an UNLABELED volume of the same (deterministic) name.
+// The OLD flow (inspect-then-create) would prune that unlabeled volume and leave it
+// behind — a GC-invisible orphan M6's adoption guard then REJECTS on every future
+// CreateInstance for that repo (a permanent wedge). The pin-then-validate flow
+// instead inspects the PINNED volume, detects the unlabeled replacement, aborts the
+// prune, and reaps that specific orphan by name — so the deterministic name is
+// adoptable again (no wedge).
+func TestPruneDiagVolumePinThenValidateReapsAutoCreatedOrphan(t *testing.T) {
+	p, fake := newCacheProvider(t, false)
+	ctx := context.Background()
+
+	repoKey := "repo-diag-wedge"
+	diagName := spec.DiagVolumeName(repoKey)
+	id := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey}
+	seedVol(t, fake, diagName, id.DiagLabels(time.Now()))
+
+	// At the prune helper's ContainerCreate, a concurrent GC removes the diag
+	// volume; ContainerCreate then AUTO-CREATES it UNLABELED (modeled by the fake's
+	// missing-named-volume auto-create). This is the exact wedge window.
+	var once sync.Once
+	fake.CreateHook = func() {
+		once.Do(func() { _ = fake.VolumeRemove(ctx, diagName, true) })
+	}
+
+	p.pruneDiagVolume(ctx, "ghcr.io/example/runner@sha256:deadbeef", diagName)
+	fake.CreateHook = nil
+
+	// No GC-invisible orphan persists: the unlabeled auto-created replacement was
+	// reaped, so the deterministic diag name is GONE entirely.
+	if v, ok := volByName(t, fake, diagName); ok {
+		t.Fatalf("[H3c] the unlabeled auto-created diag orphan %q was NOT reaped (labels=%v) — a permanent wedge", diagName, v.Labels)
+	}
+
+	// Prove NO wedge: EnsureCacheVolume for the same deterministic name now adopts
+	// cleanly (creates fresh labeled), rather than being rejected forever by M6's
+	// adoption guard.
+	res, err := p.topo.EnsureCacheVolume(ctx, diagName, id.DiagLabels(time.Now()))
+	if err != nil {
+		t.Fatalf("[H3c] the diag name is WEDGED — EnsureCacheVolume rejected it after the prune race: %v", err)
+	}
+	if res.Hit {
+		t.Errorf("[H3c] EnsureCacheVolume reported a hit; the orphan was not fully reclaimed")
 	}
 }
 

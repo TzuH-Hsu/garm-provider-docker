@@ -2,10 +2,12 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types"
@@ -175,6 +177,119 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 	extName := spec.ExternalsVolumeName(strings.TrimPrefix(insp.ID, "sha256:"))
 	if _, ok := volByName(t, fake, extName); ok {
 		t.Errorf("[H3] the empty auto-created externals orphan %q was not reaped", extName)
+	}
+}
+
+// TestRevalidateReferencedCachesClassification directly proves NEW-H1's core rule
+// at the classification boundary: an inspect FAILURE yields NO orphan (fail closed,
+// don't authorize any delete), while an inspect that SUCCEEDS and proves the volume
+// is unlabeled/wrong yields exactly that name as a reap-able orphan.
+func TestRevalidateReferencedCachesClassification(t *testing.T) {
+	p, fake := newCacheProvider(t, false)
+	ctx := context.Background()
+
+	repoKey := "repo-reval"
+	id := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey}
+	warmName := spec.ToolcacheVolumeName(repoKey, "1")
+	want := id.ToolcacheLabels("1", time.Now())
+	seedVol(t, fake, warmName, want)
+
+	var plan cachePlan
+	plan.addCacheRef(warmName, want)
+
+	// (a) Transient inspect failure → fail closed, NO orphan authorized for deletion.
+	fake.VolumeInspectErrHook = func(name string) error {
+		if name == warmName {
+			return errors.New("transient daemon error: i/o timeout")
+		}
+		return nil
+	}
+	orphans, err := p.revalidateReferencedCaches(ctx, plan)
+	if err == nil {
+		t.Fatal("[NEW-H1] revalidate returned nil error on a transient inspect failure; want fail-closed")
+	}
+	if len(orphans) != 0 {
+		t.Errorf("[NEW-H1] revalidate authorized deleting %v on a transient inspect failure; want NO orphan", orphans)
+	}
+
+	// (b) Inspect succeeds but the volume is UNLABELED (auto-created replacement) →
+	// that specific name is returned as a reap-able orphan.
+	fake.VolumeInspectErrHook = nil
+	if err := fake.VolumeRemove(ctx, warmName, true); err != nil {
+		t.Fatalf("remove warm: %v", err)
+	}
+	seedVol(t, fake, warmName, map[string]string{}) // unlabeled auto-created replacement
+	orphans, err = p.revalidateReferencedCaches(ctx, plan)
+	if err == nil {
+		t.Fatal("[NEW-H1] revalidate returned nil error for an unlabeled replacement; want fail-closed")
+	}
+	if len(orphans) != 1 || orphans[0] != warmName {
+		t.Errorf("[NEW-H1] revalidate orphans = %v, want exactly [%s]", orphans, warmName)
+	}
+}
+
+// TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache is the NEW-H1 guard:
+// during the post-create cache revalidation, a TRANSIENT VolumeInspect failure (a
+// context cancellation or a transient daemon error — NOT a genuine "gone") on a
+// referenced warm cache must fail the allocation CLOSED WITHOUT authorizing any
+// deletion of that cache. The old revalidation classified EVERY inspect error as
+// an "orphan auto-created replacement" and reaped it under a detached context, so
+// a cancelled/transient post-create inspect could DELETE a valid warm
+// toolcache/pnpm/diag/externals volume. This proves the warm toolcache SURVIVES.
+func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+	p, fake := newCacheProvider(t, false)
+
+	repoKey := spec.RepoKey(cacheRepoURL)
+	toolName := spec.ToolcacheVolumeName(repoKey, "1")
+
+	// Inject a TRANSIENT inspect failure targeted at the warm toolcache volume.
+	// The toolcache is VolumeInspect'd ONLY during the post-create revalidation
+	// (planCaches ensures it via VolumeCreate/VolumeList, never Inspect; the
+	// externals seed's own re-inspect targets the externals name, not this one), so
+	// this fires exactly at the revalidation boundary NEW-H1 is about. The volume
+	// stays PRESENT in the store — this models a transient daemon error, not a
+	// removal (which would be a NotFound, i.e. genuinely gone).
+	var once sync.Once
+	fake.VolumeInspectErrHook = func(name string) error {
+		if name != toolName {
+			return nil
+		}
+		var err error
+		once.Do(func() { err = errors.New("transient daemon error: connection reset by peer") })
+		return err
+	}
+
+	_, err := p.CreateInstance(context.Background(), cacheBootstrap("newh1-job", cacheRepoURL, srv.URL))
+	if err == nil {
+		t.Fatal("CreateInstance succeeded despite a transient inspect failure during cache revalidation; want a fail-closed allocation error")
+	}
+	t.Logf("[NEW-H1] CreateInstance failed closed as expected: %v", err)
+
+	// The warm toolcache cache volume MUST survive — a transient inspect error must
+	// never authorize deleting a valid cache.
+	tv, ok := volByName(t, fake, toolName)
+	if !ok {
+		t.Fatalf("[NEW-H1] the warm toolcache %q was DELETED by a transient revalidate inspect error — regression", toolName)
+	}
+	if tv.Labels[spec.LabelCache] != "true" || tv.Labels[spec.LabelRepo] != repoKey {
+		t.Errorf("[NEW-H1] toolcache survived but lost its cache identity labels: %v", tv.Labels)
+	}
+
+	// The other referenced caches (pnpm/diag/externals) — inspected successfully —
+	// must also survive; none is an orphan.
+	if _, ok := volByName(t, fake, spec.PnpmVolumeName(repoKey, "9")); !ok {
+		t.Error("[NEW-H1] pnpm store cache was deleted")
+	}
+	if _, ok := volByName(t, fake, spec.DiagVolumeName(repoKey)); !ok {
+		t.Error("[NEW-H1] diag cache was deleted")
+	}
+
+	// The just-created runner must be rolled back — never started against an
+	// unverified cache tree.
+	if _, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("newh1-job")); err == nil {
+		t.Error("[NEW-H1] the runner container was left present after a fail-closed create")
 	}
 }
 
