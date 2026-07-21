@@ -199,13 +199,13 @@ func TestVerifyM1WP2Allocation(t *testing.T) {
 	// --- provider config (unpinned local sleep image) ------------------------
 	configDir := t.TempDir()
 	configFile := filepath.Join(configDir, "config.toml")
+	// [network] is deliberately omitted so this run exercises config.Load's
+	// actual defaults (ADR-001, amended 2026-07-21): enable_job_network=true,
+	// internal=false. See TestVerifyOwnerRulingEgressAndIsolation for the
+	// internal=true opt-in path and the cross-allocation isolation check.
 	writeFile(t, configFile, fmt.Sprintf(`docker_host = "unix:///var/run/docker.sock"
 runner_image = %q
 allow_unpinned_runner_image = true
-
-[network]
-enable_job_network = true
-internal = true
 `, imageTag))
 
 	// --- fake metadata HTTPS server ------------------------------------------
@@ -253,17 +253,21 @@ internal = true
 		t.Errorf("(a) job network labels incorrect: %s", netLabels)
 	}
 
-	// (f) network is internal:true (no external route) per config default.
-	if netInternal != "true" {
-		t.Errorf("(f) job network Internal=%s, want true", netInternal)
+	// (f) network is internal:false (no [network] block => config.Load's
+	// default, ADR-001 amended 2026-07-21) — the job network has a normal
+	// route to the external network.
+	if netInternal != "false" {
+		t.Errorf("(f) job network Internal=%s, want false (2026-07-21 owner ruling default)", netInternal)
 	}
-	// Stronger proof: an outbound connection from the runner must fail on an
-	// internal network. Bounded so it cannot hang.
-	_, egressErr := dockerTry("exec", containerID, "sh", "-c", "wget -q -T 4 -O /dev/null http://1.1.1.1 2>&1")
-	if egressErr == nil {
-		t.Errorf("(f) runner reached the external network on an internal=true job network")
+	// Stronger proof: the runner must actually be able to reach the public
+	// internet — this is the whole point of the default flip (a real runner
+	// needs this to register with GitHub; DinD needs it for registry pulls).
+	// Bounded so it cannot hang.
+	egressOut, egressErr := dockerTry("exec", containerID, "sh", "-c", "wget -qO- -T 5 https://api.github.com/zen")
+	if egressErr != nil {
+		t.Errorf("(f) runner could NOT reach the external network on an internal=false job network: %v\n%s", egressErr, egressOut)
 	} else {
-		t.Logf("[f] outbound egress correctly blocked on internal network (wget failed as expected)")
+		t.Logf("[f] outbound egress works on the default internal=false network; api.github.com/zen replied: %q", strings.TrimSpace(egressOut))
 	}
 
 	// (b) workspace volume exists, labeled, mounted at the runner workdir.
