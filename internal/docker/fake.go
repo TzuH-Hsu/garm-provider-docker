@@ -127,6 +127,19 @@ type fakeContainer struct {
 	// the Mounts long syntax (see rejectUnsupportedTmpfsMount).
 	tmpfsMounts map[string]string
 
+	// networkMode models HostConfig.NetworkMode — the user-defined per-job
+	// network the runner joins as its sole attachment (ADR-001). Recorded at
+	// ContainerCreate so tests (and NetworkRemove's active-endpoint check) can
+	// tell which network a container is attached to, and so ContainerInspect
+	// reports it under NetworkSettings.Networks, mirroring the real daemon.
+	networkMode string
+
+	// mounts models HostConfig.Mounts — the named/anonymous workspace volume
+	// (ADR-001). Recorded at ContainerCreate so ContainerInspect reports them
+	// under .Mounts, letting a test assert the workspace volume is mounted at
+	// the runner workdir (the WP9-flagged JIT-workdir contract).
+	mounts []mount.Mount
+
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
 	state     string
@@ -461,6 +474,13 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 			c.tmpfsMounts[k] = v
 		}
 	}
+	// Record the network attachment (HostConfig.NetworkMode) and volume mounts
+	// (HostConfig.Mounts) so ContainerInspect reports them, mirroring the real
+	// daemon, and so NetworkRemove can enforce the active-endpoint rule.
+	if hostConfig != nil {
+		c.networkMode = string(hostConfig.NetworkMode)
+		c.mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
+	}
 	f.containers[id] = c
 
 	// Ambiguous create failure: the container was recorded, but the call
@@ -608,6 +628,14 @@ func (f *FakeClient) NetworkCreate(_ context.Context, name string, options netwo
 
 // NetworkRemove deletes a network (by ID or name) from the fake's in-memory
 // store, tolerating "not found" like ContainerRemove.
+//
+// It models the real daemon's active-endpoint rule: `docker network rm` fails
+// with a 403 ("has active endpoints") while any container — even a stopped one
+// — is still attached to the network. Modeling that here makes the ADR-004
+// teardown ordering (remove containers BEFORE their network) a tested
+// invariant, not merely a real-daemon-only one: a teardown that tried to
+// remove the network first would fail this check in a unit test, the same way
+// it fails on the live daemon.
 func (f *FakeClient) NetworkRemove(_ context.Context, networkID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -615,6 +643,11 @@ func (f *FakeClient) NetworkRemove(_ context.Context, networkID string) error {
 	n := f.findNetwork(networkID)
 	if n == nil {
 		return notFoundf("network %s not found", networkID)
+	}
+	for _, c := range f.containers {
+		if c.networkMode == n.name || c.networkMode == n.id {
+			return errdefs.Forbidden(fmt.Errorf("error while removing network: network %s id %s has active endpoints", n.name, n.id))
+		}
 	}
 	delete(f.networks, n.id)
 	return nil
@@ -712,18 +745,67 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		Dead:      c.state == "dead",
 		OOMKilled: c.oomKilled,
 	}
-	return types.ContainerJSON{
-		ContainerJSONBase: &types.ContainerJSONBase{
-			ID:         c.id,
-			Name:       "/" + c.name,
-			State:      state,
-			HostConfig: &container.HostConfig{Tmpfs: cloneLabels(c.tmpfsMounts)},
-		},
+	base := &types.ContainerJSONBase{
+		ID:         c.id,
+		Name:       "/" + c.name,
+		State:      state,
+		HostConfig: &container.HostConfig{Tmpfs: cloneLabels(c.tmpfsMounts)},
+	}
+	if c.networkMode != "" {
+		base.HostConfig.NetworkMode = container.NetworkMode(c.networkMode)
+	}
+
+	cj := types.ContainerJSON{
+		ContainerJSONBase: base,
 		Config: &container.Config{
 			Image:  c.image,
 			Env:    append([]string(nil), c.env...),
 			Labels: cloneLabels(c.labels),
 		},
+		Mounts: c.mountPoints(),
+	}
+	// A user-defined per-job network attachment surfaces under
+	// NetworkSettings.Networks, exactly as `docker inspect` reports it, with a
+	// deterministic fake private IP so addressesFromInspect has something to
+	// read. Built-in modes (bridge/host/none/default) are not reported here.
+	if isUserDefinedNetwork(c.networkMode) {
+		cj.NetworkSettings = &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				c.networkMode: {IPAddress: "10.240.0.2"},
+			},
+		}
+	}
+	return cj
+}
+
+// mountPoints converts the container's recorded HostConfig.Mounts into the
+// types.MountPoint slice ContainerInspect reports under .Mounts, so a test can
+// assert the workspace volume is mounted at the runner workdir.
+func (c *fakeContainer) mountPoints() []types.MountPoint {
+	if len(c.mounts) == 0 {
+		return nil
+	}
+	out := make([]types.MountPoint, 0, len(c.mounts))
+	for _, m := range c.mounts {
+		out = append(out, types.MountPoint{
+			Type:        m.Type,
+			Name:        m.Source, // for a named volume, Source is the volume name
+			Destination: m.Target,
+		})
+	}
+	return out
+}
+
+// isUserDefinedNetwork reports whether mode names a user-defined Docker
+// network (a per-job network) rather than a built-in mode. Only user-defined
+// attachments are reported as endpoints and enforced by NetworkRemove's
+// active-endpoint check.
+func isUserDefinedNetwork(mode string) bool {
+	switch mode {
+	case "", "bridge", "host", "none", "default", "container":
+		return false
+	default:
+		return true
 	}
 }
 
