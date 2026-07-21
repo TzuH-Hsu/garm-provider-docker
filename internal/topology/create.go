@@ -111,26 +111,52 @@ func (m *Manager) bestEffortRemoveOwnNetwork(ctx context.Context, nonce string) 
 }
 
 // CreateWorkspaceVolume creates the per-job workspace volume (ADR-001), a
-// named, labeled volume mounted at the runner workdir. Because the real
-// daemon's VolumeCreate is idempotent on a duplicate name (WP1 finding: it
-// silently returns the EXISTING volume with its ORIGINAL labels), a stale
-// volume left by a crashed prior allocation of the same instance name would be
-// silently reused — cross-job residue the acceptance criteria forbid. This
-// method detects that via the create-nonce and replaces the stale volume with a
-// fresh, empty one. Holding the claim-marker network for this instance name
-// guarantees no peer is racing this volume, so remove-and-recreate is safe.
+// named, labeled volume mounted at the runner workdir. Created in every mode.
+func (m *Manager) CreateWorkspaceVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
+	return m.createFreshVolume(ctx, "workspace",
+		spec.WorkspaceVolumeName(identity.InstanceName),
+		identity.WorkspaceVolumeLabels(m.now()), nonce)
+}
+
+// CreateSocketVolume creates the per-job DinD socket volume (ADR-001): the
+// shared, job-scoped volume dockerd exposes its unix socket over and the runner
+// mounts to reach it. DinD modes only — never created in "none" mode.
+func (m *Manager) CreateSocketVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
+	return m.createFreshVolume(ctx, "socket",
+		spec.SocketVolumeName(identity.InstanceName),
+		identity.SocketVolumeLabels(m.now()), nonce)
+}
+
+// CreateDindStateVolume creates the per-job dind-state volume (ADR-001):
+// dockerd's /var/lib/docker data root, isolated per allocation so overlay/vfs
+// layers never leak across jobs and are destroyed at teardown. DinD modes only.
+func (m *Manager) CreateDindStateVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
+	return m.createFreshVolume(ctx, "dind-state",
+		spec.DindStateVolumeName(identity.InstanceName),
+		identity.DindStateVolumeLabels(m.now()), nonce)
+}
+
+// createFreshVolume creates a named, labeled, guaranteed-FRESH job-scoped
+// volume, stamped with this attempt's create-nonce. Because the real daemon's
+// VolumeCreate is idempotent on a duplicate name (WP1 finding: it silently
+// returns the EXISTING volume with its ORIGINAL labels), a stale volume left by
+// a crashed prior allocation of the same instance name would be silently
+// reused — cross-job residue the acceptance criteria forbid. This helper
+// detects that via the create-nonce and replaces the stale volume with a fresh,
+// empty one. Holding the claim-marker network for this instance name guarantees
+// no peer is racing this volume, so remove-and-recreate is safe.
 //
 // This is defense-in-depth behind the pre-create SweepStale (which removes a
 // past-grace stale allocation wholesale before this runs); together they close
-// the stale-content-reuse hazard the idempotent VolumeCreate opens.
-func (m *Manager) CreateWorkspaceVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
-	name := spec.WorkspaceVolumeName(identity.InstanceName)
-	labels := identity.WorkspaceVolumeLabels(m.now())
+// the stale-content-reuse hazard the idempotent VolumeCreate opens. It backs
+// all three job-scoped volumes (workspace, socket, dind-state) so the
+// stale-replacement guarantee is defined in exactly one place.
+func (m *Manager) createFreshVolume(ctx context.Context, kind, name string, labels map[string]string, nonce string) error {
 	labels[spec.LabelCreateNonce] = nonce
 
 	created, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
 	if err != nil {
-		return fmt.Errorf("failed to create workspace volume for %q: %w", identity.InstanceName, err)
+		return fmt.Errorf("failed to create %s volume %q: %w", kind, name, err)
 	}
 	if created.Labels[spec.LabelCreateNonce] == nonce {
 		return nil // a genuinely fresh volume carries our nonce
@@ -139,10 +165,10 @@ func (m *Manager) CreateWorkspaceVolume(ctx context.Context, identity spec.Alloc
 	// Idempotent hit: `created` is a stale volume with a different (or absent)
 	// nonce. Remove and recreate so no prior job's content survives.
 	if err := m.cli.VolumeRemove(ctx, name, true); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("stale workspace volume %q could not be removed for replacement: %w", name, err)
+		return fmt.Errorf("stale %s volume %q could not be removed for replacement: %w", kind, name, err)
 	}
 	if _, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels}); err != nil {
-		return fmt.Errorf("failed to recreate a fresh workspace volume for %q: %w", identity.InstanceName, err)
+		return fmt.Errorf("failed to recreate a fresh %s volume %q: %w", kind, name, err)
 	}
 	return nil
 }

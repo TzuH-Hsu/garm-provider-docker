@@ -53,6 +53,30 @@ func seedWorkspaceVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID,
 	}
 }
 
+func seedSocketVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID, name string, createdAt time.Time, nonce string) {
+	t.Helper()
+	id := spec.AllocationIdentity{ControllerID: controllerID, PoolID: "pool-1", InstanceName: name}
+	labels := id.SocketVolumeLabels(createdAt)
+	if nonce != "" {
+		labels[spec.LabelCreateNonce] = nonce
+	}
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.SocketVolumeName(name), Labels: labels}); err != nil {
+		t.Fatalf("seed socket VolumeCreate for %q returned unexpected error: %v", name, err)
+	}
+}
+
+func seedDindStateVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID, name string, createdAt time.Time, nonce string) {
+	t.Helper()
+	id := spec.AllocationIdentity{ControllerID: controllerID, PoolID: "pool-1", InstanceName: name}
+	labels := id.DindStateVolumeLabels(createdAt)
+	if nonce != "" {
+		labels[spec.LabelCreateNonce] = nonce
+	}
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.DindStateVolumeName(name), Labels: labels}); err != nil {
+		t.Fatalf("seed dind-state VolumeCreate for %q returned unexpected error: %v", name, err)
+	}
+}
+
 func seedRunnerFor(t *testing.T, fake *docker.FakeClient, controllerID, name string, createdAt time.Time, nonce, state string) string {
 	t.Helper()
 	id := spec.AllocationIdentity{ControllerID: controllerID, PoolID: "pool-1", InstanceName: name}
@@ -338,6 +362,102 @@ func TestCreateWorkspaceVolumeCreateErrorSurfaces(t *testing.T) {
 	fake.VolumeCreateErr = errors.New("no space left on device")
 	if err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "nonce-1"); err == nil {
 		t.Fatal("expected CreateWorkspaceVolume to surface the create error, got nil")
+	}
+}
+
+// --- CreateSocketVolume / CreateDindStateVolume (WP3 DinD) --------------------
+
+func TestCreateSocketVolumeFresh(t *testing.T) {
+	m, fake := newManager(t)
+	if err := m.CreateSocketVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
+		t.Fatalf("CreateSocketVolume returned unexpected error: %v", err)
+	}
+	v := findVolume(t, fake, spec.SocketVolumeName("job-1"))
+	if v.Labels[spec.LabelResource] != spec.ResourceSocket ||
+		v.Labels[spec.LabelInstanceName] != "job-1" ||
+		v.Labels[spec.LabelCreateNonce] != "nonce-1" {
+		t.Errorf("socket volume labels missing/incorrect: %v", v.Labels)
+	}
+}
+
+func TestCreateDindStateVolumeFresh(t *testing.T) {
+	m, fake := newManager(t)
+	if err := m.CreateDindStateVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
+		t.Fatalf("CreateDindStateVolume returned unexpected error: %v", err)
+	}
+	v := findVolume(t, fake, spec.DindStateVolumeName("job-1"))
+	if v.Labels[spec.LabelResource] != spec.ResourceDindState ||
+		v.Labels[spec.LabelInstanceName] != "job-1" ||
+		v.Labels[spec.LabelCreateNonce] != "nonce-1" {
+		t.Errorf("dind-state volume labels missing/incorrect: %v", v.Labels)
+	}
+}
+
+// TestCreateSocketVolumeReplacesStaleContent proves the shared
+// createFreshVolume stale-replacement guarantee holds for the socket volume
+// too (not just workspace): a crashed prior allocation's socket volume must
+// never be silently reused (the idempotent VolumeCreate hazard).
+func TestCreateSocketVolumeReplacesStaleContent(t *testing.T) {
+	m, fake := newManager(t)
+	staleLabels := identityFor("job-1").SocketVolumeLabels(time.Now().Add(-time.Hour))
+	staleLabels[spec.LabelCreateNonce] = "stale-nonce"
+	staleLabels["test.residue"] = "prior-socket"
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
+		Name:   spec.SocketVolumeName("job-1"),
+		Labels: staleLabels,
+	}); err != nil {
+		t.Fatalf("seed stale socket VolumeCreate returned unexpected error: %v", err)
+	}
+
+	if err := m.CreateSocketVolume(context.Background(), identityFor("job-1"), "fresh-nonce"); err != nil {
+		t.Fatalf("CreateSocketVolume returned unexpected error: %v", err)
+	}
+	if countVolumes(t, fake) != 1 {
+		t.Errorf("volume count = %d, want 1", countVolumes(t, fake))
+	}
+	v := findVolume(t, fake, spec.SocketVolumeName("job-1"))
+	if v.Labels[spec.LabelCreateNonce] != "fresh-nonce" {
+		t.Errorf("socket nonce = %q, want fresh-nonce (stale volume not replaced)", v.Labels[spec.LabelCreateNonce])
+	}
+	if _, residual := v.Labels["test.residue"]; residual {
+		t.Error("stale socket volume was reused: the prior residue label survived")
+	}
+}
+
+func TestCreateDindStateVolumeCreateErrorSurfaces(t *testing.T) {
+	m, fake := newManager(t)
+	fake.VolumeCreateErr = errors.New("no space left on device")
+	if err := m.CreateDindStateVolume(context.Background(), identityFor("job-1"), "nonce-1"); err == nil {
+		t.Fatal("expected CreateDindStateVolume to surface the create error, got nil")
+	}
+}
+
+// TestTeardownAllocationRemovesFullDindTopology seeds every WP3 resource kind
+// (runner + DinD sidecar + job network + workspace/socket/dind-state volumes)
+// and asserts teardown removes ALL of them in the ADR-004 order — both
+// containers before the network (the fake's active-endpoint check enforces
+// that), and all three volumes gone last.
+func TestTeardownAllocationRemovesFullDindTopology(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+	seedNetworkFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedSocketVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedDindStateVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedRunnerFor(t, fake, testControllerID, "job-1", now, "n1", "running")
+	seedDindSidecarFor(t, fake, testControllerID, "job-1", now, "n1")
+
+	if countVolumes(t, fake) != 3 {
+		t.Fatalf("seeded volume count = %d, want 3 (workspace/socket/dind-state)", countVolumes(t, fake))
+	}
+
+	found, err := m.TeardownAllocation(context.Background(), "job-1")
+	if err != nil || !found {
+		t.Fatalf("TeardownAllocation = (found=%v, err=%v), want (true, nil)", found, err)
+	}
+	if countContainers(t, fake) != 0 || countNetworks(t, fake) != 0 || countVolumes(t, fake) != 0 {
+		t.Errorf("after full-DinD teardown: %d/%d/%d containers/networks/volumes, want 0/0/0",
+			countContainers(t, fake), countNetworks(t, fake), countVolumes(t, fake))
 	}
 }
 
