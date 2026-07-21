@@ -13,11 +13,19 @@
 #      independently of and concurrently with step 1.
 #   3. Install the credentials and exec the runner:
 #      - JIT: symlink the tmpfs files into the install dir and exec run.sh
-#        directly (no config.sh, no --jitconfig).
-#      - non-JIT: pre-create the credential symlinks onto the tmpfs, then run
-#        config.sh (as the runner user via gosu) to register so it writes the
-#        generated credentials THROUGH the symlinks onto the tmpfs directly.
-#        A scrub-on-failure trap guards the phase so no failure path leaves
+#        directly (no config.sh, no --jitconfig). All JIT files are delivered
+#        up front, so the symlinks are never dangling.
+#      - non-JIT: run config.sh (as the runner user via gosu) to register,
+#        letting it write .runner/.credentials/.credentials_rsaparams into the
+#        install dir normally; THEN, only after config.sh SUCCEEDS, move those
+#        files onto the tmpfs and replace them with symlinks, so steady-state
+#        credentials are tmpfs-resident. This is a post-config move, NOT a
+#        pre-link: the real .NET runner's `Runner.Listener configure` reads
+#        .credentials in its startup HostContext constructor, so a symlink
+#        pre-created before config.sh — whose tmpfs target does not exist yet
+#        in non-JIT mode (only registration-token is delivered) — makes that
+#        read fail (FileNotFoundException, exit 134) BEFORE registration. A
+#        scrub-on-failure trap guards the phase so no failure path leaves
 #        credentials on the writable layer.
 #
 # Credentials never land on the container's disk-backed writable layer: they
@@ -236,25 +244,37 @@ run_config_sh() {
   wait "${pid}"
 }
 
-# prelink_non_jit_credentials pre-creates the dotted-name credential symlinks
-# (pointing at the tmpfs bare-name targets, exactly like install_jit_credentials)
-# BEFORE config.sh runs, so config.sh writes its generated
-# .runner/.credentials/.credentials_rsaparams THROUGH the symlinks directly onto
-# the memory-backed tmpfs. This makes the relocation failure-atomic: there is no
-# window in which the credentials sit on the disk-backed writable layer waiting
-# to be moved — they land on tmpfs from the first write (ADR-002 F2).
+# move_non_jit_credentials_to_tmpfs relocates the .runner/.credentials/
+# .credentials_rsaparams that config.sh generated on the disk-backed writable
+# layer onto the memory-backed tmpfs, replacing each with a symlink pointing at
+# its tmpfs bare-name target (exactly like install_jit_credentials's steady
+# state). It runs ONLY after config.sh SUCCEEDS, so at steady state the non-JIT
+# credentials live only on tmpfs (ADR-002 F2), reached from the install dir
+# through symlinks.
 #
-# M0-demo verification item: this assumes the .NET runner's config.sh writes
-# these files in place (open+write through the symlink) rather than
-# rename-over-target, which would replace the symlink with a real file on the
-# writable layer. This is to be verified on the real runner during the M0 demo,
-# alongside the existing JIT symlink-compatibility item; the
-# scrub-on-failure trap below is the belt-and-braces safety net for the failure
-# path, and that demo verification is the check for the success path.
-prelink_non_jit_credentials() {
-  ln -sfn "${CRED_DIR}/runner" "${RUNNER_DIR}/.runner"
-  ln -sfn "${CRED_DIR}/credentials" "${RUNNER_DIR}/.credentials"
-  ln -sfn "${CRED_DIR}/credentials_rsaparams" "${RUNNER_DIR}/.credentials_rsaparams"
+# This is deliberately a post-config move rather than a pre-config symlink: the
+# real .NET runner's `Runner.Listener configure` reads .credentials in its
+# startup HostContext constructor, so a symlink pre-created before config.sh —
+# whose tmpfs target does not exist yet in non-JIT mode (only registration-token
+# is delivered; .credentials is CREATED by config.sh during registration) —
+# makes that read fail (FileNotFoundException, exit 134) BEFORE registration
+# runs (verified against the real runner on a live daemon).
+#
+# The move runs as root (the entrypoint has not dropped privileges yet), so it
+# can write into the runner-owned, mode-0700 tmpfs; config.sh generated the
+# files as the runner user, and mv preserves that ownership, so the runner can
+# still read them through the symlinks after run.sh drops to it. The per-file
+# guard tolerates a runner that (for any scope) did not emit one of the files.
+move_non_jit_credentials_to_tmpfs() {
+  local f bare
+  for f in .runner .credentials .credentials_rsaparams; do
+    # ${f#.} strips the leading dot to the tmpfs bare name (runner, etc.).
+    bare="${f#.}"
+    if [[ -e "${RUNNER_DIR}/${f}" ]]; then
+      mv -f "${RUNNER_DIR}/${f}" "${CRED_DIR}/${bare}"
+      ln -sfn "${CRED_DIR}/${bare}" "${RUNNER_DIR}/${f}"
+    fi
+  done
 }
 
 # scrub_non_jit_credentials unconditionally removes the credential-pattern
@@ -309,12 +329,17 @@ scrub_non_jit_credentials_on_signal() {
 
 # install_non_jit_registration registers the runner with config.sh (as the
 # runner user via gosu by default, ADR-002 F4), appending --disableupdate
-# unconditionally because the image is digest-managed (ADR-002 F9). It
-# pre-links the credential paths onto the tmpfs BEFORE config.sh so the
-# generated credentials are written through onto tmpfs directly (never
-# relocated after the fact), and guards the config phase with an EXIT trap
-# plus HUP/INT/TERM traps so no failure path — including an unhandled signal
-# — leaves credentials on the writable layer.
+# unconditionally because the image is digest-managed (ADR-002 F9). config.sh
+# writes .runner/.credentials/.credentials_rsaparams into the install dir
+# normally; ONLY after it SUCCEEDS are those files moved onto the tmpfs and
+# replaced with symlinks (move_non_jit_credentials_to_tmpfs), so steady-state
+# credentials are tmpfs-resident. The credentials are deliberately NOT
+# pre-linked before config.sh: the real runner's configure step reads
+# .credentials in its startup constructor and a dangling pre-created symlink
+# (its tmpfs target is not delivered in non-JIT mode) crashes it before
+# registration. The config phase is guarded by an EXIT trap plus HUP/INT/TERM
+# traps so no failure path — including an unhandled signal — leaves credentials
+# on the writable layer.
 install_non_jit_registration() {
   local token url
   token="$(cat "${CRED_DIR}/registration-token")"
@@ -334,7 +359,6 @@ install_non_jit_registration() {
   [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]] && args+=(--ephemeral)
 
   own_runner_dir_as_runner
-  prelink_non_jit_credentials
 
   # Scrub credential-pattern files from the writable layer (and tmpfs) if
   # config.sh fails, or if the container receives HUP/INT/TERM while it is
@@ -347,6 +371,10 @@ install_non_jit_registration() {
   trap 'scrub_non_jit_credentials_on_signal 15' TERM
   log "registering runner via config.sh (non-JIT)"
   run_config_sh "${args[@]}"
+  # config.sh SUCCEEDED (set -e would have exited into the EXIT-trap scrub
+  # otherwise): relocate the generated credentials onto the tmpfs and symlink
+  # them, so steady-state credentials are tmpfs-resident like the JIT path.
+  move_non_jit_credentials_to_tmpfs
   trap - EXIT HUP INT TERM
 
   prepare_workdir
