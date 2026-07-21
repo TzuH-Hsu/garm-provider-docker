@@ -37,6 +37,96 @@ func seedRunner(t *testing.T, fake *docker.FakeClient, instanceName, poolID, con
 	return resp.ID
 }
 
+// seedDindSidecar creates a managed DinD sidecar container (role=dind) for the
+// given instance name, so tests can exercise the runner-vs-sidecar resolution
+// (F6/N1) with both present under the same instance-name label.
+func seedDindSidecar(t *testing.T, fake *docker.FakeClient, instanceName, poolID, controllerID, state string) string {
+	t.Helper()
+	labels := map[string]string{
+		spec.LabelManaged:      "true",
+		spec.LabelControllerID: controllerID,
+		spec.LabelInstanceName: instanceName,
+		spec.LabelPoolID:       poolID,
+		spec.LabelRole:         spec.RoleDind,
+	}
+	resp, err := fake.ContainerCreate(context.Background(), &container.Config{Labels: labels}, nil, nil, nil, spec.DindContainerName(instanceName))
+	if err != nil {
+		t.Fatalf("seed sidecar ContainerCreate returned unexpected error: %v", err)
+	}
+	fake.SetState(resp.ID, state, false)
+	return resp.ID
+}
+
+// TestResolveSelectsRunnerNotSidecar is the F6/N1 guard: with a DinD sidecar
+// present under the same instance name, a by-name Get resolves the RUNNER
+// (never the sidecar, whatever order the daemon lists them in), and Delete
+// reaps the whole allocation — runner AND the lingering privileged sidecar.
+func TestResolveSelectsRunnerNotSidecar(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// Sidecar exited, runner running: if resolution picked the sidecar, the
+	// reported status would be Stopped instead of Running.
+	sidecarID := seedDindSidecar(t, fake, "job-1", "p1", "controller-abc", "exited")
+	runnerID := seedRunner(t, fake, "job-1", "p1", "controller-abc", "running")
+
+	inst, err := p.GetInstance(context.Background(), "job-1")
+	if err != nil {
+		t.Fatalf("GetInstance(job-1) returned unexpected error: %v", err)
+	}
+	if inst.Status != params.InstanceRunning {
+		t.Errorf("[F6/N1] GetInstance resolved status=%q, want running — it selected the DinD sidecar, not the runner", inst.Status)
+	}
+	if inst.ProviderID != "job-1" {
+		t.Errorf("ProviderID=%q, want the instance name job-1", inst.ProviderID)
+	}
+
+	// Delete reaps the whole allocation: runner AND the lingering sidecar.
+	if err := p.DeleteInstance(context.Background(), "job-1"); err != nil {
+		t.Fatalf("DeleteInstance(job-1) returned unexpected error: %v", err)
+	}
+	if _, err := fake.ContainerInspect(context.Background(), runnerID); err == nil {
+		t.Error("runner survived DeleteInstance")
+	}
+	if _, err := fake.ContainerInspect(context.Background(), sidecarID); err == nil {
+		t.Error("[F6] DinD sidecar leaked past DeleteInstance")
+	}
+}
+
+// TestResolveByInstanceNameCollidingWithAnotherRunnerID is the N2 guard: an
+// instance name that equals ANOTHER runner's container ID must resolve to the
+// runner that OWNS that instance name, not the id-colliding one — the exact
+// mis-resolution an inspect-by-ID-first resolver would produce.
+func TestResolveByInstanceNameCollidingWithAnotherRunnerID(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// Runner X owns instance "alpha"; it is EXITED.
+	xID := seedRunner(t, fake, "alpha", "p1", "controller-abc", "exited")
+	// Runner Y's instance NAME is exactly X's container ID; it is RUNNING.
+	yID := seedRunner(t, fake, xID, "p1", "controller-abc", "running")
+
+	// Resolving by that colliding id/name must select Y (owner of the label),
+	// not X (whose container ID it happens to equal).
+	inst, err := p.GetInstance(context.Background(), xID)
+	if err != nil {
+		t.Fatalf("GetInstance(%q) returned unexpected error: %v", xID, err)
+	}
+	if inst.ProviderID != xID {
+		t.Errorf("[N2] GetInstance(%q) resolved ProviderID=%q, want %q (runner Y owns that instance-name)", xID, inst.ProviderID, xID)
+	}
+	if inst.Status != params.InstanceRunning {
+		t.Errorf("[N2] resolved status=%q, want running — it mis-resolved to runner X via an id match", inst.Status)
+	}
+
+	// Delete by the colliding id/name removes Y (the label owner); X survives.
+	if err := p.DeleteInstance(context.Background(), xID); err != nil {
+		t.Fatalf("DeleteInstance(%q) returned unexpected error: %v", xID, err)
+	}
+	if _, err := fake.ContainerInspect(context.Background(), yID); err == nil {
+		t.Error("[N2] runner Y (the instance-name owner) survived delete")
+	}
+	if _, err := fake.ContainerInspect(context.Background(), xID); err != nil {
+		t.Errorf("[N2] runner X (id-colliding, different instance) was wrongly deleted: %v", err)
+	}
+}
+
 func TestMapContainerStatus(t *testing.T) {
 	tests := []struct {
 		name      string

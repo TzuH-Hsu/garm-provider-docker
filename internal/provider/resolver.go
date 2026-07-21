@@ -17,12 +17,19 @@ import (
 )
 
 // resolve finds the managed runner container for a GARM_INSTANCE_ID, which
-// may be either the provider-assigned container ID (ProviderID) or the GARM
-// instance Name — GARM falls back to Name when ProviderID is empty
-// (research.md §1.E, ADR-004). It first tries an inspect-by-ID (which the
-// daemon also matches against container names), then falls back to a label
-// filter on garm.docker/instance-name. The bool reports whether a container
-// was found; a genuine "gone" is (zero, false, nil), distinct from an error.
+// may be either the provider-assigned ProviderID (now the instance name — F6)
+// or the GARM instance Name — GARM falls back to Name when ProviderID is empty
+// (research.md §1.E, ADR-004). It tries the exact instance-name label lookup
+// FIRST (N2), then falls back to an inspect-by-ID for the legacy container-ID
+// case. The bool reports whether a container was found; a genuine "gone" is
+// (zero, false, nil), distinct from an error.
+//
+// The label lookup comes first specifically to fix N2: if instanceID happens to
+// equal ANOTHER runner's container ID (or a prefix a raw inspect-by-ID would
+// match), an ID-first resolve would return that OTHER allocation's container.
+// Keying on the instance-name label first resolves to the runner that actually
+// OWNS the name; only when no owned runner carries that instance-name label do
+// we treat instanceID as a raw container ID (the pre-F6 identity).
 //
 // Every successful inspect is validated for ownership (spec.IsManagedRunner):
 // a container that does not carry this controller's managed/runner labels is
@@ -31,56 +38,60 @@ import (
 // (Delete/Stop/Start), which could otherwise touch a container this provider
 // does not own (ADR-004 F3).
 func (p *Provider) resolve(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
-	inspected, err := p.cli.ContainerInspect(ctx, instanceID)
-	if err == nil {
-		if !p.ownsRunner(inspected) {
-			// A container exists under this ID/name but is not ours. Do NOT
-			// return it; fall through to the owned-label lookup, which can
-			// still find our container when instanceID was a GARM Name whose
-			// Docker name is taken by a foreign container.
-			return p.resolveByOwnedLabel(ctx, instanceID)
-		}
+	// N2: exact instance-name label lookup FIRST.
+	inspected, found, err := p.resolveByOwnedLabel(ctx, instanceID)
+	if err != nil {
+		return types.ContainerJSON{}, false, err
+	}
+	if found {
 		return inspected, true, nil
 	}
-	if !errdefs.IsNotFound(err) {
-		return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", instanceID, err)
-	}
 
-	// The id was likely a GARM instance Name that differs from the
-	// container's (lowercased) Docker name. Look it up by the instance-name
-	// label instead.
-	return p.resolveByOwnedLabel(ctx, instanceID)
-}
-
-// resolveByOwnedLabel finds this controller's runner container by the
-// garm.docker/instance-name label (the label filter already scopes to
-// managed=true + this controller-id), re-validating ownership defense-in-
-// depth before returning it.
-func (p *Provider) resolveByOwnedLabel(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
-	list, err := p.cli.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: p.managedByInstanceNameFilter(instanceID),
-	})
-	if err != nil {
-		return types.ContainerJSON{}, false, fmt.Errorf("failed to list containers for %q: %w", instanceID, err)
-	}
-	if len(list) == 0 {
-		return types.ContainerJSON{}, false, nil
-	}
-
-	inspected, err := p.cli.ContainerInspect(ctx, list[0].ID)
+	// Legacy container-ID fallback: no owned runner carries instanceID as its
+	// instance-name label, so treat it as a raw container ID (or Docker name).
+	// Validate ownership so a foreign/wrong-role container colliding on that ID
+	// or name is never returned (ADR-004 F3).
+	inspected, err = p.cli.ContainerInspect(ctx, instanceID)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			// Raced with a concurrent delete between list and inspect;
-			// treat as gone rather than an error.
 			return types.ContainerJSON{}, false, nil
 		}
-		return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", list[0].ID, err)
+		return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", instanceID, err)
 	}
 	if !p.ownsRunner(inspected) {
 		return types.ContainerJSON{}, false, nil
 	}
 	return inspected, true, nil
+}
+
+// resolveByOwnedLabel finds this controller's RUNNER container by the
+// garm.docker/instance-name label, scoped to role=runner
+// (managedRunnerByInstanceNameFilter) so the DinD sidecar that shares the
+// instance-name label is never selected (F6/N1). It ITERATES the matches to the
+// first owned runner rather than trusting list[0], and re-validates ownership
+// defense-in-depth before returning it. A NotFound on any candidate's inspect
+// (raced with a concurrent delete) is skipped, not surfaced.
+func (p *Provider) resolveByOwnedLabel(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
+	list, err := p.cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: p.managedRunnerByInstanceNameFilter(instanceID),
+	})
+	if err != nil {
+		return types.ContainerJSON{}, false, fmt.Errorf("failed to list containers for %q: %w", instanceID, err)
+	}
+	for _, c := range list {
+		inspected, err := p.cli.ContainerInspect(ctx, c.ID)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue // raced with a concurrent delete; try the next candidate
+			}
+			return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", c.ID, err)
+		}
+		if p.ownsRunner(inspected) {
+			return inspected, true, nil
+		}
+	}
+	return types.ContainerJSON{}, false, nil
 }
 
 // ownsRunner reports whether an inspected container carries this controller's

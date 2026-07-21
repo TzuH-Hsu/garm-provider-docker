@@ -63,15 +63,28 @@ func New(cli docker.Client, cfg config.Config, controllerID string) (*Provider, 
 // version defaulting to v0.1.0.
 var _ executionv010.ExternalProvider = (*Provider)(nil)
 
-// managedByInstanceNameFilter builds the Docker label filter that selects
-// this controller's managed runner container(s) for a given instance name.
-// It is the shared basis for CreateInstance's duplicate detection and the
-// ID-or-name resolver's label-filter fallback (ADR-004), so both key off
-// the same label set.
+// managedByInstanceNameFilter builds the Docker label filter that selects ALL
+// of this controller's managed, job-scoped resources for a given instance name,
+// regardless of role. It deliberately does NOT filter on role, so
+// hasManagedAllocationResources can see a lingering DinD sidecar (role=dind)
+// under the instance name after the runner is gone (F6); the runner-specific
+// resolver uses managedRunnerByInstanceNameFilter below instead.
 func (p *Provider) managedByInstanceNameFilter(instanceName string) filters.Args {
 	return filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
 		filters.Arg("label", spec.LabelControllerID+"="+p.controllerID),
 		filters.Arg("label", spec.LabelInstanceName+"="+instanceName),
 	)
+}
+
+// managedRunnerByInstanceNameFilter narrows managedByInstanceNameFilter to the
+// RUNNER container specifically (garm.docker/role=runner). The ID-or-name
+// resolver keys off this so a by-name lookup selects the owned runner and never
+// the DinD sidecar that shares the same instance-name label (F6/N1): without the
+// role conjunct, ContainerList returns both the runner and the sidecar, and a
+// resolver that trusted list[0] could return the sidecar for a live runner.
+func (p *Provider) managedRunnerByInstanceNameFilter(instanceName string) filters.Args {
+	f := p.managedByInstanceNameFilter(instanceName)
+	f.Add("label", spec.LabelRole+"="+spec.RoleRunner)
+	return f
 }
