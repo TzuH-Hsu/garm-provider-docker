@@ -54,6 +54,19 @@ const (
 	LabelLastUsed   = "garm.docker/last-used"
 	LabelCacheKind  = "garm.docker/cache-kind"
 
+	// LabelImageDigest is the W2 externals-cache key (ADR-003 amendment
+	// 2026-07-22): the runner IMAGE's content digest an externals volume was
+	// seeded from. The externals volume carries it INSTEAD of LabelRepo (it is
+	// shared across every repository — its contents are Node runtimes tied to
+	// the runner image's version, not repository data), and the opportunistic
+	// cache GC keys externals supersession on it (an externals volume whose
+	// image-digest is not the currently-configured runner image's, past a grace,
+	// is evicted). Like every cache label it is carried ONLY by cache volumes
+	// and never alongside LabelInstanceName, so it is structurally excluded from
+	// ADR-004's teardown/sweep predicate. The builder that stamps it is
+	// ExternalsVolumeIdentity.ExternalsLabels in externals.go.
+	LabelImageDigest = "garm.docker/image-digest"
+
 	// LabelOSType and LabelOSArch are informational labels carrying the
 	// bootstrap OS type/arch. They are NOT part of the ADR-004 teardown
 	// predicate; they exist so GetInstance/ListInstances can reconstruct a
@@ -95,6 +108,16 @@ const (
 const (
 	RoleRunner = "runner"
 	RoleDind   = "dind"
+
+	// RoleCacheHelper marks the short-lived, provider-run helper containers of
+	// M2-W2 (ADR-003 amendment 2026-07-22): the externals seeder and the
+	// diagnostic-log pruner. They carry managed=true + controller-id + this role
+	// (but NO instance-name, so the ADR-004 teardown/sweep predicate never
+	// matches them) so a helper leaked by a hard provider crash can still be
+	// found and reaped — by the opportunistic GC's own helper reap and by a
+	// controller-scoped rescue. Every normal path force-removes its helper in a
+	// defer, so a leak requires the process to die mid-run.
+	RoleCacheHelper = "cache-helper"
 )
 
 // Resource kind values for LabelResource. Networks and volumes only.

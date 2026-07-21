@@ -102,6 +102,9 @@ func TestCacheValidate(t *testing.T) {
 		{name: "relative pnpm_store_path rejected", mutate: func(c *Cache) { c.PnpmStorePath = "opt/pnpm" }, wantErr: true},
 		{name: "identical paths rejected", mutate: func(c *Cache) { c.PnpmStorePath = c.ToolcachePath }, wantErr: true},
 		{name: "toolcache under /run rejected", mutate: func(c *Cache) { c.ToolcachePath = "/run/x" }, wantErr: true},
+		{name: "toolcache shadowing the externals mount rejected (W2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals" }, wantErr: true},
+		{name: "pnpm store shadowing the diag mount rejected (W2)", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/_diag" }, wantErr: true},
+		{name: "toolcache nested under the externals mount rejected (W2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals/node20" }, wantErr: true},
 		{name: "negative stale days rejected", mutate: func(c *Cache) { c.StaleCacheEvictionDays = -5 }, wantErr: true},
 		{name: "negative log retention rejected", mutate: func(c *Cache) { c.DiagnosticLogRetentionDays = -1 }, wantErr: true},
 	}

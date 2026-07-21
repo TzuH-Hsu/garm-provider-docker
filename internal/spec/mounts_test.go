@@ -198,6 +198,56 @@ func TestBuildRunnerContainerMemoryLimit(t *testing.T) {
 	}
 }
 
+// mountByTarget returns the mount whose Target is dest, or a zero mount + false.
+func mountByTarget(mounts []mount.Mount, dest string) (mount.Mount, bool) {
+	for _, m := range mounts {
+		if m.Target == dest {
+			return m, true
+		}
+	}
+	return mount.Mount{}, false
+}
+
+// TestBuildRunnerContainerExternalsAndDiagMounts: the externals volume is
+// mounted READ-ONLY at RunnerExternalsDir and the diag volume READ-WRITE at
+// RunnerDiagDir when their names are set (ADR-003 W2). The externals RO flag is
+// the load-bearing cross-repo-RCE guard.
+func TestBuildRunnerContainerExternalsAndDiagMounts(t *testing.T) {
+	_, host := BuildRunnerContainer(RunnerContainerSpec{
+		Image:               "x",
+		ExternalsVolumeName: "garm-cache-externals-abc",
+		DiagVolumeName:      "garm-cache-diag-logs-repo",
+	})
+
+	ext, ok := mountByTarget(host.Mounts, RunnerExternalsDir)
+	if !ok {
+		t.Fatalf("externals not mounted at %q; mounts=%+v", RunnerExternalsDir, host.Mounts)
+	}
+	if ext.Source != "garm-cache-externals-abc" || !ext.ReadOnly {
+		t.Errorf("externals mount = %+v, want the externals volume mounted READ-ONLY", ext)
+	}
+
+	diag, ok := mountByTarget(host.Mounts, RunnerDiagDir)
+	if !ok {
+		t.Fatalf("diag not mounted at %q; mounts=%+v", RunnerDiagDir, host.Mounts)
+	}
+	if diag.Source != "garm-cache-diag-logs-repo" || diag.ReadOnly {
+		t.Errorf("diag mount = %+v, want the diag volume mounted read-write", diag)
+	}
+}
+
+// TestBuildRunnerContainerNoExternalsOrDiagWhenUnset: with the names unset (the
+// cache-disabled or cache-ineligible path), neither mount is added.
+func TestBuildRunnerContainerNoExternalsOrDiagWhenUnset(t *testing.T) {
+	_, host := BuildRunnerContainer(RunnerContainerSpec{Image: "x"})
+	if _, ok := mountByTarget(host.Mounts, RunnerExternalsDir); ok {
+		t.Error("externals mounted with no ExternalsVolumeName set")
+	}
+	if _, ok := mountByTarget(host.Mounts, RunnerDiagDir); ok {
+		t.Error("diag mounted with no DiagVolumeName set")
+	}
+}
+
 func TestDindRuntimeSelection(t *testing.T) {
 	tests := []struct {
 		name        string

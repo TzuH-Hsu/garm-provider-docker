@@ -189,13 +189,27 @@ func CacheScopeAllowed(scope CacheEntityScope, allowOrgShared bool) bool {
 // not the name.
 const cacheVolumeNamePrefix = "garm-cache-"
 
-// CacheKind names the two persistent cache kinds this work package provisions
-// (ADR-003). The externals and diagnostic-log volumes are W2, not here.
+// CacheKind names the persistent cache kinds this provider provisions
+// (ADR-003). Toolcache and pnpm are repo-scoped (M2-W1); externals is
+// image-digest-scoped and diag-logs is repo-scoped (M2-W2).
 type CacheKind string
 
 const (
 	CacheKindToolcache CacheKind = "toolcache"
 	CacheKindPnpm      CacheKind = "pnpm"
+
+	// CacheKindExternals is the W2 externals cache: the runner's Node runtimes
+	// (research.md §3, ~380MB), keyed by the runner IMAGE digest and shared
+	// across every repository (its contents carry no repo data). Mounted
+	// READ-ONLY into the runner and seeded once by a privileged init step —
+	// externals.go.
+	CacheKindExternals CacheKind = "externals"
+
+	// CacheKindDiagLogs is the W2 diagnostic-logs cache: a per-repo volume at the
+	// runner's _diag dir so runner diagnostic logs persist across jobs, pruned
+	// provider-side to a retention window (never in the untrusted runner
+	// entrypoint) — diag.go.
+	CacheKindDiagLogs CacheKind = "diag-logs"
 )
 
 // ToolcacheVolumeName builds the toolcache volume name (ADR-003):

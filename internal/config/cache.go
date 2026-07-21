@@ -28,16 +28,20 @@ var cacheSegmentPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
 // reservedMountPaths mirrors internal/spec's fixed in-runner mount targets that
 // a cache mount must never shadow: CredentialDir (/run/garm), DindSocketDir
-// (/run), RunnerWorkDir (/actions-runner/_work), and DindStateDir
-// (/var/lib/docker). It is duplicated here rather than imported to keep package
-// config decoupled from package spec — the same layering choice spec/mounts.go
-// documents for its own dind-mode-string duplication. A cache volume mounted at
-// (or straddling) one of these would break credential delivery, the DinD
-// socket, the workspace, or the daemon's data root.
+// (/run), RunnerWorkDir (/actions-runner/_work), DindStateDir (/var/lib/docker),
+// and — as of M2-W2 — the fixed externals (RunnerExternalsDir) and diagnostic-
+// logs (RunnerDiagDir) mount targets. It is duplicated here rather than imported
+// to keep package config decoupled from package spec — the same layering choice
+// spec/mounts.go documents for its own dind-mode-string duplication. A
+// configurable toolcache_path/pnpm_store_path mounted at (or straddling) one of
+// these would break credential delivery, the DinD socket, the workspace, the
+// daemon's data root, the read-only externals mount, or the diag-logs volume.
 var reservedMountPaths = []string{
 	"/run/garm",
 	"/run",
 	"/actions-runner/_work",
+	"/actions-runner/externals",
+	"/actions-runner/_diag",
 	"/var/lib/docker",
 }
 

@@ -201,6 +201,23 @@ type RunnerContainerSpec struct {
 	ToolcacheMountPath  string
 	PnpmVolumeName      string
 	PnpmMountPath       string
+
+	// ExternalsVolumeName, when non-empty (cache enabled, any scope — externals
+	// carry no repo data so they apply to every allocation), mounts the shared,
+	// digest-keyed externals volume READ-ONLY at RunnerExternalsDir (ADR-003 W2,
+	// red-line F4). Read-only is load-bearing: the volume is shared across every
+	// repository, so a writable mount would let one job poison the Node runtimes
+	// every other repo's runner executes. The provider guarantees the volume is
+	// fully SEEDED (BuildExternalsSeedContainer) before it sets this, so the
+	// runner never mounts a partial externals tree.
+	ExternalsVolumeName string
+
+	// DiagVolumeName, when non-empty (cache enabled AND repo-scope-eligible,
+	// same rule as the toolcache/pnpm volumes), mounts the per-repo diagnostic-
+	// logs volume READ-WRITE at RunnerDiagDir (ADR-003 W2) so a repository's
+	// runner diagnostics persist across its ephemeral jobs. Retention is pruned
+	// provider-side out of band, never by this runner.
+	DiagVolumeName string
 }
 
 // BuildRunnerContainer assembles the container.Config and container.HostConfig
@@ -258,6 +275,17 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	}
 	if s.PnpmVolumeName != "" && s.PnpmMountPath != "" {
 		host.Mounts = append(host.Mounts, CacheVolumeMount(s.PnpmVolumeName, s.PnpmMountPath))
+	}
+	// Shared externals volume, mounted READ-ONLY at the fixed RunnerExternalsDir
+	// (ADR-003 W2, red-line F4). The path is provider-fixed, not config-driven —
+	// unlike the toolcache/pnpm targets — so no path field pairs with it.
+	if s.ExternalsVolumeName != "" {
+		host.Mounts = append(host.Mounts, ExternalsROMount(s.ExternalsVolumeName))
+	}
+	// Per-repo diagnostic-logs volume, mounted READ-WRITE at the fixed
+	// RunnerDiagDir (ADR-003 W2).
+	if s.DiagVolumeName != "" {
+		host.Mounts = append(host.Mounts, DiagLogsMount(s.DiagVolumeName))
 	}
 	if s.MemoryBytes > 0 {
 		host.Resources.Memory = s.MemoryBytes
