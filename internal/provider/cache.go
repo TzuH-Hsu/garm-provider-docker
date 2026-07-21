@@ -39,6 +39,22 @@ type cachePlan struct {
 	// pnpmVolume is the persistent pnpm store volume's name, set alongside
 	// pnpmPath when cache-eligible.
 	pnpmVolume string
+
+	// diagVolume is the per-repo diagnostic-logs volume's name (ADR-003 W2), set
+	// ONLY when this allocation is cache-eligible (same repo-scope rule as the
+	// toolcache/pnpm volumes). Empty means no persistent diag mount is added.
+	diagVolume string
+
+	// diagDir is the runner's _diag mount target AND the GARM_DIAG_DIR value the
+	// entrypoint uses to own the mounted dir, set alongside diagVolume.
+	diagDir string
+
+	// externalsVolume is the shared, image-digest-keyed externals volume's name
+	// (ADR-003 W2), set whenever the cache feature is enabled — for ANY entity
+	// scope, since externals carry no repo data. It is resolved and SEEDED
+	// separately from planCaches (planExternals), after the runner image is
+	// present, and mounted READ-ONLY.
+	externalsVolume string
 }
 
 // planCaches resolves ADR-003's per-allocation cache decision and, when the
@@ -111,7 +127,21 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	plan.pnpmVolume = pnpmRes.Name
 	plan.pnpmPath = p.cfg.Cache.PnpmStorePath
 
-	log.Printf("garm-provider-docker: CreateInstance: %q repo-scoped caches (repokey=%s): toolcache=%s hit=%v, pnpm=%s hit=%v",
-		bootstrap.Name, repoKey, toolName, toolRes.Hit, pnpmName, pnpmRes.Hit)
+	// Per-repo diagnostic-logs volume (ADR-003 W2): same repo-scope eligibility as
+	// the toolcache/pnpm volumes. Its file-level retention is pruned provider-side
+	// during the opportunistic GC, never by the untrusted runner.
+	diagName := spec.DiagVolumeName(repoKey)
+	if err := spec.ValidateDerivedName("diag cache volume", diagName); err != nil {
+		return cachePlan{}, err
+	}
+	diagRes, err := p.topo.EnsureCacheVolume(ctx, diagName, id.DiagLabels(lastUsed))
+	if err != nil {
+		return cachePlan{}, fmt.Errorf("failed to ensure diag volume for %q: %w", bootstrap.Name, err)
+	}
+	plan.diagVolume = diagRes.Name
+	plan.diagDir = spec.RunnerDiagDir
+
+	log.Printf("garm-provider-docker: CreateInstance: %q repo-scoped caches (repokey=%s): toolcache=%s hit=%v, pnpm=%s hit=%v, diag=%s hit=%v",
+		bootstrap.Name, repoKey, toolName, toolRes.Hit, pnpmName, pnpmRes.Hit, diagName, diagRes.Hit)
 	return plan, nil
 }

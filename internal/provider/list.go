@@ -27,6 +27,12 @@ func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.P
 		log.Printf("garm-provider-docker: ListInstances: orphan sweep failed (continuing): %v", err)
 	}
 
+	// Opportunistic, best-effort cache GC (ADR-003 W2): ListInstances is the
+	// second piggyback hook (the other being CreateInstance) where superseded/
+	// aged cache volumes are evicted, diag logs pruned, and leaked helpers
+	// reaped. Best-effort — a GC failure must not fail the list GARM asked for.
+	p.runCacheGC(ctx)
+
 	f := filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
 		filters.Arg("label", spec.LabelControllerID+"="+p.controllerID),

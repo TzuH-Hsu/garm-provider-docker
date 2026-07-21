@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"slices"
@@ -331,7 +333,12 @@ func (f *FakeClient) ImagePull(_ context.Context, refStr string, _ image.PullOpt
 
 // ImageInspectWithRaw reports whether refStr is in PresentImages, returning
 // an errdefs.IsNotFound-satisfying error otherwise (matching the real SDK's
-// behavior for an absent image).
+// behavior for an absent image). The returned .ID models the real daemon's
+// content-addressable image ID — a "sha256:<hex>" derived deterministically
+// from the ref (fakeImageID), NOT the ref string itself — so a caller that
+// keys on the image digest (M2-W2's externals cache) gets a stable, Docker-
+// name-safe token that differs across refs and agrees across inspects of the
+// same ref, exactly as the real daemon does.
 func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (types.ImageInspect, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -339,7 +346,16 @@ func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (typ
 	if !f.PresentImages[imageID] {
 		return types.ImageInspect{}, nil, notFoundf("image %s not found", imageID)
 	}
-	return types.ImageInspect{ID: imageID}, nil, nil
+	return types.ImageInspect{ID: fakeImageID(imageID)}, nil, nil
+}
+
+// fakeImageID models the real daemon's content-addressable image ID: a stable
+// "sha256:<hex>" over the ref. The real daemon reports a config digest here
+// (not the ref); modeling that shape keeps the fake faithful for callers that
+// strip the algorithm prefix and use the hex as a name-safe cache key.
+func fakeImageID(ref string) string {
+	sum := sha256.Sum256([]byte(ref))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // ExecStream models docker exec with stdin streaming (the credential
@@ -1075,6 +1091,9 @@ func (c *fakeContainer) mountPoints() []types.MountPoint {
 			Type:        m.Type,
 			Name:        m.Source, // for a named volume, Source is the volume name
 			Destination: m.Target,
+			// RW mirrors the real daemon's inspect output: true when read-write,
+			// false for a ReadOnly mount (M2-W2's externals volume is mounted RO).
+			RW: !m.ReadOnly,
 		})
 	}
 	return out

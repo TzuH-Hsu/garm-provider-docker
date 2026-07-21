@@ -52,16 +52,26 @@ const externalsSeedLock = externalsSeedStagingDir + "/.garm-seed.lock"
 // ARC init-copy pattern). Under `sh -ec` it: takes an exclusive flock on the
 // in-volume lock file; if the atomic marker already exists, exits 0 (already
 // seeded — the common warm path and the lock-race loser); otherwise copies the
-// image's externals payload into the volume, fsyncs, and writes the marker LAST.
-// `cp -a` preserves ownership/perms so the runner (uid 1001) can execute the
-// Node binaries through the read-only mount. Any copy failure aborts non-zero
-// (set -e), which fails the allocation rather than mounting a partial tree.
+// image's externals payload into the volume (when the image actually ships one),
+// fsyncs, and writes the marker LAST. `cp -a` preserves ownership/perms so the
+// runner (uid 1001) can execute the Node binaries through the read-only mount.
+// Any copy failure aborts non-zero (set -e), which fails the allocation rather
+// than mounting a partial tree.
+//
+// The copy is guarded by `[ -d <source> ]`: an image that ships no externals
+// (e.g. a minimal test/sleep image, or any non-actions-runner image) seeds the
+// volume EMPTY and still writes the marker, so the provider mounts a
+// consistent (if empty) read-only externals rather than failing the create —
+// such an image does not use externals anyway, and a real runner image always
+// has the source so the guard is a true no-op there.
 const externalsSeedScript = `exec 9>"` + externalsSeedLock + `"
 flock 9
 if [ -e "` + externalsSeededMarker + `" ]; then
   exit 0
 fi
-cp -a "` + RunnerExternalsDir + `/." "` + externalsSeedStagingDir + `/"
+if [ -d "` + RunnerExternalsDir + `" ]; then
+  cp -a "` + RunnerExternalsDir + `/." "` + externalsSeedStagingDir + `/"
+fi
 sync
 touch "` + externalsSeededMarker + `"
 `

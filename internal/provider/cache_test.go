@@ -91,6 +91,27 @@ func countCacheVols(t *testing.T, fake *docker.FakeClient) int {
 	return len(out.Volumes)
 }
 
+// cacheVolsByKind returns the names of all cache volumes of a given cache-kind.
+func cacheVolsByKind(t *testing.T, fake *docker.FakeClient, kind spec.CacheKind) []string {
+	t.Helper()
+	out, err := fake.VolumeList(context.Background(), volume.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("label", spec.LabelCache+"=true"),
+			filters.Arg("label", spec.LabelCacheKind+"="+string(kind)),
+		),
+	})
+	if err != nil {
+		t.Fatalf("VolumeList: %v", err)
+	}
+	var names []string
+	for _, v := range out.Volumes {
+		if v != nil {
+			names = append(names, v.Name)
+		}
+	}
+	return names
+}
+
 const cacheRepoURL = "https://github.com/example-org/example-repo"
 
 // TestCreateInstanceMountsRepoCaches: a repo-scoped pool gets the toolcache and
@@ -158,10 +179,17 @@ func TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete(t *testing.T) {
 		t.Fatalf("CreateInstance job-2: %v", err)
 	}
 
-	// Exactly two cache volumes total (one toolcache + one pnpm) across BOTH
-	// jobs — the second job reused the first's, it did not create its own.
-	if n := countCacheVols(t, fake); n != 2 {
-		t.Errorf("cache volume count = %d after two allocations for the same repo, want 2 (toolcache + pnpm, reused)", n)
+	// Exactly four cache volumes total across BOTH jobs — one each of toolcache,
+	// pnpm, diag (all repo-keyed), and externals (image-digest-keyed, shared).
+	// The second job REUSED the first's; it did not create its own of any kind.
+	if n := countCacheVols(t, fake); n != 4 {
+		t.Errorf("cache volume count = %d after two same-repo allocations, want 4 (toolcache + pnpm + diag + externals, all reused)", n)
+	}
+	if names := cacheVolsByKind(t, fake, spec.CacheKindExternals); len(names) != 1 {
+		t.Errorf("externals volumes = %v, want exactly 1 shared across both jobs", names)
+	}
+	if names := cacheVolsByKind(t, fake, spec.CacheKindDiagLogs); len(names) != 1 {
+		t.Errorf("diag volumes = %v, want exactly 1 shared across both jobs", names)
 	}
 	// Both runners mount the SAME cache volume names.
 	c1 := inspectRunner(t, fake, "job-1")
@@ -186,15 +214,24 @@ func TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete(t *testing.T) {
 	if _, ok := volByName(t, fake, pnpmName); !ok {
 		t.Error("pnpm store volume was removed by DeleteInstance — caches must outlive allocations")
 	}
-	if n := countCacheVols(t, fake); n != 2 {
-		t.Errorf("cache volume count = %d after deleting one allocation, want 2 (both survive)", n)
+	// The externals and diag volumes (no instance-name) must also survive delete.
+	if names := cacheVolsByKind(t, fake, spec.CacheKindExternals); len(names) != 1 {
+		t.Errorf("externals volume removed by DeleteInstance — caches must outlive allocations (got %v)", names)
+	}
+	if names := cacheVolsByKind(t, fake, spec.CacheKindDiagLogs); len(names) != 1 {
+		t.Errorf("diag volume removed by DeleteInstance — caches must outlive allocations (got %v)", names)
+	}
+	if n := countCacheVols(t, fake); n != 4 {
+		t.Errorf("cache volume count = %d after deleting one allocation, want 4 (all survive)", n)
 	}
 }
 
 // TestCreateInstanceOrgScopeWithholdsCaches: an org-scoped pool WITHOUT
-// allow_org_shared gets no persistent cache volumes and no persistent cache
-// mounts, but RUNNER_TOOL_CACHE is still set (ephemeral, in-container) and
-// npm_config_store_dir is absent.
+// allow_org_shared gets no repo-scoped cache volumes (toolcache/pnpm/diag) and no
+// repo-scoped mounts, but RUNNER_TOOL_CACHE is still set (ephemeral, in-container)
+// and npm_config_store_dir is absent. The shared, image-digest-keyed externals
+// volume IS still provisioned and mounted read-only, because it carries no repo
+// data and applies to EVERY allocation regardless of entity scope (ADR-003 W2).
 func TestCreateInstanceOrgScopeWithholdsCaches(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -204,15 +241,37 @@ func TestCreateInstanceOrgScopeWithholdsCaches(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	if n := countCacheVols(t, fake); n != 0 {
-		t.Errorf("org-scoped pool created %d cache volumes without allow_org_shared, want 0", n)
+	// The ONLY cache volume for an org-scoped pool is the shared externals volume.
+	if n := countCacheVols(t, fake); n != 1 {
+		t.Errorf("org-scoped pool created %d cache volumes without allow_org_shared, want 1 (externals only)", n)
 	}
+	ext := cacheVolsByKind(t, fake, spec.CacheKindExternals)
+	if len(ext) != 1 {
+		t.Fatalf("externals volumes = %v, want exactly 1 (externals apply to all scopes)", ext)
+	}
+	// No repo-scoped cache volumes.
+	for _, kind := range []spec.CacheKind{spec.CacheKindToolcache, spec.CacheKindPnpm, spec.CacheKindDiagLogs} {
+		if names := cacheVolsByKind(t, fake, kind); len(names) != 0 {
+			t.Errorf("org-scoped pool created %s volume(s) %v without opt-in", kind, names)
+		}
+	}
+
 	c := inspectRunner(t, fake, "job-org")
 	if _, ok := mountAt(c, "/opt/hostedtoolcache"); ok {
 		t.Error("org-scoped pool mounted a persistent toolcache volume without opt-in")
 	}
 	if _, ok := mountAt(c, "/opt/pnpm-store"); ok {
 		t.Error("org-scoped pool mounted a persistent pnpm store without opt-in")
+	}
+	if _, ok := mountAt(c, spec.RunnerDiagDir); ok {
+		t.Error("org-scoped pool mounted a persistent diag volume without opt-in")
+	}
+	// The externals volume IS mounted read-only, even for the org-scoped pool.
+	extMount, ok := mountAt(c, spec.RunnerExternalsDir)
+	if !ok {
+		t.Errorf("org-scoped runner is missing the shared externals mount at %s", spec.RunnerExternalsDir)
+	} else if extMount.Name != ext[0] || extMount.RW {
+		t.Errorf("externals mount = %+v, want %q mounted READ-ONLY", extMount, ext[0])
 	}
 	// RUNNER_TOOL_CACHE is still set (ephemeral); npm_config_store_dir is not.
 	if !envHas(c, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {

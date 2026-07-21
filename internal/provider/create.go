@@ -118,6 +118,13 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		log.Printf("garm-provider-docker: CreateInstance: pre-create orphan sweep failed (continuing): %v", err)
 	}
 
+	// Opportunistic, best-effort cache GC (ADR-003 W2): CreateInstance is one of
+	// the two piggyback hooks (the other being ListInstances) where superseded/
+	// aged cache volumes are evicted, diagnostic logs pruned to their retention
+	// window, and leaked helper containers reaped — there is no background daemon
+	// (ADR-004). It never hard-fails the create: every step logs and continues.
+	p.runCacheGC(ctx)
+
 	// enable_job_network=false is reserved and not yet honored (WP2): the job
 	// network is ALWAYS created, because it is the isolation guarantee AND
 	// ADR-004's claim marker. Warn rather than weaken isolation.
@@ -228,6 +235,22 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(err)
 	}
 
+	// 4b. Externals cache (ADR-003 W2): resolve the runner image's digest,
+	// create-or-reuse the shared externals volume keyed on it, and SEED it once
+	// (blocking) so the runner mounts a fully-populated, read-only externals
+	// tree. Gated only on the cache feature being enabled — externals apply to
+	// EVERY allocation regardless of entity scope, since they carry no repo data.
+	// It runs AFTER ensureImage so the image is present as both the digest source
+	// and the seed's copy source. A seed failure fails the allocation (guarded);
+	// the externals volume itself is never rolled back (it is a cache).
+	if p.cfg.Cache.Enabled {
+		externalsVolume, err := p.planExternals(ctx, runnerImage)
+		if err != nil {
+			return guarded(fmt.Errorf("failed to prepare externals cache for %q: %w", instanceName, err))
+		}
+		plan.externalsVolume = externalsVolume
+	}
+
 	// One timestamp for both containers' created-at labels this allocation.
 	createdAt := time.Now()
 
@@ -261,7 +284,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	labels[spec.LabelOSArch] = string(bootstrap.OSArch)
 	labels[spec.LabelCreateNonce] = nonce
 
-	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath)
+	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir)
 	if err != nil {
 		return guarded(err)
 	}
@@ -287,6 +310,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		ToolcacheMountPath:  plan.toolcachePath,
 		PnpmVolumeName:      plan.pnpmVolume,
 		PnpmMountPath:       plan.pnpmPath,
+		// Shared externals volume, mounted READ-ONLY (ADR-003 W2 red-line F4), and
+		// the per-repo diagnostic-logs volume, mounted read-write. Both are empty
+		// (unset) for a cache-disabled config; externals is set for any scope when
+		// the cache is enabled, diag only for a cache-eligible repo scope.
+		ExternalsVolumeName: plan.externalsVolume,
+		DiagVolumeName:      plan.diagVolume,
 	})
 
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.RunnerContainerName(instanceName))
@@ -450,9 +479,11 @@ func validatePlatform(b params.BootstrapInstance) error {
 // RUNNER_TOOL_CACHE (set whenever the cache feature is enabled, from the
 // planCaches decision — possibly an ephemeral in-container path when the pool
 // is cache-ineligible), and pnpmStoreDir becomes npm_config_store_dir (set only
-// when a persistent pnpm store volume is mounted). Either being "" omits its
-// env var.
-func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir string) ([]string, error) {
+// when a persistent pnpm store volume is mounted). diagDir, when set (a
+// persistent diag volume is mounted), becomes GARM_DIAG_DIR so the entrypoint
+// can own the mounted _diag dir before dropping privileges. Any being "" omits
+// its env var.
+func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir string) ([]string, error) {
 	opts := spec.RunnerEnvOptions{
 		JITConfigEnabled: b.JitConfigEnabled,
 		GitHubURL:        githubBaseURL(b.RepoURL),
@@ -471,7 +502,14 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 		}
 		opts.Entity = entity
 	}
-	return spec.BuildRunnerEnv(opts), nil
+	env := spec.BuildRunnerEnv(opts)
+	// GARM_DIAG_DIR is a plain path (never a secret), appended here rather than
+	// threaded through the credential-invisibility-audited spec.BuildRunnerEnv, so
+	// that function's structural "no secret can be emitted" property is untouched.
+	if diagDir != "" {
+		env = append(env, spec.RunnerDiagDirEnv+"="+diagDir)
+	}
+	return env, nil
 }
 
 // githubBaseURL derives the GitHub server base (scheme://host) from a
