@@ -1,6 +1,8 @@
 package spec
 
 import (
+	"fmt"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 )
@@ -41,32 +43,43 @@ const (
 	// observes a partially delivered credential set.
 	ReadyMarker = ".delivered"
 
-	// credentialDirMode is the tmpfs mode: owner-only. The credential files
-	// are secrets; no other UID inside the container may read them.
-	credentialDirMode = 0o700
+	// credentialDirMode is the tmpfs mode: owner-only, expressed as the octal
+	// string the HostConfig.Tmpfs short-syntax mount option takes. The
+	// credential files are secrets; no other UID inside the container may read
+	// them.
+	credentialDirMode = "0700"
+
+	// credentialTmpfsSizeBytes caps the credential tmpfs (the "size cap" of
+	// ADR-002 F2). The credential payload is a few KiB — three JIT files, each
+	// bounded to 1 MiB by the metadata client, plus the tiny .delivered marker
+	// — so 16 MiB is comfortable headroom while still bounding a misbehaving or
+	// hostile writer inside the container.
+	credentialTmpfsSizeBytes = 16 << 20
 )
 
-// CredentialTmpfsMount returns the anonymous, memory-backed tmpfs mount that
-// the provider delivers credential files into (ADR-002). It is per-container
-// and not visible to any other container on the host; it is destroyed with
-// the container at teardown, taking the credentials with it.
+// CredentialTmpfsMap returns the HostConfig.Tmpfs short-syntax entry for the
+// anonymous, memory-backed tmpfs the provider delivers credential files into
+// (ADR-002). It is per-container and not visible to any other container on the
+// host; it is destroyed with the container at teardown, taking the credentials
+// with it.
 //
-// The mount is owned by the runner uid/gid (RunnerUID/RunnerGID) via the
-// tmpfs uid/gid options: the credential-delivery exec runs as that same
-// unprivileged user, so it must be able to write into the tmpfs, and the
-// runner process must be able to read the files back (ADR-002 F2). mode 0700
-// still excludes every other in-container UID.
-func CredentialTmpfsMount() mount.Mount {
-	return mount.Mount{
-		Type:   mount.TypeTmpfs,
-		Target: CredentialDir,
-		TmpfsOptions: &mount.TmpfsOptions{
-			Mode: credentialDirMode,
-			Options: [][]string{
-				{"uid", RunnerUID},
-				{"gid", RunnerGID},
-			},
-		},
+// The short-syntax HostConfig.Tmpfs map is used deliberately instead of the
+// Mounts long-syntax (mount.Mount{Type: tmpfs, TmpfsOptions}): the real Docker
+// daemon does NOT implement uid/gid for the long-syntax TmpfsOptions.Options
+// and rejects a create carrying them with `invalid mount config for type
+// "tmpfs": invalid option: uid` (moby api/types/mount TmpfsOptions.Options),
+// whereas the legacy short-syntax Tmpfs map string DOES honor uid/gid. Owning
+// the mount by the runner uid/gid (RunnerUID/RunnerGID) is what lets the
+// unprivileged credential-delivery exec write into the tmpfs and the runner
+// process read the files back (ADR-002 F2); mode 0700 still excludes every
+// other in-container UID, and noexec/nosuid/nodev harden it. CredentialDir is
+// the single source of truth for the mount path.
+func CredentialTmpfsMap() map[string]string {
+	return map[string]string{
+		CredentialDir: fmt.Sprintf(
+			"rw,noexec,nosuid,nodev,size=%d,mode=%s,uid=%s,gid=%s",
+			credentialTmpfsSizeBytes, credentialDirMode, RunnerUID, RunnerGID,
+		),
 	}
 }
 
@@ -105,6 +118,11 @@ type RunnerContainerSpec struct {
 // for a runner container in "none" mode (ADR-001). It is a pure builder — no
 // Docker calls — so it is cheap to table-test, and it is the single place the
 // credential tmpfs and workspace volume are attached.
+//
+// The credential tmpfs is attached via HostConfig.Tmpfs (short syntax) rather
+// than as a Mounts entry, because only the short syntax honors the runner
+// uid/gid the tmpfs must be owned by — see CredentialTmpfsMap. The workspace
+// stays a Mounts long-syntax volume.
 func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.HostConfig) {
 	cfg := &container.Config{
 		Image:  s.Image,
@@ -113,8 +131,8 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	}
 
 	host := &container.HostConfig{
+		Tmpfs: CredentialTmpfsMap(),
 		Mounts: []mount.Mount{
-			CredentialTmpfsMount(),
 			WorkspaceMount(),
 		},
 	}

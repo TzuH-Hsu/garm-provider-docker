@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -105,6 +106,16 @@ type fakeContainer struct {
 	// modeling that exec-delivered writes ARE visible inside the container,
 	// unlike docker cp (see ExecStream's regression note).
 	tmpfs map[string]string
+
+	// tmpfsMounts models the container's configured tmpfs MOUNTS — the
+	// HostConfig.Tmpfs short-syntax map (path → option string, e.g.
+	// "/run/garm" → "…,mode=0700,uid=1001,gid=1001"). It is the mount
+	// configuration, distinct from tmpfs above which is the delivered file
+	// contents. Recorded at ContainerCreate so tests (and TmpfsMounts) can
+	// assert the credential tmpfs was requested with the runner uid/gid — the
+	// exact thing the real daemon honors for the short syntax but rejects for
+	// the Mounts long syntax (see rejectUnsupportedTmpfsMount).
+	tmpfsMounts map[string]string
 
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
@@ -309,14 +320,74 @@ func (f *FakeClient) Tmpfs(containerID string) map[string]string {
 	return out
 }
 
+// TmpfsMounts returns a copy of a container's configured tmpfs MOUNTS (the
+// HostConfig.Tmpfs short-syntax map: path → option string), so tests can
+// assert the credential tmpfs was requested at /run/garm with the runner
+// uid/gid and mode 0700 — the short-syntax config the real daemon honors.
+func (f *FakeClient) TmpfsMounts(containerID string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c, ok := f.containers[containerID]
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(c.tmpfsMounts))
+	for k, v := range c.tmpfsMounts {
+		out[k] = v
+	}
+	return out
+}
+
+// rejectUnsupportedTmpfsMount mirrors the real Docker daemon's validation of a
+// Mounts long-syntax tmpfs entry (mount.Mount{Type: tmpfs, TmpfsOptions}): the
+// daemon does NOT implement the uid/gid tmpfs options for the long syntax and
+// rejects such a create with `invalid mount config for type "tmpfs": invalid
+// option: uid`. Modeling that rejection here is the regression guard for defect
+// 1 — a future revert to the long syntax fails a unit test instead of only
+// failing on a real daemon. The supported path (HostConfig.Tmpfs short syntax)
+// is not a Mounts entry and passes this check untouched.
+func rejectUnsupportedTmpfsMount(hostConfig *container.HostConfig) error {
+	if hostConfig == nil {
+		return nil
+	}
+	for _, m := range hostConfig.Mounts {
+		if m.Type != mount.TypeTmpfs || m.TmpfsOptions == nil {
+			continue
+		}
+		for _, opt := range m.TmpfsOptions.Options {
+			if len(opt) == 0 {
+				continue
+			}
+			switch opt[0] {
+			case "uid", "gid":
+				return fmt.Errorf("invalid mount config for type %q: invalid option: %s", "tmpfs", opt[0])
+			}
+		}
+	}
+	return nil
+}
+
 // ContainerCreate creates an in-memory container record in the "created,
 // not started" state.
-func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, containerName string) (container.CreateResponse, error) {
 	// Fire the concurrency hook (if any) before taking the lock, so a test can
 	// inject a same-name "winner" container that this call then collides with
 	// (NEW-2). It runs without f.mu held to avoid a re-entrant deadlock.
 	if f.CreateHook != nil {
 		f.CreateHook()
+	}
+
+	// Reject an unsupported tmpfs mount config exactly like the real daemon,
+	// BEFORE anything is recorded or any injected error is consulted — a real
+	// daemon rejects a malformed request outright. This is the regression guard
+	// for defect 1: the Mounts long-syntax tmpfs carrying uid/gid Options is NOT
+	// implemented by the daemon and must fail the create; the supported path is
+	// the HostConfig.Tmpfs short-syntax map. Modeling the long syntax as
+	// succeeding is exactly the bug that shipped green unit tests but failed on
+	// a real daemon.
+	if err := rejectUnsupportedTmpfsMount(hostConfig); err != nil {
+		return container.CreateResponse{}, err
 	}
 
 	f.mu.Lock()
@@ -353,6 +424,15 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, _
 		c.env = append([]string(nil), cfg.Env...)
 		for k, v := range cfg.Labels {
 			c.labels[k] = v
+		}
+	}
+	// Record the requested tmpfs MOUNTS (HostConfig.Tmpfs short syntax) so a
+	// test can assert the credential tmpfs was created with the runner uid/gid
+	// and mode. Any long-syntax tmpfs was already rejected above.
+	if hostConfig != nil && len(hostConfig.Tmpfs) > 0 {
+		c.tmpfsMounts = make(map[string]string, len(hostConfig.Tmpfs))
+		for k, v := range hostConfig.Tmpfs {
+			c.tmpfsMounts[k] = v
 		}
 	}
 	f.containers[id] = c
@@ -465,9 +545,10 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 	}
 	return types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{
-			ID:    c.id,
-			Name:  "/" + c.name,
-			State: state,
+			ID:         c.id,
+			Name:       "/" + c.name,
+			State:      state,
+			HostConfig: &container.HostConfig{Tmpfs: cloneLabels(c.tmpfsMounts)},
 		},
 		Config: &container.Config{
 			Image:  c.image,

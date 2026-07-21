@@ -175,6 +175,22 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Errorf("os labels = %q/%q", labels[spec.LabelOSType], labels[spec.LabelOSArch])
 	}
 
+	// Defect 1: the credential tmpfs must be requested via HostConfig.Tmpfs
+	// (short syntax) at the credential dir, owned by the runner uid/gid and
+	// mode 0700 — the config the real daemon honors (the Mounts long-syntax
+	// uid/gid it rejects). This is the load-bearing assertion that CreateInstance
+	// builds a daemon-acceptable tmpfs.
+	tmpfsMounts := fake.TmpfsMounts(inst.ProviderID)
+	tmpfsOpts, ok := tmpfsMounts[spec.CredentialDir]
+	if !ok {
+		t.Fatalf("HostConfig.Tmpfs missing the %q credential tmpfs: %v", spec.CredentialDir, tmpfsMounts)
+	}
+	for _, want := range []string{"uid=1001", "gid=1001", "mode=0700"} {
+		if !strings.Contains(tmpfsOpts, want) {
+			t.Errorf("credential tmpfs options %q missing %q", tmpfsOpts, want)
+		}
+	}
+
 	// Credential invisibility (ADR-002 / M0 gate): no env var may carry the
 	// instance token or the metadata URL.
 	for _, e := range got.Config.Env {

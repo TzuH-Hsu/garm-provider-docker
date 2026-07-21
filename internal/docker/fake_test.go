@@ -11,8 +11,69 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/errdefs"
 )
+
+// TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID is the regression
+// guard for defect 1: the real Docker daemon does NOT implement the uid/gid
+// tmpfs options for the Mounts long syntax and rejects such a create with
+// `invalid mount config for type "tmpfs": invalid option: uid`. The fake must
+// reject it identically, so any future revert from the supported
+// HostConfig.Tmpfs short syntax back to the long syntax fails here instead of
+// only on a real daemon.
+func TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	hostCfg := &container.HostConfig{
+		Mounts: []mount.Mount{{
+			Type:   mount.TypeTmpfs,
+			Target: "/run/garm",
+			TmpfsOptions: &mount.TmpfsOptions{
+				Options: [][]string{{"uid", "1001"}, {"gid", "1001"}},
+			},
+		}},
+	}
+
+	_, err := f.ContainerCreate(ctx, &container.Config{}, hostCfg, nil, nil, "rejected")
+	if err == nil {
+		t.Fatal("expected the fake to reject a long-syntax tmpfs with uid/gid, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid option: uid") {
+		t.Errorf("error = %v, want the real-daemon `invalid option: uid` rejection", err)
+	}
+	// The rejected create must have recorded nothing.
+	list, err := f.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		t.Fatalf("ContainerList returned unexpected error: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("a rejected create left %d containers behind, want 0", len(list))
+	}
+}
+
+// TestFakeClientContainerCreateRecordsShortSyntaxTmpfs proves the supported
+// path — the HostConfig.Tmpfs short-syntax map — is accepted and recorded, so
+// tests can assert the credential tmpfs was requested with the runner uid/gid.
+func TestFakeClientContainerCreateRecordsShortSyntaxTmpfs(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+
+	hostCfg := &container.HostConfig{
+		Tmpfs: map[string]string{
+			"/run/garm": "rw,noexec,nosuid,nodev,size=16777216,mode=0700,uid=1001,gid=1001",
+		},
+	}
+	created, err := f.ContainerCreate(ctx, &container.Config{}, hostCfg, nil, nil, "accepted")
+	if err != nil {
+		t.Fatalf("short-syntax tmpfs create returned unexpected error: %v", err)
+	}
+	got := f.TmpfsMounts(created.ID)
+	if opts := got["/run/garm"]; !strings.Contains(opts, "uid=1001") || !strings.Contains(opts, "gid=1001") || !strings.Contains(opts, "mode=0700") {
+		t.Errorf("recorded tmpfs mount = %q, want uid=1001,gid=1001,mode=0700", opts)
+	}
+}
 
 func TestFakeClientImagePull(t *testing.T) {
 	f := NewFakeClient()
