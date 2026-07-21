@@ -62,37 +62,57 @@ func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	}
 }
 
-// buildNonRootRunnerImage builds a docker-CLI runner image that (unlike the WP3
-// sleep image) has a real `runner` user at uid/gid 1001 and an entrypoint that
-// mirrors the production entrypoint's ensure_docker_socket_group step: it adds
-// the runner user to a group with the provider-supplied DOCKER_SOCK_GID before
-// the container settles, so `docker exec -u runner` picks up that membership and
-// a non-root `docker` call can reach the shared dind socket (F1). The entrypoint
-// stays PID 1 as root (sleep) so the harness can `docker exec -u runner` into it.
-func buildNonRootRunnerImage(t *testing.T, tag string) {
+// buildNonRootRunnerImage builds the runner image the F1 harness runs, layered
+// on the REAL production runner image (runner-images/noble — its real Dockerfile
+// and real entrypoint.sh) so F1 is proven against the production code VERBATIM,
+// not a re-implementation with softened error handling (N3). The base ships the
+// genuine `runner` user, gosu, the docker CLI, and getent/groupadd/usermod, and
+// its /entrypoint.sh is the ACTUAL runner-images/noble/entrypoint.sh whose
+// ensure_docker_socket_group carries the F1 fix.
+//
+// The ONLY deviation from production is the wrapper entrypoint: it SOURCES the
+// real /entrypoint.sh (whose main is guarded to run only when EXECUTED directly,
+// never when sourced) and invokes the REAL ensure_docker_socket_group under that
+// file's own `set -euo pipefail`, then sleeps as PID 1 (root) so the harness can
+// `docker exec -u runner` in. Production would `exec ./run.sh` here, but the fake
+// JIT credentials cannot drive the real .NET runner, so we sleep instead. This is
+// load-bearing: were the F1 bug present (the un-guarded getent probe aborting
+// under set -e on a clean image with no GID 2000), sourcing + calling the real
+// ensure_docker_socket_group would abort HERE, the container would exit, and
+// every `docker exec -u runner` below would fail — so the harness would have
+// caught F1 rather than masking it behind an Alpine `|| true` re-implementation.
+func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 	t.Helper()
+
+	// 1. Build the REAL production runner image (real Dockerfile + entrypoint).
+	nobleTag := "garm-nr-noble-real:latest"
+	if out, err := dockerTry("build", "-t", nobleTag, filepath.Join(root, "runner-images", "noble")); err != nil {
+		t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
+	}
+
+	// 2. Layer a wrapper that runs ONLY the real ensure_docker_socket_group
+	//    (sourced from the real entrypoint) then sleeps, so the harness can exec
+	//    as the non-root runner and prove F1 over the shared dind socket.
 	dir := t.TempDir()
-	// busybox addgroup/adduser; DindSocketGID is unlikely to collide in this
-	// minimal image, so a plain create-then-add is enough.
-	entry := "#!/bin/sh\n" +
-		"set -eu\n" +
-		"if [ -n \"${DOCKER_SOCK_GID:-}\" ]; then\n" +
-		"  addgroup -g \"$DOCKER_SOCK_GID\" dockersock 2>/dev/null || true\n" +
-		"  addgroup runner dockersock 2>/dev/null || true\n" +
-		"fi\n" +
-		// Mirror the production entrypoint's prepare_workdir: the workspace volume
-		// mounts root-owned, so hand it to the runner user before it settles.
+	wrapper := "#!/usr/bin/env bash\n" +
+		"set -euo pipefail\n" +
+		"# Source the REAL production entrypoint (main is guarded not to run when\n" +
+		"# sourced) and invoke the REAL ensure_docker_socket_group under its own\n" +
+		"# `set -euo pipefail`: this IS the F1 code path, verbatim.\n" +
+		"# shellcheck source=/dev/null\n" +
+		"source /entrypoint.sh\n" +
+		"ensure_docker_socket_group\n" +
+		"# prepare_workdir equivalent: the workspace volume mounts root-owned.\n" +
 		"mkdir -p /actions-runner/_work\n" +
 		"chown runner:runner /actions-runner/_work\n" +
 		"exec sleep infinity\n"
-	writeFile(t, filepath.Join(dir, "entrypoint.sh"), entry)
-	dockerfile := "FROM docker:cli\n" +
-		"RUN addgroup -g 1001 runner && adduser -D -u 1001 -G runner runner\n" +
-		"COPY --chmod=0755 entrypoint.sh /entrypoint.sh\n" +
-		"ENTRYPOINT [\"/entrypoint.sh\"]\n"
+	writeFile(t, filepath.Join(dir, "test-entrypoint.sh"), wrapper)
+	dockerfile := "FROM " + nobleTag + "\n" +
+		"COPY --chmod=0755 test-entrypoint.sh /test-entrypoint.sh\n" +
+		"ENTRYPOINT [\"/test-entrypoint.sh\"]\n"
 	writeFile(t, filepath.Join(dir, "Dockerfile"), dockerfile)
 	if out, err := dockerTry("build", "-t", tag, dir); err != nil {
-		t.Fatalf("build non-root runner image: %v\n%s", err, out)
+		t.Fatalf("build non-root runner wrapper image: %v\n%s", err, out)
 	}
 }
 
@@ -118,7 +138,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 
 	// --- build the non-root runner image + the real provider binary ----------
 	runnerTag := "garm-nr-verify-cli:latest"
-	buildNonRootRunnerImage(t, runnerTag)
+	buildNonRootRunnerImage(t, root, runnerTag)
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
