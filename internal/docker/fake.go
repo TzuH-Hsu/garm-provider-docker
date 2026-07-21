@@ -195,11 +195,12 @@ type ExecRecord struct {
 // CreatedContainer captures the shape of one ContainerCreate call, retained
 // across a later removal so a test can assert a short-lived helper's config.
 type CreatedContainer struct {
-	Name       string
-	Labels     map[string]string
-	Entrypoint []string
-	Cmd        []string
-	Mounts     []mount.Mount
+	Name        string
+	Labels      map[string]string
+	Entrypoint  []string
+	Cmd         []string
+	Mounts      []mount.Mount
+	NetworkMode container.NetworkMode
 }
 
 type fakeContainer struct {
@@ -669,6 +670,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	}
 	if hostConfig != nil {
 		rec.Mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
+		rec.NetworkMode = hostConfig.NetworkMode
 	}
 	f.Created = append(f.Created, rec)
 

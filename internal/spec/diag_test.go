@@ -72,11 +72,16 @@ func TestBuildDiagPruneContainer(t *testing.T) {
 	}
 	script := cfg.Entrypoint[2]
 
-	// A retention-scoped `find -delete`, NOT any unscoped destructive op.
-	for _, want := range []string{"find " + diagPruneMountDir, "-type f", "-mtime +7", "-delete"} {
+	// A retention-scoped `find -delete`, NOT any unscoped destructive op. L8: the
+	// window is minute-precise (-mmin +<days*1440>), not -mtime (which rounds down
+	// to whole days and effectively widens 7d to 8d).
+	for _, want := range []string{"find " + diagPruneMountDir, "-type f", "-mmin +10080", "-delete"} {
 		if !strings.Contains(script, want) {
 			t.Errorf("prune script missing %q\nscript: %s", want, script)
 		}
+	}
+	if strings.Contains(script, "-mtime") {
+		t.Errorf("prune script must use minute-precise -mmin, not the day-rounding -mtime: %s", script)
 	}
 	if strings.Contains(script, "system prune") || strings.Contains(script, "docker ") {
 		t.Errorf("prune script must be an allowlist-scoped find, never a docker/system prune: %s", script)
@@ -89,14 +94,18 @@ func TestBuildDiagPruneContainer(t *testing.T) {
 	if host.Mounts[0].Source != "garm-cache-diag-logs-repo" || host.Mounts[0].Target != diagPruneMountDir {
 		t.Errorf("prune mount = %+v, want the diag volume at %q", host.Mounts[0], diagPruneMountDir)
 	}
+	// No network (L9): the prune joins the "none" network, not the default bridge.
+	if !host.NetworkMode.IsNone() {
+		t.Errorf("prune NetworkMode = %q, want none", host.NetworkMode)
+	}
 }
 
 // TestDiagPruneRetentionInScript: the configured retention window appears in the
-// find -mtime predicate exactly.
+// find -mmin predicate exactly, converted to minutes (L8).
 func TestDiagPruneRetentionInScript(t *testing.T) {
 	for _, days := range []int{1, 7, 30} {
 		cfg, _ := BuildDiagPruneContainer(DiagPruneContainerSpec{RetentionDays: days})
-		if want := "-mtime +" + itoa(days); !strings.Contains(cfg.Entrypoint[2], want) {
+		if want := "-mmin +" + itoa(days*24*60); !strings.Contains(cfg.Entrypoint[2], want) {
 			t.Errorf("retention %d: prune script missing %q", days, want)
 		}
 	}

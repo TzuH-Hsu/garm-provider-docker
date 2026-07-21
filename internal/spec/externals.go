@@ -179,6 +179,11 @@ func BuildExternalsSeedContainer(s ExternalsSeedContainerSpec) (*container.Confi
 		Cmd: strslice.StrSlice{},
 	}
 	host := &container.HostConfig{
+		// No network (L9): the seed is a purely local `cp -a` under a flock and
+		// needs no egress, so the helper joins the "none" network rather than the
+		// default bridge — least privilege for a container that touches only the
+		// one mounted externals volume.
+		NetworkMode: "none",
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeVolume,
 			Source: s.VolumeName,

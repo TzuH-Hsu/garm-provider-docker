@@ -132,8 +132,9 @@ func TestBuildExternalsSeedContainer(t *testing.T) {
 	if seedMount.Target == RunnerExternalsDir {
 		t.Error("seed must not mount the volume over the image's own externals (its copy source)")
 	}
-	// No network for the seed (the copy is purely local).
-	if host.NetworkMode != "" {
-		t.Errorf("seed NetworkMode = %q, want empty (no network)", host.NetworkMode)
+	// No network for the seed (L9): it joins the "none" network, not the default
+	// bridge — least privilege for a purely-local copy.
+	if !host.NetworkMode.IsNone() {
+		t.Errorf("seed NetworkMode = %q, want none", host.NetworkMode)
 	}
 }

@@ -83,14 +83,22 @@ type DiagPruneContainerSpec struct {
 	Labels        map[string]string
 }
 
+// diagMinutesPerDay converts the retention window (days) to the minute-precise
+// unit diagPruneScript uses.
+const diagMinutesPerDay = 24 * 60
+
 // diagPruneScript deletes every regular file older than retentionDays under the
-// mounted diag volume (`find <dir> -type f -mtime +<N> -delete`). It runs as
-// root in the helper (so it can delete runner-owned logs) and is scoped to the
-// single mounted diag volume — it can never reach anything but the one volume the
-// provider mounted, satisfying the allowlist-safe requirement (ADR-003 F14). It
-// is deliberately NOT `docker system prune` or any unscoped operation.
+// mounted diag volume. It uses `-mmin +<retentionDays*1440>` (minutes), NOT
+// `-mtime +<N>` (L8): `find -mtime +N` counts only WHOLE 24-hour periods and
+// discards the remainder, so `-mtime +7` actually requires a file to be 8+ days
+// old before it is deleted — an off-by-a-day that silently widens the retention
+// window. The minute form deletes anything strictly older than exactly N days. It
+// runs as root in the helper (so it can delete runner-owned logs) and is scoped to
+// the single mounted diag volume — it can never reach anything but the one volume
+// the provider mounted, satisfying the allowlist-safe requirement (ADR-003 F14).
+// It is deliberately NOT `docker system prune` or any unscoped operation.
 func diagPruneScript(retentionDays int) string {
-	return "find " + diagPruneMountDir + " -type f -mtime +" + strconv.Itoa(retentionDays) + " -delete"
+	return "find " + diagPruneMountDir + " -type f -mmin +" + strconv.Itoa(retentionDays*diagMinutesPerDay) + " -delete"
 }
 
 // BuildDiagPruneContainer assembles the container.Config/HostConfig for the
@@ -107,6 +115,11 @@ func BuildDiagPruneContainer(s DiagPruneContainerSpec) (*container.Config, *cont
 		Cmd:        strslice.StrSlice{},
 	}
 	host := &container.HostConfig{
+		// No network (L9): the prune is a purely local `find -delete` and needs no
+		// egress, so the helper joins the "none" network rather than the default
+		// bridge — least privilege for a container that touches only one mounted
+		// volume.
+		NetworkMode: "none",
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeVolume,
 			Source: s.VolumeName,

@@ -55,11 +55,11 @@ var reservedMountPaths = []string{
 }
 
 // Cache is the [cache] table (ADR-003/ADR-005): the persistent repo-scoped
-// toolcache and pnpm-store caches. Externals, diagnostic logs, and opportunistic
-// GC (which consume stale_cache_eviction_days/diagnostic_log_retention_days) are
-// M2-W2 — those two retention fields are parsed and range-validated here for
-// forward-compatibility with ADR-005's canonical config block, but their
-// behavior is not wired in this work package.
+// toolcache and pnpm-store caches, plus the shared externals cache, the per-repo
+// diagnostic-logs volume, and the opportunistic GC — all wired as of M2-W2.
+// stale_cache_eviction_days drives the GC's age-since-creation eviction and
+// diagnostic_log_retention_days the provider-side diag prune; both are
+// range-validated here.
 type Cache struct {
 	// Enabled toggles the whole persistent-cache feature. Default true. When
 	// false, CreateInstance provisions no cache volumes and sets no cache env
@@ -102,10 +102,11 @@ type Cache struct {
 	AllowOrgShared bool `toml:"allow_org_shared"`
 
 	// StaleCacheEvictionDays and DiagnosticLogRetentionDays are ADR-003's GC/
-	// log-retention windows. M2-W2 consumes them; W1 only parses and
-	// range-validates (non-negative) so an operator's ADR-005-shaped config
-	// loads and a typo (a negative window) is caught rather than silently
-	// ignored. Defaults 30 / 7.
+	// log-retention windows, consumed by M2-W2's opportunistic GC (age-since-
+	// creation eviction) and provider-side diag prune respectively. Both are
+	// range-validated (non-negative) so an operator's ADR-005-shaped config loads
+	// and a typo (a negative window) is caught rather than silently ignored.
+	// Defaults 30 / 7.
 	StaleCacheEvictionDays     int `toml:"stale_cache_eviction_days"`
 	DiagnosticLogRetentionDays int `toml:"diagnostic_log_retention_days"`
 }

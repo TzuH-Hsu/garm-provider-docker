@@ -190,7 +190,7 @@ func TestRunCacheGCEvictsSupersededKeepsCurrent(t *testing.T) {
 
 // TestRunCacheGCPrunesDiagVolume: after a repo-scoped create makes a diag
 // volume, an opportunistic GC pass runs a diag-prune helper against it — with the
-// retention-scoped `find -mtime -delete` and the diag volume mounted.
+// retention-scoped `find -mmin -delete` (L8) and the diag volume mounted.
 func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -211,21 +211,29 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 
 	var pruneScript string
 	var pruneMounts []string
+	var pruneNetIsNone bool
+	found := false
 	for _, c := range fake.Created[before:] {
 		if c.Labels[spec.LabelRole] != spec.RoleCacheHelper || len(c.Entrypoint) != 3 {
 			continue
 		}
 		if strings.Contains(c.Entrypoint[2], "find") {
+			found = true
 			pruneScript = c.Entrypoint[2]
+			pruneNetIsNone = c.NetworkMode.IsNone()
 			for _, m := range c.Mounts {
 				pruneMounts = append(pruneMounts, m.Source)
 			}
 		}
 	}
-	if pruneScript == "" {
+	if !found {
 		t.Fatal("GC did not run a diag-prune helper")
 	}
-	for _, want := range []string{"find", "-mtime +", "-delete"} {
+	// L9: the helper joins the "none" network, not the default bridge.
+	if !pruneNetIsNone {
+		t.Error("diag-prune helper NetworkMode is not none (L9)")
+	}
+	for _, want := range []string{"find", "-mmin +", "-delete"} {
 		if !strings.Contains(pruneScript, want) {
 			t.Errorf("diag-prune script missing %q: %s", want, pruneScript)
 		}
