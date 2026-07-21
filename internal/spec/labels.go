@@ -168,3 +168,44 @@ func MatchesPredicate(labels map[string]string, controllerID string) bool {
 func IsManagedRunner(labels map[string]string, controllerID string) bool {
 	return MatchesPredicate(labels, controllerID) && labels[LabelRole] == RoleRunner
 }
+
+// NetworkLabels returns the labels for the per-job network. This resource
+// is ADR-004's atomic claim marker — the FIRST resource created for any
+// allocation, stamped with instance-name and created-at at the moment of
+// its own creation — so createdAt here must be the exact instant WP2/WP3
+// creates the network, not a later timestamp. Like every builder in this
+// file, it is pure: createdAt is supplied by the caller, never read from
+// time.Now() here, so the concurrency-safe claim-marker semantics ADR-004
+// depends on stay under the caller's control and this function stays cheap
+// to table-test.
+func (id AllocationIdentity) NetworkLabels(createdAt time.Time) map[string]string {
+	return id.ResourceLabels(ResourceJobNetwork, createdAt)
+}
+
+// WorkspaceVolumeLabels returns the labels for the per-job workspace
+// volume (ADR-001).
+func (id AllocationIdentity) WorkspaceVolumeLabels(createdAt time.Time) map[string]string {
+	return id.ResourceLabels(ResourceWorkspace, createdAt)
+}
+
+// SocketVolumeLabels returns the labels for the per-job DinD socket volume
+// (ADR-001). Unused when dind_mode is "none".
+func (id AllocationIdentity) SocketVolumeLabels(createdAt time.Time) map[string]string {
+	return id.ResourceLabels(ResourceSocket, createdAt)
+}
+
+// DindStateVolumeLabels returns the labels for the per-job dind-state
+// volume (ADR-001), mounted at /var/lib/docker inside the DinD sidecar.
+// Unused when dind_mode is "none".
+func (id AllocationIdentity) DindStateVolumeLabels(createdAt time.Time) map[string]string {
+	return id.ResourceLabels(ResourceDindState, createdAt)
+}
+
+// DindContainerLabels returns the labels for the DinD sidecar container
+// (role=dind). A named wrapper around ContainerLabels(RoleDind, ...) so
+// WP2/WP3 call sites read self-documented ("DindContainerLabels(t)")
+// instead of needing to know which RoleXxx constant pairs with the sidecar.
+// Unused when dind_mode is "none".
+func (id AllocationIdentity) DindContainerLabels(createdAt time.Time) map[string]string {
+	return id.ContainerLabels(RoleDind, createdAt)
+}

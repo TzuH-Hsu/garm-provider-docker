@@ -209,6 +209,100 @@ func TestMatchPredicateFiltersAgreesWithMatchesPredicate(t *testing.T) {
 	}
 }
 
+func TestResourceLabelBuilders(t *testing.T) {
+	id := AllocationIdentity{
+		ControllerID: "controller-1",
+		PoolID:       "pool-1",
+		InstanceName: "my-instance",
+	}
+
+	tests := []struct {
+		name         string
+		fn           func(time.Time) map[string]string
+		wantResource string
+	}{
+		{name: "NetworkLabels", fn: id.NetworkLabels, wantResource: ResourceJobNetwork},
+		{name: "WorkspaceVolumeLabels", fn: id.WorkspaceVolumeLabels, wantResource: ResourceWorkspace},
+		{name: "SocketVolumeLabels", fn: id.SocketVolumeLabels, wantResource: ResourceSocket},
+		{name: "DindStateVolumeLabels", fn: id.DindStateVolumeLabels, wantResource: ResourceDindState},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := tt.fn(testCreatedAt)
+			if labels[LabelResource] != tt.wantResource {
+				t.Errorf("labels[%q] = %q, want %q", LabelResource, labels[LabelResource], tt.wantResource)
+			}
+			if labels[LabelInstanceName] != "my-instance" {
+				t.Errorf("labels[%q] = %q, want %q", LabelInstanceName, labels[LabelInstanceName], "my-instance")
+			}
+			if labels[LabelCreatedAt] != "2026-07-19T12:00:00Z" {
+				t.Errorf("labels[%q] = %q, want RFC3339 %q", LabelCreatedAt, labels[LabelCreatedAt], "2026-07-19T12:00:00Z")
+			}
+			if labels[LabelManaged] != "true" {
+				t.Errorf("labels[%q] = %q, want \"true\"", LabelManaged, labels[LabelManaged])
+			}
+			if _, ok := labels[LabelRole]; ok {
+				t.Errorf("%s must not carry %q (containers only)", tt.name, LabelRole)
+			}
+			// Every builder must agree with the general-purpose
+			// ResourceLabels it wraps, not just superficially resemble it.
+			want := id.ResourceLabels(tt.wantResource, testCreatedAt)
+			if len(labels) != len(want) {
+				t.Errorf("%s = %v, want exactly %v", tt.name, labels, want)
+			}
+			for k, v := range want {
+				if labels[k] != v {
+					t.Errorf("%s[%q] = %q, want %q", tt.name, k, labels[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestNetworkLabelsIsTheClaimMarker(t *testing.T) {
+	// ADR-004: the job network doubles as the claim marker, so its labels
+	// must carry both instance-name and created-at — the two fields the
+	// concurrency-safe orphan sweep and duplicate-detection logic (WP2/WP3)
+	// key off.
+	id := AllocationIdentity{ControllerID: "c", PoolID: "p", InstanceName: "claim-me"}
+	labels := id.NetworkLabels(testCreatedAt)
+
+	if _, ok := labels[LabelInstanceName]; !ok {
+		t.Error("NetworkLabels missing garm.docker/instance-name: cannot serve as ADR-004's claim marker without it")
+	}
+	if _, ok := labels[LabelCreatedAt]; !ok {
+		t.Error("NetworkLabels missing garm.docker/created-at: cannot serve as ADR-004's claim marker without it")
+	}
+}
+
+func TestDindContainerLabels(t *testing.T) {
+	id := AllocationIdentity{
+		ControllerID: "controller-1",
+		PoolID:       "pool-1",
+		InstanceName: "my-instance",
+	}
+
+	labels := id.DindContainerLabels(testCreatedAt)
+
+	if labels[LabelRole] != RoleDind {
+		t.Errorf("labels[%q] = %q, want %q", LabelRole, labels[LabelRole], RoleDind)
+	}
+	if _, ok := labels[LabelResource]; ok {
+		t.Error("DindContainerLabels must not carry garm.docker/resource (containers only carry role)")
+	}
+	// Must agree with the general-purpose ContainerLabels it wraps.
+	want := id.ContainerLabels(RoleDind, testCreatedAt)
+	if len(labels) != len(want) {
+		t.Fatalf("DindContainerLabels = %v, want exactly %v", labels, want)
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			t.Errorf("DindContainerLabels[%q] = %q, want %q", k, labels[k], v)
+		}
+	}
+}
+
 func TestMatchPredicateFiltersUsesLabelKey(t *testing.T) {
 	// Sanity-check that MatchPredicateFilters builds "label" filters (the
 	// only filter key Docker's ContainerList/NetworkList/VolumeList

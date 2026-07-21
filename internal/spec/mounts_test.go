@@ -134,3 +134,123 @@ func TestBuildRunnerContainerMemoryLimit(t *testing.T) {
 		t.Errorf("Memory = %d, want %d", host.Resources.Memory, 512<<20)
 	}
 }
+
+func TestDindRuntimeSelection(t *testing.T) {
+	tests := []struct {
+		name        string
+		dindMode    string
+		wantPriv    bool
+		wantRuntime string
+		wantErr     bool
+	}{
+		{
+			name:        "privileged-sidecar runs privileged with the default runtime",
+			dindMode:    "privileged-sidecar",
+			wantPriv:    true,
+			wantRuntime: "",
+		},
+		{
+			name:        "sysbox-runc runs unprivileged with the sysbox-runc runtime",
+			dindMode:    "sysbox-runc",
+			wantPriv:    false,
+			wantRuntime: "sysbox-runc",
+		},
+		{
+			name:     "none has no runtime selection",
+			dindMode: "none",
+			wantErr:  true,
+		},
+		{
+			name:     "unknown mode is an error",
+			dindMode: "bogus",
+			wantErr:  true,
+		},
+		{
+			name:     "empty mode is an error",
+			dindMode: "",
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			priv, runtime, err := DindRuntimeSelection(tt.dindMode)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("DindRuntimeSelection(%q) succeeded, want error", tt.dindMode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DindRuntimeSelection(%q) returned unexpected error: %v", tt.dindMode, err)
+			}
+			if priv != tt.wantPriv {
+				t.Errorf("Privileged = %v, want %v", priv, tt.wantPriv)
+			}
+			if runtime != tt.wantRuntime {
+				t.Errorf("Runtime = %q, want %q", runtime, tt.wantRuntime)
+			}
+		})
+	}
+}
+
+func TestDindRuntimeSelectionModesAreMutuallyExclusive(t *testing.T) {
+	// privileged-sidecar and sysbox-runc must never produce the same
+	// {Privileged, Runtime} pair — that would make them indistinguishable
+	// on the wire, defeating the whole point of ADR-001's two modes.
+	privPriv, privRuntime, err := DindRuntimeSelection("privileged-sidecar")
+	if err != nil {
+		t.Fatalf("DindRuntimeSelection(privileged-sidecar) returned unexpected error: %v", err)
+	}
+	sysboxPriv, sysboxRuntime, err := DindRuntimeSelection("sysbox-runc")
+	if err != nil {
+		t.Fatalf("DindRuntimeSelection(sysbox-runc) returned unexpected error: %v", err)
+	}
+	if privPriv == sysboxPriv && privRuntime == sysboxRuntime {
+		t.Fatalf("privileged-sidecar and sysbox-runc produced the identical pair {%v,%q}", privPriv, privRuntime)
+	}
+	// sysbox-runc must specifically be unprivileged (ADR-001's stated
+	// security rationale for offering it at all).
+	if sysboxPriv {
+		t.Error("sysbox-runc mode must run Privileged=false")
+	}
+}
+
+func TestDindContainerSpecFieldsAreIndependentOfRunnerContainerSpec(t *testing.T) {
+	// DindContainerSpec is a genuinely separate type from
+	// RunnerContainerSpec — populating one must never reach into or be
+	// confused with the other. This is mostly a compile-time guarantee
+	// (they're different struct types), but assert the values round-trip
+	// independently as a smoke test against an accidental shared-field typo.
+	spec := DindContainerSpec{
+		Image:         "docker:dind@sha256:abc",
+		Env:           []string{"DOCKER_TLS_CERTDIR="},
+		Labels:        map[string]string{"garm.docker/role": "dind"},
+		MemoryBytes:   4 << 30,
+		StorageDriver: "overlay2",
+		Privileged:    true,
+		Runtime:       "",
+	}
+
+	if spec.Image != "docker:dind@sha256:abc" {
+		t.Errorf("Image = %q", spec.Image)
+	}
+	if len(spec.Env) != 1 || spec.Env[0] != "DOCKER_TLS_CERTDIR=" {
+		t.Errorf("Env = %v", spec.Env)
+	}
+	if spec.Labels["garm.docker/role"] != "dind" {
+		t.Errorf("Labels = %v", spec.Labels)
+	}
+	if spec.MemoryBytes != 4<<30 {
+		t.Errorf("MemoryBytes = %d", spec.MemoryBytes)
+	}
+	if spec.StorageDriver != "overlay2" {
+		t.Errorf("StorageDriver = %q", spec.StorageDriver)
+	}
+	if !spec.Privileged {
+		t.Error("Privileged = false, want true")
+	}
+	if spec.Runtime != "" {
+		t.Errorf("Runtime = %q, want empty", spec.Runtime)
+	}
+}

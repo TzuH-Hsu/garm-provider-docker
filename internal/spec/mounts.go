@@ -108,9 +108,15 @@ type RunnerContainerSpec struct {
 	Labels map[string]string
 
 	// MemoryBytes, when > 0, sets a hard memory limit on the container. M0
-	// leaves this 0 (unlimited): the ADR-005 [resources]/flavor config that
-	// supplies it is not part of the M0-minimal config surface yet.
-	// TODO(M1): thread the configured/flavor memory limit in here.
+	// left this 0 (unlimited) unconditionally. As of M1, package config can
+	// resolve the configured/flavor memory limit
+	// (config.Config.EffectiveRunnerMemoryBytes, internal/config/
+	// resources.go) — but the CALLER (WP2/WP3's topology layer) is what
+	// invokes it and threads the result in here, not this package: package
+	// spec stays free of a dependency on package config, the same layering
+	// rule DindRuntimeSelection's doc comment documents below. Until that
+	// wiring lands, a caller that leaves this unset still gets M0's
+	// original unlimited behavior.
 	MemoryBytes int64
 }
 
@@ -141,4 +147,81 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	}
 
 	return cfg, host
+}
+
+// DinD mode values (ADR-001), duplicated here rather than imported from
+// package config so that package spec stays free of a dependency on
+// package config — mirroring internal/docker/fake.go's existing
+// duplication of spec.CredentialDir as credentialTarTargetDir for the
+// identical layering reason (see that file's doc comment). These three
+// literal strings MUST stay identical to config.DindModeNone/
+// DindModePrivilegedSidecar/DindModeSysboxRunc; a drift here would fail
+// WP2/WP3's tests wiring the two packages together, which is the intended
+// tripwire for catching a value change in exactly one place.
+const (
+	dindModeNone              = "none"
+	dindModePrivilegedSidecar = "privileged-sidecar"
+	dindModeSysboxRunc        = "sysbox-runc"
+)
+
+// DindContainerSpec bundles the inputs a future WP2/WP3 orchestration layer
+// will use to build the DinD sidecar's container.Config/container.HostConfig
+// (ADR-001), mirroring RunnerContainerSpec's shape. This work package only
+// defines the pure data shape and the dind_mode → {Privileged, Runtime}
+// derivation (DindRuntimeSelection below) — assembling the actual moby SDK
+// structs from it (the sidecar's own tmpfs/socket-volume/dind-state-volume
+// mounts, entrypoint command, env) and wiring it into CreateInstance is
+// WP2/WP3's job, not this one's; there is deliberately no BuildDindContainer
+// function yet.
+type DindContainerSpec struct {
+	Image  string
+	Env    []string
+	Labels map[string]string
+
+	// MemoryBytes is the DinD sidecar's memory limit, resolved the same way
+	// as RunnerContainerSpec.MemoryBytes: by the caller, via
+	// config.Config.EffectiveDindMemoryBytes, never inside this package.
+	MemoryBytes int64
+
+	// StorageDriver is dockerd's explicit --storage-driver flag inside the
+	// sidecar (ADR-001; config.Config.StorageDriver), e.g. "overlay2" or
+	// "vfs" — always explicit, never autodetected, because NAS host
+	// filesystems make in-container autodetection unreliable.
+	StorageDriver string
+
+	// Privileged and Runtime are the two HostConfig fields ADR-001 says
+	// differ between privileged-sidecar and sysbox-runc mode ("Only two
+	// HostConfig fields differ on the DinD sidecar"). Both are derived from
+	// dind_mode by DindRuntimeSelection — a caller should never set them
+	// directly from any other source, extra_specs least of all (ADR-005:
+	// "the privileged flag... derived exclusively from dind_mode, never set
+	// directly").
+	Privileged bool
+	Runtime    string
+}
+
+// DindRuntimeSelection derives the HostConfig.Privileged/HostConfig.Runtime
+// pair ADR-001 specifies for dindMode: privileged-sidecar mode runs
+// Privileged=true with the daemon's default runtime (Runtime returned
+// empty); sysbox-runc mode runs Privileged=false with
+// Runtime="sysbox-runc". Everything else about the two modes' topology is
+// identical (ADR-001) — this function is the entire difference between them.
+//
+// It is an error to call this for "none": there is no DinD sidecar in that
+// mode, so no runtime selection is meaningful. WP2/WP3's topology layer
+// must never call this when dind_mode is "none" — the error return makes
+// that programmer mistake loud instead of silently returning an
+// unprivileged, default-runtime zero value that could be mistaken for a
+// deliberate sysbox-adjacent choice.
+func DindRuntimeSelection(dindMode string) (privileged bool, runtime string, err error) {
+	switch dindMode {
+	case dindModePrivilegedSidecar:
+		return true, "", nil
+	case dindModeSysboxRunc:
+		return false, "sysbox-runc", nil
+	case dindModeNone:
+		return false, "", fmt.Errorf("dind runtime selection does not apply to dind_mode %q: no DinD sidecar exists in that mode", dindModeNone)
+	default:
+		return false, "", fmt.Errorf("dind runtime selection is undefined for dind_mode %q (want %q or %q)", dindMode, dindModePrivilegedSidecar, dindModeSysboxRunc)
+	}
 }
