@@ -11,21 +11,29 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// effectiveDindMode returns the DinD mode CreateInstance provisions for this
-// allocation. WP3: it is the operator's config default. config.Load already
-// validated it is one of none/privileged-sidecar/sysbox-runc, is within
-// allowed_dind_modes, and that dind_image is set when it is not "none"
-// (ADR-001's operator ceiling), so this method can trust it without
-// re-validating.
+// resolveDindMode returns the DinD mode CreateInstance provisions for this
+// allocation, and ERRORS if it falls outside the operator's
+// allowed_dind_modes ceiling (ADR-001 F7). config.Load's Validate already
+// enforces this for the config file's own dind_mode default at load time,
+// but CreateInstance calls config.Config.EffectiveDindMode here too,
+// defensively, so a misconfiguration fails closed with a clear message even
+// for a Config that reached this provider without going through Load/Validate
+// (e.g. a hand-built one) — this is the ceiling's single enforcement point on
+// the create path.
 //
 // Per-pool extra_specs mode selection (ADR-005 — a pool requesting a narrower
 // mode within allowed_dind_modes) is deferred to M3's extra_specs schema
 // validation, exactly like flavor selection is (config.Config.Effective*
 // take a flavorName WP3 does not yet thread through either). Until then every
-// pool on this host uses the config default; this is the single place that
-// decision is made, so wiring extra_specs in later is a one-method change.
-func (p *Provider) effectiveDindMode() string {
-	return p.cfg.DindMode
+// pool on this host uses the config default (EffectiveDindMode("")); wiring
+// a pool's requested mode in later is a one-argument change here, and it
+// will be bounded by the SAME ceiling check this method already performs.
+func (p *Provider) resolveDindMode() (string, error) {
+	mode, err := p.cfg.EffectiveDindMode("")
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve dind_mode for this allocation: %w", err)
+	}
+	return mode, nil
 }
 
 // startDindSidecar pulls the dind image if missing, then builds, creates, and

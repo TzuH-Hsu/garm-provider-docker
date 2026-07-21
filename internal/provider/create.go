@@ -39,10 +39,16 @@ const cleanupTimeout = 30 * time.Second
 var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 
 // CreateInstance provisions the full per-allocation topology for one runner —
-// in "none" mode or, when dind_mode is a DinD mode (WP3: privileged-sidecar),
-// with an isolated DinD sidecar — and delivers the runner's credentials without
-// ever exposing them to the container's environment or to host disk (ADR-002).
-// The sequence is the ADR-001/ADR-004 allocation flow:
+// in "none" mode or, when dind_mode is a DinD mode (privileged-sidecar, or
+// WP4's sysbox-runc — the two share this entire flow, differing only in the
+// sidecar's Privileged/Runtime pair, ADR-001), with an isolated DinD sidecar —
+// and delivers the runner's credentials without ever exposing them to the
+// container's environment or to host disk (ADR-002). Two checks run before
+// ANY Docker operation and fail closed on their own: platform support, and
+// (WP4) resolving dind_mode within the operator's allowed_dind_modes ceiling
+// (ADR-001 F7) — a misconfiguration here is rejected before a network or
+// volume ever exists for the attempt. After those, the sequence is the
+// ADR-001/ADR-004 allocation flow:
 //
 //  1. sweep this instance-name's stale leftovers from a crashed prior
 //     allocation (claim-marker-aware, grace-windowed), so the idempotent
@@ -56,9 +62,11 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //  4. fetch the credentials provider-side, before the container exists, so a
 //     slow fetch can never outlive the entrypoint's credential wait
 //  5. pull the runner image if missing
-//  6. in DinD modes, pull the dind image and start the privileged sidecar on
-//     the job network FIRST, so the runner's entrypoint has a daemon to reach
-//     over the shared socket volume (its `until docker info` wait blocks on it)
+//  6. in DinD modes, pull the dind image and start the sidecar (privileged-
+//     sidecar or, WP4, sysbox-runc — the two differ only in Privileged/
+//     Runtime) on the job network FIRST, so the runner's entrypoint has a
+//     daemon to reach over the shared socket volume (its `until docker info`
+//     wait blocks on it)
 //  7. create the runner container on the job network, with the workspace volume
 //     at the runner workdir, a credential tmpfs, the configured memory limit,
 //     and — in DinD modes — DOCKER_HOST plus the shared socket volume mount
@@ -82,6 +90,15 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// an out-of-scope OS/arch surfaces as a clean provider_fault rather than
 	// a partially-created allocation.
 	if err := validatePlatform(bootstrap); err != nil {
+		return params.ProviderInstance{}, err
+	}
+
+	// Resolve dind_mode before ANY Docker operation too (ADR-001 F7): a
+	// misconfiguration that would escalate past the operator's
+	// allowed_dind_modes ceiling must fail closed with a clear message, not
+	// after a network/volume has already been created for the attempt.
+	dindMode, err := p.resolveDindMode()
+	if err != nil {
 		return params.ProviderInstance{}, err
 	}
 
@@ -112,13 +129,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		InstanceName: instanceName,
 	}
 
-	// The effective DinD mode decides whether this allocation gets the full
-	// isolated DinD topology (socket + dind-state volumes and a privileged
-	// sidecar) or the none-mode flow. dindEnabled is an explicit positive test
-	// for the two DinD modes, so "none" — and any unset/empty mode from a
-	// hand-built config that skipped config.Load's defaulting — takes the
-	// none-mode path, byte-for-byte the M0/WP2 flow.
-	dindMode := p.effectiveDindMode()
+	// The effective DinD mode (resolved and ceiling-checked above) decides
+	// whether this allocation gets the full isolated DinD topology (socket +
+	// dind-state volumes and a sidecar) or the none-mode flow. dindEnabled is
+	// an explicit positive test for the two DinD modes, so "none" — and any
+	// unset/empty mode from a hand-built config that skipped config.Load's
+	// defaulting — takes the none-mode path, byte-for-byte the M0/WP2 flow.
 	dindEnabled := dindMode == config.DindModePrivilegedSidecar || dindMode == config.DindModeSysboxRunc
 
 	// 1. CLAIM-MARKER NETWORK FIRST (ADR-004). A genuine same-instance

@@ -285,6 +285,88 @@ func TestConfigValidateFlavors(t *testing.T) {
 	}
 }
 
+// TestConfigEffectiveDindMode covers EffectiveDindMode's ceiling enforcement
+// (ADR-001 F7): a mode within allowed_dind_modes resolves cleanly, and a
+// mode outside it — whether the config-wide default or a (future M3)
+// poolMode override — is rejected with a clear error, exactly as
+// validateDindMode already enforces at Load time (config_test.go /
+// TestConfigValidateDindMode above), but re-checked here since this is the
+// method WP4's provider create path calls defensively.
+func TestConfigEffectiveDindMode(t *testing.T) {
+	tests := []struct {
+		name             string
+		dindMode         string
+		allowedDindModes []string
+		poolMode         string
+		want             string
+		wantErr          bool
+	}{
+		{
+			name:             "config default within the ceiling resolves",
+			dindMode:         DindModePrivilegedSidecar,
+			allowedDindModes: []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc},
+			want:             DindModePrivilegedSidecar,
+		},
+		{
+			name:             "config default outside the ceiling is rejected",
+			dindMode:         DindModePrivilegedSidecar,
+			allowedDindModes: []string{DindModeNone},
+			wantErr:          true,
+		},
+		{
+			name:             "sysbox-runc within the ceiling resolves",
+			dindMode:         DindModeSysboxRunc,
+			allowedDindModes: []string{DindModeNone, DindModeSysboxRunc},
+			want:             DindModeSysboxRunc,
+		},
+		{
+			name:             "sysbox-runc outside the ceiling is rejected",
+			dindMode:         DindModeSysboxRunc,
+			allowedDindModes: []string{DindModeNone, DindModePrivilegedSidecar},
+			wantErr:          true,
+		},
+		{
+			name:             "poolMode override within the ceiling wins over the config default",
+			dindMode:         DindModeNone,
+			allowedDindModes: []string{DindModeNone, DindModePrivilegedSidecar},
+			poolMode:         DindModePrivilegedSidecar,
+			want:             DindModePrivilegedSidecar,
+		},
+		{
+			name:             "poolMode override outside the ceiling is rejected even though the config default is allowed",
+			dindMode:         DindModeNone,
+			allowedDindModes: []string{DindModeNone},
+			poolMode:         DindModeSysboxRunc,
+			wantErr:          true,
+		},
+		{
+			name:             "an empty AllowedDindModes (a hand-built Config that skipped Load) is unrestricted",
+			dindMode:         DindModePrivilegedSidecar,
+			allowedDindModes: nil,
+			want:             DindModePrivilegedSidecar,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{DindMode: tt.dindMode, AllowedDindModes: tt.allowedDindModes}
+			got, err := cfg.EffectiveDindMode(tt.poolMode)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("EffectiveDindMode(%q) succeeded with %q, want an error", tt.poolMode, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EffectiveDindMode(%q) returned unexpected error: %v", tt.poolMode, err)
+			}
+			if got != tt.want {
+				t.Errorf("EffectiveDindMode(%q) = %q, want %q", tt.poolMode, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestConfigEffectiveRunnerMemoryBytes(t *testing.T) {
 	cfg := validBaseConfig("ghcr.io/example/runner@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", false)
 	cfg.Resources = Resources{RunnerMemory: "8GiB", DindMemory: "4GiB"}
