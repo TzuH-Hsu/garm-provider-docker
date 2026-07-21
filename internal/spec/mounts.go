@@ -156,6 +156,15 @@ type RunnerContainerSpec struct {
 	// per-job isolation WP2 provisions. Left empty, the container joins the
 	// default bridge, the M0 behavior.
 	NetworkName string
+
+	// SocketVolumeName, when non-empty (DinD modes only, WP3), mounts the
+	// shared DinD socket volume at DindSocketDir (/var/run) so the runner
+	// sees ONLY the sidecar's daemon socket there. It is the same named
+	// volume the DinD sidecar mounts at the same path
+	// (DindContainerSpec.SocketVolumeName), the sole runner→daemon channel —
+	// never a host docker.sock, never TCP (ADR-001). Left empty ("none"
+	// mode), the runner mounts no socket volume and DOCKER_HOST is unset.
+	SocketVolumeName string
 }
 
 // BuildRunnerContainer assembles the container.Config and container.HostConfig
@@ -179,11 +188,18 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 		workspace = NamedWorkspaceMount(s.WorkspaceVolumeName)
 	}
 
+	mounts := []mount.Mount{workspace}
+	if s.SocketVolumeName != "" {
+		// DinD modes (WP3): the runner mounts the shared socket volume at
+		// DindSocketDir so it reaches ONLY the sidecar's daemon socket. Never
+		// the host socket, never TCP (ADR-001). The DinD sidecar mounts this
+		// same named volume at the same path.
+		mounts = append(mounts, SocketVolumeMount(s.SocketVolumeName))
+	}
+
 	host := &container.HostConfig{
-		Tmpfs: CredentialTmpfsMap(),
-		Mounts: []mount.Mount{
-			workspace,
-		},
+		Tmpfs:  CredentialTmpfsMap(),
+		Mounts: mounts,
 	}
 	if s.NetworkName != "" {
 		// Attach the runner to the per-job network as its sole network
@@ -247,6 +263,28 @@ type DindContainerSpec struct {
 	// directly").
 	Privileged bool
 	Runtime    string
+
+	// NetworkName joins the DinD sidecar to the per-job network (ADR-001:
+	// the sidecar is on the SAME job network as the runner) as its sole
+	// attachment via HostConfig.NetworkMode, exactly like
+	// RunnerContainerSpec.NetworkName. WP3 always sets it —
+	// spec.JobNetworkName(instanceName) — so the runner reaches the daemon
+	// over the shared socket volume on a network isolated from every other
+	// allocation.
+	NetworkName string
+
+	// SocketVolumeName backs the shared DinD socket mount at DindSocketDir
+	// (/var/run): dockerd creates its unix socket there and the runner,
+	// mounting the SAME named volume, reaches it. It is the ONLY channel
+	// between the runner and the daemon — never a host socket, never TCP
+	// (ADR-001). Required for a DinD sidecar.
+	SocketVolumeName string
+
+	// DindStateVolumeName backs the dind-state mount at DindStateDir
+	// (/var/lib/docker): the daemon's own storage, isolated per-allocation
+	// on a dedicated volume so overlay/vfs layers never leak across jobs and
+	// are destroyed at teardown (ADR-001). Required for a DinD sidecar.
+	DindStateVolumeName string
 }
 
 // DindRuntimeSelection derives the HostConfig.Privileged/HostConfig.Runtime

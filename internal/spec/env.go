@@ -87,6 +87,14 @@ type RunnerEnvOptions struct {
 	// container, always set.
 	RunnerWorkDir string
 
+	// DockerHost, when non-empty (DinD modes only, WP3), is emitted as
+	// DOCKER_HOST so the runner's docker CLI — and the entrypoint's
+	// `until docker info` readiness wait (ADR-002) — target the DinD
+	// sidecar's daemon over the shared socket volume (spec.DindDockerHost).
+	// Left empty ("none" mode), DOCKER_HOST is not set and the entrypoint
+	// skips the Docker readiness wait entirely (ADR-002's none-mode path).
+	DockerHost string
+
 	// Entity is the parsed repo/org/enterprise scope (ParseEntity),
 	// consulted only in non-JIT mode.
 	Entity Entity
@@ -115,15 +123,23 @@ type RunnerEnvOptions struct {
 // function's structure rather than something that has to be reviewed for
 // each new field added to it.
 //
-// DOCKER_HOST is deliberately not emitted here: ADR-002 only requires it
-// "in DinD modes", which M0 (ADR-001's "none" mode only, per plan.md §3)
-// never selects. DinD-mode env wiring is added in M1.
+// DOCKER_HOST is emitted only in DinD modes (opts.DockerHost non-empty, set
+// by WP3's CreateInstance to spec.DindDockerHost): it points the runner's
+// docker CLI at the sidecar's daemon over the shared socket volume, and the
+// entrypoint's `until docker info` wait blocks on that daemon's readiness
+// (ADR-001, ADR-002). In "none" mode opts.DockerHost is empty and DOCKER_HOST
+// is absent, so the entrypoint skips the Docker readiness wait — the M0
+// behavior. It applies in both JIT and non-JIT delivery modes, so it is
+// emitted before the JIT early return below.
 func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 	env := []string{
 		"JIT_CONFIG_ENABLED=" + strconv.FormatBool(opts.JITConfigEnabled),
 		"RUNNER_WORKDIR=" + opts.RunnerWorkDir,
 		"GITHUB_URL=" + opts.GitHubURL,
 		"DISABLE_RUNNER_UPDATE=true",
+	}
+	if opts.DockerHost != "" {
+		env = append(env, "DOCKER_HOST="+opts.DockerHost)
 	}
 
 	if opts.JITConfigEnabled {
