@@ -35,7 +35,7 @@ enabled = true
 generation = "1"
 pnpm_major = "9"
 toolcache_path = "/opt/hostedtoolcache"
-# pnpm_store_path is TBD — see ADR-003 open questions.
+pnpm_store_path = "/opt/pnpm-store"  # resolved M2-W1 (ADR-003 Amendment): mounted volume + npm_config_store_dir
 stale_cache_eviction_days = 30
 diagnostic_log_retention_days = 7
 allow_org_shared = false  # operator opt-in for org/enterprise-keyed shared caches — see ADR-003
