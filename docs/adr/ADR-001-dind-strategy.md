@@ -1,6 +1,6 @@
 # ADR-001: Docker-in-Docker (DinD) Strategy
 
-Status: Accepted (2026-07-19); amended 2026-07-21 (see Amendment below)
+Status: Accepted (2026-07-19); amended 2026-07-21 (see Amendments below)
 
 ## Context
 
@@ -23,7 +23,7 @@ Per-allocation resources, created on `CreateInstance` and destroyed on `DeleteIn
 - DinD sidecar container, job-scoped socket volume, and a dedicated `dind-state` volume mounted at `/var/lib/docker` — DinD modes only (`privileged-sidecar`, `sysbox-runc`).
 - Workspace volume — all modes.
 
-**`privileged-sidecar` wiring** (default): the DinD sidecar runs `dockerd --host=unix:///var/run/docker.sock --storage-driver=overlay2` with `DOCKER_TLS_CERTDIR=""` — TLS is disabled because the daemon socket is exposed only over the shared volume, never over TCP. This mirrors ARC's own `gha-runner-scale-set` DinD values file. The runner container mounts the same socket volume and sets `DOCKER_HOST=unix:///var/run/docker.sock`; the entrypoint polls for daemon readiness (`until docker info; do sleep …; done`, budget roughly 120 seconds) before proceeding.
+**`privileged-sidecar` wiring** (default): the DinD sidecar runs `dockerd --host=unix:///run/docker.sock --storage-driver=overlay2` with `DOCKER_TLS_CERTDIR=""` — TLS is disabled because the daemon socket is exposed only over the shared volume, never over TCP. This mirrors ARC's own `gha-runner-scale-set` DinD values file. The runner container mounts the same socket volume **at `/run`** (corrected 2026-07-21 — see the DinD socket path Amendment below; originally this ADR specified `/var/run`) and sets `DOCKER_HOST=unix:///run/docker.sock`; the entrypoint polls for daemon readiness (`until docker info; do sleep …; done`, budget roughly 120 seconds) before proceeding.
 
 **`sysbox-runc` mode**: identical topology to `privileged-sidecar`. Only two `HostConfig` fields differ on the DinD sidecar: `HostConfig.Runtime = "sysbox-runc"` and `Privileged = false`. Everything else — networking, volumes, entrypoint, readiness wait — is shared code.
 
@@ -91,4 +91,14 @@ But in the default `privileged-sidecar` mode, a malicious workflow's job code ho
 
 **Config default**: `[network].internal` now defaults to `false` (`internal/config/config.go`). Operators who want the pre-amendment behavior (or the future proxy-sidecar opt-in once it exists) can still set `internal = true` explicitly; nothing about that knob's mechanics changed, only its default.
 
-See research.md §1–§2 for the upstream `GARM_POOL_EXTRASPECS` gap and the prior-art comparison this decision responds to, and §3.C for the Sysbox/DSM/Unraid platform-support gap underlying the residual-risk discussion above. See ADR-002 for the runner image the sidecar pairs with, ADR-004 for teardown ordering of the five per-allocation resource kinds, and ADR-005 for how `dind_mode`, `allowed_dind_modes`, and `storage_driver` are exposed in config and `extra_specs`.
+## Amendment (2026-07-21) — DinD socket mounted at `/run`, not `/var/run`
+
+**The shared DinD socket volume (sidecar and runner alike) is mounted at `/run`, not `/var/run`.** This ADR originally specified the socket path literally as `/var/run/docker.sock` throughout the Decision text above (the `dockerd --host=...` flag, the mount target, and the runner's `DOCKER_HOST`); those references have been corrected in place to `/run/docker.sock` (mount target `/run`), rather than left to silently contradict this amendment, mirroring how the `internal=false` amendment above was applied.
+
+**Why**: real-daemon verification during M1/WP3 (Docker Engine 29.6.1) found that on the Debian/Ubuntu/Alpine bases this provider actually runs on — the `myoung34` runner image and `docker:dind` alike — `/var/run` is a symlink to `/run`. Mounting the shared socket volume "at `/var/run`" therefore resolves onto `/run` itself and **shadows** the credential tmpfs ADR-002 mounts directly at `/run/garm`: the tmpfs is no longer reachable at that path once the socket volume is mounted over its parent directory, and credential delivery (`tar -x -p -C /run/garm`) fails on the live daemon — confirmed exit 1, "can't change directory to `/run/garm`". Mounting the socket volume at `/run` instead — the *parent* of `/run/garm` — lets Docker mount `/run` first and the `/run/garm` tmpfs on top of it, so both coexist; confirmed on the same live daemon: delivery exits 0, both paths present. This is also **ARC's actual `gha-runner-scale-set` pattern**, which this ADR's Decision already says it mirrors: the shared var-run volume is mounted at `/run` with `DOCKER_HOST=unix:///run/docker.sock`, not at `/var/run`.
+
+**Scope**: this correction is the shared DinD socket volume only (`internal/spec.DindSocketDir`/`DindSocketPath`/`DindDockerHost`) — the job-scoped path the DinD sidecar and runner share for the *nested* daemon. It does not touch `docker_host`, this provider's own connection to the **host** Docker daemon it manages allocations on (`internal/config.Config.DockerHost`, still conventionally `/var/run/docker.sock`); that is a separate socket serving a separate purpose and was never part of this shadowing hazard.
+
+**Status**: the code was already correct as of M1/WP3 (commit `bb4b8a4`, real-daemon-confirmed per the evidence above); this amendment brings the ADR text into agreement with the code and records why, so the ADR is not left silently wrong about its own topology.
+
+See research.md §1–§2 for the upstream `GARM_POOL_EXTRASPECS` gap and the prior-art comparison this decision responds to, and §3.C for the Sysbox/DSM/Unraid platform-support gap underlying the residual-risk discussion above. See ADR-002 for the runner image the sidecar pairs with (and the `/run/garm` credential tmpfs this amendment's shadowing hazard involves), ADR-004 for teardown ordering of the five per-allocation resource kinds, and ADR-005 for how `dind_mode`, `allowed_dind_modes`, and `storage_driver` are exposed in config and `extra_specs`.
