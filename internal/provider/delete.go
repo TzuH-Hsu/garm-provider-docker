@@ -8,11 +8,12 @@ import (
 )
 
 // DeleteInstance tears down the WHOLE per-allocation topology for instanceID —
-// the runner container, the job network, and the job-scoped volumes — in the
-// ADR-004 delete order (container(s) → network after endpoints detach →
-// volumes). It is idempotent at every step (NotFound tolerated); an instance
-// whose entire allocation is already gone returns the not-found error, which
-// maps to exit code 30 (GARM treats that as success).
+// the runner container, the job-scoped volumes, and the job network — in the
+// ADR-004 (network-last) delete order (container(s) → volumes → network,
+// removed LAST so the claim marker is held for the entire teardown). It is
+// idempotent at every step (NotFound tolerated); an instance whose entire
+// allocation is already gone returns the not-found error, which maps to exit
+// code 30 (GARM treats that as success).
 //
 // instanceID is the GARM instance NAME — provider_id is the instance name (F6),
 // and GARM falls back to the instance Name when provider_id is empty
