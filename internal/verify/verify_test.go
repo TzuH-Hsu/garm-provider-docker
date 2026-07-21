@@ -3,7 +3,10 @@
 // Package verify holds the M1-WP2 real-daemon verification harness. It is
 // gated behind the `dockerverify` build tag so it never runs in the normal
 // `go test ./...` gate: it requires a live Docker daemon and builds/pulls
-// images. Run it explicitly against a real daemon with:
+// images, and (since the 2026-07-21 internal=false default, ADR-001's
+// Amendment) outbound internet access from the Docker host, since it
+// verifies real egress to api.github.com rather than merely asserting a
+// network's Internal flag. Run it explicitly against a real daemon with:
 //
 //	go test -tags dockerverify -v -run TestVerifyM1WP2Allocation ./internal/verify/
 //
