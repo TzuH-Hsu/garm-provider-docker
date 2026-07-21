@@ -121,6 +121,21 @@ func NamedWorkspaceMount(name string) mount.Mount {
 	}
 }
 
+// CacheVolumeMount returns a persistent cache volume mount (ADR-003): the named
+// cache volume `name` mounted read-write at `target` (e.g. the toolcache at
+// /opt/hostedtoolcache or the pnpm store at /opt/pnpm-store). It is a plain
+// named-volume mount like NamedWorkspaceMount, but with a caller-supplied
+// target rather than the fixed RunnerWorkDir, since the two cache kinds mount at
+// different, config-driven paths. Read-write is deliberate: setup-* actions and
+// pnpm POPULATE these volumes — that is how the cache warms.
+func CacheVolumeMount(name, target string) mount.Mount {
+	return mount.Mount{
+		Type:   mount.TypeVolume,
+		Source: name,
+		Target: target,
+	}
+}
+
 // RunnerContainerSpec bundles the inputs BuildRunnerContainer turns into the
 // moby SDK's container/host config structs.
 type RunnerContainerSpec struct {
@@ -166,6 +181,26 @@ type RunnerContainerSpec struct {
 	// never a host docker.sock, never TCP (ADR-001). Left empty ("none"
 	// mode), the runner mounts no socket volume and DOCKER_HOST is unset.
 	SocketVolumeName string
+
+	// ToolcacheVolumeName/ToolcacheMountPath and PnpmVolumeName/PnpmMountPath
+	// are ADR-003's persistent, repo-scoped cache volumes (M2-W1). Each is
+	// mounted read-write only when BOTH its name and path are non-empty, so a
+	// cache-ineligible allocation (org/enterprise without allow_org_shared, or
+	// a cache-disabled config) simply leaves them unset and gets no cache mount.
+	//
+	// They are mounted into the RUNNER only, never the DinD sidecar — unlike the
+	// workspace volume (which is shared into the sidecar so nested `docker run
+	// -v "$PWD":…` bind sources resolve, F2). The toolcache and pnpm store are
+	// consumed by the runner's OWN job steps (setup-node/setup-python populate
+	// the toolcache; pnpm reads/writes its store via npm_config_store_dir),
+	// which execute in the runner container, not inside containers the DinD
+	// daemon launches — so there is no daemon-side bind-source to resolve and no
+	// reason to widen the sidecar's mount set (or the cache's blast radius) by
+	// sharing them into it.
+	ToolcacheVolumeName string
+	ToolcacheMountPath  string
+	PnpmVolumeName      string
+	PnpmMountPath       string
 }
 
 // BuildRunnerContainer assembles the container.Config and container.HostConfig
@@ -214,6 +249,15 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 		// (ADR-001). A user-defined NetworkMode means the container does not
 		// also join the default bridge, which is the isolation guarantee.
 		host.NetworkMode = container.NetworkMode(s.NetworkName)
+	}
+	// Persistent, repo-scoped cache volumes (ADR-003), each mounted only when
+	// BOTH its name and path are set — so a cache-ineligible or cache-disabled
+	// allocation gets no cache mount. Runner-only (see the field docs).
+	if s.ToolcacheVolumeName != "" && s.ToolcacheMountPath != "" {
+		host.Mounts = append(host.Mounts, CacheVolumeMount(s.ToolcacheVolumeName, s.ToolcacheMountPath))
+	}
+	if s.PnpmVolumeName != "" && s.PnpmMountPath != "" {
+		host.Mounts = append(host.Mounts, CacheVolumeMount(s.PnpmVolumeName, s.PnpmMountPath))
 	}
 	if s.MemoryBytes > 0 {
 		host.Resources.Memory = s.MemoryBytes

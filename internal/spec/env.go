@@ -95,6 +95,23 @@ type RunnerEnvOptions struct {
 	// skips the Docker readiness wait entirely (ADR-002's none-mode path).
 	DockerHost string
 
+	// ToolCacheDir, when non-empty, is emitted as RUNNER_TOOL_CACHE — the
+	// hosted-runner toolcache location the setup-* actions consult before
+	// downloading a tool (research.md §3; ADR-003). The provider sets it to the
+	// configured [cache].toolcache_path whenever the cache feature is enabled,
+	// even for a cache-INELIGIBLE allocation (giving the runner a consistent
+	// toolcache path — merely an ephemeral in-container one, since no persistent
+	// volume backs it there). Emitted in both JIT and non-JIT modes.
+	ToolCacheDir string
+
+	// PnpmStoreDir, when non-empty, is emitted as npm_config_store_dir — the
+	// env pnpm honors as its store-dir (verified on Docker Engine 29.6.1:
+	// `pnpm config get store-dir`/`pnpm store path` resolve to it, and package
+	// content is reused across containers sharing the volume). Set ONLY when a
+	// persistent pnpm store volume is actually mounted, so a cache-ineligible
+	// allocation leaves pnpm on its own default store. Emitted in both modes.
+	PnpmStoreDir string
+
 	// Entity is the parsed repo/org/enterprise scope (ParseEntity),
 	// consulted only in non-JIT mode.
 	Entity Entity
@@ -145,6 +162,17 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 		// reach the DinD socket (group-owned by this GID via dockerd --group).
 		// Emitted only in DinD modes (DockerHost set), alongside DOCKER_HOST.
 		env = append(env, DindSocketGIDEnv+"="+DindSocketGID)
+	}
+	// Persistent-cache env (ADR-003), emitted in BOTH JIT and non-JIT modes —
+	// like DOCKER_HOST, these apply regardless of credential-delivery mode, so
+	// they precede the JIT early return. RUNNER_TOOL_CACHE is a provider-injected
+	// name (the RUNNER_* reserved prefix, ADR-005): a pool's extra_specs can
+	// never override it once that path is wired.
+	if opts.ToolCacheDir != "" {
+		env = append(env, "RUNNER_TOOL_CACHE="+opts.ToolCacheDir)
+	}
+	if opts.PnpmStoreDir != "" {
+		env = append(env, "npm_config_store_dir="+opts.PnpmStoreDir)
 	}
 
 	if opts.JITConfigEnabled {

@@ -200,6 +200,17 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		}
 	}
 
+	// 2c. Persistent, repo-scoped caches (ADR-003): resolve entity scope and,
+	// when eligible, create-or-reuse the toolcache and pnpm store volumes.
+	// Cache volumes carry no instance-name/create-nonce, so the creation-guard
+	// rollback never removes them — a create that fails after this point leaves
+	// the warm cache intact for the next job. An org/enterprise pool without
+	// allow_org_shared (or a disabled cache) gets no persistent cache volumes.
+	plan, err := p.planCaches(ctx, bootstrap)
+	if err != nil {
+		return guarded(err)
+	}
+
 	// 3. Fetch credentials (ADR-002 F7): never enter the container env, built
 	// into an in-memory tar with the atomic ready marker as its last entry.
 	creds, err := p.fetchCredentials(ctx, bootstrap)
@@ -250,7 +261,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	labels[spec.LabelOSArch] = string(bootstrap.OSArch)
 	labels[spec.LabelCreateNonce] = nonce
 
-	env, err := buildRunnerEnv(bootstrap, dockerHost)
+	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath)
 	if err != nil {
 		return guarded(err)
 	}
@@ -268,6 +279,14 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
 		NetworkName:         spec.JobNetworkName(instanceName),
 		SocketVolumeName:    socketVolumeName,
+		// Persistent, repo-scoped cache mounts (ADR-003). ToolcacheMountPath is
+		// set whenever the cache is enabled, but a mount is added only when the
+		// VOLUME name is also set (cache-eligible) — so a cache-ineligible
+		// allocation gets RUNNER_TOOL_CACHE (ephemeral) but no persistent mount.
+		ToolcacheVolumeName: plan.toolcacheVolume,
+		ToolcacheMountPath:  plan.toolcachePath,
+		PnpmVolumeName:      plan.pnpmVolume,
+		PnpmMountPath:       plan.pnpmPath,
 	})
 
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.RunnerContainerName(instanceName))
@@ -426,7 +445,14 @@ func validatePlatform(b params.BootstrapInstance) error {
 // parsed) in non-JIT mode. dockerHost, when non-empty (DinD modes), is emitted
 // as DOCKER_HOST so the runner reaches the sidecar's daemon over the shared
 // socket volume; it is "" in none mode, leaving DOCKER_HOST unset (M0 behavior).
-func buildRunnerEnv(b params.BootstrapInstance, dockerHost string) ([]string, error) {
+//
+// toolCacheDir and pnpmStoreDir carry ADR-003's cache env: toolCacheDir becomes
+// RUNNER_TOOL_CACHE (set whenever the cache feature is enabled, from the
+// planCaches decision — possibly an ephemeral in-container path when the pool
+// is cache-ineligible), and pnpmStoreDir becomes npm_config_store_dir (set only
+// when a persistent pnpm store volume is mounted). Either being "" omits its
+// env var.
+func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir string) ([]string, error) {
 	opts := spec.RunnerEnvOptions{
 		JITConfigEnabled: b.JitConfigEnabled,
 		GitHubURL:        githubBaseURL(b.RepoURL),
@@ -435,6 +461,8 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost string) ([]string, er
 		RunnerGroup:      b.GitHubRunnerGroup,
 		Labels:           b.Labels,
 		DockerHost:       dockerHost,
+		ToolCacheDir:     toolCacheDir,
+		PnpmStoreDir:     pnpmStoreDir,
 	}
 	if !b.JitConfigEnabled {
 		entity, err := spec.ParseEntity(b.RepoURL)
