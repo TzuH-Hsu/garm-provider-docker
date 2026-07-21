@@ -27,15 +27,20 @@ func newSysboxTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	t.Helper()
 	fake := docker.NewFakeClient()
 	cfg := config.Config{
-		DockerHost:    "unix:///var/run/docker.sock",
-		RunnerImage:   "ghcr.io/example/runner@sha256:deadbeef",
-		DindMode:      config.DindModeSysboxRunc,
-		DindImage:     "docker:dind@sha256:beefdead",
-		StorageDriver: "overlay2",
-		Resources:     config.Resources{DindMemory: "4GiB"},
-		Network:       config.Network{EnableJobNetwork: true, Internal: false},
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeSysboxRunc,
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
+		DindImage:        "docker:dind@sha256:beefdead",
+		StorageDriver:    "overlay2",
+		Resources:        config.Resources{DindMemory: "4GiB"},
+		Network:          config.Network{EnableJobNetwork: true, Internal: false},
 	}
-	return New(fake, cfg, "controller-abc"), fake
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+	return p, fake
 }
 
 // TestCreateInstanceSysboxRuncFullTopology proves WP4's "thin flip" claim
@@ -206,6 +211,29 @@ func TestCreateInstanceSysboxRuncOtherCreateFailureKeepsGenericMessage(t *testin
 	}
 	if strings.Contains(err.Error(), "requires the") && strings.Contains(err.Error(), "runtime to be registered") {
 		t.Errorf("error = %q, an unrelated create failure must not be mislabeled as a missing runtime", err.Error())
+	}
+	assertNoLeftovers(t, fake)
+}
+
+// TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed is the F12
+// tightening guard: an unrelated OCI failure that happens to mention "runtime"
+// and "not found" — the container entrypoint binary missing, NOT the sysbox-runc
+// runtime — must NOT be relabeled as a missing runtime. The classifier now
+// requires both the configured runtime name AND the canonical "unknown runtime"
+// phrase, and this message carries neither.
+func TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newSysboxTestProvider(t)
+	fake.CreateErr = errors.New("failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: \"dockerd\": executable file not found in $PATH")
+
+	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	if err == nil {
+		t.Fatal("expected CreateInstance to fail, got nil")
+	}
+	if strings.Contains(err.Error(), "requires the") && strings.Contains(err.Error(), "runtime to be registered") {
+		t.Errorf("error = %q, an unrelated OCI executable-not-found must not be mislabeled as a missing runtime (F12)", err.Error())
 	}
 	assertNoLeftovers(t, fake)
 }

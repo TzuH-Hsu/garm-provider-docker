@@ -340,10 +340,14 @@ func TestConfigEffectiveDindMode(t *testing.T) {
 			wantErr:          true,
 		},
 		{
-			name:             "an empty AllowedDindModes (a hand-built Config that skipped Load) is unrestricted",
+			// F10: an empty AllowedDindModes must FAIL CLOSED (deny every mode),
+			// never be treated as fail-open "unrestricted". A loaded config
+			// always carries the all-three default, so an empty slice only ever
+			// reaches here from a hand-built Config that bypassed Load.
+			name:             "an empty AllowedDindModes fails closed (denies every mode)",
 			dindMode:         DindModePrivilegedSidecar,
 			allowedDindModes: nil,
-			want:             DindModePrivilegedSidecar,
+			wantErr:          true,
 		},
 	}
 
@@ -362,6 +366,37 @@ func TestConfigEffectiveDindMode(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("EffectiveDindMode(%q) = %q, want %q", tt.poolMode, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConfigValidateAllowedDindModes covers the provider-construction ceiling
+// check (F10): an empty ceiling is rejected (never fail-open), an invalid entry
+// is rejected, and a well-formed non-empty ceiling passes — deliberately
+// WITHOUT requiring dind_mode to be a member (that relationship is Load's and
+// EffectiveDindMode's job).
+func TestConfigValidateAllowedDindModes(t *testing.T) {
+	tests := []struct {
+		name    string
+		modes   []string
+		wantErr bool
+	}{
+		{name: "all three is valid", modes: []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc}},
+		{name: "a single mode is valid", modes: []string{DindModeNone}},
+		{name: "empty is rejected (never fail-open)", modes: nil, wantErr: true},
+		{name: "empty slice is rejected", modes: []string{}, wantErr: true},
+		{name: "an invalid entry is rejected", modes: []string{DindModeNone, "bogus"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{AllowedDindModes: tt.modes}
+			err := cfg.ValidateAllowedDindModes()
+			if tt.wantErr && err == nil {
+				t.Fatal("ValidateAllowedDindModes() succeeded, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateAllowedDindModes() returned unexpected error: %v", err)
 			}
 		})
 	}

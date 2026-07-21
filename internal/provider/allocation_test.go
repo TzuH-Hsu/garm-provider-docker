@@ -329,11 +329,16 @@ func TestCreateInstanceJobNetworkDisabledStillIsolates(t *testing.T) {
 
 	fake := docker.NewFakeClient()
 	cfg := config.Config{
-		DockerHost:  "unix:///var/run/docker.sock",
-		RunnerImage: "ghcr.io/example/runner@sha256:deadbeef",
-		Network:     config.Network{EnableJobNetwork: false, Internal: true},
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeNone,
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
+		Network:          config.Network{EnableJobNetwork: false, Internal: true},
 	}
-	p := New(fake, cfg, "controller-abc")
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
 
 	inst, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err != nil {

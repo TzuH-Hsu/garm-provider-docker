@@ -80,26 +80,48 @@ func (c Config) validateDindMode() error {
 // ADR-005). Empty poolMode (all of M1) falls through to DindMode, the
 // config-wide default/fallback.
 //
-// An empty AllowedDindModes is treated as "no ceiling configured" rather
-// than "nothing allowed": Load always populates it (defaulting to every
-// mode when the config file omits allowed_dind_modes, ADR-001), so an empty
-// slice here only ever comes from a hand-built Config that bypassed Load —
-// exactly the shape most of this package's own tests (and WP1-WP3's
-// provider tests) construct. Treating that as unrestricted, rather than as
-// an implicit "allow nothing", keeps this method's introduction from
-// silently breaking every test that predates it.
+// An empty AllowedDindModes FAILS CLOSED (denies every mode) rather than being
+// treated as "unrestricted" (F10). A loaded config always carries the
+// all-three default (Load populates it when the file omits allowed_dind_modes,
+// and Load's Validate rejects an explicitly empty list because DindMode could
+// not be a member of it), so an empty slice here can only reach this method
+// from a hand-built Config that bypassed Load — exactly the "bypassing caller"
+// case a fail-open ceiling would silently let permit every mode. Provider
+// construction independently rejects an empty/malformed ceiling
+// (Config.ValidateAllowedDindModes, called from provider.New), so in practice
+// this branch is a belt-and-braces last line rather than the only guard.
 func (c Config) EffectiveDindMode(poolMode string) (string, error) {
 	mode := c.DindMode
 	if poolMode != "" {
 		mode = poolMode
 	}
 	if len(c.AllowedDindModes) == 0 {
-		return mode, nil
+		return "", fmt.Errorf("dind_mode %q is denied: allowed_dind_modes is empty (an empty ceiling denies every mode; a loaded config always has the all-three default)", mode)
 	}
 	if !slices.Contains(c.AllowedDindModes, mode) {
 		return "", fmt.Errorf("dind_mode %q is not within allowed_dind_modes %v", mode, c.AllowedDindModes)
 	}
 	return mode, nil
+}
+
+// ValidateAllowedDindModes checks the operator ceiling is WELL-FORMED — a
+// non-empty list containing only valid modes (F10). An empty ceiling is
+// rejected here (never treated as fail-open "allow everything"), and any
+// invalid entry is rejected. This is the check provider.New runs at
+// construction so a hand-built or Load-bypassing caller cannot silently permit
+// every mode; it deliberately does NOT assert DindMode ∈ AllowedDindModes
+// (that relationship is enforced by Load's Validate and, defensively on every
+// create, by EffectiveDindMode).
+func (c Config) ValidateAllowedDindModes() error {
+	if len(c.AllowedDindModes) == 0 {
+		return fmt.Errorf("allowed_dind_modes must not be empty (an empty ceiling denies every mode; set it to a non-empty subset of %v)", allDindModes)
+	}
+	for _, m := range c.AllowedDindModes {
+		if !slices.Contains(allDindModes, m) {
+			return fmt.Errorf("allowed_dind_modes contains invalid mode %q: must be one of %v", m, allDindModes)
+		}
+	}
+	return nil
 }
 
 // validateStorageDriver checks StorageDriver against ADR-001's two

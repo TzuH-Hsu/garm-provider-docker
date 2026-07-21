@@ -26,15 +26,20 @@ func newDindTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	t.Helper()
 	fake := docker.NewFakeClient()
 	cfg := config.Config{
-		DockerHost:    "unix:///var/run/docker.sock",
-		RunnerImage:   "ghcr.io/example/runner@sha256:deadbeef",
-		DindMode:      config.DindModePrivilegedSidecar,
-		DindImage:     "docker:dind@sha256:beefdead",
-		StorageDriver: "overlay2",
-		Resources:     config.Resources{DindMemory: "4GiB"},
-		Network:       config.Network{EnableJobNetwork: true, Internal: false},
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModePrivilegedSidecar,
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
+		DindImage:        "docker:dind@sha256:beefdead",
+		StorageDriver:    "overlay2",
+		Resources:        config.Resources{DindMemory: "4GiB"},
+		Network:          config.Network{EnableJobNetwork: true, Internal: false},
 	}
-	return New(fake, cfg, "controller-abc"), fake
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+	return p, fake
 }
 
 func TestCreateInstanceDinDFullTopology(t *testing.T) {
@@ -102,8 +107,11 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if dind.HostConfig == nil || !dind.HostConfig.Privileged {
 		t.Errorf("sidecar Privileged = %v, want true", dind.HostConfig)
 	}
-	if dind.HostConfig.Runtime != "" {
-		t.Errorf("sidecar Runtime = %q, want empty (default runtime)", dind.HostConfig.Runtime)
+	// The RAW create request set no explicit runtime (privileged-sidecar uses
+	// the daemon default); inspect normalizes that to the daemon default (F13),
+	// so the meaningful assertion is that no explicit sysbox runtime was set.
+	if raw := fake.RawRuntime(spec.DindContainerName(name)); raw != "" {
+		t.Errorf("sidecar raw Runtime create request = %q, want empty (default runtime)", raw)
 	}
 	// dockerd argv carries the explicit storage driver from config and the
 	// explicit socket --group (F1).

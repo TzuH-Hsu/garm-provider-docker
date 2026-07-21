@@ -191,6 +191,14 @@ type fakeContainer struct {
 	// test can assert the DinD socket GID was added.
 	groupAdd []string
 
+	// rawRuntime is the Runtime EXACTLY as the create request set it — "" for
+	// privileged-sidecar (no explicit runtime), "sysbox-runc" for sysbox-runc.
+	// It is preserved separately from what ContainerInspect reports because the
+	// real daemon NORMALIZES an omitted runtime to the daemon default in
+	// inspect output (F13); tests that assert on the create request use
+	// RawRuntime, tests that assert on inspect see the normalized value.
+	rawRuntime string
+
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
 	state     string
@@ -359,6 +367,12 @@ const credentialTarTargetDir = "/run/garm"
 // tarFailureExitCode is the non-zero code the fake reports when the streamed
 // archive is not a valid tar, modeling `tar -x` failing.
 const tarFailureExitCode = 2
+
+// fakeDefaultRuntime is the daemon-default OCI runtime the fake reports for a
+// container created without an explicit Runtime (F13): the real daemon's
+// inspect output shows "runc", not the empty create-request value. RawRuntime
+// exposes the un-normalized create request for tests that assert on it.
+const fakeDefaultRuntime = "runc"
 
 // expectedCredentialTarExtractCmd is the exact argv the provider's
 // credentialDeliverCmd (internal/provider/create.go) builds for credential
@@ -544,6 +558,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
 		c.privileged = hostConfig.Privileged
 		c.runtime = hostConfig.Runtime
+		c.rawRuntime = hostConfig.Runtime
 		c.groupAdd = append([]string(nil), hostConfig.GroupAdd...)
 	}
 	f.containers[id] = c
@@ -558,6 +573,14 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 }
 
 // ContainerStart marks a previously created container as running.
+//
+// It models the real daemon rejecting a start whose prerequisites were removed
+// out from under it (F5): starting a container attached to a user-defined
+// network that no longer exists fails ("network … not found"), and so does
+// starting one whose required NAMED volume is gone. This is the class of bug
+// where a concurrent sweep deleted an in-flight allocation's network/volume and
+// the create's ContainerStart then "succeeded" anyway in a unit test while
+// failing on the live daemon; modeling the failure makes it fail in units too.
 func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ container.StartOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -568,6 +591,16 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	c := f.find(containerID)
 	if c == nil {
 		return notFoundf("container %s not found", containerID)
+	}
+	if isUserDefinedNetwork(c.networkMode) && f.findNetworkByName(c.networkMode) == nil && f.networks[c.networkMode] == nil {
+		return fmt.Errorf("failed to start container %s: network %s not found", containerID, c.networkMode)
+	}
+	for _, m := range c.mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			if _, ok := f.volumes[m.Source]; !ok {
+				return fmt.Errorf("failed to start container %s: volume %s not found", containerID, m.Source)
+			}
+		}
 	}
 	c.state = "running"
 	return nil
@@ -824,6 +857,19 @@ func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) er
 	if _, ok := f.volumes[volumeID]; !ok {
 		return notFoundf("volume %s not found", volumeID)
 	}
+	// F13(a): the real daemon rejects removing a volume still referenced by ANY
+	// container — running OR stopped — with a 409 "volume is in use", and force
+	// does NOT override that for a named volume with an existing container
+	// reference (force only suppresses the "no such volume" case). Model it so a
+	// teardown that tried to remove a volume before its container fails in units
+	// too, exactly as it would on the live daemon.
+	for _, c := range f.containers {
+		for _, m := range c.mounts {
+			if m.Type == mount.TypeVolume && m.Source == volumeID {
+				return conflictf("remove %s: volume is in use - [%s]", volumeID, c.id)
+			}
+		}
+	}
 	delete(f.volumes, volumeID)
 	f.RemoveOrder = append(f.RemoveOrder, "volume:"+volumeID)
 	return nil
@@ -866,8 +912,10 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		HostConfig: &container.HostConfig{
 			Tmpfs:      cloneLabels(c.tmpfsMounts),
 			Privileged: c.privileged,
-			Runtime:    c.runtime,
-			GroupAdd:   append([]string(nil), c.groupAdd...),
+			// F13: the daemon normalizes an omitted runtime to its default in
+			// inspect output; RawRuntime exposes the un-normalized request.
+			Runtime:  normalizeRuntime(c.runtime),
+			GroupAdd: append([]string(nil), c.groupAdd...),
 		},
 	}
 	if c.networkMode != "" {
@@ -914,6 +962,29 @@ func (c *fakeContainer) mountPoints() []types.MountPoint {
 		})
 	}
 	return out
+}
+
+// normalizeRuntime maps an omitted create-request runtime ("") to the daemon
+// default (F13), mirroring how the real daemon reports runtime in inspect
+// output. A non-empty runtime (e.g. "sysbox-runc") is reported verbatim.
+func normalizeRuntime(runtime string) string {
+	if runtime == "" {
+		return fakeDefaultRuntime
+	}
+	return runtime
+}
+
+// RawRuntime returns the Runtime EXACTLY as the container's create request set
+// it — "" when no explicit runtime was requested — un-normalized, for tests
+// that assert on what the builder emitted rather than on inspect output (F13).
+func (f *FakeClient) RawRuntime(containerID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if c := f.find(containerID); c != nil {
+		return c.rawRuntime
+	}
+	return ""
 }
 
 // isUserDefinedNetwork reports whether mode names a user-defined Docker

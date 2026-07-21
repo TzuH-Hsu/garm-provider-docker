@@ -3,6 +3,8 @@
 package provider
 
 import (
+	"fmt"
+
 	executionv010 "github.com/cloudbase/garm-provider-common/execution/v0.1.0"
 	"github.com/docker/docker/api/types/filters"
 
@@ -34,13 +36,23 @@ type Provider struct {
 // New constructs a Provider from its injected dependencies: the Docker
 // client, the parsed provider config, and the GARM controller ID (from
 // GARM_CONTROLLER_ID) that scopes every managed resource.
-func New(cli docker.Client, cfg config.Config, controllerID string) *Provider {
+//
+// It validates that the operator's dind_mode ceiling is well-formed at
+// construction (F10): a Config that reached the provider with an empty or
+// malformed allowed_dind_modes — a hand-built or Load-bypassing caller — is
+// rejected here rather than silently permitting every mode. main.go's real
+// path already runs config.Load's full Validate; this is the defensive
+// construction-time guard for any other caller.
+func New(cli docker.Client, cfg config.Config, controllerID string) (*Provider, error) {
+	if err := cfg.ValidateAllowedDindModes(); err != nil {
+		return nil, fmt.Errorf("invalid provider config: %w", err)
+	}
 	return &Provider{
 		cli:          cli,
 		cfg:          cfg,
 		controllerID: controllerID,
 		topo:         topology.New(cli, controllerID),
-	}
+	}, nil
 }
 
 // Compile-time assertion that *Provider satisfies the interface main.go

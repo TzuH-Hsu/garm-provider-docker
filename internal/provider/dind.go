@@ -126,20 +126,31 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 // This is a message-content heuristic, not an errdefs classification: the
 // real daemon reports an unknown runtime as a generic 400 (invalid
 // parameter), indistinguishable by status/error-kind alone from any other
-// malformed-create rejection. sysbox-runc itself has no install path on this
-// project's own dev daemon (macOS/Docker Desktop) any more than on Synology
-// DSM/Unraid, so this path is unit-verified only (docker.FakeClient
-// simulating the daemon's rejection message) — the real-daemon shape is
-// documented here from Docker's own published behavior, not reproduced live.
+// malformed-create rejection. To avoid MISdiagnosing an unrelated OCI failure
+// as a missing runtime (F12) — e.g. `OCI runtime create failed: … executable
+// file not found in $PATH`, which is the container entrypoint missing, not the
+// runtime — it requires BOTH signals: the message must name the CONFIGURED
+// runtime (e.g. "sysbox-runc") AND carry the canonical daemon missing-runtime
+// phrase "unknown runtime". An "executable file not found" error names neither,
+// so it is left to the caller's generic wrapping.
+//
+// sysbox-runc itself has no install path on this project's own dev daemon
+// (macOS/Docker Desktop) any more than on Synology DSM/Unraid, so this path is
+// unit-verified only (docker.FakeClient simulating the daemon's rejection
+// message) — the real-daemon shape is documented here from Docker's own
+// published behavior, not reproduced live.
 func runtimeUnavailableError(dindMode, runtime string, err error) error {
 	if runtime == "" || err == nil {
 		return nil
 	}
 	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "runtime") {
+	// Must name the CONFIGURED runtime — an OCI error about some other thing
+	// (a missing entrypoint binary, say) does not, so it is not misdiagnosed.
+	if !strings.Contains(msg, strings.ToLower(runtime)) {
 		return nil
 	}
-	if !strings.Contains(msg, "unknown") && !strings.Contains(msg, "not found") && !strings.Contains(msg, "no such") {
+	// AND carry the canonical daemon phrase for an unregistered runtime.
+	if !strings.Contains(msg, "unknown runtime") {
 		return nil
 	}
 	return fmt.Errorf("dind_mode=%s requires the %q runtime to be registered on the Docker daemon; it is not available: %w", dindMode, runtime, err)

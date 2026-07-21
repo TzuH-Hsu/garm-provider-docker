@@ -49,9 +49,14 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 	if got.HostConfig == nil || !got.HostConfig.Privileged {
 		t.Errorf("HostConfig.Privileged = %v, want true", got.HostConfig)
 	}
-	// Default runtime (privileged-sidecar) is empty.
-	if got.HostConfig.Runtime != "" {
-		t.Errorf("HostConfig.Runtime = %q, want empty (default runtime)", got.HostConfig.Runtime)
+	// F13: the RAW create request set no explicit runtime (privileged-sidecar),
+	// while ContainerInspect NORMALIZES that to the daemon default, exactly like
+	// the real daemon reports it.
+	if raw := f.RawRuntime(resp.ID); raw != "" {
+		t.Errorf("RawRuntime = %q, want empty (privileged-sidecar sets no explicit runtime)", raw)
+	}
+	if got.HostConfig.Runtime != fakeDefaultRuntime {
+		t.Errorf("inspected HostConfig.Runtime = %q, want the normalized daemon default %q", got.HostConfig.Runtime, fakeDefaultRuntime)
 	}
 	// Both DinD mounts surface under .Mounts.
 	haveSocket, haveState := false, false

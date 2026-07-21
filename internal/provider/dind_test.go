@@ -12,6 +12,25 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 )
 
+// TestNewRejectsEmptyOrMalformedCeiling is the F10 construction guard: a
+// hand-built or Load-bypassing Config whose allowed_dind_modes is empty or
+// malformed is rejected at provider construction, so it can never silently
+// permit every mode. A well-formed non-empty ceiling constructs fine, even
+// without dind_mode being a member (that is deferred to the create path).
+func TestNewRejectsEmptyOrMalformedCeiling(t *testing.T) {
+	fake := docker.NewFakeClient()
+
+	if _, err := New(fake, config.Config{AllowedDindModes: nil}, "controller-abc"); err == nil {
+		t.Error("New with an empty allowed_dind_modes must fail closed (F10), got nil")
+	}
+	if _, err := New(fake, config.Config{AllowedDindModes: []string{"bogus"}}, "controller-abc"); err == nil {
+		t.Error("New with an invalid allowed_dind_modes entry must fail, got nil")
+	}
+	if _, err := New(fake, config.Config{AllowedDindModes: []string{config.DindModeNone}}, "controller-abc"); err != nil {
+		t.Errorf("New with a well-formed ceiling returned unexpected error: %v", err)
+	}
+}
+
 // TestResolveDindModeWithinCeiling confirms resolveDindMode passes through
 // the config's dind_mode unchanged when it is within allowed_dind_modes —
 // the ordinary case (config.Load's own Validate already guarantees this for
@@ -22,7 +41,10 @@ func TestResolveDindModeWithinCeiling(t *testing.T) {
 		DindMode:         config.DindModePrivilegedSidecar,
 		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
 	}
-	p := New(fake, cfg, "controller-abc")
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
 
 	got, err := p.resolveDindMode()
 	if err != nil {
@@ -46,9 +68,15 @@ func TestResolveDindModeOutsideCeilingErrors(t *testing.T) {
 		DindMode:         config.DindModePrivilegedSidecar,
 		AllowedDindModes: []string{config.DindModeNone}, // ceiling excludes DindMode
 	}
-	p := New(fake, cfg, "controller-abc")
+	// The ceiling is well-formed (non-empty, valid entries), so construction
+	// succeeds; the DindMode-outside-ceiling violation is caught on the create
+	// path by resolveDindMode, not at construction (F10 keeps that split).
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
 
-	_, err := p.resolveDindMode()
+	_, err = p.resolveDindMode()
 	if err == nil {
 		t.Fatal("resolveDindMode() succeeded, want an error (dind_mode outside allowed_dind_modes)")
 	}
@@ -76,11 +104,14 @@ func TestCreateInstanceFailsClosedWhenDindModeOutsideCeiling(t *testing.T) {
 		AllowedDindModes: []string{config.DindModeNone}, // ceiling excludes DindMode
 		Network:          config.Network{EnableJobNetwork: true, Internal: false},
 	}
-	p := New(fake, cfg, "controller-abc")
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
 
 	// Metadata URL is deliberately unreachable: the ceiling check must trip
 	// before credentials are ever fetched, exactly like platform validation.
-	_, err := p.CreateInstance(context.Background(), jitBootstrap("https://metadata.invalid/"))
+	_, err = p.CreateInstance(context.Background(), jitBootstrap("https://metadata.invalid/"))
 	if err == nil {
 		t.Fatal("expected CreateInstance to fail closed on a dind_mode outside allowed_dind_modes, got nil")
 	}

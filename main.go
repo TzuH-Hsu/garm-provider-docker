@@ -44,7 +44,11 @@ func run() int {
 		return 1
 	}
 
-	prov := provider.New(cli, cfg, env.ControllerID)
+	prov, err := provider.New(cli, cfg, env.ControllerID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to construct provider: %s\n", err)
+		return 1
+	}
 
 	result, err := env.Run(ctx, prov)
 	if err != nil {
