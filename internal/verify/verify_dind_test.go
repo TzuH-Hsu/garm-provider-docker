@@ -41,12 +41,11 @@ const dindImageDigest = "docker@sha256:bfec1f5159c63a81ca6fdedbd81404d2c0e16378e
 
 const wp3Instance = "wp3-verify-01"
 
-// WP3 derived resource names must match internal/spec's name builders.
-func wp3Net() string       { return wp3Instance + "-net" }
-func wp3Workspace() string { return wp3Instance + "-workspace" }
-func wp3Socket() string    { return wp3Instance + "-socket" }
-func wp3DindState() string { return wp3Instance + "-dind-state" }
-func wp3DindName() string  { return wp3Instance + "-dind" }
+// WP3 derived resource names must match internal/spec's name builders. The
+// network/sidecar names are stable per instance; the volume names are
+// generation-nonce-embedded (F4) and discovered by label at runtime.
+func wp3Net() string      { return wp3Instance + "-net" }
+func wp3DindName() string { return wp3Instance + "-dind" }
 
 func wp3Bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	return params.BootstrapInstance{
@@ -188,6 +187,13 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	runnerID := created.ProviderID
 	t.Logf("[create] runner provider_id=%s; sidecar=%s", runnerID, wp3DindName())
 
+	// F4: the three job-scoped volumes carry generation-nonce names, discovered
+	// by resource label rather than reconstructed.
+	wp3Workspace := volumeNameByResource(t, controllerID, "workspace")
+	wp3Socket := volumeNameByResource(t, controllerID, "socket")
+	wp3DindState := volumeNameByResource(t, controllerID, "dind-state")
+	t.Logf("[create] generation-nonce volume names: workspace=%s socket=%s dind-state=%s", wp3Workspace, wp3Socket, wp3DindState)
+
 	// Topology sanity: sidecar + both DinD volumes exist and are labeled.
 	dindPriv := dockerOut(t, "inspect", wp3DindName(), "-f", "{{.HostConfig.Privileged}}")
 	dindCmd := dockerOut(t, "inspect", wp3DindName(), "-f", "{{json .Config.Cmd}}")
@@ -199,7 +205,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	if !strings.Contains(dindCmd, "--storage-driver=overlay2") {
 		t.Errorf("sidecar dockerd cmd missing --storage-driver=overlay2: %s", dindCmd)
 	}
-	for _, v := range []string{wp3Workspace(), wp3Socket(), wp3DindState()} {
+	for _, v := range []string{wp3Workspace, wp3Socket, wp3DindState} {
 		if _, err := dockerTry("volume", "inspect", v); err != nil {
 			t.Errorf("[topology] job volume %q missing: %v", v, err)
 		}
@@ -284,9 +290,9 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	assertGone(t, "runner", "inspect", runnerID)
 	assertGone(t, "sidecar", "inspect", wp3DindName())
 	assertGone(t, "network", "network", "inspect", wp3Net())
-	assertGone(t, "workspace volume", "volume", "inspect", wp3Workspace())
-	assertGone(t, "socket volume", "volume", "inspect", wp3Socket())
-	assertGone(t, "dind-state volume", "volume", "inspect", wp3DindState())
+	assertGone(t, "workspace volume", "volume", "inspect", wp3Workspace)
+	assertGone(t, "socket volume", "volume", "inspect", wp3Socket)
+	assertGone(t, "dind-state volume", "volume", "inspect", wp3DindState)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("(W3-e) %d managed resources remain after delete, want 0", n)
 	} else {

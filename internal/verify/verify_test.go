@@ -44,9 +44,26 @@ const (
 	bearer        = "Bearer " + instanceToken
 )
 
-// derived resource names must match internal/spec's name builders.
-func jobNetworkName() string   { return instanceName + "-net" }
-func workspaceVolName() string { return instanceName + "-workspace" }
+// jobNetworkName must match internal/spec's stable claim-marker network name.
+func jobNetworkName() string { return instanceName + "-net" }
+
+// volumeNameByResource discovers a managed volume's ACTUAL name by its
+// controller-id + resource labels. As of F4 the workspace/socket/dind-state
+// volume names embed the allocation's create-nonce (<instance>-<nonce>-<kind>),
+// which the harness does not know up front, so it must resolve the name by label
+// rather than reconstruct it. It fails unless exactly one volume matches.
+func volumeNameByResource(t *testing.T, controllerID, resource string) string {
+	t.Helper()
+	out := dockerOut(t, "volume", "ls",
+		"--filter", "label=garm.docker/controller-id="+controllerID,
+		"--filter", "label=garm.docker/resource="+resource,
+		"--format", "{{.Name}}")
+	names := lines(out)
+	if len(names) != 1 {
+		t.Fatalf("want exactly one %q volume for controller %s, got %v", resource, controllerID, names)
+	}
+	return names[0]
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -273,12 +290,14 @@ allow_unpinned_runner_image = true
 		t.Logf("[f] outbound egress works on the default internal=false network; api.github.com/zen replied: %q", strings.TrimSpace(egressOut))
 	}
 
-	// (b) workspace volume exists, labeled, mounted at the runner workdir.
-	volLabels := dockerOut(t, "volume", "inspect", workspaceVolName(), "-f",
+	// (b) workspace volume exists, labeled, mounted at the runner workdir. Its
+	// name is generation-nonce-embedded (F4), so discover it by label.
+	wsVol := volumeNameByResource(t, controllerID, "workspace")
+	volLabels := dockerOut(t, "volume", "inspect", wsVol, "-f",
 		"managed={{index .Labels \"garm.docker/managed\"}} resource={{index .Labels \"garm.docker/resource\"}} instance={{index .Labels \"garm.docker/instance-name\"}}")
-	t.Logf("[b] workspace volume %s labels: %s", workspaceVolName(), volLabels)
+	t.Logf("[b] workspace volume %s labels: %s", wsVol, volLabels)
 	mountTarget := dockerOut(t, "inspect", containerID, "-f",
-		"{{range .Mounts}}{{if eq .Name \""+workspaceVolName()+"\"}}{{.Destination}}{{end}}{{end}}")
+		"{{range .Mounts}}{{if eq .Name \""+wsVol+"\"}}{{.Destination}}{{end}}{{end}}")
 	t.Logf("[b] workspace mount destination: %s", mountTarget)
 	if mountTarget != "/actions-runner/_work" {
 		t.Errorf("(b) workspace volume mounted at %q, want /actions-runner/_work", mountTarget)
@@ -334,7 +353,9 @@ allow_unpinned_runner_image = true
 	}
 	assertGone(t, "container", "inspect", containerID)
 	assertGone(t, "network", "network", "inspect", jobNetworkName())
-	assertGone(t, "volume", "volume", "inspect", workspaceVolName())
+	// wsVol was discovered above (its generation-nonce name), so assert that
+	// exact volume is gone.
+	assertGone(t, "volume", "volume", "inspect", wsVol)
 	t.Logf("[d] DeleteInstance removed container + network + volume")
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("(d) %d managed resources remain for this controller after delete, want 0", n)

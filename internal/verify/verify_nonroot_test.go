@@ -42,11 +42,8 @@ import (
 
 const nrInstance = "nr-verify-01"
 
-func nrNet() string       { return nrInstance + "-net" }
-func nrWorkspace() string { return nrInstance + "-workspace" }
-func nrSocket() string    { return nrInstance + "-socket" }
-func nrDindState() string { return nrInstance + "-dind-state" }
-func nrDindName() string  { return nrInstance + "-dind" }
+func nrNet() string      { return nrInstance + "-net" }
+func nrDindName() string { return nrInstance + "-dind" }
 
 func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	return params.BootstrapInstance{
@@ -140,6 +137,20 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	runnerTag := "garm-nr-verify-cli:latest"
 	buildNonRootRunnerImage(t, root, runnerTag)
 
+	// N3: GID 2000 (spec.DindSocketGID) must be ABSENT in the freshly built image
+	// BEFORE the entrypoint runs. The F1 regression relies on the base image NOT
+	// pre-declaring this group — ensure_docker_socket_group must CREATE it, and
+	// the F1 bug was exactly that create path aborting under `set -e` on a clean
+	// image with no GID 2000. If a future base-image change pre-created GID 2000,
+	// F1 would go green without ever exercising the group-create path this harness
+	// guards; assert its absence so that silent weakening fails loudly here.
+	// `getent group 2000` exits non-zero when the group is absent (the wanted
+	// state); a zero exit means it already exists.
+	if out, err := dockerTry("run", "--rm", "--entrypoint", "getent", runnerTag, "group", spec.DindSocketGID); err == nil {
+		t.Fatalf("[N3] GID %s already exists in the freshly built image before the entrypoint runs (getent: %q); the F1 group-create path would be silently skipped", spec.DindSocketGID, strings.TrimSpace(out))
+	}
+	t.Logf("[N3] GID %s absent in the freshly built image pre-entrypoint — the F1 group-create path stays load-bearing", spec.DindSocketGID)
+
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = root
@@ -196,6 +207,13 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	}
 	runnerName := spec.RunnerContainerName(nrInstance)
 	t.Logf("[create] provider_id=%s; runner container=%s; sidecar=%s", created.ProviderID, runnerName, nrDindName())
+
+	// F4: the three job-scoped volumes carry generation-nonce names the harness
+	// does not know up front, so discover their ACTUAL names by resource label.
+	nrWorkspace := volumeNameByResource(t, controllerID, "workspace")
+	nrSocket := volumeNameByResource(t, controllerID, "socket")
+	nrDindState := volumeNameByResource(t, controllerID, "dind-state")
+	t.Logf("[create] generation-nonce volume names: workspace=%s socket=%s dind-state=%s", nrWorkspace, nrSocket, nrDindState)
 
 	// F1 topology: the runner carries the DinD socket GID as a supplementary
 	// group, and dockerd was launched with the matching --group.
@@ -302,9 +320,9 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	assertGone(t, "runner", "inspect", runnerName)
 	assertGone(t, "sidecar", "inspect", nrDindName())
 	assertGone(t, "network", "network", "inspect", nrNet())
-	assertGone(t, "workspace volume", "volume", "inspect", nrWorkspace())
-	assertGone(t, "socket volume", "volume", "inspect", nrSocket())
-	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState())
+	assertGone(t, "workspace volume", "volume", "inspect", nrWorkspace)
+	assertGone(t, "socket volume", "volume", "inspect", nrSocket)
+	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("[F4] %d managed resources remain after delete, want 0", n)
 	} else {
@@ -332,6 +350,11 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	if !waitForDindReady(t, nrDindName()) {
 		t.Fatalf("[F6] dind daemon never became ready on re-create")
 	}
+	// The re-create is a NEW generation with a NEW nonce, so re-discover the
+	// (differently-named) volumes by label before asserting they are reaped.
+	nrWorkspace2 := volumeNameByResource(t, controllerID, "workspace")
+	nrSocket2 := volumeNameByResource(t, controllerID, "socket")
+	nrDindState2 := volumeNameByResource(t, controllerID, "dind-state")
 	// Remove ONLY the runner container out of band, leaving the privileged
 	// sidecar + network + volumes behind — exactly the leak F6 closes.
 	if out, err := dockerTry("rm", "-f", runnerName); err != nil {
@@ -347,9 +370,9 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	}
 	assertGone(t, "leaked sidecar", "inspect", nrDindName())
 	assertGone(t, "network", "network", "inspect", nrNet())
-	assertGone(t, "workspace volume", "volume", "inspect", nrWorkspace())
-	assertGone(t, "socket volume", "volume", "inspect", nrSocket())
-	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState())
+	assertGone(t, "workspace volume", "volume", "inspect", nrWorkspace2)
+	assertGone(t, "socket volume", "volume", "inspect", nrSocket2)
+	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState2)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("[F6] %d managed resources leaked after delete-by-provider_id with the runner gone, want 0", n)
 	} else {
