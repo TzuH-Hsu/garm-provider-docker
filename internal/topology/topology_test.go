@@ -50,7 +50,7 @@ func seedWorkspaceVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID,
 	if nonce != "" {
 		labels[spec.LabelCreateNonce] = nonce
 	}
-	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.WorkspaceVolumeName(name), Labels: labels}); err != nil {
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.WorkspaceVolumeName(name, nonce), Labels: labels}); err != nil {
 		t.Fatalf("seed VolumeCreate for %q returned unexpected error: %v", name, err)
 	}
 }
@@ -62,7 +62,7 @@ func seedSocketVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID, na
 	if nonce != "" {
 		labels[spec.LabelCreateNonce] = nonce
 	}
-	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.SocketVolumeName(name), Labels: labels}); err != nil {
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.SocketVolumeName(name, nonce), Labels: labels}); err != nil {
 		t.Fatalf("seed socket VolumeCreate for %q returned unexpected error: %v", name, err)
 	}
 }
@@ -74,7 +74,7 @@ func seedDindStateVolumeFor(t *testing.T, fake *docker.FakeClient, controllerID,
 	if nonce != "" {
 		labels[spec.LabelCreateNonce] = nonce
 	}
-	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.DindStateVolumeName(name), Labels: labels}); err != nil {
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.DindStateVolumeName(name, nonce), Labels: labels}); err != nil {
 		t.Fatalf("seed dind-state VolumeCreate for %q returned unexpected error: %v", name, err)
 	}
 }
@@ -325,7 +325,8 @@ func TestCreateWorkspaceVolumeFresh(t *testing.T) {
 	if err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
 		t.Fatalf("CreateWorkspaceVolume returned unexpected error: %v", err)
 	}
-	v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1"))
+	// The volume name is generation-unique (F4): <instance>-<nonce>-workspace.
+	v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "nonce-1"))
 	if v.Labels[spec.LabelResource] != spec.ResourceWorkspace ||
 		v.Labels[spec.LabelInstanceName] != "job-1" ||
 		v.Labels[spec.LabelCreateNonce] != "nonce-1" {
@@ -333,16 +334,65 @@ func TestCreateWorkspaceVolumeFresh(t *testing.T) {
 	}
 }
 
+// TestCreateWorkspaceVolumePriorGenerationNameDiffers is the F4 create-level
+// structural guard: a stale workspace volume left by a crashed PRIOR generation
+// of the same instance name carries that generation's nonce, so its name
+// (<instance>-<staleNonce>-workspace) DIFFERS from the fresh generation's name
+// (<instance>-<freshNonce>-workspace). The fresh create therefore never
+// idempotent-hits it and never reuses its content — the two volumes are
+// distinct by construction. (The stale one is reaped by the pre-create sweep /
+// teardown, not by create.)
+func TestCreateWorkspaceVolumePriorGenerationNameDiffers(t *testing.T) {
+	m, fake := newManager(t)
+	// A stale prior-generation workspace volume with residue, at ITS OWN
+	// generation-unique name (nonce "stale-gen").
+	staleLabels := identityFor("job-1").WorkspaceVolumeLabels(time.Now().Add(-time.Hour))
+	staleLabels[spec.LabelCreateNonce] = "stale-gen"
+	staleLabels["test.residue"] = "prior-job"
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
+		Name:   spec.WorkspaceVolumeName("job-1", "stale-gen"),
+		Labels: staleLabels,
+	}); err != nil {
+		t.Fatalf("seed stale VolumeCreate returned unexpected error: %v", err)
+	}
+
+	if err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "fresh-gen"); err != nil {
+		t.Fatalf("CreateWorkspaceVolume returned unexpected error: %v", err)
+	}
+
+	// The fresh volume is a DISTINCT, empty resource under a different name.
+	fresh := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "fresh-gen"))
+	if fresh.Labels[spec.LabelCreateNonce] != "fresh-gen" {
+		t.Errorf("fresh workspace nonce = %q, want fresh-gen", fresh.Labels[spec.LabelCreateNonce])
+	}
+	if _, residual := fresh.Labels["test.residue"]; residual {
+		t.Error("[F4] fresh generation reused stale content: residue label present on the fresh volume")
+	}
+	// Both volumes coexist under distinct names — the stale one was NOT
+	// name-collided/replaced by create (it is the sweep's job, not create's).
+	if countVolumes(t, fake) != 2 {
+		t.Errorf("volume count = %d, want 2 (stale + fresh under distinct generation-unique names)", countVolumes(t, fake))
+	}
+}
+
+// TestCreateWorkspaceVolumeReplacesStaleContent exercises createFreshVolume's
+// ownership-validated replace path — now defense-in-depth behind the F4
+// generation-unique names. Since a fresh generation's name embeds its own
+// nonce, the ONLY way VolumeCreate can still idempotent-hit an existing volume
+// is at THIS generation's own name (e.g. a retried create step within one
+// attempt). We model that adversarial case: a volume already sitting at the
+// generation-unique name but carrying a DIFFERENT (stale) nonce label and
+// residue. createFreshVolume must detect the nonce mismatch, confirm the
+// ownership tuple, and replace it with a fresh, empty volume.
 func TestCreateWorkspaceVolumeReplacesStaleContent(t *testing.T) {
 	m, fake := newManager(t)
-	// A stale workspace volume from a crashed prior allocation of the same
-	// instance name, carrying a DIFFERENT nonce and a residue marker. Because
-	// VolumeCreate is idempotent, a naive create would silently reuse it.
+	// A stale-labeled volume occupying THIS generation's own name (nonce
+	// "fresh-nonce" in the name) but tagged with a stale nonce + residue.
 	staleLabels := identityFor("job-1").WorkspaceVolumeLabels(time.Now().Add(-time.Hour))
 	staleLabels[spec.LabelCreateNonce] = "stale-nonce"
 	staleLabels["test.residue"] = "prior-job"
 	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
-		Name:   spec.WorkspaceVolumeName("job-1"),
+		Name:   spec.WorkspaceVolumeName("job-1", "fresh-nonce"),
 		Labels: staleLabels,
 	}); err != nil {
 		t.Fatalf("seed stale VolumeCreate returned unexpected error: %v", err)
@@ -356,7 +406,7 @@ func TestCreateWorkspaceVolumeReplacesStaleContent(t *testing.T) {
 	if countVolumes(t, fake) != 1 {
 		t.Errorf("volume count = %d, want 1", countVolumes(t, fake))
 	}
-	v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1"))
+	v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "fresh-nonce"))
 	if v.Labels[spec.LabelCreateNonce] != "fresh-nonce" {
 		t.Errorf("workspace nonce = %q, want fresh-nonce (stale volume not replaced)", v.Labels[spec.LabelCreateNonce])
 	}
@@ -381,8 +431,10 @@ func TestCreateWorkspaceVolumeCreateErrorSurfaces(t *testing.T) {
 // data.
 func TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume(t *testing.T) {
 	m, fake := newManager(t)
+	// A foreign volume occupying THIS generation's own name (nonce "nonce-1")
+	// so the idempotent VolumeCreate hits it and the refuse path is exercised.
 	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
-		Name:   spec.WorkspaceVolumeName("job-1"),
+		Name:   spec.WorkspaceVolumeName("job-1", "nonce-1"),
 		Labels: map[string]string{"some.other/label": "x"},
 	}); err != nil {
 		t.Fatalf("seed foreign VolumeCreate returned unexpected error: %v", err)
@@ -396,7 +448,7 @@ func TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume(t *testing.T) {
 	if countVolumes(t, fake) != 1 {
 		t.Errorf("volume count = %d, want 1 (foreign untouched)", countVolumes(t, fake))
 	}
-	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels["some.other/label"] != "x" {
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "nonce-1")); v.Labels["some.other/label"] != "x" {
 		t.Errorf("foreign volume labels = %v, want the original foreign label untouched", v.Labels)
 	}
 }
@@ -410,8 +462,9 @@ func TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume(t *testing.T
 	other := spec.AllocationIdentity{ControllerID: "other-controller", PoolID: "pool-1", InstanceName: "job-1"}
 	labels := other.WorkspaceVolumeLabels(time.Now())
 	labels[spec.LabelCreateNonce] = "theirs"
+	// Occupy THIS generation's own name so the idempotent VolumeCreate hits it.
 	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
-		Name:   spec.WorkspaceVolumeName("job-1"),
+		Name:   spec.WorkspaceVolumeName("job-1", "nonce-1"),
 		Labels: labels,
 	}); err != nil {
 		t.Fatalf("seed other-controller VolumeCreate returned unexpected error: %v", err)
@@ -423,7 +476,7 @@ func TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume(t *testing.T
 	if countVolumes(t, fake) != 1 {
 		t.Errorf("volume count = %d, want 1 (other-controller volume untouched)", countVolumes(t, fake))
 	}
-	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "theirs" {
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "nonce-1")); v.Labels[spec.LabelCreateNonce] != "theirs" {
 		t.Error("an other-controller volume was replaced (nonce no longer theirs)")
 	}
 }
@@ -435,7 +488,7 @@ func TestCreateSocketVolumeFresh(t *testing.T) {
 	if err := m.CreateSocketVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
 		t.Fatalf("CreateSocketVolume returned unexpected error: %v", err)
 	}
-	v := findVolume(t, fake, spec.SocketVolumeName("job-1"))
+	v := findVolume(t, fake, spec.SocketVolumeName("job-1", "nonce-1"))
 	if v.Labels[spec.LabelResource] != spec.ResourceSocket ||
 		v.Labels[spec.LabelInstanceName] != "job-1" ||
 		v.Labels[spec.LabelCreateNonce] != "nonce-1" {
@@ -448,7 +501,7 @@ func TestCreateDindStateVolumeFresh(t *testing.T) {
 	if err := m.CreateDindStateVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
 		t.Fatalf("CreateDindStateVolume returned unexpected error: %v", err)
 	}
-	v := findVolume(t, fake, spec.DindStateVolumeName("job-1"))
+	v := findVolume(t, fake, spec.DindStateVolumeName("job-1", "nonce-1"))
 	if v.Labels[spec.LabelResource] != spec.ResourceDindState ||
 		v.Labels[spec.LabelInstanceName] != "job-1" ||
 		v.Labels[spec.LabelCreateNonce] != "nonce-1" {
@@ -465,8 +518,10 @@ func TestCreateSocketVolumeReplacesStaleContent(t *testing.T) {
 	staleLabels := identityFor("job-1").SocketVolumeLabels(time.Now().Add(-time.Hour))
 	staleLabels[spec.LabelCreateNonce] = "stale-nonce"
 	staleLabels["test.residue"] = "prior-socket"
+	// Occupy THIS generation's own name (nonce "fresh-nonce") with a stale nonce
+	// label, so the idempotent VolumeCreate hits it and the replace path runs.
 	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
-		Name:   spec.SocketVolumeName("job-1"),
+		Name:   spec.SocketVolumeName("job-1", "fresh-nonce"),
 		Labels: staleLabels,
 	}); err != nil {
 		t.Fatalf("seed stale socket VolumeCreate returned unexpected error: %v", err)
@@ -478,7 +533,7 @@ func TestCreateSocketVolumeReplacesStaleContent(t *testing.T) {
 	if countVolumes(t, fake) != 1 {
 		t.Errorf("volume count = %d, want 1", countVolumes(t, fake))
 	}
-	v := findVolume(t, fake, spec.SocketVolumeName("job-1"))
+	v := findVolume(t, fake, spec.SocketVolumeName("job-1", "fresh-nonce"))
 	if v.Labels[spec.LabelCreateNonce] != "fresh-nonce" {
 		t.Errorf("socket nonce = %q, want fresh-nonce (stale volume not replaced)", v.Labels[spec.LabelCreateNonce])
 	}
@@ -631,11 +686,14 @@ func TestTeardownRemovesNetworkLast(t *testing.T) {
 // F4 T1/T2/gen-B interleave: a teardown of generation A captures A's nonce, then
 // — in the window between that capture and its per-kind volume removal — a peer
 // teardown finishes removing A and a concurrent CreateInstance claims generation
-// B, creating B's fresh network + volume under the SAME deterministic names but
-// a NEW nonce. Before the fix, the still-running teardown enumerated volumes
-// purely by instance-name and deleted B's brand-new volume. With generation
-// scoping, the teardown removes only nonce-A resources, so B's volume AND
-// network survive.
+// B, creating B's fresh CLAIM NETWORK under the SAME stable name (the network is
+// the dedup primitive, so its name never changes) and B's workspace volume under
+// a generation-UNIQUE name embedding B's nonce. Before the fix, the still-running
+// teardown enumerated volumes purely by instance-name and deleted B's brand-new
+// volume. This test exercises the generation-nonce GATE (now defense-in-depth
+// behind the unique names) — it still protects the stable-named claim network,
+// and it also protects B's volume even though the VolumeListHook makes B's volume
+// appear in the teardown's own list snapshot.
 //
 // The interleave is driven deterministically via the fake's VolumeListHook,
 // which fires exactly when the teardown lists volumes for removal (T2's
@@ -654,8 +712,8 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 			ctx := context.Background()
 			// T1 finishes tearing down generation A (its runner is already gone —
 			// removeContainers ran before this volume list — so its volume and
-			// claim network can be removed).
-			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1"), true); err != nil {
+			// claim network can be removed). Gen-A's volume name embeds gen-a.
+			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1", "gen-a"), true); err != nil {
 				t.Errorf("hook: removing gen-A volume: %v", err)
 			}
 			nets, err := fake.NetworkList(ctx, network.ListOptions{})
@@ -670,7 +728,8 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 				}
 			}
 			// A concurrent CreateInstance claims generation B: fresh claim network
-			// and workspace volume, SAME deterministic names, a DIFFERENT nonce.
+			// (SAME stable name) and workspace volume (DIFFERENT, gen-b-embedding
+			// name), a DIFFERENT nonce.
 			seedNetworkFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
 			seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
 		})
@@ -692,7 +751,7 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 	if countVolumes(t, fake) != 1 {
 		t.Fatalf("volume count = %d, want 1 (generation B's fresh volume survives)", countVolumes(t, fake))
 	}
-	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "gen-b")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
 		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — a stale teardown deleted the newer generation's volume", v.Labels[spec.LabelCreateNonce])
 	}
 	if countNetworks(t, fake) != 1 {
@@ -721,7 +780,7 @@ func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testin
 			ctx := context.Background()
 			// Remove the orphan leftover (as a peer teardown would) and let a fresh
 			// generation B claim the name: a live claim network + volume appear.
-			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1"), true); err != nil {
+			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1", "orphan"), true); err != nil {
 				t.Errorf("hook: removing orphan volume: %v", err)
 			}
 			seedNetworkFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
@@ -735,12 +794,91 @@ func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testin
 
 	// Generation B's volume and network survive: the fallback protected the nonce
 	// the live claim network holds (refreshLive re-read it before removing).
-	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "gen-b")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
 		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — the fallback deleted a newer generation's volume", v.Labels[spec.LabelCreateNonce])
 	}
 	if countNetworks(t, fake) != 1 {
 		t.Errorf("network count = %d, want 1 (generation B's claim network survives the fallback)", countNetworks(t, fake))
 	}
+}
+
+// TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave is the
+// F4 STRUCTURAL guard the older VolumeListHook tests did not exercise (the
+// interleave codex flagged): generation B's volume appears AFTER the teardown's
+// volume-list snapshot but strictly BEFORE the teardown physically removes the
+// (generation A) volume it read from that snapshot. Because volume names are now
+// generation-UNIQUE (F4), B's volume has a DIFFERENT name than anything in the
+// teardown's snapshot, so the teardown — which removes only the exact names it
+// enumerated — can NEVER name-collide with B's fresh volume. This is the TOCTOU
+// removed by construction: the name protection here is independent of the
+// generation-nonce gate (B's volume is never even enumerated by this teardown,
+// so mayRemove is never consulted for it).
+//
+// The boundary is driven deterministically by the fake's VolumeRemoveHook, which
+// fires immediately before each VolumeRemove — i.e. after the list snapshot,
+// exactly where the old name-based bug struck.
+func TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+	// Generation A: claim network + workspace volume + a running runner.
+	seedNetworkFor(t, fake, testControllerID, "job-1", now, "gen-a")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "gen-a")
+	seedRunnerFor(t, fake, testControllerID, "job-1", now, "gen-a", "running")
+
+	genAVol := spec.WorkspaceVolumeName("job-1", "gen-a")
+	genBVol := spec.WorkspaceVolumeName("job-1", "gen-b")
+
+	var once sync.Once
+	hookFired := false
+	fake.VolumeRemoveHook = func(name string) {
+		// Fire exactly at the boundary: the teardown is about to remove gen-A's
+		// volume (the name it snapshotted). A concurrent CreateInstance claims
+		// generation B and creates B's workspace volume under B's OWN, DIFFERENT
+		// generation-unique name — after the snapshot, before this remove.
+		if name != genAVol {
+			return
+		}
+		once.Do(func() {
+			hookFired = true
+			seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
+		})
+	}
+
+	if _, err := m.TeardownAllocation(context.Background(), "job-1"); err != nil {
+		t.Fatalf("TeardownAllocation returned unexpected error: %v", err)
+	}
+	if !hookFired {
+		t.Fatal("VolumeRemoveHook never fired at the gen-A volume-remove boundary; the interleave was not exercised")
+	}
+
+	// Generation A's volume is gone; generation B's DIFFERENTLY-NAMED volume is
+	// untouched — the teardown physically could not have named it.
+	if _, err := fake.VolumeList(context.Background(), volume.ListOptions{}); err != nil {
+		t.Fatalf("VolumeList returned unexpected error: %v", err)
+	}
+	if countVolumes(t, fake) != 1 {
+		t.Fatalf("volume count = %d, want 1 (only generation B's fresh volume survives)", countVolumes(t, fake))
+	}
+	surviving := findVolume(t, fake, genBVol)
+	if surviving.Labels[spec.LabelCreateNonce] != "gen-b" {
+		t.Errorf("[F4] surviving volume = %q nonce=%q, want %q (gen-b) — a stale teardown removed the newer generation's volume", surviving.Name, surviving.Labels[spec.LabelCreateNonce], genBVol)
+	}
+	// And gen-A's volume really was removed by name.
+	for _, v := range volumesSnapshot(t, fake) {
+		if v.Name == genAVol {
+			t.Errorf("[F4] generation A's volume %q survived teardown, want removed", genAVol)
+		}
+	}
+}
+
+// volumesSnapshot returns all volumes in the fake, for name assertions.
+func volumesSnapshot(t *testing.T, fake *docker.FakeClient) []*volume.Volume {
+	t.Helper()
+	out, err := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if err != nil {
+		t.Fatalf("VolumeList returned unexpected error: %v", err)
+	}
+	return out.Volumes
 }
 
 // TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined is the F7 guard: when the
@@ -818,12 +956,13 @@ func TestTeardownAllocationJoinsNetworkRemovalError(t *testing.T) {
 
 func TestCreateWorkspaceVolumeStaleReplaceRemoveErrorSurfaces(t *testing.T) {
 	m, fake := newManager(t)
-	// A stale volume with a different nonce forces the remove-and-recreate path;
-	// a VolumeRemove failure there must surface.
+	// A stale-labeled volume occupying THIS generation's own name (nonce
+	// "fresh-nonce") but tagged with a different nonce forces the idempotent-hit
+	// remove-and-recreate path; a VolumeRemove failure there must surface.
 	staleLabels := identityFor("job-1").WorkspaceVolumeLabels(time.Now().Add(-time.Hour))
 	staleLabels[spec.LabelCreateNonce] = "stale-nonce"
 	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
-		Name:   spec.WorkspaceVolumeName("job-1"),
+		Name:   spec.WorkspaceVolumeName("job-1", "fresh-nonce"),
 		Labels: staleLabels,
 	}); err != nil {
 		t.Fatalf("seed stale VolumeCreate returned unexpected error: %v", err)

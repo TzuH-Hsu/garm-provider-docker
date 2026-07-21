@@ -77,9 +77,9 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 		volName  string
 		resource string
 	}{
-		{spec.WorkspaceVolumeName(name), spec.ResourceWorkspace},
-		{spec.SocketVolumeName(name), spec.ResourceSocket},
-		{spec.DindStateVolumeName(name), spec.ResourceDindState},
+		{spec.WorkspaceVolumeName(name, nonce), spec.ResourceWorkspace},
+		{spec.SocketVolumeName(name, nonce), spec.ResourceSocket},
+		{spec.DindStateVolumeName(name, nonce), spec.ResourceDindState},
 	} {
 		v, ok := volByName(t, fake, tc.volName)
 		if !ok {
@@ -115,8 +115,8 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	if string(dind.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
 		t.Errorf("sidecar NetworkMode = %q, want the job network", dind.HostConfig.NetworkMode)
 	}
-	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
-	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name), spec.DindStateDir)
+	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
+	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name, nonce), spec.DindStateDir)
 	assertNoHostSocketMount(t, dind.Mounts)
 
 	// --- runner container: unchanged from privileged-sidecar's shape ---
@@ -124,8 +124,8 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	if !hasEnv(runner.Config.Env, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("runner env = %v, want DOCKER_HOST=unix:///run/docker.sock", runner.Config.Env)
 	}
-	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
-	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
+	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
+	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name, nonce), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, runner.Mounts)
 
 	if inst.Status != "running" {

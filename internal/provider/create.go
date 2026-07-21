@@ -224,7 +224,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		}
 		dindID = id
 		dockerHost = spec.DindDockerHost
-		socketVolumeName = spec.SocketVolumeName(instanceName)
+		socketVolumeName = spec.SocketVolumeName(instanceName, nonce)
 	}
 
 	// 6. Build the runner container: ownership labels (ADR-004) + informational
@@ -253,7 +253,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		Env:                 env,
 		Labels:              labels,
 		MemoryBytes:         memoryBytes,
-		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName),
+		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
 		NetworkName:         spec.JobNetworkName(instanceName),
 		SocketVolumeName:    socketVolumeName,
 	})

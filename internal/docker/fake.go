@@ -136,6 +136,21 @@ type FakeClient struct {
 	// without f.mu held (so it may call back into the fake's own locked methods)
 	// and must guard against re-entrancy/once-ness itself.
 	VolumeListHook func()
+
+	// VolumeRemoveHook, when non-nil, is invoked at the very start of every
+	// VolumeRemove — before f.mu is taken — with the volume NAME the caller is
+	// about to remove. It is the destructive-boundary seam for the F4
+	// generation-unique-names interleave (ADR-004 amendment 2026-07-21): a test
+	// can swap in generation B's freshly-created (differently-named) volume
+	// AFTER a teardown's label-scoped VolumeList snapshot but BEFORE the teardown
+	// physically removes the volume it read from that snapshot, then assert B's
+	// volume is untouched — proving the removal can never name-collide across
+	// generations because the names differ by construction. VolumeListHook fires
+	// on the LIST; this fires on the REMOVE, the precise instant the old
+	// name-based TOCTOU would have struck. Like the other hooks it runs without
+	// f.mu held (so it may call back into the fake's own locked methods) and must
+	// guard re-entrancy/once-ness itself.
+	VolumeRemoveHook func(name string)
 }
 
 // ExecRecord captures one ExecStream call for test assertions.
@@ -858,6 +873,15 @@ func (f *FakeClient) VolumeCreate(_ context.Context, options volume.CreateOption
 // accepted for interface parity with the real SDK but has no effect here:
 // the fake has no container-reference tracking for volumes to override.
 func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) error {
+	// Fire the destructive-boundary hook (if any) before taking the lock, so a
+	// test can mutate the store to model a concurrent generation B claiming the
+	// instance name in the window between a teardown's volume LIST and this
+	// physical REMOVE (F4). It runs without f.mu held so it may call back into
+	// the fake's own locked methods.
+	if f.VolumeRemoveHook != nil {
+		f.VolumeRemoveHook(volumeID)
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

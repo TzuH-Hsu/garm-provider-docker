@@ -36,19 +36,32 @@ const (
 	LabelOSType = "garm.docker/os-type"
 	LabelOSArch = "garm.docker/os-arch"
 
-	// LabelCreateNonce is a per-CreateInstance-attempt random tag written on
-	// the container that attempt creates. It exists so the ambiguous-create
-	// cleanup (create.go) can tell a container THIS attempt created apart from
-	// one a concurrent, same-instance-name CreateInstance won the create race
-	// for: cleanup removes only a container whose nonce matches this attempt's,
-	// and treats a name-conflict against a DIFFERENT nonce as a genuine
-	// duplicate (exit 31) rather than deleting the concurrent winner's
-	// container (NEW-2).
+	// LabelCreateNonce is a per-CreateInstance-attempt random tag (crypto/rand
+	// hex, see provider.newCreateNonce) written on every resource that attempt
+	// creates. It plays THREE load-bearing roles:
 	//
-	// It is deliberately INFORMATIONAL and outside the ADR-004 teardown
-	// predicate (MatchesPredicate / MatchPredicateFilters / IsManagedRunner do
-	// not reference it): ownership and teardown scoping are unchanged; the
-	// nonce only disambiguates the create race.
+	//  1. Ambiguous-create disambiguation (NEW-2): the create-guard cleanup
+	//     removes only a container/network whose nonce matches THIS attempt's,
+	//     and treats a name-conflict against a DIFFERENT nonce as a genuine
+	//     duplicate (exit 31) rather than deleting the concurrent winner's
+	//     resource.
+	//  2. Generation-unique VOLUME NAMES (F4, ADR-004 amendment 2026-07-21): the
+	//     workspace/socket/dind-state volume names now EMBED this nonce
+	//     (spec.WorkspaceVolumeName/SocketVolumeName/DindStateVolumeName), so a
+	//     stale teardown that removes a volume by the name it read from its own
+	//     label-scoped list can never name-collide with a different generation's
+	//     freshly-created volume. This is what makes name-based teardown
+	//     generation-safe by construction — the re-list alone could not.
+	//  3. Generation-nonce teardown gating (defense-in-depth): the network keeps
+	//     a STABLE per-instance name (it is the claim marker), so its removal is
+	//     still gated by comparing this nonce against the generation the teardown
+	//     captured at start (teardownScope), protecting a stable-named claim
+	//     network a concurrent create may have re-claimed mid-teardown.
+	//
+	// It remains outside the ADR-004 ownership predicate
+	// (MatchesPredicate / MatchPredicateFilters / IsManagedRunner do not
+	// reference it): ownership scoping is unchanged; the nonce disambiguates
+	// generations, it does not decide ownership.
 	LabelCreateNonce = "garm.docker/create-nonce"
 )
 

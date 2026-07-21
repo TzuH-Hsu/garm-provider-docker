@@ -76,9 +76,9 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		volName  string
 		resource string
 	}{
-		{spec.WorkspaceVolumeName(name), spec.ResourceWorkspace},
-		{spec.SocketVolumeName(name), spec.ResourceSocket},
-		{spec.DindStateVolumeName(name), spec.ResourceDindState},
+		{spec.WorkspaceVolumeName(name, nonce), spec.ResourceWorkspace},
+		{spec.SocketVolumeName(name, nonce), spec.ResourceSocket},
+		{spec.DindStateVolumeName(name, nonce), spec.ResourceDindState},
 	} {
 		v, ok := volByName(t, fake, tc.volName)
 		if !ok {
@@ -128,12 +128,12 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		t.Errorf("sidecar NetworkMode = %q, want the job network", dind.HostConfig.NetworkMode)
 	}
 	// Socket at /run and dind-state at /var/lib/docker; no host docker.sock.
-	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
-	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name), spec.DindStateDir)
+	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
+	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name, nonce), spec.DindStateDir)
 	// F2: the runner's workspace volume is ALSO mounted into the sidecar at the
 	// runner workdir, so a nested `docker run -v "$PWD":/work` the job issues
 	// resolves its bind source (daemon-side) to the real checked-out files.
-	assertContainerMount(t, dind.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
+	assertContainerMount(t, dind.Mounts, spec.WorkspaceVolumeName(name, nonce), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, dind.Mounts)
 
 	// --- runner container ---
@@ -152,8 +152,8 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		}
 	}
 	// Runner shares the SAME socket volume (at /run) + its workspace; no host socket.
-	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
-	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
+	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
+	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name, nonce), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, runner.Mounts)
 	// F1: the runner carries the DinD socket GID as a supplementary group so
 	// its unprivileged user can reach the shared dockerd socket.

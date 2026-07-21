@@ -143,9 +143,10 @@ type RunnerContainerSpec struct {
 	// WorkspaceVolumeName, when non-empty, backs the workspace mount with a
 	// named, job-scoped, labeled volume (NamedWorkspaceMount) instead of the
 	// anonymous volume M0 used (WorkspaceMount). WP2 always sets it —
-	// spec.WorkspaceVolumeName(instanceName) — so the workspace is a
-	// first-class ADR-004 resource. Left empty (e.g. a spec-only unit test),
-	// the builder falls back to the M0 anonymous volume.
+	// spec.WorkspaceVolumeName(instanceName, nonce), the generation-unique name
+	// (F4) — so the workspace is a first-class ADR-004 resource. Left empty
+	// (e.g. a spec-only unit test), the builder falls back to the M0 anonymous
+	// volume.
 	WorkspaceVolumeName string
 
 	// NetworkName, when non-empty, joins the runner container to that Docker

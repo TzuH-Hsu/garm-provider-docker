@@ -30,7 +30,7 @@ func seedWorkspaceVol(t *testing.T, fake *docker.FakeClient, name string, create
 	for k, v := range extra {
 		labels[k] = v
 	}
-	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.WorkspaceVolumeName(name), Labels: labels}); err != nil {
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: spec.WorkspaceVolumeName(name, nonce), Labels: labels}); err != nil {
 		t.Fatalf("seed VolumeCreate returned unexpected error: %v", err)
 	}
 }
@@ -93,6 +93,25 @@ func volByName(t *testing.T, fake *docker.FakeClient, name string) (*volume.Volu
 	return nil, false
 }
 
+// volByResource finds a managed volume by its instance-name + resource labels,
+// for cases where the volume's generation-unique NAME embeds a create-nonce the
+// test does not know up front (F4): after CreateInstance generates a fresh
+// nonce, the workspace volume can only be located by label, not by a
+// reconstructed name.
+func volByResource(t *testing.T, fake *docker.FakeClient, instanceName, resource string) (*volume.Volume, bool) {
+	t.Helper()
+	out, err := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if err != nil {
+		t.Fatalf("VolumeList returned unexpected error: %v", err)
+	}
+	for _, v := range out.Volumes {
+		if v != nil && v.Labels[spec.LabelInstanceName] == instanceName && v.Labels[spec.LabelResource] == resource {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 // --- full none-mode allocation: create → inspect labels/attachment/mount -----
 
 func TestCreateInstanceFullAllocationTopology(t *testing.T) {
@@ -123,10 +142,11 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 		t.Error("job network is missing the create-nonce (claim marker)")
 	}
 
-	// (b) Workspace volume exists, labeled, sharing the attempt's nonce.
-	v, ok := volByName(t, fake, spec.WorkspaceVolumeName(name))
+	// (b) Workspace volume exists, labeled, sharing the attempt's nonce. Its
+	// name is generation-unique (F4): <instance>-<nonce>-workspace.
+	v, ok := volByName(t, fake, spec.WorkspaceVolumeName(name, netNonce))
 	if !ok {
-		t.Fatalf("workspace volume %q was not created", spec.WorkspaceVolumeName(name))
+		t.Fatalf("workspace volume %q was not created", spec.WorkspaceVolumeName(name, netNonce))
 	}
 	if v.Labels[spec.LabelResource] != spec.ResourceWorkspace ||
 		v.Labels[spec.LabelInstanceName] != name {
@@ -155,8 +175,8 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 		t.Fatalf("runner mounts = %d, want 1 (workspace)", len(got.Mounts))
 	}
 	m := got.Mounts[0]
-	if m.Name != spec.WorkspaceVolumeName(name) || m.Destination != spec.RunnerWorkDir {
-		t.Errorf("workspace mount = %+v, want %q at %q", m, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
+	if m.Name != spec.WorkspaceVolumeName(name, netNonce) || m.Destination != spec.RunnerWorkDir {
+		t.Errorf("workspace mount = %+v, want %q at %q", m, spec.WorkspaceVolumeName(name, netNonce), spec.RunnerWorkDir)
 	}
 	if spec.RunnerWorkDir != "/actions-runner/_work" {
 		t.Errorf("RunnerWorkDir = %q, want /actions-runner/_work", spec.RunnerWorkDir)
@@ -210,8 +230,9 @@ func TestCreateInstanceSweepsStaleAllocationBeforeReuse(t *testing.T) {
 		t.Fatalf("CreateInstance returned unexpected error (stale sweep should have cleared the way): %v", err)
 	}
 
-	// Exactly one of each resource, all fresh.
-	v, ok := volByName(t, fake, spec.WorkspaceVolumeName(name))
+	// Exactly one of each resource, all fresh. The fresh volume's name embeds a
+	// new create-nonce the test does not know, so locate it by label (F4).
+	v, ok := volByResource(t, fake, name, spec.ResourceWorkspace)
 	if !ok {
 		t.Fatal("workspace volume missing after create")
 	}
@@ -256,7 +277,7 @@ func TestListInstancesSweepsOrphansAndReturnsLiveRunners(t *testing.T) {
 	if _, ok := netByName(t, fake, spec.JobNetworkName("job-stale")); ok {
 		t.Error("orphan sweep left the stale job network")
 	}
-	if _, ok := volByName(t, fake, spec.WorkspaceVolumeName("job-stale")); ok {
+	if _, ok := volByName(t, fake, spec.WorkspaceVolumeName("job-stale", "n1")); ok {
 		t.Error("orphan sweep left the stale workspace volume")
 	}
 }

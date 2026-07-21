@@ -80,12 +80,12 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		Privileged:          privileged,
 		Runtime:             runtime,
 		NetworkName:         spec.JobNetworkName(instanceName),
-		SocketVolumeName:    spec.SocketVolumeName(instanceName),
-		DindStateVolumeName: spec.DindStateVolumeName(instanceName),
+		SocketVolumeName:    spec.SocketVolumeName(instanceName, nonce),
+		DindStateVolumeName: spec.DindStateVolumeName(instanceName, nonce),
 		// F2: share the runner's workspace volume into the daemon at the same
 		// path, so nested `docker run -v "$PWD":/work` bind sources resolve to
 		// the real checked-out files rather than an empty daemon-side path.
-		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName),
+		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
 	})
 
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.DindContainerName(instanceName))

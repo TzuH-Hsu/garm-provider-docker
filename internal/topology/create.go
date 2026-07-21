@@ -139,7 +139,7 @@ func (m *Manager) bestEffortRemoveOwnNetwork(ctx context.Context, nonce string) 
 // named, labeled volume mounted at the runner workdir. Created in every mode.
 func (m *Manager) CreateWorkspaceVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
 	return m.createFreshVolume(ctx, "workspace",
-		spec.WorkspaceVolumeName(identity.InstanceName),
+		spec.WorkspaceVolumeName(identity.InstanceName, nonce),
 		identity.WorkspaceVolumeLabels(m.now()), nonce)
 }
 
@@ -148,7 +148,7 @@ func (m *Manager) CreateWorkspaceVolume(ctx context.Context, identity spec.Alloc
 // mounts to reach it. DinD modes only — never created in "none" mode.
 func (m *Manager) CreateSocketVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
 	return m.createFreshVolume(ctx, "socket",
-		spec.SocketVolumeName(identity.InstanceName),
+		spec.SocketVolumeName(identity.InstanceName, nonce),
 		identity.SocketVolumeLabels(m.now()), nonce)
 }
 
@@ -157,25 +157,30 @@ func (m *Manager) CreateSocketVolume(ctx context.Context, identity spec.Allocati
 // layers never leak across jobs and are destroyed at teardown. DinD modes only.
 func (m *Manager) CreateDindStateVolume(ctx context.Context, identity spec.AllocationIdentity, nonce string) error {
 	return m.createFreshVolume(ctx, "dind-state",
-		spec.DindStateVolumeName(identity.InstanceName),
+		spec.DindStateVolumeName(identity.InstanceName, nonce),
 		identity.DindStateVolumeLabels(m.now()), nonce)
 }
 
 // createFreshVolume creates a named, labeled, guaranteed-FRESH job-scoped
-// volume, stamped with this attempt's create-nonce. Because the real daemon's
-// VolumeCreate is idempotent on a duplicate name (WP1 finding: it silently
-// returns the EXISTING volume with its ORIGINAL labels), a stale volume left by
-// a crashed prior allocation of the same instance name would be silently
-// reused — cross-job residue the acceptance criteria forbid. This helper
-// detects that via the create-nonce and replaces the stale volume with a fresh,
-// empty one. Holding the claim-marker network for this instance name guarantees
-// no peer is racing this volume, so remove-and-recreate is safe.
+// volume, stamped with this attempt's create-nonce. The name is
+// GENERATION-UNIQUE (F4): spec.WorkspaceVolumeName/SocketVolumeName/
+// DindStateVolumeName now embed this attempt's create-nonce, so a stale volume
+// left by a crashed PRIOR generation of the same instance name has a DIFFERENT
+// name and can never be idempotent-hit here — the primary defense against
+// cross-job residue is now structural, in the name itself.
 //
-// This is defense-in-depth behind the pre-create SweepStale (which removes a
-// past-grace stale allocation wholesale before this runs); together they close
-// the stale-content-reuse hazard the idempotent VolumeCreate opens. It backs
-// all three job-scoped volumes (workspace, socket, dind-state) so the
-// stale-replacement guarantee is defined in exactly one place.
+// Because the real daemon's VolumeCreate is idempotent on a duplicate name
+// (WP1 finding: it silently returns the EXISTING volume with its ORIGINAL
+// labels), this helper keeps the ownership-validated replace as defense-in-
+// depth for the only case that can still idempotent-hit: THIS same generation's
+// OWN name (e.g. a retried step within one attempt). On a name collision it
+// detects the stale/foreign volume via the create-nonce and, only when the
+// COMPLETE ownership tuple matches (F3), replaces it with a fresh, empty one.
+// Holding the claim-marker network for this instance name guarantees no peer is
+// racing this volume, so remove-and-recreate is safe.
+//
+// It backs all three job-scoped volumes (workspace, socket, dind-state) so the
+// fresh-volume guarantee is defined in exactly one place.
 func (m *Manager) createFreshVolume(ctx context.Context, kind, name string, labels map[string]string, nonce string) error {
 	labels[spec.LabelCreateNonce] = nonce
 
