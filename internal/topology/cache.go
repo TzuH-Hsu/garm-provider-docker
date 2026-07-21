@@ -48,10 +48,20 @@ type CacheVolumeResult struct {
 // local volume's labels after creation (same probe: re-VolumeCreate keeps the
 // original labels; `docker volume update` is cluster-only), and removing-and-
 // recreating to refresh a label would destroy the cache. The label therefore
-// records the volume's creation instant; W2's opportunistic GC ages a warm
-// cache by its filesystem mtime — advanced every job, since the cache is
-// mounted read-write into the runner and used there — rather than by this
-// immutable label. See ADR-003's amendment.
+// records the volume's creation instant; W2's opportunistic GC ages a warm cache
+// by AGE-since-that-creation-timestamp plus SALT SUPERSESSION (spec.gc.go) — NOT
+// by filesystem mtime, which the provider cannot portably stat from outside the
+// Docker Desktop VM. See ADR-003's W2 amendment (point 3).
+//
+// M6/L7: because VolumeCreate is idempotent on a duplicate name (it returns the
+// EXISTING volume with its ORIGINAL labels, discarding this call's labels), a
+// deterministically-named volume that already exists but ISN'T ours — a foreign
+// volume squatting the name, or a DIFFERENT repository that collided on the
+// repokey — would otherwise be silently adopted and mounted as this repo's
+// writable cache (or, for externals, run as executable runtime). This validates
+// the RETURNED volume's ownership+identity labels and fails CLOSED on a
+// mismatch, so only a genuinely-ours (or an intended cross-controller shared)
+// cache is ever adopted.
 //
 // The provider (create path) is what builds `name` and `labels` from the
 // spec.CacheVolumeIdentity/ToolcacheVolumeName/PnpmVolumeName builders and calls
@@ -62,8 +72,12 @@ func (m *Manager) EnsureCacheVolume(ctx context.Context, name string, labels map
 	if err != nil {
 		return CacheVolumeResult{}, err
 	}
-	if _, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels}); err != nil {
+	created, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
+	if err != nil {
 		return CacheVolumeResult{}, fmt.Errorf("failed to ensure cache volume %q: %w", name, err)
+	}
+	if err := spec.ValidateAdoptedCacheVolume(name, created.Labels, labels); err != nil {
+		return CacheVolumeResult{}, err
 	}
 	return CacheVolumeResult{Name: name, Hit: existed}, nil
 }

@@ -2,6 +2,7 @@ package topology
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,56 @@ func TestEvictCachesRemovesDecidedKeepsOthers(t *testing.T) {
 	}
 	if _, ok := cacheVolumeByName(t, fake, keepName); !ok {
 		t.Error("a kept volume was removed")
+	}
+}
+
+// TestEvictCachesReInspectsBeforeRemove is the H3 stale-name TOCTOU guard: a
+// volume the label-scoped snapshot flagged for eviction is replaced by a FRESH
+// foreign volume under the SAME name (a remove/recreate) before the physical
+// removal. EvictCaches RE-INSPECTS by name immediately before removing, sees the
+// replacement is not this controller's cache, and skips it — so a freshly created
+// foreign (or new same-repo) volume is never deleted by a stale snapshot.
+func TestEvictCachesReInspectsBeforeRemove(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	victim := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
+	name := spec.ToolcacheVolumeName("evict", "1")
+	seedRawCacheVolume(t, fake, name, victim.ToolcacheLabels("1", gcTime()))
+
+	// Between the snapshot list and the re-inspect of this candidate, a concurrent
+	// actor removes the stale cache and creates a FRESH foreign volume under the
+	// same name.
+	var once sync.Once
+	fake.VolumeInspectHook = func(n string) {
+		if n != name {
+			return
+		}
+		once.Do(func() {
+			if err := fake.VolumeRemove(ctx, name, true); err != nil {
+				t.Errorf("swap remove: %v", err)
+			}
+			if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{"foreign": "yes"}}); err != nil {
+				t.Errorf("swap create: %v", err)
+			}
+		})
+	}
+
+	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
+	if err != nil {
+		t.Fatalf("EvictCaches: %v", err)
+	}
+	if len(evicted) != 0 {
+		t.Errorf("EvictCaches evicted %+v, want none — the snapshot candidate was replaced by a foreign volume before removal", evicted)
+	}
+	// The fresh foreign volume under the same name must SURVIVE (it was never ours).
+	fake.VolumeInspectHook = nil // stop the swap on this final inspect
+	v, err := fake.VolumeInspect(ctx, name)
+	if err != nil {
+		t.Fatalf("the freshly-created foreign volume %q was wrongly deleted by the GC: %v", name, err)
+	}
+	if v.Labels[spec.LabelCache] == "true" {
+		t.Errorf("expected the foreign replacement (no cache label) to survive, got %v", v.Labels)
 	}
 }
 

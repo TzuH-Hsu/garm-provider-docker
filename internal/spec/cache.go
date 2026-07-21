@@ -3,6 +3,7 @@ package spec
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -15,11 +16,15 @@ import (
 // the caller (the provider create path) supplies the last-used timestamp.
 
 // repoKeyHashLen is the number of leading hex characters of the repo-URL
-// SHA-256 that form the hash suffix of a repokey. ADR-003 fixes this at 12
-// ("the first 12 hex characters (minimum)"), i.e. 48 bits — collision-
-// RESISTANT, not collision-PROOF, and (per ADR-003) far more than sufficient
-// for the number of distinct repositories any single Docker host will realise.
-const repoKeyHashLen = 12
+// SHA-256 that form the hash suffix of a repokey. ADR-003 fixes a MINIMUM of 12
+// ("the first 12 hex characters (minimum)"); L7 raises it to 32 hex = 128 bits,
+// so the truncated key is collision-resistant to a cryptographic degree rather
+// than merely "sufficient in practice" at 48 bits. The FULL normalized-URL digest
+// still rides along as a label (RepoURLDigest / LabelRepoURLDigest), validated on
+// every cache reuse (topology.EnsureCacheVolume), so even an astronomically
+// unlikely 128-bit truncation collision cannot cause one repo to adopt another's
+// cache — the reuse is rejected closed when the full-digest label disagrees.
+const repoKeyHashLen = 32
 
 // repoSlugMaxLen bounds the human-readable slug half of a repokey. The hash
 // suffix guarantees uniqueness, so the slug is purely for operator legibility
@@ -59,6 +64,18 @@ func RepoKey(repoURL string) string {
 		return hash
 	}
 	return slug + "-" + hash
+}
+
+// RepoURLDigest returns the FULL (64-hex, 256-bit) SHA-256 of the NORMALIZED
+// repo URL — the same normalization RepoKey hashes, but untruncated. It is
+// stamped as a label on every repo-keyed cache volume (LabelRepoURLDigest) and
+// re-checked on every cache reuse, so a repokey truncation collision (two
+// different repositories whose slug+128-bit-hash happen to coincide) cannot cause
+// one repo to silently adopt the other's cache: the reuse fails closed when the
+// full-digest labels disagree (L7, ties into topology's foreign-adoption guard).
+func RepoURLDigest(repoURL string) string {
+	sum := sha256.Sum256([]byte(normalizeRepoURL(repoURL)))
+	return hex.EncodeToString(sum[:])
 }
 
 // normalizeRepoURL applies ADR-003's normalization: trim surrounding space,
@@ -183,6 +200,51 @@ func CacheScopeAllowed(scope CacheEntityScope, allowOrgShared bool) bool {
 	}
 }
 
+// cacheIdentityLabelKeys are the label keys that DISCRIMINATE one cache volume's
+// identity from another's. On a cache reuse the daemon's idempotent VolumeCreate
+// returns the EXISTING volume's ORIGINAL labels; if any of these keys that the
+// EXPECTED set specifies disagrees with the returned set, the existing volume is
+// a DIFFERENT cache (a repokey/name collision) or a foreign volume, and must not
+// be adopted. It deliberately EXCLUDES controller-id and last-used: cache volumes
+// are shared across controllers (ADR-003 W1 point 4 / W2 point 1), so a peer
+// controller's id and a different creation timestamp are EXPECTED on a legitimate
+// shared reuse and must not trip the guard.
+var cacheIdentityLabelKeys = []string{
+	LabelCacheKind,
+	LabelRepo,
+	LabelRepoURLDigest,
+	LabelImageDigest,
+	LabelGeneration,
+	LabelPnpmMajor,
+}
+
+// ValidateAdoptedCacheVolume checks that a cache volume returned by an idempotent
+// VolumeCreate (its `got` labels) is actually OURS to reuse, given the labels we
+// asked for (`want`). It requires the managed+cache markers and agreement with
+// `want` on every identity key `want` sets. A foreign volume that squatted the
+// deterministic name (no cache=true — M6), or a genuinely different cache that
+// collided on the repokey/name (a mismatching repo-url-digest or image-digest —
+// L7), is REJECTED so the provider fails CLOSED rather than mounting someone
+// else's data as this repo's writable cache, or — for externals — running
+// preexisting content as executable runtime. Intended cross-controller reuse of a
+// legitimately shared cache still passes, because controller-id is not an identity
+// key; only explicit semantic-label agreement permits adoption.
+func ValidateAdoptedCacheVolume(name string, got, want map[string]string) error {
+	if got[LabelManaged] != "true" || got[LabelCache] != "true" {
+		return fmt.Errorf("cache volume %q already exists but is not a managed cache volume (managed=%q cache=%q); refusing to adopt a foreign volume as a cache", name, got[LabelManaged], got[LabelCache])
+	}
+	for _, k := range cacheIdentityLabelKeys {
+		w := want[k]
+		if w == "" {
+			continue
+		}
+		if got[k] != w {
+			return fmt.Errorf("cache volume %q already exists but its %s=%q does not match the expected %q; refusing to adopt a different cache under a colliding name", name, k, got[k], w)
+		}
+	}
+	return nil
+}
+
 // cacheVolumeNamePrefix is the shared prefix for every cache volume, so a
 // label-blind operator can still spot cache volumes by name (`docker volume ls`
 // | grep garm-cache-). ADR-003's authoritative selector is still the label set,
@@ -238,6 +300,13 @@ func PnpmVolumeName(repoKey, pnpmMajor string) string {
 type CacheVolumeIdentity struct {
 	ControllerID string
 	RepoKey      string
+
+	// RepoURLDigest is the FULL normalized-URL SHA-256 (RepoURLDigest), carried
+	// as LabelRepoURLDigest so a cache reuse can re-verify it is the SAME
+	// repository — not a different one that collided on the truncated repokey
+	// (L7). The provider sets it from the same repo_url it derives RepoKey from;
+	// when empty (a spec-only unit test), the digest label is simply omitted.
+	RepoURLDigest string
 }
 
 // baseCacheLabels returns the labels every cache volume carries regardless of
@@ -254,7 +323,7 @@ type CacheVolumeIdentity struct {
 // LabelLastUsed's doc in labels.go), this timestamp is fixed at creation; it is
 // not re-stamped on a cache hit.
 func (c CacheVolumeIdentity) baseCacheLabels(kind CacheKind, lastUsed time.Time) map[string]string {
-	return map[string]string{
+	labels := map[string]string{
 		LabelManaged:      "true",
 		LabelControllerID: c.ControllerID,
 		LabelCache:        "true",
@@ -262,6 +331,13 @@ func (c CacheVolumeIdentity) baseCacheLabels(kind CacheKind, lastUsed time.Time)
 		LabelRepo:         c.RepoKey,
 		LabelLastUsed:     lastUsed.UTC().Format(time.RFC3339),
 	}
+	// The full normalized-URL digest (L7) rides along so a reuse can verify the
+	// repository identity beyond the truncated repokey. Omitted when unset so a
+	// spec-only builder without the URL still produces a valid label set.
+	if c.RepoURLDigest != "" {
+		labels[LabelRepoURLDigest] = c.RepoURLDigest
+	}
+	return labels
 }
 
 // ToolcacheLabels returns the label set for a toolcache volume (ADR-003): the

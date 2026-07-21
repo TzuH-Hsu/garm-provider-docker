@@ -56,6 +56,14 @@ type CacheEviction struct {
 // consulted, defense-in-depth on top of the label filter, so this can only ever
 // touch this controller's own cache=true volumes and never a job-scoped or
 // foreign resource.
+//
+// H3 (stale-name TOCTOU): the list above is a snapshot. Between it and the
+// physical removal, a remove/recreate-under-the-same-name could replace a stale
+// cache with a FRESH foreign, or a brand-new same-repo, volume that a by-name
+// VolumeRemove would then wrongly delete. So immediately before removing, the
+// volume is RE-INSPECTED by name and its FULL ownership+cache labels re-validated
+// and the eviction decision re-run against those live labels — a candidate that
+// is no longer ours, or no longer evictable, is skipped.
 func (m *Manager) EvictCaches(ctx context.Context, decide func(labels map[string]string) (bool, string), maxEvictions int) ([]CacheEviction, error) {
 	list, err := m.cli.VolumeList(ctx, volume.ListOptions{Filters: m.cacheVolumeFilter()})
 	if err != nil {
@@ -74,12 +82,33 @@ func (m *Manager) EvictCaches(ctx context.Context, decide func(labels map[string
 			log.Printf("garm-provider-docker: cache GC: hit the per-pass eviction cap (%d); remaining stale caches will be reaped on a later pass", maxEvictions)
 			break
 		}
-		// Defense-in-depth re-assertion: only THIS controller's cache volumes.
+		// Defense-in-depth re-assertion on the SNAPSHOT labels: only THIS
+		// controller's cache volumes, and only ones the snapshot flags as evictable
+		// (a cheap pre-filter so we re-inspect only genuine candidates).
 		if v.Labels[spec.LabelCache] != "true" || v.Labels[spec.LabelControllerID] != m.controllerID {
 			continue
 		}
-		evict, reason := decide(v.Labels)
+		if evict, _ := decide(v.Labels); !evict {
+			continue
+		}
+
+		// RE-VALIDATE against LIVE labels immediately before removing by name.
+		fresh, err := m.cli.VolumeInspect(ctx, v.Name)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue // raced with a removal — already gone
+			}
+			errs = append(errs, fmt.Errorf("cache GC: failed to re-inspect %q before eviction: %w", v.Name, err))
+			continue
+		}
+		if fresh.Labels[spec.LabelCache] != "true" || fresh.Labels[spec.LabelControllerID] != m.controllerID {
+			// A different/foreign volume now holds this name (remove+recreate since
+			// the snapshot); do NOT delete it.
+			continue
+		}
+		evict, reason := decide(fresh.Labels)
 		if !evict {
+			// A freshly re-created same-name cache that is no longer evictable.
 			continue
 		}
 		// force=false so an in-use (mounted) cache is protected — the daemon

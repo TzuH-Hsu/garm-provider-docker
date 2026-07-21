@@ -35,24 +35,31 @@ const (
 	// it out of ADR-004's teardown/sweep predicate (MatchesPredicate). The
 	// builders that stamp them are CacheVolumeIdentity's methods in cache.go.
 	//
-	//   - LabelRepo       = the <repokey> the cache is keyed on (RepoKey).
+	//   - LabelRepo          = the <repokey> the cache is keyed on (RepoKey).
+	//   - LabelRepoURLDigest = the FULL (64-hex) normalized-URL SHA-256, carried
+	//     alongside the truncated repokey so a cache reuse can re-verify the
+	//     repository identity and refuse to adopt a different repo's volume that
+	//     collided on the repokey (L7; validated in topology.EnsureCacheVolume).
 	//   - LabelGeneration = the toolcache generation salt (config [cache].generation).
 	//   - LabelPnpmMajor  = the pnpm store's pnpm major version (config [cache].pnpm_major).
 	//   - LabelLastUsed   = an RFC3339 timestamp, set at CREATION. The real
 	//     daemon cannot mutate a local volume's labels after creation (verified
 	//     against Docker Engine 29.6.1: re-VolumeCreate keeps the ORIGINAL
 	//     labels, and `docker volume update` is cluster-volumes-only), so this
-	//     records the volume's creation instant; W2's opportunistic GC ages a
-	//     warm cache by the volume's filesystem mtime (advanced every job, since
-	//     the cache is mounted read-write into the runner) rather than by
-	//     mutating this label. See cache.go and ADR-003's amendment.
-	//   - LabelCacheKind  = "toolcache" or "pnpm", so a GC/purge pass (W2) can
-	//     tell the two cache kinds apart without parsing the volume name.
-	LabelRepo       = "garm.docker/repo"
-	LabelGeneration = "garm.docker/generation"
-	LabelPnpmMajor  = "garm.docker/pnpm-major"
-	LabelLastUsed   = "garm.docker/last-used"
-	LabelCacheKind  = "garm.docker/cache-kind"
+	//     records the volume's creation instant. W2's opportunistic GC evicts by
+	//     AGE-since-this-creation-timestamp plus SALT SUPERSESSION (a toolcache
+	//     generation / pnpm-major / externals image-digest that no longer matches
+	//     the current config, past a grace) — NOT by filesystem mtime, which the
+	//     provider cannot portably stat from outside the Docker Desktop VM. See
+	//     spec/gc.go, cache.go, and ADR-003's W2 amendment (point 3).
+	//   - LabelCacheKind  = "toolcache" | "pnpm" | "externals" | "diag-logs", so a
+	//     GC/purge pass (W2) can tell the cache kinds apart without parsing the name.
+	LabelRepo          = "garm.docker/repo"
+	LabelRepoURLDigest = "garm.docker/repo-url-digest"
+	LabelGeneration    = "garm.docker/generation"
+	LabelPnpmMajor     = "garm.docker/pnpm-major"
+	LabelLastUsed      = "garm.docker/last-used"
+	LabelCacheKind     = "garm.docker/cache-kind"
 
 	// LabelImageDigest is the W2 externals-cache key (ADR-003 amendment
 	// 2026-07-22): the runner IMAGE's content digest an externals volume was

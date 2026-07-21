@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
@@ -328,6 +329,25 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("failed to create container for %q: %w", instanceName, err))
 	}
 
+	// 5b. Revalidate the cache volumes the runner now references (ADR-003 W2, H3).
+	// The externals volume was ensured+seeded, and the toolcache/pnpm/diag volumes
+	// ensured, BEFORE this ContainerCreate. A concurrent, opportunistic age-based
+	// GC (a peer CreateInstance/ListInstances) could have evicted a still-current
+	// cache in that ensure→mount gap — before this container pins it in use — and
+	// real Moby then AUTO-CREATES the missing named volume UNLABELED during
+	// ContainerCreate, so the runner would mount an EMPTY read-only externals tree
+	// (or an empty cache) and leave a GC-invisible orphan behind. Confirm every
+	// referenced cache volume still carries our cache labels; if any was replaced
+	// by an auto-created empty volume, remove the just-created (not-yet-started)
+	// runner so the empty replacement can be reclaimed, reap the orphan(s) by name,
+	// and FAIL the allocation CLOSED — never run a runner against an empty
+	// externals tree.
+	if orphans, rerr := p.revalidateReferencedCaches(ctx, plan); rerr != nil {
+		p.bestEffortRemoveContainer(ctx, created.ID)
+		p.bestEffortRemoveOrphanVolumes(ctx, orphans)
+		return guarded(rerr)
+	}
+
 	// 6. Start it; the entrypoint now blocks waiting for the delivery marker.
 	if err := p.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
 		return guarded(fmt.Errorf("failed to start container for %q: %w", instanceName, err))
@@ -378,6 +398,65 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		OSArch:     bootstrap.OSArch,
 		Status:     params.InstanceRunning,
 	}, nil
+}
+
+// revalidateReferencedCaches confirms every persistent cache volume the runner
+// container now references still carries our cache labels (ADR-003 W2, H3). A
+// volume that lost its cache label was AUTO-CREATED empty by the daemon during
+// ContainerCreate because a concurrent GC evicted the original in the ensure→mount
+// window. It returns the names of any such empty replacements (for a best-effort
+// by-name reclaim) alongside a non-nil error, so the caller fails the allocation
+// closed rather than running the runner against an empty externals tree.
+func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePlan) ([]string, error) {
+	var orphans, bad []string
+	for _, name := range plan.referencedCacheVolumeNames() {
+		v, err := p.cli.VolumeInspect(ctx, name)
+		if err != nil {
+			// The referenced volume cannot be inspected at all — treat it as a
+			// failed allocation and record it for a best-effort reclaim (which
+			// tolerates NotFound if it is genuinely gone).
+			orphans = append(orphans, name)
+			bad = append(bad, fmt.Sprintf("%s (inspect failed: %v)", name, err))
+			continue
+		}
+		if v.Labels[spec.LabelCache] != "true" {
+			// An UNLABELED auto-created replacement: a concurrent GC evicted the
+			// original cache in the ensure→mount gap and Moby recreated it empty.
+			orphans = append(orphans, name)
+			bad = append(bad, name+" (auto-created empty, not our seeded cache)")
+		}
+	}
+	if len(bad) > 0 {
+		return orphans, fmt.Errorf("cache volume(s) were evicted and auto-recreated empty during create (a GC/create race); refusing to run the runner against an empty cache: %s", strings.Join(bad, ", "))
+	}
+	return nil, nil
+}
+
+// bestEffortRemoveContainer force-removes a container under a detached context,
+// tolerating NotFound. Used to drop the just-created (not-yet-started) runner so
+// an empty auto-created replacement cache volume it references can be reclaimed
+// before the allocation is rolled back (H3).
+func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
+	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := p.cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		log.Printf("garm-provider-docker: cache-revalidation rollback: failed to remove runner container %s (continuing): %v", id, err)
+	}
+}
+
+// bestEffortRemoveOrphanVolumes reaps the empty, unlabeled cache volumes the
+// daemon auto-created during a GC/create race, by name, under a detached context
+// (H3). It tolerates NotFound (already gone) and Conflict (a concurrent peer's
+// create still references the same auto-created name) so it never turns a
+// best-effort cleanup into a hard failure.
+func (p *Provider) bestEffortRemoveOrphanVolumes(ctx context.Context, names []string) {
+	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	for _, name := range names {
+		if err := p.cli.VolumeRemove(rmCtx, name, false); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsConflict(err) {
+			log.Printf("garm-provider-docker: cache-revalidation rollback: failed to reap empty auto-created cache volume %q (continuing): %v", name, err)
+		}
+	}
 }
 
 // withReadyMarker appends the atomic ready marker (spec.ReadyMarker) as the

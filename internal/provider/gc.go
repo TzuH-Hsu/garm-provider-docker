@@ -111,7 +111,26 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 
 // pruneDiagVolume runs one diagnostic-log prune helper to completion against a
 // single diag volume (best-effort: a prune failure is logged, never fatal).
+//
+// H3: it RE-VALIDATES the volume is STILL this controller's diag volume
+// immediately before mounting it into the age-scoped `find -delete` helper. The
+// name came from a ListDiagVolumes snapshot; a remove/recreate-under-the-same-name
+// since then could have replaced it with a foreign volume the prune would
+// otherwise wrongly delete files from. If it is no longer our diag volume (or is
+// gone), the prune is skipped.
 func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName string) {
+	v, err := p.cli.VolumeInspect(ctx, volumeName)
+	if err != nil {
+		log.Printf("garm-provider-docker: cache GC: skipping diag prune of %q (re-inspect failed): %v", volumeName, err)
+		return
+	}
+	if v.Labels[spec.LabelCache] != "true" ||
+		v.Labels[spec.LabelControllerID] != p.controllerID ||
+		v.Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) {
+		log.Printf("garm-provider-docker: cache GC: skipping diag prune of %q — it is no longer this controller's diag volume (a same-name replacement since the snapshot)", volumeName)
+		return
+	}
+
 	nonce, err := newCreateNonce()
 	if err != nil {
 		log.Printf("garm-provider-docker: cache GC: failed to name diag-prune helper for %q: %v", volumeName, err)

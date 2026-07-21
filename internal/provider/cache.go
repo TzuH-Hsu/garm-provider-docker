@@ -57,6 +57,21 @@ type cachePlan struct {
 	externalsVolume string
 }
 
+// referencedCacheVolumeNames returns the non-empty persistent cache volume names
+// this plan mounts into the runner. The create path revalidates each of these
+// AFTER ContainerCreate (H3): a concurrent GC could have evicted a still-current
+// cache in the ensure→mount gap, and real Moby then auto-creates the missing named
+// volume UNLABELED during ContainerCreate — an empty externals tree plus an orphan.
+func (c cachePlan) referencedCacheVolumeNames() []string {
+	var names []string
+	for _, n := range []string{c.toolcacheVolume, c.pnpmVolume, c.diagVolume, c.externalsVolume} {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
 // planCaches resolves ADR-003's per-allocation cache decision and, when the
 // allocation is cache-eligible, create-or-reuses the toolcache and pnpm store
 // volumes for the repo. It returns the plan CreateInstance threads into the
@@ -101,7 +116,11 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	}
 
 	repoKey := spec.RepoKey(bootstrap.RepoURL)
-	id := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey}
+	id := spec.CacheVolumeIdentity{
+		ControllerID:  p.controllerID,
+		RepoKey:       repoKey,
+		RepoURLDigest: spec.RepoURLDigest(bootstrap.RepoURL),
+	}
 	// One creation timestamp for both volumes' last-used labels. time.Now() is
 	// here (the impure provider layer), not in the pure spec builders.
 	lastUsed := time.Now()

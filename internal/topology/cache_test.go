@@ -100,6 +100,68 @@ func TestEnsureCacheVolumeMissThenHit(t *testing.T) {
 	}
 }
 
+// TestEnsureCacheVolumeRejectsForeignSquatter is the M6 fail-closed guard: a
+// FOREIGN volume that already holds the deterministic cache name (no cache
+// labels) must NOT be adopted and mounted as this repo's cache. VolumeCreate is
+// idempotent on a duplicate name and returns the existing (foreign) volume with
+// its ORIGINAL labels, so without validation the provider would silently mount
+// someone else's data (or, for externals, run preexisting content).
+func TestEnsureCacheVolumeRejectsForeignSquatter(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	// A foreign volume squats the name with no managed/cache labels.
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{"someone": "else"}}); err != nil {
+		t.Fatalf("seed foreign volume: %v", err)
+	}
+
+	_, err := m.EnsureCacheVolume(ctx, name, cacheIdentity().ToolcacheLabels("1", time.Now()))
+	if err == nil {
+		t.Fatal("EnsureCacheVolume adopted a foreign volume squatting the cache name, want a fail-closed error")
+	}
+}
+
+// TestEnsureCacheVolumeRejectsRepokeyCollision is the L7 guard: a DIFFERENT
+// repository whose cache volume collided on the (truncated) repokey — same name,
+// same managed+cache markers, but a DIFFERENT full repo-url-digest — must be
+// rejected, so one repo never adopts another's cache.
+func TestEnsureCacheVolumeRejectsRepokeyCollision(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	other := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "digest-of-a-DIFFERENT-repo"}
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: other.ToolcacheLabels("1", time.Now())}); err != nil {
+		t.Fatalf("seed colliding cache volume: %v", err)
+	}
+
+	ours := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "digest-of-OUR-repo"}
+	if _, err := m.EnsureCacheVolume(ctx, name, ours.ToolcacheLabels("1", time.Now())); err == nil {
+		t.Fatal("EnsureCacheVolume adopted a repokey-colliding foreign repo's cache, want a fail-closed error")
+	}
+}
+
+// TestEnsureCacheVolumeCrossControllerSharedReuseOK is the flip side: a
+// legitimately shared cache first LABELED by ANOTHER controller (different
+// controller-id, different creation timestamp, but the SAME repo identity) IS
+// adopted — controller-id/last-used are not identity keys (ADR-003 shared caches).
+func TestEnsureCacheVolumeCrossControllerSharedReuseOK(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	peer := spec.CacheVolumeIdentity{ControllerID: "some-OTHER-controller", RepoKey: testRepoKey, RepoURLDigest: "shared-digest"}
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: peer.ToolcacheLabels("1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))}); err != nil {
+		t.Fatalf("seed peer-controller cache volume: %v", err)
+	}
+
+	ours := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "shared-digest"}
+	if _, err := m.EnsureCacheVolume(ctx, name, ours.ToolcacheLabels("1", time.Now())); err != nil {
+		t.Fatalf("EnsureCacheVolume rejected a legitimately shared cross-controller cache: %v", err)
+	}
+}
+
 // TestEnsureCacheVolumeDistinctKinds: toolcache and pnpm are distinct volumes.
 func TestEnsureCacheVolumeDistinctKinds(t *testing.T) {
 	m, fake := newManager(t)

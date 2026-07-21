@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cloudbase/garm-provider-common/params"
@@ -113,6 +114,69 @@ func cacheVolsByKind(t *testing.T, fake *docker.FakeClient, kind spec.CacheKind)
 }
 
 const cacheRepoURL = "https://github.com/example-org/example-repo"
+
+// TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate is the H3
+// ensure→mount-window guard: a concurrent age-based GC evicts the (already
+// ensured+seeded) externals cache in the gap before the runner container pins it
+// in use; real Moby then AUTO-CREATES the missing named volume UNLABELED when the
+// runner references it (modeled by the fake). The provider revalidates the
+// referenced caches after ContainerCreate, detects the empty unlabeled
+// replacement, and FAILS the allocation CLOSED — no runner is left against an
+// empty externals tree, and the empty auto-created orphan is reaped (not left
+// GC-invisible).
+func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+	p, fake := newCacheProvider(t, false)
+
+	externalsFilter := volume.ListOptions{Filters: filters.NewArgs(
+		filters.Arg("label", spec.LabelCache+"=true"),
+		filters.Arg("label", spec.LabelCacheKind+"="+string(spec.CacheKindExternals)),
+	)}
+
+	// Evict the externals cache exactly once, at the first ContainerCreate AFTER
+	// planExternals has ensured it (the seed helper) — modeling a peer's
+	// opportunistic GC deleting it in the ensure→mount window.
+	var once sync.Once
+	fake.CreateHook = func() {
+		out, _ := fake.VolumeList(context.Background(), externalsFilter)
+		if len(out.Volumes) == 0 {
+			return // externals not ensured yet; wait for a later ContainerCreate
+		}
+		once.Do(func() {
+			for _, v := range out.Volumes {
+				_ = fake.VolumeRemove(context.Background(), v.Name, true)
+			}
+		})
+	}
+
+	_, err := p.CreateInstance(context.Background(), cacheBootstrap("h3-job", cacheRepoURL, srv.URL))
+	if err == nil {
+		t.Fatal("CreateInstance succeeded despite the externals cache being evicted and auto-recreated EMPTY during create; want a fail-closed allocation error")
+	}
+	t.Logf("[H3] CreateInstance failed closed as expected: %v", err)
+
+	// No runner left behind (rolled back) — it must never run against an empty
+	// externals tree.
+	if _, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("h3-job")); err == nil {
+		t.Error("[H3] the runner container was left present after a fail-closed create")
+	}
+
+	// The empty auto-created externals volume must be reaped — no labeled externals
+	// cache remains, and the deterministic externals name is gone entirely (no
+	// GC-invisible unlabeled orphan).
+	if out, _ := fake.VolumeList(context.Background(), externalsFilter); len(out.Volumes) != 0 {
+		t.Errorf("[H3] a labeled externals cache unexpectedly remains: %d", len(out.Volumes))
+	}
+	insp, _, err := fake.ImageInspectWithRaw(context.Background(), "ghcr.io/example/runner@sha256:deadbeef")
+	if err != nil {
+		t.Fatalf("[H3] runner image inspect: %v", err)
+	}
+	extName := spec.ExternalsVolumeName(strings.TrimPrefix(insp.ID, "sha256:"))
+	if _, ok := volByName(t, fake, extName); ok {
+		t.Errorf("[H3] the empty auto-created externals orphan %q was not reaped", extName)
+	}
+}
 
 // TestCreateInstanceMountsRepoCaches: a repo-scoped pool gets the toolcache and
 // pnpm store volumes created, mounted at their configured paths, and the cache
