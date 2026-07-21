@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -80,12 +81,56 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		// We hold the claim network exclusively; a create failure (incl. an
 		// ambiguous daemon leak of a nonce-tagged sidecar) is reclaimed by the
 		// nonce-keyed rollback, which removes any sidecar this attempt leaked.
+		if clearErr := runtimeUnavailableError(dindMode, runtime, err); clearErr != nil {
+			return "", clearErr
+		}
 		return "", fmt.Errorf("failed to create DinD sidecar for %q: %w", instanceName, err)
 	}
 	if err := p.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		// A daemon that accepts an unregistered Runtime at create time (the
+		// commonly observed shape — "Unknown runtime specified <name>",
+		// rejected before a container is ever recorded) can still, depending
+		// on daemon/containerd version, defer that rejection to start instead;
+		// classify here too so either shape gets the same clear message.
+		if clearErr := runtimeUnavailableError(dindMode, runtime, err); clearErr != nil {
+			return "", clearErr
+		}
 		return "", fmt.Errorf("failed to start DinD sidecar for %q: %w", instanceName, err)
 	}
 	return created.ID, nil
+}
+
+// runtimeUnavailableError returns a clear, actionable provider error when err
+// looks like the daemon rejecting an unregistered OCI runtime (observed real
+// -daemon shape: "Unknown runtime specified <name>", returned e.g. for
+// Runtime="sysbox-runc" when the daemon's `runtimes` config — daemon.json —
+// has no such entry; see docs/research.md §3.C: Sysbox has no supported
+// install path on Synology DSM or Unraid, so this is the EXPECTED failure
+// mode there). It returns nil when runtime is empty (privileged-sidecar sets
+// no Runtime, so this never applies to it) or err does not look
+// runtime-shaped, in which case the caller falls through to its own generic
+// wrapping.
+//
+// This is a message-content heuristic, not an errdefs classification: the
+// real daemon reports an unknown runtime as a generic 400 (invalid
+// parameter), indistinguishable by status/error-kind alone from any other
+// malformed-create rejection. sysbox-runc itself has no install path on this
+// project's own dev daemon (macOS/Docker Desktop) any more than on Synology
+// DSM/Unraid, so this path is unit-verified only (docker.FakeClient
+// simulating the daemon's rejection message) — the real-daemon shape is
+// documented here from Docker's own published behavior, not reproduced live.
+func runtimeUnavailableError(dindMode, runtime string, err error) error {
+	if runtime == "" || err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "runtime") {
+		return nil
+	}
+	if !strings.Contains(msg, "unknown") && !strings.Contains(msg, "not found") && !strings.Contains(msg, "no such") {
+		return nil
+	}
+	return fmt.Errorf("dind_mode=%s requires the %q runtime to be registered on the Docker daemon; it is not available: %w", dindMode, runtime, err)
 }
 
 // verifyRunning inspects containerID and errors unless it is running — used to
