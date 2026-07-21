@@ -107,6 +107,19 @@ func TestCacheValidate(t *testing.T) {
 		{name: "toolcache nested under the externals mount rejected (W2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals/node20" }, wantErr: true},
 		{name: "negative stale days rejected", mutate: func(c *Cache) { c.StaleCacheEvictionDays = -5 }, wantErr: true},
 		{name: "negative log retention rejected", mutate: func(c *Cache) { c.DiagnosticLogRetentionDays = -1 }, wantErr: true},
+
+		// H2: canonical-alias bypasses. Each of these would canonicalize onto a
+		// reserved in-runner mount (the runner install dir or the /run socket dir)
+		// but slip past the old raw-string ancestor check.
+		{name: "dot-segment onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/." }, wantErr: true},
+		{name: "/opt/../ traversal onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/opt/../actions-runner" }, wantErr: true},
+		{name: "repeated slashes are non-canonical, rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "//opt//hostedtoolcache" }, wantErr: true},
+		{name: "trailing slash is non-canonical, rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/opt/pnpm-store/" }, wantErr: true},
+		{name: "filesystem root rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/" }, wantErr: true},
+		{name: "/var/run aliases onto the /run socket dir, rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/var/run" }, wantErr: true},
+		{name: "/var/run/garm aliases onto the credential tmpfs, rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/var/run/garm" }, wantErr: true},
+		{name: "the bare runner install dir is reserved (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner" }, wantErr: true},
+		{name: "traversal that canonicalizes onto the runner dir rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/x/.." }, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
