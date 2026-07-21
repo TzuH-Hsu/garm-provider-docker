@@ -76,11 +76,13 @@ type Config struct {
 	// is deliberately a SEPARATE flag from AllowUnpinnedRunnerImage rather
 	// than the two sharing one: an operator developing against an unpinned
 	// runner_image tag should not have to also relax pinning on the
-	// separately security-sensitive (privileged-by-default, ADR-001) DinD
-	// sidecar image, and vice versa. Two independent, narrowly-scoped
-	// escape hatches were judged cleaner than one shared flag whose blast
-	// radius covers both images — flagged in the WP1 report since ADR-005
-	// left the naming/sharing choice open ("honor the existing
+	// separately security-sensitive DinD sidecar image — privileged-sidecar
+	// is the default DinD MECHANISM once an operator opts into a DinD mode
+	// (ADR-001), but DinD itself defaults to "none" (no sidecar at all,
+	// above) — and vice versa. Two independent, narrowly-scoped escape
+	// hatches were judged cleaner than one shared flag whose blast radius
+	// covers both images — flagged in the WP1 report since ADR-005 left the
+	// naming/sharing choice open ("honor the existing
 	// allow_unpinned_runner_image flag naming").
 	AllowUnpinnedDindImage bool `toml:"allow_unpinned_dind_image"`
 
