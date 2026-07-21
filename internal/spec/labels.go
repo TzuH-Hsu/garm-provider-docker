@@ -20,13 +20,39 @@ const (
 	LabelResource     = "garm.docker/resource"
 	LabelCreatedAt    = "garm.docker/created-at"
 
-	// LabelCache is ADR-003's cache-volume marker. It is defined here
-	// (rather than left undocumented) only because ADR-004's match
-	// predicate is defined in terms of its absence — see
-	// MatchPredicateFilters and MatchesPredicate below. Cache-volume
-	// label builders themselves belong to the ADR-003 (M2) work package,
-	// not this one.
+	// LabelCache is ADR-003's cache-volume marker. ADR-004's teardown/
+	// orphan-sweep match predicate is defined in terms of its absence — see
+	// MatchPredicateFilters and MatchesPredicate below — so a cache volume,
+	// which carries cache=true and NO instance-name, is structurally excluded
+	// from every teardown path. The cache-volume label builders that stamp it
+	// live in cache.go (ADR-003, M2-W1).
 	LabelCache = "garm.docker/cache"
+
+	// LabelRepo, LabelGeneration, LabelPnpmMajor, LabelLastUsed, and
+	// LabelCacheKind are ADR-003's cache-volume label set (M2-W1). They are
+	// carried ONLY by cache volumes, never by a job-scoped resource, and a
+	// cache volume never carries LabelInstanceName — that absence is what keeps
+	// it out of ADR-004's teardown/sweep predicate (MatchesPredicate). The
+	// builders that stamp them are CacheVolumeIdentity's methods in cache.go.
+	//
+	//   - LabelRepo       = the <repokey> the cache is keyed on (RepoKey).
+	//   - LabelGeneration = the toolcache generation salt (config [cache].generation).
+	//   - LabelPnpmMajor  = the pnpm store's pnpm major version (config [cache].pnpm_major).
+	//   - LabelLastUsed   = an RFC3339 timestamp, set at CREATION. The real
+	//     daemon cannot mutate a local volume's labels after creation (verified
+	//     against Docker Engine 29.6.1: re-VolumeCreate keeps the ORIGINAL
+	//     labels, and `docker volume update` is cluster-volumes-only), so this
+	//     records the volume's creation instant; W2's opportunistic GC ages a
+	//     warm cache by the volume's filesystem mtime (advanced every job, since
+	//     the cache is mounted read-write into the runner) rather than by
+	//     mutating this label. See cache.go and ADR-003's amendment.
+	//   - LabelCacheKind  = "toolcache" or "pnpm", so a GC/purge pass (W2) can
+	//     tell the two cache kinds apart without parsing the volume name.
+	LabelRepo       = "garm.docker/repo"
+	LabelGeneration = "garm.docker/generation"
+	LabelPnpmMajor  = "garm.docker/pnpm-major"
+	LabelLastUsed   = "garm.docker/last-used"
+	LabelCacheKind  = "garm.docker/cache-kind"
 
 	// LabelOSType and LabelOSArch are informational labels carrying the
 	// bootstrap OS type/arch. They are NOT part of the ADR-004 teardown
