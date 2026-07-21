@@ -33,6 +33,24 @@ const (
 	// diagPruneTimeout bounds one diagnostic-log prune helper (a `find -delete`
 	// over one volume — fast; this is generous headroom).
 	diagPruneTimeout = 2 * time.Minute
+
+	// helperTerminalGrace and helperRunningMaxAge tune the leaked-helper reaper
+	// by container state (H5), so it never races a live peer's helper yet still
+	// eventually reclaims a genuinely stuck one:
+	//
+	//   - helperTerminalGrace leaves a freshly-TERMINAL (exited/dead) helper alone:
+	//     a helper that just finished is about to be force-removed by its own
+	//     provider's defer, so reaping it inside this grace only races that defer.
+	//     It exceeds the create→start→wait handoff; a terminal helper older than it
+	//     whose provider clearly died is reaped.
+	//   - helperRunningMaxAge is the age past which a still-CREATED-or-RUNNING helper
+	//     is treated as WEDGED and reaped. Below it a peer's in-flight seed/prune is
+	//     never touched — a legit helper is briefly `created` between ContainerCreate
+	//     and ContainerStart, and `running` while it copies/prunes. Above it a crashed
+	//     running seeder is reaped so it can no longer hold the externals seeding
+	//     flock indefinitely. It comfortably exceeds the externals seed timeout.
+	helperTerminalGrace = 2 * time.Minute
+	helperRunningMaxAge = externalsSeedTimeout + 5*time.Minute
 )
 
 // runCacheGC is the opportunistic, best-effort cache housekeeping pass ADR-003
@@ -154,12 +172,24 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName 
 	log.Printf("garm-provider-docker: cache GC: pruned diag volume %s (files older than %dd)", volumeName, p.cfg.Cache.DiagnosticLogRetentionDays)
 }
 
-// reapLeakedHelpers force-removes any non-running cache-helper container for
-// THIS controller — a seed/prune helper whose provider process died before its
-// own defer removed it. It only touches containers labeled role=cache-helper for
-// this controller and carrying NO instance-name (defense-in-depth: a helper is
-// never a job allocation), and it leaves RUNNING helpers alone (a concurrent
-// peer process's in-flight seed/prune). Bounded and best-effort.
+// reapLeakedHelpers force-removes a LEAKED cache-helper container for THIS
+// controller — a seed/prune helper whose provider process died before its own
+// defer removed it — while NEVER racing a live peer's in-flight helper (H5). It
+// only touches containers labeled role=cache-helper for this controller and
+// carrying NO instance-name (defense-in-depth: a helper is never a job
+// allocation), and it gates the removal on the helper's Docker STATE and its
+// creation AGE (the created-at label helperLabels stamps):
+//
+//   - `created`/`running`: a peer's seed/prune is briefly `created` between
+//     ContainerCreate and ContainerStart, and `running` while it copies/prunes —
+//     both are LEFT ALONE until older than helperRunningMaxAge, at which point a
+//     WEDGED/crashed one is reaped so it can no longer hold the externals seeding
+//     flock indefinitely (the old reaper skipped every `running` helper forever,
+//     leaking the lock, AND reaped every `created` one immediately, racing a peer);
+//   - terminal (exited/dead): left to its own provider's defer within
+//     helperTerminalGrace, then reaped as a genuine leak.
+//
+// Bounded and best-effort.
 func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 	f := filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
@@ -171,19 +201,23 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 		log.Printf("garm-provider-docker: cache GC: failed to list helper containers (continuing): %v", err)
 		return
 	}
+	now := time.Now()
 	reaped := 0
 	for _, c := range list {
 		if reaped >= helperReapMax {
 			break
 		}
-		if c.State == "running" {
-			continue // an in-flight peer's seed/prune — never reap a live one
-		}
+		// Defense-in-depth: only THIS controller's cache-helpers, never a job
+		// allocation (which would carry an instance-name).
 		if c.Labels[spec.LabelRole] != spec.RoleCacheHelper || c.Labels[spec.LabelControllerID] != p.controllerID {
 			continue
 		}
 		if _, hasInst := c.Labels[spec.LabelInstanceName]; hasInst {
-			continue // a helper never carries an instance-name; refuse to touch it
+			continue
+		}
+		age, known := helperAge(now, c.Labels[spec.LabelCreatedAt])
+		if !helperReapable(c.State, age, known) {
+			continue
 		}
 		if err := p.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 			log.Printf("garm-provider-docker: cache GC: failed to reap leaked helper %s (continuing): %v", c.ID, err)
@@ -196,16 +230,50 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 	}
 }
 
+// helperReapable decides whether a leaked cache-helper in Docker state `state`,
+// aged `age` (known=false when its created-at label was missing/unparseable),
+// should be reaped now (H5). A non-terminal helper is reaped only once it is
+// clearly WEDGED (older than helperRunningMaxAge, and only when its age is known,
+// so a live peer is never guessed at); a terminal helper is reaped once past
+// helperTerminalGrace, or immediately when its age is unknown (it holds no lock,
+// so reaping it is always safe).
+func helperReapable(state string, age time.Duration, known bool) bool {
+	switch state {
+	case "created", "running":
+		return known && age >= helperRunningMaxAge
+	default: // exited, dead, or any other terminal state
+		return !known || age >= helperTerminalGrace
+	}
+}
+
+// helperAge parses a helper's created-at label (RFC3339, stamped by helperLabels)
+// into an age relative to now. known is false when the label is missing or
+// unparseable, which the reaper treats conservatively (never reaping a
+// non-terminal helper it cannot age).
+func helperAge(now time.Time, createdAt string) (age time.Duration, known bool) {
+	if createdAt == "" {
+		return 0, false
+	}
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return 0, false
+	}
+	return now.Sub(t), true
+}
+
 // helperLabels returns the labels every short-lived cache-helper container (the
 // externals seeder / diag pruner) carries: managed + controller-id +
-// role=cache-helper. It carries NO instance-name, so ADR-004's teardown/sweep
-// predicate structurally excludes it and ListInstances (role=runner) never
-// reports it; the role label lets reapLeakedHelpers find a crash-leaked helper.
+// role=cache-helper + a CREATION-time created-at (H5). It carries NO
+// instance-name, so ADR-004's teardown/sweep predicate structurally excludes it
+// and ListInstances (role=runner) never reports it; the role label lets
+// reapLeakedHelpers find a crash-leaked helper and the created-at label lets it
+// age one by state without ever racing a live peer's in-flight helper.
 func (p *Provider) helperLabels() map[string]string {
 	return map[string]string{
 		spec.LabelManaged:      "true",
 		spec.LabelControllerID: p.controllerID,
 		spec.LabelRole:         spec.RoleCacheHelper,
+		spec.LabelCreatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}
 }
 

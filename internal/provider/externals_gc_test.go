@@ -6,11 +6,73 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/volume"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
+
+// seedHelperContainer creates a cache-helper container with the given created-at
+// label and Docker state, returning its ID — so the H5 leaked-helper reaper can
+// be driven across the (state, age) matrix.
+func seedHelperContainer(t *testing.T, fake *docker.FakeClient, controllerID string, createdAt time.Time, state string) string {
+	t.Helper()
+	labels := map[string]string{
+		spec.LabelManaged:      "true",
+		spec.LabelControllerID: controllerID,
+		spec.LabelRole:         spec.RoleCacheHelper,
+		spec.LabelCreatedAt:    createdAt.UTC().Format(time.RFC3339),
+	}
+	resp, err := fake.ContainerCreate(context.Background(), &container.Config{Image: "runner", Labels: labels}, &container.HostConfig{}, nil, nil, "")
+	if err != nil {
+		t.Fatalf("seed helper container: %v", err)
+	}
+	if state != "created" {
+		fake.SetState(resp.ID, state, false)
+	}
+	return resp.ID
+}
+
+func helperContainerExists(t *testing.T, fake *docker.FakeClient, id string) bool {
+	t.Helper()
+	_, err := fake.ContainerInspect(context.Background(), id)
+	return err == nil
+}
+
+// TestReapLeakedHelpersRespectsStateAndAge is the H5 guard: the leaked-helper
+// reaper never reaps a helper that could be a live peer's in-flight handoff
+// (a briefly `created` one, or a `running` seed/prune) yet DOES eventually reap a
+// wedged/crashed one so it cannot hold the externals seeding flock forever.
+func TestReapLeakedHelpersRespectsStateAndAge(t *testing.T) {
+	p, fake := newCacheProvider(t, false)
+	now := time.Now()
+
+	freshCreated := seedHelperContainer(t, fake, p.controllerID, now, "created")
+	freshRunning := seedHelperContainer(t, fake, p.controllerID, now, "running")
+	staleRunning := seedHelperContainer(t, fake, p.controllerID, now.Add(-(helperRunningMaxAge + time.Minute)), "running")
+	freshExited := seedHelperContainer(t, fake, p.controllerID, now, "exited")
+	staleExited := seedHelperContainer(t, fake, p.controllerID, now.Add(-(helperTerminalGrace + time.Minute)), "exited")
+
+	p.reapLeakedHelpers(context.Background())
+
+	for _, tc := range []struct {
+		name       string
+		id         string
+		wantReaped bool
+	}{
+		{"created (fresh) not reaped — a peer between create and start", freshCreated, false},
+		{"running (fresh) not reaped — a peer's in-flight seed/prune", freshRunning, false},
+		{"running (stale) reaped — a wedged seeder holding the flock", staleRunning, true},
+		{"exited (fresh) not reaped — its own provider's defer will remove it", freshExited, false},
+		{"exited (stale) reaped — a genuine leak", staleExited, true},
+	} {
+		gone := !helperContainerExists(t, fake, tc.id)
+		if gone != tc.wantReaped {
+			t.Errorf("%s: reaped=%v, want %v", tc.name, gone, tc.wantReaped)
+		}
+	}
+}
 
 // seedHelperScript finds the externals-seed helper recorded in the fake's
 // Created log (by its cache-helper role + flock script) and returns its shell
