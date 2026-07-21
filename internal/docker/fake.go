@@ -178,6 +178,12 @@ type fakeContainer struct {
 	privileged bool
 	runtime    string
 
+	// groupAdd models HostConfig.GroupAdd — the supplementary groups the
+	// runner is given so its unprivileged user can reach the shared DinD socket
+	// (F1). Recorded at ContainerCreate and surfaced by ContainerInspect so a
+	// test can assert the DinD socket GID was added.
+	groupAdd []string
+
 	// state is the Docker state string: created, running, exited, or dead.
 	// It drives both the Running bool and the status a caller maps from.
 	state     string
@@ -521,6 +527,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
 		c.privileged = hostConfig.Privileged
 		c.runtime = hostConfig.Runtime
+		c.groupAdd = append([]string(nil), hostConfig.GroupAdd...)
 	}
 	f.containers[id] = c
 
@@ -815,6 +822,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 			Tmpfs:      cloneLabels(c.tmpfsMounts),
 			Privileged: c.privileged,
 			Runtime:    c.runtime,
+			GroupAdd:   append([]string(nil), c.groupAdd...),
 		},
 	}
 	if c.networkMode != "" {

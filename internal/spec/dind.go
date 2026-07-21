@@ -52,18 +52,50 @@ const (
 	// structural property of the builder rather than something a caller must
 	// remember to set.
 	DindTLSDisabledEnv = "DOCKER_TLS_CERTDIR="
+
+	// DindSocketGID is a fixed, dedicated supplementary group ID for the
+	// shared DinD socket (F1). dockerd is launched with `--group <this>`
+	// (DindCommand below), so it creates /run/docker.sock group-owned by this
+	// GID and group-writable; the runner container is given this GID as a
+	// supplementary group (HostConfig.GroupAdd, BuildRunnerContainer) AND its
+	// unprivileged `runner` user is added to a group with this GID by the
+	// entrypoint before it drops privileges, so a `docker` call made as that
+	// non-root user can reach the daemon socket.
+	//
+	// It is deliberately a FIXED value the provider controls end to end, not
+	// the runner image's or docker:dind's own "docker" group: those two base
+	// images ship DIFFERENT docker-group GIDs (myoung34/github-runner vs.
+	// docker:dind), so relying on a named `docker` group would leave the
+	// socket group-owned by one GID and the runner user a member of a
+	// different one — the exact permission-denied gap this constant closes.
+	// It is distinct from the runner user's own primary GID (RunnerGID=1001)
+	// so socket access is an explicit, auditable group membership rather than
+	// conflated with the runner user's identity, and high enough to avoid the
+	// base images' system groups.
+	DindSocketGID = "2000"
+
+	// DindSocketGIDEnv is the environment variable the provider sets on the
+	// runner (DinD modes only, BuildRunnerEnv) carrying DindSocketGID, so the
+	// runner-image entrypoint knows which GID to add the `runner` user to
+	// before dropping privileges (ADR-002; runner-images/noble/entrypoint.sh).
+	DindSocketGIDEnv = "DOCKER_SOCK_GID"
 )
 
 // DindCommand is dockerd's argv inside the sidecar (ADR-001): listen only on
 // the shared unix socket, with an EXPLICIT --storage-driver (never
 // autodetected — NAS host filesystems make in-container autodetection
-// unreliable, so config.Config.StorageDriver is always passed through). The
-// docker:dind image's entrypoint runs the DinD setup then execs this argv.
+// unreliable, so config.Config.StorageDriver is always passed through) and an
+// EXPLICIT --group so the socket is group-owned by DindSocketGID (F1) rather
+// than by whatever docker:dind's own base image happens to number its `docker`
+// group — the runner user is made a member of that same GID, so a non-root
+// `docker` call from the runner can reach this socket. The docker:dind image's
+// entrypoint runs the DinD setup then execs this argv.
 func DindCommand(storageDriver string) []string {
 	return []string{
 		"dockerd",
 		"--host=" + DindDockerHost,
 		"--storage-driver=" + storageDriver,
+		"--group=" + DindSocketGID,
 	}
 }
 
@@ -116,12 +148,24 @@ func BuildDindContainer(s DindContainerSpec) (*container.Config, *container.Host
 		Cmd:    DindCommand(s.StorageDriver),
 	}
 
+	mounts := []mount.Mount{
+		SocketVolumeMount(s.SocketVolumeName),
+		DindStateMount(s.DindStateVolumeName),
+	}
+	if s.WorkspaceVolumeName != "" {
+		// F2: mount the allocation's workspace volume into the DinD daemon at
+		// the SAME path the runner uses (RunnerWorkDir). A nested `docker run
+		// -v "$PWD":/work …` the job issues resolves its bind SOURCE in the
+		// DAEMON's (this sidecar's) filesystem, not the runner's — so without
+		// this the daemon would bind an empty/new path instead of the runner's
+		// checked-out workspace. Sharing the same named volume here makes the
+		// runner's workspace and the daemon's view of it the same files.
+		mounts = append(mounts, NamedWorkspaceMount(s.WorkspaceVolumeName))
+	}
+
 	host := &container.HostConfig{
 		Privileged: s.Privileged,
-		Mounts: []mount.Mount{
-			SocketVolumeMount(s.SocketVolumeName),
-			DindStateMount(s.DindStateVolumeName),
-		},
+		Mounts:     mounts,
 	}
 	if s.Runtime != "" {
 		// Empty for privileged-sidecar (the daemon default runtime);

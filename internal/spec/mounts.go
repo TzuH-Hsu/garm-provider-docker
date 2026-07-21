@@ -189,17 +189,24 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	}
 
 	mounts := []mount.Mount{workspace}
+	host := &container.HostConfig{
+		Tmpfs:  CredentialTmpfsMap(),
+		Mounts: mounts,
+	}
 	if s.SocketVolumeName != "" {
 		// DinD modes (WP3): the runner mounts the shared socket volume at
 		// DindSocketDir so it reaches ONLY the sidecar's daemon socket. Never
 		// the host socket, never TCP (ADR-001). The DinD sidecar mounts this
 		// same named volume at the same path.
-		mounts = append(mounts, SocketVolumeMount(s.SocketVolumeName))
-	}
-
-	host := &container.HostConfig{
-		Tmpfs:  CredentialTmpfsMap(),
-		Mounts: mounts,
+		host.Mounts = append(host.Mounts, SocketVolumeMount(s.SocketVolumeName))
+		// F1: give the runner container the DinD socket GID as a supplementary
+		// group so the unprivileged `runner` user can read/write the shared
+		// dockerd socket (dockerd created it group-owned by DindSocketGID via
+		// its --group flag). GroupAdd covers processes that run as the
+		// container's user tree directly (e.g. the RUN_AS_ROOT path); the
+		// entrypoint additionally adds the runner user to a group with this GID
+		// so gosu's own initgroups preserves it when it drops privileges.
+		host.GroupAdd = append(host.GroupAdd, DindSocketGID)
 	}
 	if s.NetworkName != "" {
 		// Attach the runner to the per-job network as its sole network
@@ -285,6 +292,15 @@ type DindContainerSpec struct {
 	// on a dedicated volume so overlay/vfs layers never leak across jobs and
 	// are destroyed at teardown (ADR-001). Required for a DinD sidecar.
 	DindStateVolumeName string
+
+	// WorkspaceVolumeName, when set, mounts the allocation's workspace volume
+	// into the sidecar at RunnerWorkDir (F2). It is the SAME named volume the
+	// runner mounts at the same path, so a nested `docker run -v "$PWD":/work`
+	// the job issues resolves its bind source — which the daemon resolves in
+	// ITS OWN (the sidecar's) filesystem, not the runner's — to the runner's
+	// real checked-out workspace rather than an empty new path. WP3 always
+	// sets it in DinD modes.
+	WorkspaceVolumeName string
 }
 
 // DindRuntimeSelection derives the HostConfig.Privileged/HostConfig.Runtime

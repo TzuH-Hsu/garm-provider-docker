@@ -104,8 +104,9 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if dind.HostConfig.Runtime != "" {
 		t.Errorf("sidecar Runtime = %q, want empty (default runtime)", dind.HostConfig.Runtime)
 	}
-	// dockerd argv carries the explicit storage driver from config.
-	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
+	// dockerd argv carries the explicit storage driver from config and the
+	// explicit socket --group (F1).
+	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + spec.DindSocketGID}
 	if !slices.Equal([]string(dind.Config.Cmd), wantCmd) {
 		t.Errorf("sidecar Cmd = %v, want %v", dind.Config.Cmd, wantCmd)
 	}
@@ -120,6 +121,10 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	// Socket at /run and dind-state at /var/lib/docker; no host docker.sock.
 	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
 	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name), spec.DindStateDir)
+	// F2: the runner's workspace volume is ALSO mounted into the sidecar at the
+	// runner workdir, so a nested `docker run -v "$PWD":/work` the job issues
+	// resolves its bind source (daemon-side) to the real checked-out files.
+	assertContainerMount(t, dind.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, dind.Mounts)
 
 	// --- runner container ---
@@ -144,6 +149,11 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name), spec.DindSocketDir)
 	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, runner.Mounts)
+	// F1: the runner carries the DinD socket GID as a supplementary group so
+	// its unprivileged user can reach the shared dockerd socket.
+	if !slices.Contains(runner.HostConfig.GroupAdd, spec.DindSocketGID) {
+		t.Errorf("runner GroupAdd = %v, want it to include the DinD socket GID %q", runner.HostConfig.GroupAdd, spec.DindSocketGID)
+	}
 	// Runner on the job network, with the credential tmpfs.
 	if string(runner.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
 		t.Errorf("runner NetworkMode = %q, want the job network", runner.HostConfig.NetworkMode)

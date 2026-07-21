@@ -100,7 +100,7 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	// Everything else about the sidecar is the SAME shared-code shape as
 	// privileged-sidecar: dockerd Cmd (with the config storage driver), TLS
 	// off, same job network, same two named-volume mounts, no host socket.
-	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
+	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + spec.DindSocketGID}
 	if !slices.Equal([]string(dind.Config.Cmd), wantCmd) {
 		t.Errorf("sidecar Cmd = %v, want %v", dind.Config.Cmd, wantCmd)
 	}

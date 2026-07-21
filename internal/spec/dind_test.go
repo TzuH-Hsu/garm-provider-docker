@@ -10,13 +10,21 @@ import (
 
 func TestDindCommand(t *testing.T) {
 	got := DindCommand("overlay2")
-	want := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
+	// F1: dockerd is launched with an explicit --group so the socket is
+	// group-owned by DindSocketGID (the runner user is made a member of it).
+	want := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + DindSocketGID}
 	if !slices.Equal(got, want) {
 		t.Fatalf("DindCommand(overlay2) = %v, want %v", got, want)
 	}
 	// The storage driver is passed through verbatim (vfs fallback, ADR-001).
 	if got := DindCommand("vfs"); got[2] != "--storage-driver=vfs" {
 		t.Errorf("DindCommand(vfs) storage arg = %q, want --storage-driver=vfs", got[2])
+	}
+	// F1: the socket group is a fixed, provider-controlled GID, distinct from
+	// the runner user's own primary GID so socket access is an explicit
+	// supplementary-group membership, not conflated with the runner identity.
+	if DindSocketGID == RunnerGID {
+		t.Errorf("DindSocketGID (%q) must differ from RunnerGID (%q)", DindSocketGID, RunnerGID)
 	}
 	// DindDockerHost is the exact socket the runner's DOCKER_HOST must match.
 	if DindDockerHost != "unix:///run/docker.sock" {
@@ -40,11 +48,12 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 		NetworkName:         "job-1-net",
 		SocketVolumeName:    "job-1-socket",
 		DindStateVolumeName: "job-1-dind-state",
+		WorkspaceVolumeName: "job-1-workspace",
 	})
 
 	// dockerd argv listens ONLY on the shared unix socket, with the explicit
-	// storage driver.
-	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2"}
+	// storage driver and the explicit socket --group (F1).
+	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + DindSocketGID}
 	if !slices.Equal([]string(cfg.Cmd), wantCmd) {
 		t.Errorf("Cmd = %v, want %v", cfg.Cmd, wantCmd)
 	}
@@ -78,11 +87,14 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 		t.Errorf("Memory = %d, want %d", host.Resources.Memory, 4<<30)
 	}
 
-	// Exactly two mounts: socket at /run, dind-state at /var/lib/docker.
+	// Three mounts: socket at /run, dind-state at /var/lib/docker, and (F2) the
+	// runner's workspace at RunnerWorkDir so nested bind sources resolve to the
+	// real checked-out files daemon-side.
 	assertMount(t, host.Mounts, "job-1-socket", DindSocketDir)
 	assertMount(t, host.Mounts, "job-1-dind-state", DindStateDir)
-	if len(host.Mounts) != 2 {
-		t.Errorf("Mounts = %d, want exactly 2 (socket + dind-state)", len(host.Mounts))
+	assertMount(t, host.Mounts, "job-1-workspace", RunnerWorkDir)
+	if len(host.Mounts) != 3 {
+		t.Errorf("Mounts = %d, want exactly 3 (socket + dind-state + workspace)", len(host.Mounts))
 	}
 
 	// NO host docker.sock is ever bound into the sidecar (ADR-001 red line):
@@ -160,6 +172,11 @@ func TestBuildRunnerContainerDinDSocketMountAndNoHostSocket(t *testing.T) {
 	if _, ok := host.Tmpfs[CredentialDir]; !ok {
 		t.Errorf("HostConfig.Tmpfs missing %q", CredentialDir)
 	}
+	// F1: the runner gets the DinD socket GID as a supplementary group so the
+	// unprivileged runner user can reach the shared dockerd socket.
+	if !slices.Contains(host.GroupAdd, DindSocketGID) {
+		t.Errorf("HostConfig.GroupAdd = %v, want it to include the DinD socket GID %q", host.GroupAdd, DindSocketGID)
+	}
 }
 
 func TestBuildRunnerContainerNoneModeHasNoSocketMount(t *testing.T) {
@@ -171,6 +188,10 @@ func TestBuildRunnerContainerNoneModeHasNoSocketMount(t *testing.T) {
 	})
 	if len(host.Mounts) != 1 || host.Mounts[0].Target != RunnerWorkDir {
 		t.Errorf("Mounts = %+v, want only the workspace mount (no socket in none mode)", host.Mounts)
+	}
+	// F1: no DinD socket group in none mode (no DinD daemon to reach).
+	if len(host.GroupAdd) != 0 {
+		t.Errorf("HostConfig.GroupAdd = %v, want empty in none mode", host.GroupAdd)
 	}
 }
 
@@ -184,6 +205,11 @@ func TestBuildRunnerEnvEmitsDockerHostOnlyInDinDModes(t *testing.T) {
 	})
 	if !hasExactEnv(jit, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("JIT DinD env = %v, want DOCKER_HOST set", jit)
+	}
+	// F1: DinD modes also carry the socket GID so the entrypoint can add the
+	// runner user to a group with it before dropping privileges.
+	if !hasExactEnv(jit, DindSocketGIDEnv+"="+DindSocketGID) {
+		t.Errorf("JIT DinD env = %v, want %s=%s set", jit, DindSocketGIDEnv, DindSocketGID)
 	}
 
 	// DinD mode (non-JIT): still emitted, before the entity vars.
@@ -208,6 +234,9 @@ func TestBuildRunnerEnvEmitsDockerHostOnlyInDinDModes(t *testing.T) {
 	for _, e := range none {
 		if strings.HasPrefix(e, "DOCKER_HOST=") {
 			t.Errorf("none mode must not set DOCKER_HOST, got %q", e)
+		}
+		if strings.HasPrefix(e, DindSocketGIDEnv+"=") {
+			t.Errorf("none mode must not set %s, got %q", DindSocketGIDEnv, e)
 		}
 	}
 }

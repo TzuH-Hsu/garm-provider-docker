@@ -140,6 +140,11 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 	}
 	if opts.DockerHost != "" {
 		env = append(env, "DOCKER_HOST="+opts.DockerHost)
+		// F1: tell the entrypoint which supplementary GID to add the runner
+		// user to before dropping privileges, so a non-root `docker` call can
+		// reach the DinD socket (group-owned by this GID via dockerd --group).
+		// Emitted only in DinD modes (DockerHost set), alongside DOCKER_HOST.
+		env = append(env, DindSocketGIDEnv+"="+DindSocketGID)
 	}
 
 	if opts.JITConfigEnabled {

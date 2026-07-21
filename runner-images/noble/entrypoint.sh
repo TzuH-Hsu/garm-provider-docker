@@ -99,6 +99,32 @@ require_gosu() {
   fail "gosu is required to drop privileges to ${RUNNER_USER} but was not found on PATH; refusing to run as root (set RUN_AS_ROOT=true to override deliberately)"
 }
 
+# ensure_docker_socket_group makes the unprivileged runner user able to reach
+# the shared DinD daemon socket (F1). In DinD modes the provider launches the
+# sidecar's dockerd with `--group ${DOCKER_SOCK_GID}`, so /run/docker.sock is
+# group-owned by that GID and group-writable. gosu re-derives the runner's
+# supplementary groups from /etc/group when it drops privileges, so the runner
+# user must be a MEMBER of a group with that GID here (the container's
+# HostConfig.GroupAdd alone does not survive gosu's initgroups) — otherwise a
+# `docker` call as the runner user is permission-denied. No-op when
+# DOCKER_SOCK_GID is unset (none mode). Fails CLOSED in DinD mode: without the
+# membership the runner cannot use Docker at all, which the job needs.
+ensure_docker_socket_group() {
+  local gid="${DOCKER_SOCK_GID:-}"
+  [[ -z "${gid}" ]] && return 0
+
+  local grp
+  grp="$(getent group "${gid}" | cut -d: -f1)"
+  if [[ -z "${grp}" ]]; then
+    grp="dockersock"
+    groupadd -g "${gid}" "${grp}" \
+      || fail "could not create group ${grp} for DinD socket GID ${gid}"
+  fi
+  usermod -aG "${grp}" "${RUNNER_USER}" \
+    || fail "could not add ${RUNNER_USER} to group ${grp} (GID ${gid}) for DinD socket access"
+  log "added ${RUNNER_USER} to group ${grp} (GID ${gid}) for DinD socket access"
+}
+
 # Step 1: credential wait. Both modes wait for the single atomic delivery
 # marker the provider writes last (ADR-002 F1).
 wait_for_credentials() {
@@ -398,6 +424,10 @@ main() {
   cd "${RUNNER_DIR}"
 
   run_concurrent_waits
+
+  # DinD modes: make the runner user a member of the DinD socket group before
+  # dropping privileges, so `docker` works as the unprivileged runner (F1).
+  ensure_docker_socket_group
 
   if [[ "${JIT_CONFIG_ENABLED:-false}" == "true" ]]; then
     install_jit_credentials
