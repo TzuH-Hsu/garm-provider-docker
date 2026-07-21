@@ -40,10 +40,34 @@ type Entity struct {
 // exactly as given in repo_url: GitHub org/repo/enterprise names are
 // treated as opaque path segments here, never normalized, since GitHub's
 // API accepts whatever case the operator's URL used.
+//
+// It requires an ABSOLUTE http(s) URL with a non-empty host and REJECTS any
+// scheme-less, relative, or otherwise unparseable form. This is a fail-SAFE
+// boundary for the cache-eligibility decision (H1): url.Parse("github.com/acme")
+// yields a RELATIVE path ("github.com/acme") with an EMPTY host, which — split on
+// "/" — has two segments and would otherwise be misclassified as REPO scope, so
+// an org-scoped pool that happened to use a scheme-less repo_url would be handed
+// writable per-repo caches even with allow_org_shared=false (a cross-org leak).
+// Demanding a real scheme+host means such an input reaches DetectCacheEntityScope
+// as an error (→ CacheScopeUnknown → NO persistent cache), never a mis-scoped one.
 func ParseEntity(repoURL string) (Entity, error) {
-	u, err := url.Parse(repoURL)
+	u, err := url.Parse(strings.TrimSpace(repoURL))
 	if err != nil {
 		return Entity{}, fmt.Errorf("failed to parse repo_url %q: %w", repoURL, err)
+	}
+
+	// An absolute http(s) URL with a host is the ONLY shape that can be
+	// confidently classified; anything else (scheme-less "github.com/acme",
+	// bare "owner/repo", or a non-http scheme) is treated as unclassifiable so
+	// the cache decision fails safe rather than open.
+	switch scheme := strings.ToLower(u.Scheme); scheme {
+	case "http", "https":
+		// ok
+	default:
+		return Entity{}, fmt.Errorf("repo_url %q is not an absolute http(s) URL (scheme %q); refusing to classify its entity scope", repoURL, u.Scheme)
+	}
+	if u.Host == "" {
+		return Entity{}, fmt.Errorf("repo_url %q has no host; refusing to classify its entity scope", repoURL)
 	}
 
 	path := strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")

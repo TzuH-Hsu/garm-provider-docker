@@ -87,6 +87,26 @@ func TestParseEntity(t *testing.T) {
 			repoURL: "://not-a-url",
 			wantErr: true,
 		},
+		{
+			name:    "scheme-less org URL is rejected (H1: was mis-read as a repo)",
+			repoURL: "github.com/acme",
+			wantErr: true,
+		},
+		{
+			name:    "scheme-less repo URL is rejected (H1)",
+			repoURL: "github.com/acme/repo",
+			wantErr: true,
+		},
+		{
+			name:    "bare owner/repo is rejected (H1)",
+			repoURL: "owner/repo",
+			wantErr: true,
+		},
+		{
+			name:    "non-http scheme is rejected (H1)",
+			repoURL: "ssh://git@github.com/acme/repo",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
