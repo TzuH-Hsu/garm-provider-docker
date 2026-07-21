@@ -2,7 +2,10 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	"github.com/docker/docker/api/types/network"
@@ -15,6 +18,13 @@ import (
 // jobNetworkDriver is the driver for every per-job network (ADR-001: a labeled
 // bridge network).
 const jobNetworkDriver = "bridge"
+
+// networkCleanupTimeout bounds the detached cleanup of a network an ambiguous
+// NetworkCreate may have leaked (F7). The cleanup runs under a context detached
+// from the caller's (context.WithoutCancel), so a caller cancellation — the
+// very condition that can make NetworkCreate's own response ambiguous — cannot
+// also abort the cleanup; this timeout keeps that detached work from hanging.
+const networkCleanupTimeout = 30 * time.Second
 
 // CreateClaimNetwork creates the per-job network — ADR-004's atomic claim
 // marker, the FIRST resource created for any allocation, stamped with
@@ -63,11 +73,21 @@ func (m *Manager) CreateClaimNetwork(ctx context.Context, identity spec.Allocati
 	}
 
 	// A non-conflict NetworkCreate error is ambiguous — the daemon may have
-	// created the network before failing. Remove any network tagged with THIS
-	// attempt's nonce so the failed claim leaves nothing behind, then surface
-	// the original error.
-	m.bestEffortRemoveOwnNetwork(ctx, nonce)
-	return "", nil, fmt.Errorf("failed to create job network for %q: %w", instanceName, cerr)
+	// created the network before failing (the "committed but response lost"
+	// case). Remove any network tagged with THIS attempt's nonce so the failed
+	// claim leaves nothing behind, then surface the original error (F7). The
+	// cleanup runs under a context detached from the caller's with a bounded
+	// timeout, so a caller cancellation cannot abort it, and any cleanup error
+	// is logged AND joined onto the returned error rather than swallowed —
+	// mirroring the M0 creation-guard pattern.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), networkCleanupTimeout)
+	defer cancel()
+	err = fmt.Errorf("failed to create job network for %q: %w", instanceName, cerr)
+	if cleanupErr := m.bestEffortRemoveOwnNetwork(cleanupCtx, nonce); cleanupErr != nil {
+		log.Printf("garm-provider-docker: CreateClaimNetwork: ambiguous-create cleanup for %q failed: %v", instanceName, cleanupErr)
+		err = errors.Join(err, fmt.Errorf("ambiguous-create network cleanup for %q failed: %w", instanceName, cleanupErr))
+	}
+	return "", nil, err
 }
 
 // existingClaimIsOurs reports whether the network already holding `name` is a
@@ -93,21 +113,26 @@ func (m *Manager) existingClaimIsOurs(ctx context.Context, name, instanceName st
 
 // bestEffortRemoveOwnNetwork removes any network carrying this attempt's
 // create-nonce, used to clean up a network an ambiguous NetworkCreate may have
-// leaked. It is nonce-scoped so it can never touch a peer's or a foreign
-// network; failures are ignored (best-effort).
-func (m *Manager) bestEffortRemoveOwnNetwork(ctx context.Context, nonce string) {
+// leaked (F7). It is nonce-scoped so it can never touch a peer's or a foreign
+// network. Per-network removal errors (NotFound tolerated) are joined and
+// returned so the caller can log/join them rather than silently swallow them.
+func (m *Manager) bestEffortRemoveOwnNetwork(ctx context.Context, nonce string) error {
 	list, err := m.cli.NetworkList(ctx, network.ListOptions{
 		Filters: filtersForNonce(m.controllerID, nonce),
 	})
 	if err != nil {
-		return
+		return fmt.Errorf("failed to list nonce-scoped networks for cleanup: %w", err)
 	}
+	var errs []error
 	for _, n := range list {
 		if n.Labels[spec.LabelCreateNonce] != nonce {
 			continue
 		}
-		_ = m.cli.NetworkRemove(ctx, n.ID)
+		if rerr := m.cli.NetworkRemove(ctx, n.ID); rerr != nil && !errdefs.IsNotFound(rerr) {
+			errs = append(errs, fmt.Errorf("failed to remove leaked network %s: %w", n.ID, rerr))
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // CreateWorkspaceVolume creates the per-job workspace volume (ADR-001), a
@@ -162,13 +187,54 @@ func (m *Manager) createFreshVolume(ctx context.Context, kind, name string, labe
 		return nil // a genuinely fresh volume carries our nonce
 	}
 
-	// Idempotent hit: `created` is a stale volume with a different (or absent)
-	// nonce. Remove and recreate so no prior job's content survives.
+	// Idempotent hit: `created` is a PRE-EXISTING volume (the real daemon
+	// returns the existing volume with its ORIGINAL labels on a duplicate name,
+	// discarding ours). Before force-removing it, require the COMPLETE ownership
+	// tuple to match this controller/allocation (F3): managed=true + this
+	// controller-id + this instance-name + the expected resource label. On ANY
+	// mismatch we FAIL CLOSED — a volume named `<instance>-workspace`/`-socket`/
+	// `-dind-state` that we do not fully own is a foreign or other-controller
+	// resource that merely collides on the deterministic name, and destroying it
+	// would violate the red line "cleanup is allowlist-only, never touch what we
+	// do not own." Only a volume we own (a stale leftover from a crashed prior
+	// allocation of OUR instance name) is replaced.
+	if !m.ownsVolumeForReplacement(created.Labels, labels) {
+		return fmt.Errorf("refusing to replace %s volume %q: it already exists but does not carry this controller's full ownership tuple (managed + controller-id + instance-name + resource=%s) — it is a foreign or other-controller volume colliding on the name, not a stale allocation of ours", kind, name, labels[spec.LabelResource])
+	}
+
+	// It is ours: remove and recreate so no prior job's content survives.
 	if err := m.cli.VolumeRemove(ctx, name, true); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("stale %s volume %q could not be removed for replacement: %w", kind, name, err)
 	}
-	if _, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels}); err != nil {
+	recreated, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
+	if err != nil {
 		return fmt.Errorf("failed to recreate a fresh %s volume %q: %w", kind, name, err)
 	}
+	// Re-validate the recreated volume carries THIS attempt's nonce (F3, close
+	// the TOCTOU): if the create idempotent-hit an existing volume again — a
+	// concurrent recreation of the same name by something not holding our claim
+	// marker — we did not get the fresh, empty volume we require, so fail closed
+	// rather than proceed on residue we cannot vouch for.
+	if recreated.Labels[spec.LabelCreateNonce] != nonce {
+		return fmt.Errorf("failed to obtain a fresh %s volume %q: after replacement it still does not carry this attempt's create-nonce (a concurrent recreation of the same name?)", kind, name)
+	}
 	return nil
+}
+
+// ownsVolumeForReplacement reports whether an existing volume's labels satisfy
+// the COMPLETE ownership tuple for this allocation (F3), so createFreshVolume
+// may safely destroy and replace it: the full ADR-004 predicate (managed + this
+// controller + has instance-name + NOT cache=true), plus an exact match on the
+// instance-name and resource kind we intend to (re)create. A foreign volume
+// carries none of these; an other-controller or other-allocation volume fails
+// the controller/instance-name/resource comparison. Any mismatch means "not
+// ours" and the caller fails closed rather than deleting it.
+func (m *Manager) ownsVolumeForReplacement(existing, want map[string]string) bool {
+	if !spec.MatchesPredicate(existing, m.controllerID) {
+		return false
+	}
+	if existing[spec.LabelInstanceName] != want[spec.LabelInstanceName] {
+		return false
+	}
+	return existing[spec.LabelResource] == want[spec.LabelResource]
 }

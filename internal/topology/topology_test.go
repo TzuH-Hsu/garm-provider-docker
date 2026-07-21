@@ -3,6 +3,7 @@ package topology
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,12 @@ func seedRunnerFor(t *testing.T, fake *docker.FakeClient, controllerID, name str
 		t.Fatalf("seed ContainerCreate for %q returned unexpected error: %v", name, err)
 	}
 	fake.SetState(resp.ID, state, false)
+	// The exited-runner sweep grace (F8) is measured from State.FinishedAt, so a
+	// stopped seed runner models finishing when the allocation was created — old
+	// created-at ⇒ old FinishedAt ⇒ past grace, now ⇒ within grace.
+	if state == "exited" || state == "dead" {
+		fake.SetFinishedAt(resp.ID, createdAt)
+	}
 	return resp.ID
 }
 
@@ -365,6 +372,61 @@ func TestCreateWorkspaceVolumeCreateErrorSurfaces(t *testing.T) {
 	}
 }
 
+// TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume is the F3 red-line
+// guard: a volume occupying the deterministic workspace name that does NOT
+// carry this controller's full ownership tuple (here, a completely foreign
+// volume) must NEVER be force-removed. The idempotent VolumeCreate returns it,
+// but createFreshVolume must fail closed rather than destroy someone else's
+// data.
+func TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume(t *testing.T) {
+	m, fake := newManager(t)
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
+		Name:   spec.WorkspaceVolumeName("job-1"),
+		Labels: map[string]string{"some.other/label": "x"},
+	}); err != nil {
+		t.Fatalf("seed foreign VolumeCreate returned unexpected error: %v", err)
+	}
+
+	err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "nonce-1")
+	if err == nil {
+		t.Fatal("expected CreateWorkspaceVolume to fail closed on a foreign name collision, got nil")
+	}
+	// The foreign volume is untouched: still exactly one, still its own labels.
+	if countVolumes(t, fake) != 1 {
+		t.Errorf("volume count = %d, want 1 (foreign untouched)", countVolumes(t, fake))
+	}
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels["some.other/label"] != "x" {
+		t.Errorf("foreign volume labels = %v, want the original foreign label untouched", v.Labels)
+	}
+}
+
+// TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume proves the F3
+// ownership tuple is checked in FULL: a managed volume with the right resource
+// and instance-name but a DIFFERENT controller-id is not ours, so it must not
+// be replaced.
+func TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume(t *testing.T) {
+	m, fake := newManager(t)
+	other := spec.AllocationIdentity{ControllerID: "other-controller", PoolID: "pool-1", InstanceName: "job-1"}
+	labels := other.WorkspaceVolumeLabels(time.Now())
+	labels[spec.LabelCreateNonce] = "theirs"
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{
+		Name:   spec.WorkspaceVolumeName("job-1"),
+		Labels: labels,
+	}); err != nil {
+		t.Fatalf("seed other-controller VolumeCreate returned unexpected error: %v", err)
+	}
+
+	if err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "nonce-1"); err == nil {
+		t.Fatal("expected CreateWorkspaceVolume to fail closed on an other-controller volume, got nil")
+	}
+	if countVolumes(t, fake) != 1 {
+		t.Errorf("volume count = %d, want 1 (other-controller volume untouched)", countVolumes(t, fake))
+	}
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "theirs" {
+		t.Error("an other-controller volume was replaced (nonce no longer theirs)")
+	}
+}
+
 // --- CreateSocketVolume / CreateDindStateVolume (WP3 DinD) --------------------
 
 func TestCreateSocketVolumeFresh(t *testing.T) {
@@ -518,6 +580,75 @@ func TestTeardownAllocationLeavesForeignCacheAndOtherController(t *testing.T) {
 		t.Errorf("volume count = %d, want 2 (other-controller workspace + cache)", countVolumes(t, fake))
 	}
 	findVolume(t, fake, "toolcache-generation-1") // must still exist
+}
+
+// TestTeardownRemovesNetworkLast is the F4 ordering guard: teardown removes all
+// containers first, then all volumes, then the job network (the claim marker)
+// LAST — so the network is held until every volume is gone and a concurrent
+// same-name create cannot claim a new generation mid-teardown (ADR-004
+// amendment 2026-07-21).
+func TestTeardownRemovesNetworkLast(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+	seedNetworkFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedSocketVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedDindStateVolumeFor(t, fake, testControllerID, "job-1", now, "n1")
+	seedRunnerFor(t, fake, testControllerID, "job-1", now, "n1", "running")
+	seedDindSidecarFor(t, fake, testControllerID, "job-1", now, "n1")
+
+	found, err := m.TeardownAllocation(context.Background(), "job-1")
+	if err != nil || !found {
+		t.Fatalf("TeardownAllocation = (found=%v, err=%v), want (true, nil)", found, err)
+	}
+
+	// Walk the recorded removal order: once a volume has been removed, no
+	// container may follow; once the network is removed, nothing may follow.
+	seenVolume, seenNetwork := false, false
+	for _, ev := range fake.RemoveOrder {
+		switch {
+		case strings.HasPrefix(ev, "container:"):
+			if seenVolume || seenNetwork {
+				t.Errorf("container removed after a volume/network: order=%v", fake.RemoveOrder)
+			}
+		case strings.HasPrefix(ev, "volume:"):
+			seenVolume = true
+			if seenNetwork {
+				t.Errorf("volume removed after the network (network must be LAST): order=%v", fake.RemoveOrder)
+			}
+		case strings.HasPrefix(ev, "network:"):
+			seenNetwork = true
+		}
+	}
+	// The network must be the very last removal (F4).
+	if n := len(fake.RemoveOrder); n == 0 || !strings.HasPrefix(fake.RemoveOrder[n-1], "network:") {
+		t.Errorf("last removal = %q, want the network last: order=%v", fake.RemoveOrder, fake.RemoveOrder)
+	}
+}
+
+// TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined is the F7 guard: when the
+// ambiguous-create cleanup (removing a leaked, nonce-tagged network) itself
+// fails, that failure is joined onto — not swallowed by — the returned error,
+// and the original create error is preserved for diagnostics.
+func TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined(t *testing.T) {
+	m, fake := newManager(t)
+	fake.NetworkCreateErr = errors.New("transient daemon error")
+	fake.NetworkCreateErrLeaks = true
+	fake.NetworkRemoveErr = errors.New("cleanup remove boom")
+
+	_, dupErr, err := m.CreateClaimNetwork(context.Background(), identityFor("job-1"), "nonce-1", true)
+	if dupErr != nil {
+		t.Fatalf("dupErr = %v, want nil (a non-conflict failure is not a duplicate)", dupErr)
+	}
+	if err == nil {
+		t.Fatal("expected a hard error from the ambiguous create, got nil")
+	}
+	if !strings.Contains(err.Error(), "transient daemon error") {
+		t.Errorf("error = %q, want the original create error preserved", err.Error())
+	}
+	if !strings.Contains(err.Error(), "cleanup") {
+		t.Errorf("error = %q, want the joined cleanup failure, not a swallowed one", err.Error())
+	}
 }
 
 func TestTeardownAllocationRemovesRunnerBeforeDind(t *testing.T) {
@@ -695,6 +826,49 @@ func TestSweepRemovesDanglingNetworkWithNoRunnerPastGrace(t *testing.T) {
 	}
 	if countNetworks(t, fake) != 0 || countVolumes(t, fake) != 0 {
 		t.Errorf("sweep left a dangling network/volume: %d/%d", countNetworks(t, fake), countVolumes(t, fake))
+	}
+}
+
+// TestSweepUsesFinishedAtNotCreatedAtForExitedRunner is the F8 guard: the
+// exited-runner grace is measured from State.FinishedAt, NOT allocation
+// creation. A long-running job whose allocation was created long ago but which
+// only JUST exited must not be swept — it is inside the (short) exited grace
+// despite its old created-at.
+func TestSweepUsesFinishedAtNotCreatedAtForExitedRunner(t *testing.T) {
+	m, fake := newManager(t)
+	old := time.Now().Add(-time.Hour)
+	seedNetworkFor(t, fake, testControllerID, "job-1", old, "n1")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", old, "n1")
+	id := seedRunnerFor(t, fake, testControllerID, "job-1", old, "n1", "exited")
+	// Override: the runner ran for an hour and only just finished.
+	fake.SetFinishedAt(id, time.Now())
+
+	if err := m.SweepOrphans(context.Background()); err != nil {
+		t.Fatalf("SweepOrphans returned unexpected error: %v", err)
+	}
+	if countContainers(t, fake) != 1 || countNetworks(t, fake) != 1 {
+		t.Errorf("sweep tore down a just-finished job (FinishedAt recent) with an old created-at: %d/%d containers/networks",
+			countContainers(t, fake), countNetworks(t, fake))
+	}
+}
+
+// TestSweepSkipsInFlightCreatePastExitedGraceButWithinInflightGrace is the F5
+// guard: an allocation with NO runner yet (an in-flight create), older than the
+// short exited-runner grace (2m) but younger than the long in-flight-create
+// deadline (20m), must NOT be swept — a cold, emulated image pull plus
+// credential fetch can legitimately take this long.
+func TestSweepSkipsInFlightCreatePastExitedGraceButWithinInflightGrace(t *testing.T) {
+	m, fake := newManager(t)
+	fiveMinAgo := time.Now().Add(-5 * time.Minute)
+	seedNetworkFor(t, fake, testControllerID, "job-1", fiveMinAgo, "n1")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", fiveMinAgo, "n1")
+
+	if err := m.SweepOrphans(context.Background()); err != nil {
+		t.Fatalf("SweepOrphans returned unexpected error: %v", err)
+	}
+	if countNetworks(t, fake) != 1 || countVolumes(t, fake) != 1 {
+		t.Errorf("sweep tore down a valid in-flight create (5m old, no runner yet): %d/%d networks/volumes",
+			countNetworks(t, fake), countVolumes(t, fake))
 	}
 }
 

@@ -57,6 +57,11 @@ func seedAttachedRunner(t *testing.T, fake *docker.FakeClient, name string, crea
 		t.Fatalf("seed ContainerCreate returned unexpected error: %v", err)
 	}
 	fake.SetState(resp.ID, state, false)
+	// The exited-runner sweep grace (F8) is measured from State.FinishedAt, so a
+	// stopped seed runner models finishing when the allocation was created.
+	if state == "exited" || state == "dead" {
+		fake.SetFinishedAt(resp.ID, createdAt)
+	}
 	return resp.ID
 }
 

@@ -46,12 +46,14 @@ func (m *Manager) SweepOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// SweepStale runs the orphan decision for a single instance name — the
-// pre-create sweep CreateInstance runs before it reuses the name, so a crashed
-// prior allocation's leftovers (a stale workspace/socket/dind-state volume that
-// the idempotent VolumeCreate would otherwise silently reuse) are removed
-// first. It applies the same grace window as SweepOrphans, so a concurrent
-// peer's fresh claim marker — younger than the window — is never swept.
+// SweepStale runs the orphan decision for a single instance name. As of F9 the
+// pre-create hook runs the host-wide SweepOrphans instead, but this targeted
+// variant is retained as a focused helper (and unit-tested boundary) for
+// clearing exactly one instance-name's stale leftovers — a crashed prior
+// allocation's stale workspace/socket/dind-state volume that the idempotent
+// VolumeCreate would otherwise silently reuse. It applies the same grace
+// windows as SweepOrphans, so a concurrent peer's fresh claim marker is never
+// swept.
 func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 	swept, err := m.sweepInstance(ctx, instanceName)
 	if err != nil {
@@ -64,21 +66,23 @@ func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 }
 
 // sweepInstance applies the ADR-004 orphan decision to one instance name and,
-// if the allocation is abandoned, tears it down wholesale. The rule (a single
-// predicate, evaluated over the allocation's containers, network, and volumes):
+// if the allocation is abandoned, tears it down wholesale. It distinguishes the
+// two grace bases F5/F8 make explicit:
 //
 //   - a running runner container → active allocation, never swept (any age);
-//   - otherwise, the allocation's youngest resource (by created-at label) is
-//     within the grace window → too recent to sweep (a peer's in-flight create,
-//     or a just-finished job we must not race GARM's own delete for);
-//   - otherwise → abandoned (an exited-runner or never-completed create past
-//     grace) → TeardownAllocation.
+//   - an EXITED (or dead) runner → a just-finished/failed job: age it from the
+//     runner's State.FinishedAt (F8) against the SHORT exitedGrace; past that,
+//     tear it down;
+//   - no runner container at all (or one still in the "created" state, never
+//     started) → an in-flight or never-completed create: age the allocation
+//     from its youngest resource's created-at label against the LONG
+//     inflightGrace (F5); only past that hard deadline — which exceeds every
+//     legitimate create phase, so a valid cold create is never swept — is it
+//     abandoned.
 //
-// The "youngest resource within grace ⇒ skip" test is deliberately
-// conservative: if anything about the allocation is recent, it is treated as
-// in-flight/recent, which is what keeps the concurrency-safe claim-marker
-// guarantee (ADR-004) — a peer that just created its claim network is never
-// swept out from under its still-running CreateInstance.
+// The decision is deliberately conservative: an unparseable clock (no FinishedAt
+// on an exited runner, or no created-at when there is no runner) means "cannot
+// age" and the allocation is skipped rather than risk deleting something live.
 func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool, error) {
 	f := m.instanceScopedFilter(instanceName)
 
@@ -98,6 +102,8 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	var (
 		hasResource      bool
 		hasRunningRunner bool
+		hasExitedRunner  bool
+		exitedFinishedAt time.Time
 		youngest         time.Time
 		haveYoungest     bool
 	)
@@ -113,9 +119,19 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 
 	for _, c := range containers {
 		note(c.Labels)
-		if spec.MatchesPredicate(c.Labels, m.controllerID) &&
-			c.Labels[spec.LabelRole] == spec.RoleRunner && c.State == "running" {
+		if !spec.MatchesPredicate(c.Labels, m.controllerID) || c.Labels[spec.LabelRole] != spec.RoleRunner {
+			continue
+		}
+		if c.State == "running" {
 			hasRunningRunner = true
+			continue
+		}
+		// An exited/dead runner: read its FinishedAt (F8) via inspect — the list
+		// summary does not carry it. Track the latest across any runners.
+		if fa, ok := m.runnerFinishedAt(ctx, c.ID); ok {
+			if !hasExitedRunner || fa.After(exitedFinishedAt) {
+				exitedFinishedAt, hasExitedRunner = fa, true
+			}
 		}
 	}
 	for _, n := range networks {
@@ -133,16 +149,48 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	if hasRunningRunner {
 		return false, nil // active allocation, never sweep
 	}
-	// A malformed/absent created-at means we cannot age the allocation; skip it
-	// conservatively rather than risk deleting something in flight.
-	if !haveYoungest {
-		return false, nil
+
+	if hasExitedRunner {
+		// Exited-runner grace (F8): measured from FinishedAt, SHORT window.
+		if m.now().Sub(exitedFinishedAt) < m.exitedGrace {
+			return false, nil // just-finished — do not race GARM's own delete
+		}
+		return m.TeardownAllocation(ctx, instanceName)
 	}
-	if m.now().Sub(youngest) < m.grace {
-		return false, nil // too recent — an in-flight peer or a just-finished job
+
+	// No runner has run: an in-flight or never-completed create. Age from the
+	// youngest resource's created-at against the LONG in-flight-create grace
+	// (F5) — a valid cold create can exceed the short exited grace, so this
+	// deadline must be the one that exceeds every create phase.
+	if !haveYoungest {
+		return false, nil // cannot age → conservatively skip
+	}
+	if m.now().Sub(youngest) < m.inflightGrace {
+		return false, nil // too recent — a peer's still-in-progress create
 	}
 
 	return m.TeardownAllocation(ctx, instanceName)
+}
+
+// runnerFinishedAt inspects a runner container and returns its State.FinishedAt
+// (F8), the moment the daemon recorded it exiting. The bool is false when the
+// container is gone (raced with a delete), the inspect fails, or FinishedAt is
+// absent/zero/unparseable — in which case the caller cannot age the allocation
+// on the exited-runner clock and falls back to the conservative skip.
+func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (time.Time, bool) {
+	inspected, err := m.cli.ContainerInspect(ctx, containerID)
+	if err != nil || inspected.State == nil {
+		return time.Time{}, false
+	}
+	raw := inspected.State.FinishedAt
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || t.IsZero() || t.Year() <= 1 {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // enumerateInstanceNames returns the distinct instance names across this

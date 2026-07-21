@@ -27,16 +27,21 @@ func filtersForNonce(controllerID, nonce string) filters.Args {
 }
 
 // TeardownAllocation removes every managed, job-scoped resource for
-// instanceName in the ADR-004 order — runner container, then DinD sidecar
-// (WP3), then the job network (after its endpoints detach with the
-// containers), then job-scoped volumes (workspace, and WP3's socket/dind-state)
-// — for THIS controller. It is nonce-agnostic (DeleteInstance and the sweep
-// tear down the whole allocation regardless of which attempt created it) and
-// fully idempotent: a NotFound at any step is tolerated. The bool reports
-// whether anything existed to remove, so DeleteInstance can return exit 30 when
-// the whole instance was already gone. Per-resource errors are joined and
-// returned, but the teardown continues past a failure so one stuck resource
-// does not strand the rest.
+// instanceName in the ADR-004 (network-last) order — runner container, then
+// DinD sidecar (WP3), then job-scoped volumes (workspace, socket, dind-state),
+// then the job network (the claim marker) LAST — for THIS controller. It is
+// nonce-agnostic (DeleteInstance and the sweep tear down the whole allocation
+// regardless of which attempt created it) and fully idempotent: a NotFound at
+// any step is tolerated. The bool reports whether anything existed to remove,
+// so DeleteInstance can return exit 30 when the whole instance was already
+// gone. Per-resource errors are joined and returned, but the teardown
+// continues past a failure so one stuck resource does not strand the rest.
+//
+// The network is removed LAST (F4, ADR-004 amendment 2026-07-21): it is the
+// allocation's claim marker, so holding it until every volume is gone keeps a
+// concurrent same-name CreateInstance from claiming a new generation (its
+// CreateClaimNetwork 409s on the still-present network) and creating volumes
+// that this still-running teardown would then delete out from under it.
 //
 // Cache and diagnostic volumes (ADR-003) are never touched: they carry no
 // instance-name label, so the instance-scoped filter structurally excludes
@@ -47,14 +52,15 @@ func (m *Manager) TeardownAllocation(ctx context.Context, instanceName string) (
 }
 
 // TeardownAll removes EVERY managed, job-scoped resource for this controller —
-// runner containers, DinD sidecars (WP3), job networks, and job-scoped volumes —
-// in the ADR-004 order (all containers first, then all networks, then all
-// volumes, so no network is removed while it still has active endpoints). It is
-// the manual-rescue teardown behind RemoveAllInstances (ADR-004): label-scoped
-// to this controller, never a global wipe, and it never touches cache or
-// diagnostic volumes (they carry no instance-name, so the predicate excludes
-// them structurally). Best-effort: per-resource errors are joined and the
-// teardown continues.
+// runner containers, DinD sidecars (WP3), job-scoped volumes, and job networks —
+// in the ADR-004 (network-last) order (all containers first, then all volumes,
+// then all networks last, so no network is removed while it still has active
+// endpoints and each allocation's claim marker is held until its volumes are
+// gone). It is the manual-rescue teardown behind RemoveAllInstances (ADR-004):
+// label-scoped to this controller, never a global wipe, and it never touches
+// cache or diagnostic volumes (they carry no instance-name, so the predicate
+// excludes them structurally). Best-effort: per-resource errors are joined and
+// the teardown continues.
 func (m *Manager) TeardownAll(ctx context.Context) error {
 	_, err := m.teardown(ctx, spec.MatchPredicateFilters(m.controllerID), "")
 	return err
@@ -72,10 +78,22 @@ func (m *Manager) Rollback(ctx context.Context, instanceName, nonce string) erro
 	return err
 }
 
-// teardown removes the containers, then networks, then volumes matching f, in
-// that ADR-004 order. When requireNonce is non-empty, only resources whose
-// create-nonce label equals it are removed (defense-in-depth on top of the
-// Docker-side nonce filter Rollback supplies). Every removal tolerates NotFound.
+// teardown removes the containers, then volumes, then the network(s) matching
+// f, in that ADR-004 (network-last) order. When requireNonce is non-empty, only
+// resources whose create-nonce label equals it are removed (defense-in-depth on
+// top of the Docker-side nonce filter Rollback supplies). Every removal
+// tolerates NotFound.
+//
+// Ordering is load-bearing (F4): containers come first so the network has no
+// active endpoints when it is removed (the real daemon — and this repo's fake —
+// reject removing a network with attached containers) AND so a volume is never
+// removed while a container still references it (the real daemon rejects that
+// too); the network — the allocation's claim marker — is removed LAST so a
+// concurrent same-name create cannot claim a new generation and create volumes
+// mid-teardown (ADR-004 amendment 2026-07-21). The generation is re-validated
+// immediately before each destructive op: every remove* re-lists fresh and
+// re-asserts ownedForTeardown on the labels in hand, so a resource whose
+// ownership changed since the enumerating call is never removed.
 func (m *Manager) teardown(ctx context.Context, f filters.Args, requireNonce string) (bool, error) {
 	var (
 		found bool
@@ -88,16 +106,17 @@ func (m *Manager) teardown(ctx context.Context, f filters.Args, requireNonce str
 		errs = append(errs, cErr)
 	}
 
-	nFound, nErr := m.removeNetworks(ctx, f, requireNonce)
-	found = found || nFound
-	if nErr != nil {
-		errs = append(errs, nErr)
-	}
-
 	vFound, vErr := m.removeVolumes(ctx, f, requireNonce)
 	found = found || vFound
 	if vErr != nil {
 		errs = append(errs, vErr)
+	}
+
+	// Network LAST (F4): the claim marker is held until every volume is gone.
+	nFound, nErr := m.removeNetworks(ctx, f, requireNonce)
+	found = found || nFound
+	if nErr != nil {
+		errs = append(errs, nErr)
 	}
 
 	return found, errors.Join(errs...)
@@ -137,10 +156,12 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, requireN
 	return found, errors.Join(errs...)
 }
 
-// removeNetworks removes every managed job network matching f. It runs after
-// removeContainers so the network's endpoints are already detached (the real
-// daemon — and this repo's fake — reject removing a network with active
-// endpoints). NotFound is tolerated.
+// removeNetworks removes every managed job network matching f. It runs LAST
+// (F4, after removeContainers and removeVolumes): the network's endpoints are
+// already detached (the real daemon — and this repo's fake — reject removing a
+// network with active endpoints), and holding the claim-marker network until
+// the volumes are gone keeps a concurrent same-name create from claiming a new
+// generation mid-teardown (ADR-004 amendment). NotFound is tolerated.
 func (m *Manager) removeNetworks(ctx context.Context, f filters.Args, requireNonce string) (bool, error) {
 	list, err := m.cli.NetworkList(ctx, network.ListOptions{Filters: f})
 	if err != nil {

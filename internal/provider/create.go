@@ -50,9 +50,11 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 // volume ever exists for the attempt. After those, the sequence is the
 // ADR-001/ADR-004 allocation flow:
 //
-//  1. sweep this instance-name's stale leftovers from a crashed prior
-//     allocation (claim-marker-aware, grace-windowed), so the idempotent
-//     VolumeCreate can never silently reuse a stale volume
+//  1. run the host-wide, controller-scoped orphan sweep (F9): collect every
+//     abandoned allocation past its grace window (a crashed prior allocation of
+//     THIS instance-name included, so the idempotent VolumeCreate can never
+//     silently reuse a stale volume), while a peer's in-flight create is left
+//     untouched by F5's long in-flight-create deadline
 //  2. create the CLAIM-MARKER job network FIRST (ADR-004): a labeled bridge
 //     network stamped with instance-name, created-at, and this attempt's
 //     create-nonce. NetworkCreate's 409 is the atomic duplicate primitive —
@@ -102,13 +104,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, err
 	}
 
-	// Opportunistic pre-create sweep (ADR-004): clear a crashed prior
-	// allocation's leftovers for THIS instance-name so a stale workspace volume
-	// is removed rather than silently reused by the idempotent VolumeCreate. It
-	// is grace-windowed, so a concurrent peer's fresh claim is never swept.
-	// Best-effort: a sweep failure must not block a legitimate create.
-	if err := p.topo.SweepStale(ctx, instanceName); err != nil {
-		log.Printf("garm-provider-docker: CreateInstance: pre-create sweep for %q failed (continuing): %v", instanceName, err)
+	// Opportunistic pre-create orphan sweep (ADR-004, F9): CreateInstance is one
+	// of the two host-wide sweep hooks (the other being ListInstances), so it
+	// runs the FULL controller-scoped sweep — not just this instance-name — to
+	// collect abandoned allocations across the host. This is safe under F5's
+	// split grace: a peer's still-in-progress create (no runner yet, within the
+	// long in-flight-create deadline) is never swept, while a genuinely stale
+	// prior allocation of THIS instance-name is cleared so a stale workspace
+	// volume is removed rather than silently reused by the idempotent
+	// VolumeCreate. Best-effort: a sweep failure must not block a legitimate
+	// create.
+	if err := p.topo.SweepOrphans(ctx); err != nil {
+		log.Printf("garm-provider-docker: CreateInstance: pre-create orphan sweep failed (continuing): %v", err)
 	}
 
 	// enable_job_network=false is reserved and not yet honored (WP2): the job

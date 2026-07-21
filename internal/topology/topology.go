@@ -19,15 +19,30 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// orphanGraceWindow is the grace period (ADR-004) before an allocation with no
-// live runner container is treated as abandoned and swept. It serves both roles
-// ADR-004 describes: the concurrency-safe claim-marker window (never delete a
-// peer's in-flight allocation before its runner container exists) and the
-// exited-container window (never race GARM's own in-flight DeleteInstance for a
-// just-finished job). ADR-004 leaves open whether these should be one value or
-// two independently tunable ones; WP2 tunes them to the same ~2 minutes and
-// flags the split as a later decision.
-const orphanGraceWindow = 2 * time.Minute
+// The orphan sweep uses TWO distinct grace windows (F5/F8), which ADR-004
+// always described as conceptually separate even while WP2 tuned them to one
+// value:
+//
+//   - inflightCreateGrace guards an allocation whose runner container does not
+//     (yet) exist — either a peer's still-in-progress CreateInstance or a
+//     never-completed one. This MUST exceed every create phase, because a cold,
+//     emulated image pull plus credential fetch can legitimately take many
+//     minutes; sweeping such an allocation would destroy a valid in-flight
+//     create. It is bound to a hard deadline aligned with GARM's own
+//     runner_bootstrap_timeout (~20 min), the point past which GARM itself
+//     gives up on a create, so anything older is genuinely abandoned. (F9's
+//     host-wide sweep-on-create is only safe because of this: a peer create
+//     inside this window is never swept.)
+//
+//   - exitedRunnerGrace guards an allocation whose runner has EXITED — a
+//     just-finished (or failed) job. It is measured from the runner's
+//     State.FinishedAt (F8), not from allocation creation, and is a SEPARATE,
+//     much shorter constant: its only job is to avoid racing GARM's own
+//     in-flight DeleteInstance for the same just-finished runner.
+const (
+	inflightCreateGrace = 20 * time.Minute
+	exitedRunnerGrace   = 2 * time.Minute
+)
 
 // Manager orchestrates a job's networks and volumes on one Docker host. It
 // holds no cross-call state (ADR-004's one-shot subprocess model): every "what
@@ -36,19 +51,22 @@ type Manager struct {
 	cli          docker.Client
 	controllerID string
 
-	// grace and now are the orphan-sweep clock, defaulted in New and settable
-	// within the package so sweep-boundary tests are deterministic.
-	grace time.Duration
-	now   func() time.Time
+	// inflightGrace, exitedGrace, and now are the orphan-sweep clock, defaulted
+	// in New and settable within the package so sweep-boundary tests are
+	// deterministic.
+	inflightGrace time.Duration
+	exitedGrace   time.Duration
+	now           func() time.Time
 }
 
 // New constructs a Manager for one controller.
 func New(cli docker.Client, controllerID string) *Manager {
 	return &Manager{
-		cli:          cli,
-		controllerID: controllerID,
-		grace:        orphanGraceWindow,
-		now:          time.Now,
+		cli:           cli,
+		controllerID:  controllerID,
+		inflightGrace: inflightCreateGrace,
+		exitedGrace:   exitedRunnerGrace,
+		now:           time.Now,
 	}
 }
 

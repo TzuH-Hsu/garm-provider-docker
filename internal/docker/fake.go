@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -112,6 +113,12 @@ type FakeClient struct {
 	// command.
 	Execs []ExecRecord
 
+	// RemoveOrder records every successful resource removal, in order, as
+	// "container:<id>", "volume:<name>", or "network:<id>", so a test can
+	// assert the ADR-004 network-last teardown ordering (F4): containers, then
+	// volumes, then the network.
+	RemoveOrder []string
+
 	// CreateHook, when non-nil, is invoked at the very start of every
 	// ContainerCreate — before the name-uniqueness check and before f.mu is
 	// taken — so a test can model a concurrent CreateInstance that occupied a
@@ -188,6 +195,13 @@ type fakeContainer struct {
 	// It drives both the Running bool and the status a caller maps from.
 	state     string
 	oomKilled bool
+
+	// finishedAt models State.FinishedAt — the moment the daemon recorded the
+	// container exiting (F8). ContainerStop sets it to now; SetFinishedAt lets
+	// a test place it in the past to exercise the exited-runner sweep grace,
+	// which is measured from this timestamp, not from allocation creation. Zero
+	// until the container has stopped.
+	finishedAt time.Time
 }
 
 // fakeNetwork models an in-memory Docker network.
@@ -566,12 +580,15 @@ func (f *FakeClient) ContainerStop(_ context.Context, containerID string, _ cont
 		return notFoundf("container %s not found", containerID)
 	}
 	c.state = "exited"
+	c.finishedAt = time.Now()
 	return nil
 }
 
 // SetState forces a container's Docker state (created, running, exited,
 // dead) and OOMKilled flag, so status-mapping paths that a plain
-// start/stop cannot reach (dead, OOM-killed) are testable end-to-end.
+// start/stop cannot reach (dead, OOM-killed) are testable end-to-end. A
+// transition into a terminal (exited/dead) state stamps FinishedAt with now if
+// it is not already set, so status-mapping tests get a plausible timestamp.
 func (f *FakeClient) SetState(containerID, state string, oomKilled bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -579,6 +596,21 @@ func (f *FakeClient) SetState(containerID, state string, oomKilled bool) {
 	if c, ok := f.containers[containerID]; ok {
 		c.state = state
 		c.oomKilled = oomKilled
+		if (state == "exited" || state == "dead") && c.finishedAt.IsZero() {
+			c.finishedAt = time.Now()
+		}
+	}
+}
+
+// SetFinishedAt places a container's State.FinishedAt at a specific instant, so
+// a test can drive the exited-runner sweep grace (F8), which is measured from
+// this timestamp rather than from allocation creation.
+func (f *FakeClient) SetFinishedAt(containerID string, finishedAt time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if c, ok := f.containers[containerID]; ok {
+		c.finishedAt = finishedAt
 	}
 }
 
@@ -611,6 +643,7 @@ func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ co
 		return notFoundf("container %s not found", containerID)
 	}
 	delete(f.containers, c.id)
+	f.RemoveOrder = append(f.RemoveOrder, "container:"+c.id)
 	return nil
 }
 
@@ -712,6 +745,7 @@ func (f *FakeClient) NetworkRemove(_ context.Context, networkID string) error {
 		}
 	}
 	delete(f.networks, n.id)
+	f.RemoveOrder = append(f.RemoveOrder, "network:"+n.id)
 	return nil
 }
 
@@ -788,6 +822,7 @@ func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) er
 		return notFoundf("volume %s not found", volumeID)
 	}
 	delete(f.volumes, volumeID)
+	f.RemoveOrder = append(f.RemoveOrder, "volume:"+volumeID)
 	return nil
 }
 
@@ -813,6 +848,13 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		Running:   c.state == "running",
 		Dead:      c.state == "dead",
 		OOMKilled: c.oomKilled,
+	}
+	// FinishedAt is surfaced only once the container has actually finished, as
+	// an RFC3339Nano string exactly like the real daemon, so the orphan sweep's
+	// exited-runner grace (F8) can age it. A never-finished container leaves it
+	// empty (the real daemon reports the zero time "0001-01-01T00:00:00Z").
+	if !c.finishedAt.IsZero() {
+		state.FinishedAt = c.finishedAt.UTC().Format(time.RFC3339Nano)
 	}
 	base := &types.ContainerJSONBase{
 		ID:    c.id,
