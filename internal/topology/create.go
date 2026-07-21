@@ -197,12 +197,15 @@ func (m *Manager) createFreshVolume(ctx context.Context, kind, name string, labe
 	// discarding ours). Before force-removing it, require the COMPLETE ownership
 	// tuple to match this controller/allocation (F3): managed=true + this
 	// controller-id + this instance-name + the expected resource label. On ANY
-	// mismatch we FAIL CLOSED — a volume named `<instance>-workspace`/`-socket`/
-	// `-dind-state` that we do not fully own is a foreign or other-controller
-	// resource that merely collides on the deterministic name, and destroying it
-	// would violate the red line "cleanup is allowlist-only, never touch what we
-	// do not own." Only a volume we own (a stale leftover from a crashed prior
-	// allocation of OUR instance name) is replaced.
+	// mismatch we FAIL CLOSED — a volume named
+	// `<instance>-<nonce>-workspace`/`-socket`/`-dind-state` (F4, ADR-004
+	// amendment 2026-07-21: generation-nonce-qualified, not the old stable
+	// `<instance>-workspace`/... scheme) that we do not fully own is a foreign
+	// or other-controller resource that merely collides on THIS generation's
+	// own name (an idempotent VolumeCreate hit within one attempt — see this
+	// function's own doc), and destroying it would violate the red line
+	// "cleanup is allowlist-only, never touch what we do not own." Only a
+	// volume we own (a same-generation retry of OUR own create) is replaced.
 	if !m.ownsVolumeForReplacement(created.Labels, labels) {
 		return fmt.Errorf("refusing to replace %s volume %q: it already exists but does not carry this controller's full ownership tuple (managed + controller-id + instance-name + resource=%s) — it is a foreign or other-controller volume colliding on the name, not a stale allocation of ours", kind, name, labels[spec.LabelResource])
 	}
