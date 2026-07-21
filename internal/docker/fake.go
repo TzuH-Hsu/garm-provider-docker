@@ -113,6 +113,24 @@ type FakeClient struct {
 	// command.
 	Execs []ExecRecord
 
+	// Created records the SHAPE of every ContainerCreate call, in order, and
+	// PERSISTS even after the container is removed — unlike the live containers
+	// map, which drops a removed container. It is how a test asserts the shape of
+	// a short-lived run-to-completion helper (the M2-W2 externals seeder /
+	// diag-log pruner, which force-remove themselves in a defer) after
+	// CreateInstance/GC returns.
+	Created []CreatedContainer
+
+	// BatchExitCode is the exit status ContainerWait reports for a
+	// run-to-completion helper (default 0). A non-zero value models a seed/prune
+	// helper that ran but failed, so a test can exercise the seed-failure
+	// creation-guard path.
+	BatchExitCode int
+
+	// BatchWaitErr, when non-nil, is delivered on ContainerWait's error channel
+	// instead of a status — modeling a daemon-side wait failure.
+	BatchWaitErr error
+
 	// RemoveOrder records every successful resource removal, in order, as
 	// "container:<id>", "volume:<name>", or "network:<id>", so a test can
 	// assert the ADR-004 network-last teardown ordering (F4): containers, then
@@ -158,6 +176,16 @@ type ExecRecord struct {
 	ContainerID string
 	Cmd         []string
 	Stdin       []byte
+}
+
+// CreatedContainer captures the shape of one ContainerCreate call, retained
+// across a later removal so a test can assert a short-lived helper's config.
+type CreatedContainer struct {
+	Name       string
+	Labels     map[string]string
+	Entrypoint []string
+	Cmd        []string
+	Mounts     []mount.Mount
 }
 
 type fakeContainer struct {
@@ -588,6 +616,18 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	}
 	f.containers[id] = c
 
+	// Record the create SHAPE, retained across a later removal, so a test can
+	// assert a short-lived helper's config after it force-removes itself.
+	rec := CreatedContainer{Name: name, Labels: cloneLabels(c.labels)}
+	if cfg != nil {
+		rec.Entrypoint = append([]string(nil), cfg.Entrypoint...)
+		rec.Cmd = append([]string(nil), cfg.Cmd...)
+	}
+	if hostConfig != nil {
+		rec.Mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
+	}
+	f.Created = append(f.Created, rec)
+
 	// Ambiguous create failure: the container was recorded, but the call
 	// still reports an error (ADR-004 F6).
 	if f.CreateErr != nil {
@@ -722,6 +762,40 @@ func (f *FakeClient) ContainerList(_ context.Context, options container.ListOpti
 		out = append(out, c.toContainerSummary())
 	}
 	return out, nil
+}
+
+// ContainerWait models the moby SDK's two-channel run-to-completion wait for
+// M2-W2's helper containers (the externals seeder / diag-log pruner). It
+// transitions a running (or created) container to "exited" — modeling the batch
+// job running to completion — and delivers the configured BatchExitCode on the
+// response channel; BatchWaitErr, or a missing container, is delivered on the
+// error channel instead. Both channels are buffered so the send never blocks,
+// matching the real SDK (whose caller selects on the two channels).
+func (f *FakeClient) ContainerWait(_ context.Context, containerID string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+	statusCh := make(chan container.WaitResponse, 1)
+	errCh := make(chan error, 1)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.BatchWaitErr != nil {
+		errCh <- f.BatchWaitErr
+		return statusCh, errCh
+	}
+	c := f.find(containerID)
+	if c == nil {
+		errCh <- notFoundf("container %s not found", containerID)
+		return statusCh, errCh
+	}
+	// Model the helper running to completion: created/running → exited.
+	if c.state == "running" || c.state == "created" {
+		c.state = "exited"
+		if c.finishedAt.IsZero() {
+			c.finishedAt = time.Now()
+		}
+	}
+	statusCh <- container.WaitResponse{StatusCode: int64(f.BatchExitCode)}
+	return statusCh, errCh
 }
 
 // findNetwork resolves a network by ID first, then by exact Docker name,

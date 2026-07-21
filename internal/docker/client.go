@@ -68,6 +68,17 @@ type Client interface {
 	// with a "label" filter for every managed-resource lookup (ADR-004).
 	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
 
+	// ContainerWait blocks until the container reaches condition (e.g.
+	// container.WaitConditionNotRunning) and delivers the exit status on the
+	// returned response channel, or a failure on the error channel — the moby
+	// SDK's own two-channel shape. It backs M2-W2's run-to-completion helpers
+	// (the externals seeder and the diagnostic-log pruner): create → start →
+	// wait-for-exit → remove. The seeder in particular MUST block here until the
+	// copy finishes, so the runner never mounts a half-seeded externals tree.
+	// The real *client.Client already provides this exact signature, so
+	// mobyClient satisfies it unchanged.
+	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+
 	// ExecStream runs cmd inside a running container, streaming stdin to the
 	// exec's standard input, and returns the command's exit code once it has
 	// finished. It is how the provider delivers credentials into the
