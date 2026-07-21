@@ -4,10 +4,35 @@ import (
 	"context"
 	"testing"
 
+	"github.com/docker/docker/api/types"
+
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/version"
 )
+
+// inspectRunner inspects the runner container CreateInstance built for
+// instanceName, resolved by its (lowercased) Docker name. As of F6 a created
+// instance's provider_id is the instance NAME, not the container ID, so tests
+// that want the actual runner container inspect it by its derived Docker name
+// rather than by provider_id.
+func inspectRunner(t *testing.T, fake *docker.FakeClient, instanceName string) types.ContainerJSON {
+	t.Helper()
+	c, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName(instanceName))
+	if err != nil {
+		t.Fatalf("inspect runner container for %q: %v", instanceName, err)
+	}
+	return c
+}
+
+// runnerContainerID returns the actual Docker container ID of the runner
+// CreateInstance built for instanceName (distinct from its provider_id, which
+// is the instance name as of F6).
+func runnerContainerID(t *testing.T, fake *docker.FakeClient, instanceName string) string {
+	t.Helper()
+	return inspectRunner(t, fake, instanceName).ID
+}
 
 // newTestProvider builds a Provider backed by a FakeClient for unit tests.
 func newTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {

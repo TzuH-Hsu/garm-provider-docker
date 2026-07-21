@@ -106,20 +106,29 @@ func TestResolveNotFound(t *testing.T) {
 // not-found and that the container foreignID is never removed.
 func assertForeignUntouched(t *testing.T, p *Provider, fake *docker.FakeClient, ref, foreignID string) {
 	t.Helper()
-	if _, err := p.GetInstance(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
-		t.Errorf("GetInstance(%q) err = %v, want not-found (foreign container)", ref, err)
-	}
-	if err := p.Stop(context.Background(), ref, false); !errors.Is(err, gErrors.ErrNotFound) {
-		t.Errorf("Stop(%q) err = %v, want not-found (foreign container)", ref, err)
-	}
-	if err := p.Start(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
-		t.Errorf("Start(%q) err = %v, want not-found (foreign container)", ref, err)
-	}
+	assertGetStopStartNotFound(t, p, ref)
 	if err := p.DeleteInstance(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
 		t.Errorf("DeleteInstance(%q) err = %v, want not-found (foreign container)", ref, err)
 	}
 	if _, err := fake.ContainerInspect(context.Background(), foreignID); err != nil {
 		t.Errorf("foreign container %s was touched/removed: %v", foreignID, err)
+	}
+}
+
+// assertGetStopStartNotFound asserts the three RUNNER-scoped lifecycle methods
+// (which resolve the runner container) treat ref as not-found — used both for
+// genuinely foreign containers and for our own wrong-role (DinD sidecar)
+// containers, which are not runners and so must never be operated on as one.
+func assertGetStopStartNotFound(t *testing.T, p *Provider, ref string) {
+	t.Helper()
+	if _, err := p.GetInstance(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("GetInstance(%q) err = %v, want not-found", ref, err)
+	}
+	if err := p.Stop(context.Background(), ref, false); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("Stop(%q) err = %v, want not-found", ref, err)
+	}
+	if err := p.Start(context.Background(), ref); !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("Start(%q) err = %v, want not-found", ref, err)
 	}
 }
 
@@ -136,8 +145,9 @@ func TestResolveRejectsForeignController(t *testing.T) {
 
 func TestResolveRejectsWrongRole(t *testing.T) {
 	p, fake := newTestProvider(t)
-	// A container this controller owns, but with a non-runner role (e.g. a
-	// future DinD sidecar): it must not be resolvable as a runner instance.
+	// A container this controller owns, but with a non-runner role (a DinD
+	// sidecar). It must not be resolvable as a RUNNER — Get/Stop/Start operate on
+	// the runner, so they treat it as not-found and never touch it.
 	resp, err := fake.ContainerCreate(context.Background(), &container.Config{
 		Labels: map[string]string{
 			spec.LabelManaged:      "true",
@@ -151,9 +161,22 @@ func TestResolveRejectsWrongRole(t *testing.T) {
 	}
 	fake.SetState(resp.ID, "running", false)
 
-	// By ID and by name.
+	// By the sidecar's OWN container ID, nothing resolves (its ID is not the
+	// instance-name label), so every op is not-found and it is untouched.
 	assertForeignUntouched(t, p, fake, resp.ID, resp.ID)
-	assertForeignUntouched(t, p, fake, "sidecar-1", resp.ID)
+
+	// By the allocation's instance NAME, the runner-scoped ops still reject the
+	// wrong-role container...
+	assertGetStopStartNotFound(t, p, "sidecar-1")
+	// ...but DeleteInstance MUST reap the lingering sidecar (F6): a managed DinD
+	// sidecar under this instance-name is part of an allocation whose runner is
+	// gone, and the privileged sidecar must never be left behind.
+	if err := p.DeleteInstance(context.Background(), "sidecar-1"); err != nil {
+		t.Errorf("DeleteInstance(sidecar-1) should reap the lingering managed sidecar (F6), got %v", err)
+	}
+	if _, err := fake.ContainerInspect(context.Background(), resp.ID); err == nil {
+		t.Error("F6: DeleteInstance must reap the lingering privileged sidecar, but it survived")
+	}
 }
 
 func TestResolveRejectsUnmanaged(t *testing.T) {
@@ -196,8 +219,9 @@ func TestGetInstanceStatusMapping(t *testing.T) {
 			if inst.Status != tt.want {
 				t.Errorf("Status = %q, want %q", inst.Status, tt.want)
 			}
-			if inst.ProviderID != id || inst.Name != "runner-x" {
-				t.Errorf("ProviderID/Name = %q/%q, want %q/runner-x", inst.ProviderID, inst.Name, id)
+			// provider_id is the stable instance NAME (F6), not the container id.
+			if inst.ProviderID != "runner-x" || inst.Name != "runner-x" {
+				t.Errorf("ProviderID/Name = %q/%q, want runner-x/runner-x (F6)", inst.ProviderID, inst.Name)
 			}
 			if inst.OSType != params.Linux || inst.OSArch != params.Amd64 {
 				t.Errorf("os fields = %q/%q, want linux/amd64", inst.OSType, inst.OSArch)

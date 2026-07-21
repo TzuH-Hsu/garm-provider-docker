@@ -10,6 +10,7 @@ import (
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 
@@ -128,10 +129,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	assertNoHostSocketMount(t, dind.Mounts)
 
 	// --- runner container ---
-	runner, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect(runner) returned unexpected error: %v", err)
-	}
+	runner := inspectRunner(t, fake, name)
 	if runner.Config.Labels[spec.LabelRole] != spec.RoleRunner {
 		t.Errorf("provider_id container role = %q, want runner", runner.Config.Labels[spec.LabelRole])
 	}
@@ -158,7 +156,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if string(runner.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
 		t.Errorf("runner NetworkMode = %q, want the job network", runner.HostConfig.NetworkMode)
 	}
-	if _, ok := fake.TmpfsMounts(inst.ProviderID)[spec.CredentialDir]; !ok {
+	if _, ok := fake.TmpfsMounts(spec.RunnerContainerName(name))[spec.CredentialDir]; !ok {
 		t.Error("runner is missing the credential tmpfs")
 	}
 
@@ -348,6 +346,48 @@ func TestDeleteInstanceDinDTearsDownFullTopology(t *testing.T) {
 	if !errors.Is(err, gErrors.ErrNotFound) {
 		t.Errorf("second DeleteInstance err = %v, want not-found (exit 30)", err)
 	}
+}
+
+// TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand is the F6 red-line
+// guard: after the runner container is removed out of band (a crash, or an
+// external `docker rm`), DeleteInstance by the ORIGINAL provider_id must still
+// reap the privileged DinD sidecar, the network, and every volume — not return
+// exit 30 and leak them. This is exactly the leak the old provider_id=container-id
+// scheme caused: the sidecar/network/volumes are labeled with the instance
+// NAME, so a stable name-keyed provider_id (F6) is what makes the label-scoped
+// teardown always resolvable, even with the runner gone.
+func TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newDindTestProvider(t)
+	inst, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	if err != nil {
+		t.Fatalf("CreateInstance (DinD) returned unexpected error: %v", err)
+	}
+	// Runner + sidecar exist.
+	if n := listAll(t, p); n != 2 {
+		t.Fatalf("container count after create = %d, want 2 (runner + sidecar)", n)
+	}
+
+	// Remove ONLY the runner container out of band, leaving the privileged
+	// sidecar, the network, and all volumes behind.
+	runnerID := runnerContainerID(t, fake, inst.Name)
+	if err := fake.ContainerRemove(context.Background(), runnerID, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("out-of-band runner removal returned unexpected error: %v", err)
+	}
+	// The sidecar is still present (this is the resource that used to leak).
+	if _, err := fake.ContainerInspect(context.Background(), spec.DindContainerName(inst.Name)); err != nil {
+		t.Fatalf("precondition: DinD sidecar should still exist after removing only the runner: %v", err)
+	}
+
+	// DeleteInstance by the ORIGINAL provider_id (the instance name, F6).
+	if err := p.DeleteInstance(context.Background(), inst.ProviderID); err != nil {
+		t.Fatalf("DeleteInstance(%q) returned unexpected error: %v", inst.ProviderID, err)
+	}
+
+	// The privileged sidecar + network + all volumes must be gone — no leak.
+	assertNoLeftovers(t, fake)
 }
 
 // TestVerifyRunning covers the shared BOTH-containers-running check's branches

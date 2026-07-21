@@ -100,8 +100,7 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 	defer srv.Close()
 
 	p, fake := newTestProvider(t)
-	inst, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
-	if err != nil {
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err != nil {
 		t.Fatalf("CreateInstance returned unexpected error: %v", err)
 	}
 
@@ -139,10 +138,7 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 
 	// (c) The runner container is attached to the job network as its sole
 	// network and shares the attempt's nonce.
-	got, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect returned unexpected error: %v", err)
-	}
+	got := inspectRunner(t, fake, name)
 	if got.HostConfig == nil || string(got.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
 		t.Errorf("runner NetworkMode = %v, want the job network", got.HostConfig)
 	}
@@ -226,10 +222,7 @@ func TestCreateInstanceSweepsStaleAllocationBeforeReuse(t *testing.T) {
 		t.Error("workspace volume still carries the stale nonce; it was not replaced")
 	}
 	// The fresh runner is the one CreateInstance returned.
-	got, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect returned unexpected error: %v", err)
-	}
+	got := inspectRunner(t, fake, inst.Name)
 	if got.State == nil || !got.State.Running {
 		t.Error("the freshly created runner is not running")
 	}

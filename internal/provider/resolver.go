@@ -92,15 +92,30 @@ func (p *Provider) ownsRunner(c types.ContainerJSON) bool {
 	return spec.IsManagedRunner(c.Config.Labels, p.controllerID)
 }
 
-// hasManagedAllocationResources reports whether any managed job-scoped network
-// or volume for this controller lingers under instanceName. DeleteInstance uses
-// it when no owned runner container resolves, so an allocation whose runner has
-// already exited but whose network/volumes still exist is still torn down
-// (ADR-004: "finds the runner container already gone but its network or volumes
-// still lingering"). Containers are not checked here — a live/owned runner is
-// already handled by resolve; this is the leftover-only fallback.
+// hasManagedAllocationResources reports whether any managed job-scoped resource
+// for this controller lingers under instanceName — a container (e.g. the
+// PRIVILEGED DinD sidecar), network, or volume. DeleteInstance uses it when no
+// owned RUNNER container resolves, so an allocation whose runner has already
+// been removed out of band but whose sidecar/network/volumes still exist is
+// still fully torn down (F6, ADR-004: "finds the runner container already gone
+// but its network or volumes still lingering").
+//
+// The container check is what closes the F6 red line specifically: the runner
+// is gone, but the sidecar (role=dind) is NOT a runner, so resolve() never
+// returns it — without checking here it could leak. Every match re-asserts
+// spec.MatchesPredicate defense-in-depth against the labels in hand.
 func (p *Provider) hasManagedAllocationResources(ctx context.Context, instanceName string) (bool, error) {
 	f := p.managedByInstanceNameFilter(instanceName)
+
+	conts, err := p.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		return false, fmt.Errorf("failed to list containers for %q: %w", instanceName, err)
+	}
+	for _, c := range conts {
+		if spec.MatchesPredicate(c.Labels, p.controllerID) {
+			return true, nil
+		}
+	}
 
 	nets, err := p.cli.NetworkList(ctx, network.ListOptions{Filters: f})
 	if err != nil {
@@ -132,6 +147,12 @@ func notFoundError(instanceID string) error {
 }
 
 // toProviderInstance maps a fully inspected container to a ProviderInstance.
+//
+// ProviderID is the GARM instance NAME (from the instance-name label), not the
+// container ID (F6, ADR-004 amendment): CreateInstance returns the instance
+// name as provider_id, so GetInstance/ListInstances MUST report the same stable
+// identity, or GARM could overwrite its stored provider_id with a container ID
+// and reintroduce the delete-by-stale-container-id leak this fix closes.
 func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 	labels := map[string]string{}
 	if c.Config != nil {
@@ -149,7 +170,7 @@ func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 	}
 
 	return params.ProviderInstance{
-		ProviderID: c.ID,
+		ProviderID: name,
 		Name:       name,
 		OSType:     params.OSType(labels[spec.LabelOSType]),
 		OSArch:     params.OSArch(labels[spec.LabelOSArch]),
@@ -163,13 +184,17 @@ func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 // not available in a list summary, so a caller needing exact error status
 // for an OOM-killed container should GetInstance it. A "dead" state still
 // maps to error via the state string.
+//
+// ProviderID is the GARM instance NAME, matching CreateInstance and
+// toProviderInstance (F6): a stable identity resolvable by label independently
+// of the runner container.
 func toProviderInstanceFromSummary(c types.Container) params.ProviderInstance {
 	name := c.Labels[spec.LabelInstanceName]
 	if name == "" && len(c.Names) > 0 {
 		name = strings.TrimPrefix(c.Names[0], "/")
 	}
 	return params.ProviderInstance{
-		ProviderID: c.ID,
+		ProviderID: name,
 		Name:       name,
 		OSType:     params.OSType(c.Labels[spec.LabelOSType]),
 		OSArch:     params.OSArch(c.Labels[spec.LabelOSArch]),

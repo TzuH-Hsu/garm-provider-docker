@@ -401,13 +401,16 @@ func extractTarIntoTmpfs(c *fakeContainer, data []byte) error {
 }
 
 // Tmpfs returns a copy of a container's modeled credential-tmpfs contents,
-// keyed by filename, so tests can assert what a docker-exec delivery wrote.
+// keyed by filename, so tests can assert what a docker-exec delivery wrote. The
+// container is resolved by ID OR name (mirroring ContainerInspect), so a test
+// can look it up by the instance's provider_id (now the instance name, F6) via
+// its lowercased Docker name.
 func (f *FakeClient) Tmpfs(containerID string) map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	c, ok := f.containers[containerID]
-	if !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return nil
 	}
 	out := make(map[string]string, len(c.tmpfs))
@@ -425,8 +428,8 @@ func (f *FakeClient) TmpfsMounts(containerID string) map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	c, ok := f.containers[containerID]
-	if !ok {
+	c := f.find(containerID)
+	if c == nil {
 		return nil
 	}
 	out := make(map[string]string, len(c.tmpfsMounts))

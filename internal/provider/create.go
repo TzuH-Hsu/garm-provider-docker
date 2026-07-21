@@ -300,9 +300,19 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 
 	// CreateInstance reports running (research.md §2.A): the container is up and
 	// the runner registers once its entrypoint consumes the delivered
-	// credentials. The provider_id is the runner container's ID (ADR-004).
+	// credentials.
+	//
+	// The provider_id is the GARM INSTANCE NAME, not the runner container's ID
+	// (F6, ADR-004 amendment 2026-07-21). GARM passes provider_id back as
+	// GARM_INSTANCE_ID on DeleteInstance; keying it to the instance name — the
+	// label every allocation resource carries — means DeleteInstance can always
+	// resolve-and-teardown the whole allocation (dind sidecar, network, volumes)
+	// by that label, even when the runner container has already been removed out
+	// of band. Returning the runner container ID here instead would strand the
+	// privileged sidecar and volumes the moment the runner was gone, because
+	// those are labeled with the instance name, not the container id.
 	return params.ProviderInstance{
-		ProviderID: created.ID,
+		ProviderID: instanceName,
 		Name:       instanceName,
 		OSType:     bootstrap.OSType,
 		OSArch:     bootstrap.OSArch,

@@ -143,9 +143,10 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Fatalf("CreateInstance returned unexpected error: %v", err)
 	}
 
-	// Returned ProviderInstance.
-	if inst.ProviderID == "" {
-		t.Error("ProviderID is empty, want the container ID")
+	// Returned ProviderInstance. provider_id is the stable instance NAME (F6),
+	// resolvable by label independently of the runner container.
+	if inst.ProviderID != "Test-Instance-01" {
+		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01 (F6)", inst.ProviderID)
 	}
 	if inst.Name != "Test-Instance-01" {
 		t.Errorf("Name = %q, want Test-Instance-01", inst.Name)
@@ -163,10 +164,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	}
 
 	// Container exists with the right labels.
-	got, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect returned unexpected error: %v", err)
-	}
+	got := inspectRunner(t, fake, inst.Name)
 	labels := got.Config.Labels
 	if labels[spec.LabelManaged] != "true" ||
 		labels[spec.LabelControllerID] != "controller-abc" ||
@@ -184,7 +182,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	// mode 0700 — the config the real daemon honors (the Mounts long-syntax
 	// uid/gid it rejects). This is the load-bearing assertion that CreateInstance
 	// builds a daemon-acceptable tmpfs.
-	tmpfsMounts := fake.TmpfsMounts(inst.ProviderID)
+	tmpfsMounts := fake.TmpfsMounts(spec.RunnerContainerName(inst.Name))
 	tmpfsOpts, ok := tmpfsMounts[spec.CredentialDir]
 	if !ok {
 		t.Fatalf("HostConfig.Tmpfs missing the %q credential tmpfs: %v", spec.CredentialDir, tmpfsMounts)
@@ -218,8 +216,10 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Fatalf("Execs = %d, want 1", len(fake.Execs))
 	}
 	ex := fake.Execs[0]
-	if ex.ContainerID != inst.ProviderID {
-		t.Errorf("exec target = %s, want %s", ex.ContainerID, inst.ProviderID)
+	// The exec target is the runner container's actual ID (not its provider_id,
+	// which is the instance name as of F6).
+	if wantID := runnerContainerID(t, fake, inst.Name); ex.ContainerID != wantID {
+		t.Errorf("exec target = %s, want the runner container ID %s", ex.ContainerID, wantID)
 	}
 	// The delivery command must extract the tar into the credential tmpfs.
 	if strings.Join(ex.Cmd, " ") != strings.Join(credentialDeliverCmd, " ") {
@@ -259,10 +259,7 @@ func TestCreateInstanceHappyPathNonJIT(t *testing.T) {
 		t.Fatalf("CreateInstance (non-JIT) returned unexpected error: %v", err)
 	}
 
-	got, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect returned unexpected error: %v", err)
-	}
+	got := inspectRunner(t, fake, inst.Name)
 	// Non-JIT env: entity + ephemeral, and still no token.
 	if !hasEnv(got.Config.Env, "RUNNER_ORG=example-org") || !hasEnv(got.Config.Env, "RUNNER_REPO=example-repo") {
 		t.Errorf("expected RUNNER_ORG/REPO in non-JIT env, got %v", got.Config.Env)

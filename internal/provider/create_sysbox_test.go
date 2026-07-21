@@ -115,10 +115,7 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	assertNoHostSocketMount(t, dind.Mounts)
 
 	// --- runner container: unchanged from privileged-sidecar's shape ---
-	runner, err := fake.ContainerInspect(context.Background(), inst.ProviderID)
-	if err != nil {
-		t.Fatalf("ContainerInspect(runner) returned unexpected error: %v", err)
-	}
+	runner := inspectRunner(t, fake, name)
 	if !hasEnv(runner.Config.Env, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("runner env = %v, want DOCKER_HOST=unix:///run/docker.sock", runner.Config.Env)
 	}
