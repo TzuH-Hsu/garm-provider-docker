@@ -1,0 +1,6 @@
+# toolcache_path == pnpm_store_path: rejected (they must be distinct mounts).
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[cache]
+toolcache_path = "/opt/shared-cache"
+pnpm_store_path = "/opt/shared-cache"

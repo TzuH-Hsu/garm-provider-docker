@@ -1,0 +1,13 @@
+# A full, valid M2-W1 [cache] block with every field set to a legal,
+# non-default value so Load exercises real parsing rather than defaults.
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[cache]
+enabled = true
+generation = "3"
+pnpm_major = "10"
+toolcache_path = "/opt/hostedtoolcache"
+pnpm_store_path = "/opt/pnpm-store"
+allow_org_shared = true
+stale_cache_eviction_days = 45
+diagnostic_log_retention_days = 14

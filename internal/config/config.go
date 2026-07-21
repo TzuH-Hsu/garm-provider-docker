@@ -24,8 +24,8 @@ const defaultDockerHost = "unix:///var/run/docker.sock"
 // parse error.
 //
 // TODO(M3): switch to strict/schema-validated parsing against ADR-005's
-// go:embed'ed JSON Schema, and add the extra_specs reserved-env denylist
-// and [cache] table (ADR-003), once those milestones land.
+// go:embed'ed JSON Schema, and add the extra_specs reserved-env denylist,
+// once that milestone lands.
 type Config struct {
 	// DockerHost is the address of the Docker daemon this provider talks
 	// to. Defaults to the local Unix socket when omitted or empty.
@@ -107,6 +107,11 @@ type Config struct {
 	// ruling, restated in ADR-005) — no other field, in config or
 	// extra_specs, accepts a raw image reference.
 	Flavors map[string]Flavor `toml:"flavors"`
+
+	// Cache is the [cache] table: ADR-003's persistent, repo-scoped toolcache
+	// and pnpm-store caches (M2-W1). Defaulted to enabled with the ADR-005
+	// values by Load; see cache.go.
+	Cache Cache `toml:"cache"`
 }
 
 // Load reads the TOML config file at path, applies defaults, and validates
@@ -121,6 +126,7 @@ func Load(path string) (Config, error) {
 			EnableJobNetwork: true,
 			Internal:         false,
 		},
+		Cache: defaultCache(),
 	}
 
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
@@ -165,6 +171,9 @@ func (c Config) Validate() error {
 		if err := fl.validate(c.AllowUnpinnedRunnerImage); err != nil {
 			return fmt.Errorf("flavor %q: %w", name, err)
 		}
+	}
+	if err := c.Cache.validate(); err != nil {
+		return fmt.Errorf("[cache]: %w", err)
 	}
 
 	return nil

@@ -1,0 +1,5 @@
+# toolcache_path is not absolute: rejected.
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[cache]
+toolcache_path = "relative/hostedtoolcache"

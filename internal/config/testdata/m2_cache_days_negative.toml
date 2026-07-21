@@ -1,0 +1,5 @@
+# A negative retention window: rejected (typo guard, even though W2 consumes it).
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[cache]
+stale_cache_eviction_days = -1

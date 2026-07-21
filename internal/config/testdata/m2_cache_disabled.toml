@@ -1,0 +1,5 @@
+# Cache explicitly disabled: valid, and the salts/paths are not required.
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[cache]
+enabled = false
