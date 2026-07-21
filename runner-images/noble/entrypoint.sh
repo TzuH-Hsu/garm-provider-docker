@@ -113,8 +113,18 @@ ensure_docker_socket_group() {
   local gid="${DOCKER_SOCK_GID:-}"
   [[ -z "${gid}" ]] && return 0
 
+  # Looking up the group is CONTROL FLOW, not an error condition: on a clean
+  # image no group owns this GID (the NORMAL case), so getent exits non-zero.
+  # Under `set -euo pipefail` (line 35) an un-guarded `grp="$(getent … | cut …)"`
+  # assignment would abort the whole entrypoint here — before the groupadd branch
+  # below ever runs (F1). Suppress getent's diagnostics and neutralize the
+  # pipeline's exit status with `|| true`, so a missing group yields an empty
+  # `grp` and we fall through to CREATE it, while a pre-existing group (custom
+  # image already owning this GID) is REUSED by name — acceptable for socket
+  # access. groupadd/usermod remain fail-closed: a genuine failure of either
+  # still aborts, because without the membership the runner cannot use Docker.
   local grp
-  grp="$(getent group "${gid}" | cut -d: -f1)"
+  grp="$(getent group "${gid}" 2>/dev/null | cut -d: -f1 || true)"
   if [[ -z "${grp}" ]]; then
     grp="dockersock"
     groupadd -g "${gid}" "${grp}" \
@@ -438,4 +448,13 @@ main() {
   exec_as_runner ./run.sh
 }
 
-main "$@"
+# Run main only when EXECUTED directly (the container's ENTRYPOINT), not when
+# SOURCED. Sourcing loads the functions without running the full flow, so the
+# live non-root verification harness (internal/verify) can invoke the REAL
+# ensure_docker_socket_group under this file's own `set -euo pipefail` — proving
+# F1 against the production code verbatim rather than a re-implementation. In the
+# production container ${BASH_SOURCE[0]} == ${0} == /entrypoint.sh, so main runs
+# exactly as before.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
