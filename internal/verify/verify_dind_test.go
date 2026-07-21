@@ -274,7 +274,8 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	}
 
 	// =========================================================================
-	// (W3-e) teardown removes runner->dind->network->volumes; repeat → exit 30
+	// (W3-e) teardown removes runner->dind->volumes->network (network LAST, F4);
+	// repeat → exit 30
 	// =========================================================================
 	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", wp3Instance, nil)
 	if delCode != 0 {
