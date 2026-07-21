@@ -130,6 +130,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, fmt.Errorf("failed to generate create nonce for %q: %w", instanceName, err)
 	}
 
+	// Fail EARLY — before this attempt's first Docker call — if instanceName
+	// is long enough (or charset-unsafe enough) that a derived name would be
+	// rejected by the daemon: the generation-nonce-qualified volume names
+	// (F4) add a fixed ~44 bytes on top of the instance name, so a
+	// pathologically long GARM instance name could otherwise push a volume
+	// name past Docker's 255-byte resource-name limit and surface as an
+	// opaque daemon rejection deep inside VolumeCreate, after the claim
+	// network (and possibly other resources) already exist.
+	if err := spec.ValidateAllocationNames(instanceName, nonce); err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("instance name %q produces an invalid Docker resource name: %w", instanceName, err)
+	}
+
 	identity := spec.AllocationIdentity{
 		ControllerID: p.controllerID,
 		PoolID:       bootstrap.PoolID,

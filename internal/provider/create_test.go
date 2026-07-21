@@ -547,6 +547,35 @@ func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
 	}
 }
 
+// TestCreateInstanceRejectsPathologicallyLongInstanceName is the
+// derived-name-length-hardening guard (internal/spec.ValidateAllocationNames)
+// exercised end to end: an instance name long enough that its
+// generation-nonce-qualified volume names (F4) would exceed Docker's
+// 255-byte resource-name limit must fail EARLY, before the claim network (or
+// anything else) is created — a clear provider error, not an opaque daemon
+// rejection surfacing mid-allocation.
+func TestCreateInstanceRejectsPathologicallyLongInstanceName(t *testing.T) {
+	p, fake := newTestProvider(t)
+	// Metadata URL is deliberately never contacted: the name-length check
+	// runs before any Docker op or credential fetch.
+	b := jitBootstrap("https://metadata.invalid/")
+	b.Name = strings.Repeat("a", 300)
+
+	if _, err := p.CreateInstance(context.Background(), b); err == nil {
+		t.Fatal("expected an invalid-derived-name error, got nil")
+	}
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("over-long instance name left %d containers behind, want 0", n)
+	}
+	nets, err := fake.NetworkList(context.Background(), network.ListOptions{})
+	if err != nil {
+		t.Fatalf("NetworkList returned unexpected error: %v", err)
+	}
+	if len(nets) != 0 {
+		t.Errorf("over-long instance name created %d networks, want 0 (must fail before the claim network)", len(nets))
+	}
+}
+
 // hasEnv reports whether env contains an exact entry.
 func hasEnv(env []string, want string) bool {
 	for _, e := range env {

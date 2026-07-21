@@ -1,6 +1,9 @@
 package spec
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRunnerContainerName(t *testing.T) {
 	tests := []struct {
@@ -110,4 +113,98 @@ func TestVolumeNamesAreGenerationUnique(t *testing.T) {
 	if JobNetworkName(instanceName) != JobNetworkName(instanceName) {
 		t.Fatal("JobNetworkName is unexpectedly non-deterministic")
 	}
+}
+
+// TestValidateDerivedName is the derived-name length/charset hardening guard:
+// a name at or under Docker's 255-byte resource-name limit and matching its
+// [a-zA-Z0-9][a-zA-Z0-9_.-]* grammar is accepted; anything else is rejected
+// with a clear, specific error rather than being handed to the daemon to
+// reject opaquely.
+func TestValidateDerivedName(t *testing.T) {
+	longButValid := strings.Repeat("a", dockerNameMaxLength) // exactly at the limit: ok
+	tooLong := strings.Repeat("a", dockerNameMaxLength+1)    // one byte over: rejected
+
+	tests := []struct {
+		name    string
+		kind    string
+		value   string
+		wantErr bool
+		errSub  string
+	}{
+		{name: "normal name ok", kind: "workspace volume", value: "my-instance-0a1b2c3d-workspace", wantErr: false},
+		{name: "exactly at the 255-byte limit", kind: "workspace volume", value: longButValid, wantErr: false},
+		{name: "one byte over the limit", kind: "workspace volume", value: tooLong, wantErr: true, errSub: "exceeds Docker's 255-byte"},
+		{name: "empty name", kind: "job network", value: "", wantErr: true, errSub: "is empty"},
+		{name: "invalid leading character", kind: "runner container", value: "-leading-dash", wantErr: true, errSub: "not a valid Docker resource name"},
+		{name: "invalid embedded character", kind: "runner container", value: "has/a/slash", wantErr: true, errSub: "not a valid Docker resource name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateDerivedName(tt.kind, tt.value)
+			if tt.wantErr && err == nil {
+				t.Fatalf("ValidateDerivedName(%q, %q) = nil, want an error", tt.kind, tt.value)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateDerivedName(%q, %q) = %v, want nil", tt.kind, tt.value, err)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), tt.errSub) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errSub)
+			}
+		})
+	}
+}
+
+// TestValidateAllocationNamesPathologicallyLongInstanceName is the
+// derived-name-length-hardening guard for a full allocation attempt: a
+// normal instance name produces valid names for every derived resource, but
+// a pathologically long one — long enough that the generation-nonce-
+// qualified volume names (F4, ~44 bytes of fixed overhead: a dash, the
+// 32-hex-char create-nonce, a dash, and the longest suffix "dind-state") push
+// past Docker's 255-byte resource-name limit — fails EARLY with a clear,
+// aggregated provider error rather than succeeding here and failing opaquely
+// at the daemon later, deep inside VolumeCreate.
+func TestValidateAllocationNamesPathologicallyLongInstanceName(t *testing.T) {
+	const nonce = "0123456789abcdef0123456789abcdef" // 32 hex chars, matches newCreateNonce's length
+	if len(nonce) != 32 {
+		t.Fatalf("test fixture bug: nonce is %d chars, want 32", len(nonce))
+	}
+
+	t.Run("normal instance name is ok", func(t *testing.T) {
+		if err := ValidateAllocationNames("my-normal-instance-01", nonce); err != nil {
+			t.Fatalf("ValidateAllocationNames returned unexpected error: %v", err)
+		}
+	})
+
+	t.Run("pathologically long instance name fails clearly", func(t *testing.T) {
+		longName := strings.Repeat("a", 300)
+		err := ValidateAllocationNames(longName, nonce)
+		if err == nil {
+			t.Fatal("ValidateAllocationNames(300-char instance name) = nil, want an error")
+		}
+		if !strings.Contains(err.Error(), "dind-state volume") {
+			t.Errorf("error = %q, want it to name the offending dind-state volume", err.Error())
+		}
+		if !strings.Contains(err.Error(), "exceeds Docker's 255-byte") {
+			t.Errorf("error = %q, want a clear over-the-limit message", err.Error())
+		}
+	})
+
+	t.Run("boundary: exactly at the limit for every derived name", func(t *testing.T) {
+		// dind-state has the largest fixed overhead (44 bytes: '-' + the
+		// 32-char nonce + '-' + "dind-state"), so sizing the instance name so
+		// THAT name lands exactly at 255 proves every other, shorter derived
+		// name is within bounds too.
+		instanceName := strings.Repeat("b", dockerNameMaxLength-44)
+		if got := len(DindStateVolumeName(instanceName, nonce)); got != dockerNameMaxLength {
+			t.Fatalf("test fixture bug: DindStateVolumeName length = %d, want exactly %d", got, dockerNameMaxLength)
+		}
+		if err := ValidateAllocationNames(instanceName, nonce); err != nil {
+			t.Errorf("ValidateAllocationNames at the exact 255-byte boundary returned unexpected error: %v", err)
+		}
+
+		// One byte longer pushes dind-state (only) past the limit.
+		if err := ValidateAllocationNames(instanceName+"b", nonce); err == nil {
+			t.Fatal("ValidateAllocationNames one byte past the boundary = nil, want an error")
+		}
+	})
 }
