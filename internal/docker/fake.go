@@ -126,6 +126,16 @@ type FakeClient struct {
 	// its own create (NEW-2). It must not re-enter this same ContainerCreate
 	// call reentrantly without guarding (it runs without f.mu held).
 	CreateHook func()
+
+	// VolumeListHook, when non-nil, is invoked at the very start of every
+	// VolumeList — before f.mu is taken — so a test can model a concurrent
+	// mutation that lands exactly when a teardown enumerates volumes: e.g. a
+	// peer teardown finishing generation A and a fresh CreateInstance claiming
+	// generation B, in the window between a teardown capturing generation A's
+	// nonce and its per-kind volume removal (F4). Like CreateHook it runs
+	// without f.mu held (so it may call back into the fake's own locked methods)
+	// and must guard against re-entrancy/once-ness itself.
+	VolumeListHook func()
 }
 
 // ExecRecord captures one ExecStream call for test assertions.
@@ -878,6 +888,14 @@ func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) er
 // VolumeList returns every volume whose labels match options.Filters (a
 // "label" filter), exactly as ContainerList/NetworkList do.
 func (f *FakeClient) VolumeList(_ context.Context, options volume.ListOptions) (volume.ListResponse, error) {
+	// Fire the concurrency hook (if any) before taking the lock, so a test can
+	// mutate the store to model a concurrent teardown+create landing right when a
+	// teardown enumerates volumes (F4). It runs without f.mu held to avoid a
+	// re-entrant deadlock when the hook calls back into the fake.
+	if f.VolumeListHook != nil {
+		f.VolumeListHook()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

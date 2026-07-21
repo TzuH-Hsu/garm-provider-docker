@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -623,6 +624,122 @@ func TestTeardownRemovesNetworkLast(t *testing.T) {
 	// The network must be the very last removal (F4).
 	if n := len(fake.RemoveOrder); n == 0 || !strings.HasPrefix(fake.RemoveOrder[n-1], "network:") {
 		t.Errorf("last removal = %q, want the network last: order=%v", fake.RemoveOrder, fake.RemoveOrder)
+	}
+}
+
+// TestTeardownAllocationGenerationScopedProtectsConcurrentCreate reproduces the
+// F4 T1/T2/gen-B interleave: a teardown of generation A captures A's nonce, then
+// — in the window between that capture and its per-kind volume removal — a peer
+// teardown finishes removing A and a concurrent CreateInstance claims generation
+// B, creating B's fresh network + volume under the SAME deterministic names but
+// a NEW nonce. Before the fix, the still-running teardown enumerated volumes
+// purely by instance-name and deleted B's brand-new volume. With generation
+// scoping, the teardown removes only nonce-A resources, so B's volume AND
+// network survive.
+//
+// The interleave is driven deterministically via the fake's VolumeListHook,
+// which fires exactly when the teardown lists volumes for removal (T2's
+// per-kind volume list) — the precise instant the original bug struck.
+func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+	// Generation A: claim network + workspace volume + a running runner.
+	seedNetworkFor(t, fake, testControllerID, "job-1", now, "gen-a")
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "gen-a")
+	seedRunnerFor(t, fake, testControllerID, "job-1", now, "gen-a", "running")
+
+	var once sync.Once
+	fake.VolumeListHook = func() {
+		once.Do(func() {
+			ctx := context.Background()
+			// T1 finishes tearing down generation A (its runner is already gone —
+			// removeContainers ran before this volume list — so its volume and
+			// claim network can be removed).
+			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1"), true); err != nil {
+				t.Errorf("hook: removing gen-A volume: %v", err)
+			}
+			nets, err := fake.NetworkList(ctx, network.ListOptions{})
+			if err != nil {
+				t.Errorf("hook: listing networks: %v", err)
+			}
+			for _, n := range nets {
+				if n.Name == spec.JobNetworkName("job-1") {
+					if err := fake.NetworkRemove(ctx, n.ID); err != nil {
+						t.Errorf("hook: removing gen-A network: %v", err)
+					}
+				}
+			}
+			// A concurrent CreateInstance claims generation B: fresh claim network
+			// and workspace volume, SAME deterministic names, a DIFFERENT nonce.
+			seedNetworkFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
+			seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
+		})
+	}
+
+	found, err := m.TeardownAllocation(context.Background(), "job-1")
+	if err != nil {
+		t.Fatalf("TeardownAllocation returned unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("TeardownAllocation found=false, want true (generation A's runner existed)")
+	}
+
+	// Generation B's volume AND network survive: exactly one of each, both nonce
+	// gen-b. Generation A's runner is gone.
+	if countContainers(t, fake) != 0 {
+		t.Errorf("container count = %d, want 0 (generation A's runner removed)", countContainers(t, fake))
+	}
+	if countVolumes(t, fake) != 1 {
+		t.Fatalf("volume count = %d, want 1 (generation B's fresh volume survives)", countVolumes(t, fake))
+	}
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
+		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — a stale teardown deleted the newer generation's volume", v.Labels[spec.LabelCreateNonce])
+	}
+	if countNetworks(t, fake) != 1 {
+		t.Fatalf("network count = %d, want 1 (generation B's fresh network survives)", countNetworks(t, fake))
+	}
+	if n := findNetwork(t, fake, spec.JobNetworkName("job-1")); n.Labels[spec.LabelCreateNonce] != "gen-b" {
+		t.Errorf("[F4] surviving network nonce = %q, want gen-b — a stale teardown deleted the newer generation's claim marker", n.Labels[spec.LabelCreateNonce])
+	}
+}
+
+// TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone is the F4
+// fallback guard: when the claim network is already GONE at teardown start
+// (nothing to key a generation to), removal falls back to instance-scoped — but
+// if a generation then claims the name mid-teardown (a live claim network with a
+// fresh nonce appears before the per-kind volume removal), the teardown must NOT
+// delete that newer generation's resources.
+func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testing.T) {
+	m, fake := newManager(t)
+	now := time.Now()
+	// Only a leftover workspace volume, NO claim network at start -> fallback.
+	seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", now, "orphan")
+
+	var once sync.Once
+	fake.VolumeListHook = func() {
+		once.Do(func() {
+			ctx := context.Background()
+			// Remove the orphan leftover (as a peer teardown would) and let a fresh
+			// generation B claim the name: a live claim network + volume appear.
+			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1"), true); err != nil {
+				t.Errorf("hook: removing orphan volume: %v", err)
+			}
+			seedNetworkFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
+			seedWorkspaceVolumeFor(t, fake, testControllerID, "job-1", time.Now(), "gen-b")
+		})
+	}
+
+	if _, err := m.TeardownAllocation(context.Background(), "job-1"); err != nil {
+		t.Fatalf("TeardownAllocation returned unexpected error: %v", err)
+	}
+
+	// Generation B's volume and network survive: the fallback protected the nonce
+	// the live claim network holds (refreshLive re-read it before removing).
+	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
+		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — the fallback deleted a newer generation's volume", v.Labels[spec.LabelCreateNonce])
+	}
+	if countNetworks(t, fake) != 1 {
+		t.Errorf("network count = %d, want 1 (generation B's claim network survives the fallback)", countNetworks(t, fake))
 	}
 }
 
