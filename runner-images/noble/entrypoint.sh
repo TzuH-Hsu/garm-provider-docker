@@ -179,6 +179,23 @@ run_concurrent_waits() {
   return 0
 }
 
+# prepare_diag ensures the mounted diagnostic-logs directory (GARM_DIAG_DIR, set
+# by the provider ONLY when a persistent diag-logs volume is mounted, ADR-003 W2)
+# exists and is owned by the runner user before privileges are dropped: a fresh
+# named volume mounts root-owned, so without this the unprivileged runner could
+# not write its _diag logs into it. This is DIRECTORY SETUP only — retention and
+# pruning are enforced provider-side, out of band, NEVER in this untrusted
+# entrypoint (ADR-003 F14). The chown is non-recursive: logs from prior jobs are
+# already runner-owned, and recursing a full log history every job would be
+# needless. No-op when GARM_DIAG_DIR is unset (cache disabled or ineligible).
+prepare_diag() {
+  local dir="${GARM_DIAG_DIR:-}"
+  [[ -z "${dir}" ]] && return 0
+  mkdir -p "${dir}"
+  chown "${RUNNER_USER}:${RUNNER_USER}" "${dir}"
+  log "prepared diagnostic-logs dir ${dir} (owned by ${RUNNER_USER})"
+}
+
 # resolve_workdir mirrors the base image's own convention: an absolute
 # RUNNER_WORKDIR is used as-is, a relative one is relative to RUNNER_DIR
 # (which is also the entrypoint's cwd by the time this runs).
@@ -438,6 +455,10 @@ main() {
   # DinD modes: make the runner user a member of the DinD socket group before
   # dropping privileges, so `docker` works as the unprivileged runner (F1).
   ensure_docker_socket_group
+
+  # W2: own the mounted diagnostic-logs dir (if any) so the unprivileged runner
+  # can write into the persistent diag volume (ADR-003; no-op when unset).
+  prepare_diag
 
   if [[ "${JIT_CONFIG_ENABLED:-false}" == "true" ]]; then
     install_jit_credentials

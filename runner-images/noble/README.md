@@ -65,6 +65,7 @@ Always set by the provider:
 | `GITHUB_URL` | Base GitHub host (e.g. `https://github.com`) - informational/connectivity-check in JIT mode, the host component of the constructed registration URL in non-JIT mode. |
 | `DISABLE_RUNNER_UPDATE` | Always `true`. |
 | `DOCKER_HOST` | DinD modes only - triggers the Docker readiness wait (step 2 below). Unset in `none` mode. |
+| `GARM_DIAG_DIR` | M2-W2 only - set when a persistent diagnostic-logs volume is mounted, so the entrypoint owns that dir (`mkdir -p` + `chown` to `runner`) before dropping privileges. Unset when the cache is disabled or the pool is cache-ineligible. |
 
 JIT mode only (`JIT_CONFIG_ENABLED=true`) — deliberately nothing else:
 GARM bakes the runner's name, labels, group, and ephemeral flag into the
@@ -135,6 +136,22 @@ that could emit any of them.
      root.
 
 The script never echoes credential file contents.
+
+## pnpm (M2-W2)
+
+The base `myoung34/github-runner` image ships Node but **not** `pnpm`, `npm`, or
+`corepack`, so the provider's persistent pnpm store (ADR-003,
+`npm_config_store_dir=/opt/pnpm-store`) was inert against the stock image. This
+image installs a **pinned** pnpm (`ARG PNPM_VERSION`, default `9.15.9`) lean: the
+pnpm npm-registry tarball (~20 MB of JS) is extracted to `/opt/pnpm` and run by
+the base image's own Node through a tiny `/usr/local/bin/pnpm` wrapper — no
+second bundled Node runtime, no apt `npm`/build-toolchain bloat. `pnpm --version`
+works out of the box, and with `npm_config_store_dir` set, `pnpm config get
+store-dir` resolves to `/opt/pnpm-store`.
+
+The pnpm **major** version must match the provider's `[cache].pnpm_major`
+(default `9`) — the pnpm store's on-disk layout is tied to the major, so bumping
+`pnpm_major` in provider config is the signal to bump `PNPM_VERSION` here too.
 
 ## Build
 
