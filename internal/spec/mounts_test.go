@@ -125,6 +125,69 @@ func TestBuildRunnerContainer(t *testing.T) {
 	}
 }
 
+func TestNamedWorkspaceMount(t *testing.T) {
+	m := NamedWorkspaceMount("test-instance-01-workspace")
+	if m.Type != mount.TypeVolume {
+		t.Errorf("Type = %q, want volume", m.Type)
+	}
+	if m.Source != "test-instance-01-workspace" {
+		t.Errorf("Source = %q, want the named workspace volume", m.Source)
+	}
+	// WP9-flagged JIT-workdir check: the workspace mount target MUST equal the
+	// runner image's RUNNER_WORKDIR (/actions-runner/_work) so a job's _work
+	// lands on the dedicated volume, not the container rootfs (ADR-002).
+	if m.Target != RunnerWorkDir {
+		t.Errorf("Target = %q, want %q (runner image RUNNER_WORKDIR)", m.Target, RunnerWorkDir)
+	}
+	if RunnerWorkDir != "/actions-runner/_work" {
+		t.Errorf("RunnerWorkDir = %q, want /actions-runner/_work (runner-images/noble RUNNER_DIR + _work)", RunnerWorkDir)
+	}
+}
+
+func TestBuildRunnerContainerNamedWorkspaceAndNetwork(t *testing.T) {
+	cfg, host := BuildRunnerContainer(RunnerContainerSpec{
+		Image:               "ghcr.io/example/runner@sha256:abc",
+		WorkspaceVolumeName: "job-1-workspace",
+		NetworkName:         "job-1-net",
+	})
+	if cfg.Image != "ghcr.io/example/runner@sha256:abc" {
+		t.Errorf("Image = %q", cfg.Image)
+	}
+
+	// The workspace is the NAMED volume mounted at the runner workdir.
+	if len(host.Mounts) != 1 {
+		t.Fatalf("Mounts = %d, want 1 (workspace only)", len(host.Mounts))
+	}
+	w := host.Mounts[0]
+	if w.Type != mount.TypeVolume || w.Source != "job-1-workspace" || w.Target != RunnerWorkDir {
+		t.Errorf("workspace mount = %+v, want the named volume at %q", w, RunnerWorkDir)
+	}
+
+	// The container joins the per-job network as its sole network.
+	if host.NetworkMode != "job-1-net" {
+		t.Errorf("NetworkMode = %q, want the job network", host.NetworkMode)
+	}
+	if !host.NetworkMode.IsUserDefined() {
+		t.Errorf("NetworkMode %q should be user-defined (not the default bridge)", host.NetworkMode)
+	}
+
+	// The credential tmpfs is unchanged (short-syntax, runner uid/gid).
+	if _, ok := host.Tmpfs[CredentialDir]; !ok {
+		t.Errorf("HostConfig.Tmpfs missing the %q entry: %v", CredentialDir, host.Tmpfs)
+	}
+}
+
+func TestBuildRunnerContainerDefaultsToAnonymousWorkspaceAndNoNetwork(t *testing.T) {
+	// No WorkspaceVolumeName / NetworkName: the M0 fallback shape.
+	_, host := BuildRunnerContainer(RunnerContainerSpec{Image: "x"})
+	if len(host.Mounts) != 1 || host.Mounts[0].Source != "" {
+		t.Errorf("Mounts = %+v, want a single anonymous (empty Source) workspace volume", host.Mounts)
+	}
+	if host.NetworkMode != "" {
+		t.Errorf("NetworkMode = %q, want empty (default bridge) when no network is set", host.NetworkMode)
+	}
+}
+
 func TestBuildRunnerContainerMemoryLimit(t *testing.T) {
 	_, host := BuildRunnerContainer(RunnerContainerSpec{
 		Image:       "x",

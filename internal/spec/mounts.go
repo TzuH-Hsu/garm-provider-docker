@@ -84,18 +84,39 @@ func CredentialTmpfsMap() map[string]string {
 }
 
 // WorkspaceMount returns the per-job workspace mount at the runner working
-// directory. In M0 this is an anonymous volume (empty Source): it is removed
-// with the container via ContainerRemove(RemoveVolumes=true), which is why
-// the M0 teardown does not need a separate named-volume delete step.
+// directory as an ANONYMOUS volume (empty Source): it is removed with the
+// container via ContainerRemove(RemoveVolumes=true). This is the M0 shape,
+// kept as the fallback BuildRunnerContainer uses when no named workspace
+// volume is supplied (e.g. a spec-level unit test).
 //
-// TODO(M1): replace with a named, job-scoped, labeled volume
-// (spec.WorkspaceVolumeName + ResourceWorkspace labels) so the workspace
-// participates directly in the ADR-004 teardown/orphan-sweep predicate. An
-// anonymous volume carries no garm.docker/* labels of its own, so it can
-// only be reclaimed via its container, not swept independently.
+// As of M1-WP2 the provider supplies a NAMED, job-scoped, labeled workspace
+// volume (NamedWorkspaceMount below) so the workspace participates directly
+// in the ADR-004 teardown/orphan-sweep predicate: an anonymous volume carries
+// no garm.docker/* labels of its own, so it can only be reclaimed via its
+// container, never swept independently.
 func WorkspaceMount() mount.Mount {
 	return mount.Mount{
 		Type:   mount.TypeVolume,
+		Target: RunnerWorkDir,
+	}
+}
+
+// NamedWorkspaceMount returns the per-job workspace mount backed by the
+// named, job-scoped, labeled volume `name` (spec.WorkspaceVolumeName), mounted
+// at RunnerWorkDir. This is the M1-WP2 shape: the volume is created and labeled
+// separately (ADR-001 workspace volume, ADR-004 job-scoped predicate) so it can
+// be torn down and swept as a first-class resource, not merely reaped as the
+// container's anonymous volume.
+//
+// The target is RunnerWorkDir (/actions-runner/_work), which is exactly where
+// the runner image writes _work (RUNNER_WORKDIR resolved by
+// runner-images/noble/entrypoint.sh's resolve_workdir), so a job's checkout
+// lands on this dedicated volume rather than the container rootfs — the ADR-002
+// contract the WP9-flagged JIT-workdir check asserts.
+func NamedWorkspaceMount(name string) mount.Mount {
+	return mount.Mount{
+		Type:   mount.TypeVolume,
+		Source: name,
 		Target: RunnerWorkDir,
 	}
 }
@@ -118,6 +139,23 @@ type RunnerContainerSpec struct {
 	// wiring lands, a caller that leaves this unset still gets M0's
 	// original unlimited behavior.
 	MemoryBytes int64
+
+	// WorkspaceVolumeName, when non-empty, backs the workspace mount with a
+	// named, job-scoped, labeled volume (NamedWorkspaceMount) instead of the
+	// anonymous volume M0 used (WorkspaceMount). WP2 always sets it —
+	// spec.WorkspaceVolumeName(instanceName) — so the workspace is a
+	// first-class ADR-004 resource. Left empty (e.g. a spec-only unit test),
+	// the builder falls back to the M0 anonymous volume.
+	WorkspaceVolumeName string
+
+	// NetworkName, when non-empty, joins the runner container to that Docker
+	// network as its sole network via HostConfig.NetworkMode (ADR-001's
+	// per-job network, the claim marker of ADR-004). Setting NetworkMode to a
+	// user-defined network makes it the container's only attachment — the
+	// container does NOT also join the default bridge — which is the
+	// per-job isolation WP2 provisions. Left empty, the container joins the
+	// default bridge, the M0 behavior.
+	NetworkName string
 }
 
 // BuildRunnerContainer assembles the container.Config and container.HostConfig
@@ -136,11 +174,22 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 		Labels: s.Labels,
 	}
 
+	workspace := WorkspaceMount()
+	if s.WorkspaceVolumeName != "" {
+		workspace = NamedWorkspaceMount(s.WorkspaceVolumeName)
+	}
+
 	host := &container.HostConfig{
 		Tmpfs: CredentialTmpfsMap(),
 		Mounts: []mount.Mount{
-			WorkspaceMount(),
+			workspace,
 		},
+	}
+	if s.NetworkName != "" {
+		// Attach the runner to the per-job network as its sole network
+		// (ADR-001). A user-defined NetworkMode means the container does not
+		// also join the default bridge, which is the isolation guarantee.
+		host.NetworkMode = container.NetworkMode(s.NetworkName)
 	}
 	if s.MemoryBytes > 0 {
 		host.Resources.Memory = s.MemoryBytes
