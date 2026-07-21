@@ -43,7 +43,9 @@ func TestLoadM1(t *testing.T) {
 // TestLoadM1Defaults confirms an M0-shaped config (no M1 keys at all, e.g.
 // testdata/valid.toml) still loads with ADR-001's documented M1 defaults
 // applied: dind_mode=none, every mode allowed, storage_driver=overlay2,
-// and enable_job_network/internal both true.
+// enable_job_network=true, and internal=false (the 2026-07-21 owner ruling,
+// ADR-001 Amendment — job networks default to open egress; per-allocation
+// network separation, not this flag, provides job-to-job isolation).
 func TestLoadM1Defaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
@@ -67,8 +69,8 @@ func TestLoadM1Defaults(t *testing.T) {
 	if !cfg.Network.EnableJobNetwork {
 		t.Error("Network.EnableJobNetwork = false, want true (default)")
 	}
-	if !cfg.Network.Internal {
-		t.Error("Network.Internal = false, want true (default)")
+	if cfg.Network.Internal {
+		t.Error("Network.Internal = true, want false (default, 2026-07-21 owner ruling)")
 	}
 	if cfg.DindImage != "" {
 		t.Errorf("DindImage = %q, want empty (dind_mode=none, never set)", cfg.DindImage)

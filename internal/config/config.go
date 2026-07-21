@@ -117,7 +117,7 @@ func Load(path string) (Config, error) {
 		StorageDriver:    defaultStorageDriver,
 		Network: Network{
 			EnableJobNetwork: true,
-			Internal:         true,
+			Internal:         false,
 		},
 	}
 
