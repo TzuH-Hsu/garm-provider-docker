@@ -153,16 +153,24 @@ func TestMapContainerStatus(t *testing.T) {
 	}
 }
 
-func TestResolveByID(t *testing.T) {
+// TestResolveRawContainerIDNoLongerResolves is the NEW-H1 regression guard: the
+// raw inspect-by-ID fallback was DROPPED (2026-07-21). A GARM_INSTANCE_ID that
+// is a bare container ID (never a legitimate value — provider_id has always been
+// the instance name in this pre-release provider) must NOT resolve the runner by
+// that id; only the instance-name label resolves. This closes the residual
+// ambiguity where a foreign/other-generation container could be reached by a raw
+// id inspect.
+func TestResolveRawContainerIDNoLongerResolves(t *testing.T) {
 	p, fake := newTestProvider(t)
 	id := seedRunner(t, fake, "runner-a", "p1", "controller-abc", "running")
 
-	c, found, err := p.resolve(context.Background(), id)
+	// The runner's own instance-name label is "runner-a", NOT its container id.
+	_, found, err := p.resolve(context.Background(), id)
 	if err != nil {
 		t.Fatalf("resolve returned unexpected error: %v", err)
 	}
-	if !found || c.ID != id {
-		t.Errorf("resolve(id) = %q found=%v, want %q true", c.ID, found, id)
+	if found {
+		t.Errorf("resolve(rawContainerID=%q) found a container; the raw inspect-by-ID fallback must be gone (resolution is instance-name-label only)", id)
 	}
 }
 
@@ -302,7 +310,9 @@ func TestGetInstanceStatusMapping(t *testing.T) {
 			id := seedRunner(t, fake, "runner-x", "p1", "controller-abc", tt.state)
 			fake.SetState(id, tt.state, tt.oomKilled)
 
-			inst, err := p.GetInstance(context.Background(), id)
+			// GARM_INSTANCE_ID is the instance NAME (F6), resolved by the
+			// instance-name label — never the raw container id (NEW-H1).
+			inst, err := p.GetInstance(context.Background(), "runner-x")
 			if err != nil {
 				t.Fatalf("GetInstance returned unexpected error: %v", err)
 			}
@@ -350,15 +360,31 @@ func TestDeleteInstanceIdempotentAndExit30(t *testing.T) {
 	}
 }
 
-func TestDeleteInstanceByContainerID(t *testing.T) {
+// TestDeleteInstanceByRawContainerIDNoLongerResolves is the NEW-H1 guard for the
+// delete path: DeleteInstance with a raw container ID (never a legitimate
+// GARM_INSTANCE_ID — provider_id is always the instance name) must NOT resolve
+// the runner by that id and must leave the allocation untouched, returning
+// not-found (exit 30). The raw inspect-by-ID fallback was dropped, so a stray
+// container-id value can no longer trigger a delete of a container it happens to
+// id-match. Deleting by the instance NAME still works (covered elsewhere).
+func TestDeleteInstanceByRawContainerIDNoLongerResolves(t *testing.T) {
 	p, fake := newTestProvider(t)
 	id := seedRunner(t, fake, "runner-byid", "p1", "controller-abc", "running")
 
-	if err := p.DeleteInstance(context.Background(), id); err != nil {
-		t.Fatalf("DeleteInstance(id) returned unexpected error: %v", err)
+	err := p.DeleteInstance(context.Background(), id)
+	if !errors.Is(err, gErrors.ErrNotFound) {
+		t.Errorf("DeleteInstance(rawContainerID) err = %v, want not-found (raw-ID resolution is dropped)", err)
+	}
+	// The runner is untouched — a raw container id never resolved it.
+	if n := listAll(t, p); n != 1 {
+		t.Errorf("after delete-by-raw-id, %d runners remain, want 1 (untouched)", n)
+	}
+	// And deleting by the instance NAME does reap it.
+	if err := p.DeleteInstance(context.Background(), "runner-byid"); err != nil {
+		t.Fatalf("DeleteInstance(name) returned unexpected error: %v", err)
 	}
 	if n := listAll(t, p); n != 0 {
-		t.Errorf("after delete by id, %d containers remain, want 0", n)
+		t.Errorf("after delete-by-name, %d runners remain, want 0", n)
 	}
 }
 
@@ -448,11 +474,14 @@ func TestStopAndStartViaResolver(t *testing.T) {
 
 func TestResolveInspectErrorIsPropagated(t *testing.T) {
 	p, fake := newTestProvider(t)
+	// A matching runner exists, so the label lookup finds a candidate to inspect;
+	// the inspect (of that candidate) then fails with a non-NotFound daemon error.
+	seedRunner(t, fake, "runner-x", "p1", "controller-abc", "running")
 	fake.InspectErr = errors.New("docker daemon exploded")
 
 	// A non-NotFound inspect error must surface as an error, not be treated
 	// as "gone" (which would be a not-found error / exit 30).
-	_, gotErr := p.GetInstance(context.Background(), "anything")
+	_, gotErr := p.GetInstance(context.Background(), "runner-x")
 	if gotErr == nil {
 		t.Fatal("expected the inspect error to surface, got nil")
 	}

@@ -32,7 +32,9 @@ func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.P
 		filters.Arg("label", spec.LabelControllerID+"="+p.controllerID),
 		// role=runner so a DinD sidecar (WP3) is never reported to GARM as an
 		// instance; a runner is the only container that represents a GARM
-		// instance (ADR-004: provider_id is the runner container's ID).
+		// instance. Its provider_id is the stable GARM instance NAME (F6,
+		// ADR-004 amendment 2026-07-21), resolved by the instance-name label —
+		// never the runner container's ID.
 		filters.Arg("label", spec.LabelRole+"="+spec.RoleRunner),
 	)
 	if poolID != "" {

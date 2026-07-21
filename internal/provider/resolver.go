@@ -16,52 +16,33 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// resolve finds the managed runner container for a GARM_INSTANCE_ID, which
-// may be either the provider-assigned ProviderID (now the instance name — F6)
-// or the GARM instance Name — GARM falls back to Name when ProviderID is empty
-// (research.md §1.E, ADR-004). It tries the exact instance-name label lookup
-// FIRST (N2), then falls back to an inspect-by-ID for the legacy container-ID
-// case. The bool reports whether a container was found; a genuine "gone" is
+// resolve finds the managed runner container for a GARM_INSTANCE_ID by the
+// instance-name label, AUTHORITATIVELY — the instance-name label is the single
+// resolution key (NEW-H1/N2). GARM_INSTANCE_ID is always the GARM instance name:
+// provider_id is the instance name (F6), and GARM falls back to the instance
+// Name when provider_id is empty (research.md §1.E, ADR-004) — both equal the
+// instance name, so a single label lookup satisfies GARM's "ProviderID or Name"
+// contract. The bool reports whether a container was found; a genuine "gone" is
 // (zero, false, nil), distinct from an error.
 //
-// The label lookup comes first specifically to fix N2: if instanceID happens to
-// equal ANOTHER runner's container ID (or a prefix a raw inspect-by-ID would
-// match), an ID-first resolve would return that OTHER allocation's container.
-// Keying on the instance-name label first resolves to the runner that actually
-// OWNS the name; only when no owned runner carries that instance-name label do
-// we treat instanceID as a raw container ID (the pre-F6 identity).
+// There is deliberately NO raw inspect-by-ID fallback (dropped 2026-07-21,
+// NEW-H1). The pre-F6 identity was the runner's container ID, but provider_id
+// has ALWAYS been the instance name in this pre-release provider — there are no
+// deployed container-ID provider_ids to migrate — so a raw inspect-by-ID would
+// serve no legitimate case while opening a residual ambiguity: an instance name
+// that happens to be container-ID-shaped could inspect-resolve a FOREIGN or
+// other-generation container by ID even though it is not the runner that owns
+// that instance-name label. Resolving solely by the instance-name label (with a
+// full ownership check) removes that ambiguity by construction — the id-shaped
+// name resolves ITS OWN allocation via the label, never an id collision.
 //
-// Every successful inspect is validated for ownership (spec.IsManagedRunner):
-// a container that does not carry this controller's managed/runner labels is
-// treated as not-found, so a foreign or wrong-role container that happens to
-// collide on a Docker ID or name is never returned to a mutating caller
-// (Delete/Stop/Start), which could otherwise touch a container this provider
-// does not own (ADR-004 F3).
+// Every candidate is validated for ownership (spec.IsManagedRunner): a container
+// that does not carry this controller's managed/runner labels is treated as
+// not-found, so a foreign or wrong-role container that happens to collide on a
+// Docker ID or name is never returned to a mutating caller (Delete/Stop/Start),
+// which could otherwise touch a container this provider does not own (F3).
 func (p *Provider) resolve(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
-	// N2: exact instance-name label lookup FIRST.
-	inspected, found, err := p.resolveByOwnedLabel(ctx, instanceID)
-	if err != nil {
-		return types.ContainerJSON{}, false, err
-	}
-	if found {
-		return inspected, true, nil
-	}
-
-	// Legacy container-ID fallback: no owned runner carries instanceID as its
-	// instance-name label, so treat it as a raw container ID (or Docker name).
-	// Validate ownership so a foreign/wrong-role container colliding on that ID
-	// or name is never returned (ADR-004 F3).
-	inspected, err = p.cli.ContainerInspect(ctx, instanceID)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return types.ContainerJSON{}, false, nil
-		}
-		return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", instanceID, err)
-	}
-	if !p.ownsRunner(inspected) {
-		return types.ContainerJSON{}, false, nil
-	}
-	return inspected, true, nil
+	return p.resolveByOwnedLabel(ctx, instanceID)
 }
 
 // resolveByOwnedLabel finds this controller's RUNNER container by the

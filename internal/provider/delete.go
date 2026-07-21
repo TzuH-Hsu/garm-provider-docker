@@ -14,11 +14,14 @@ import (
 // whose entire allocation is already gone returns the not-found error, which
 // maps to exit code 30 (GARM treats that as success).
 //
-// instanceID may be a runner container ID (the ProviderID) or the GARM instance
-// Name (research.md §1.E). resolveInstanceName maps either to the instance-name
-// label that scopes the teardown; if the runner container is already gone but a
-// network or volume lingers (a crashed/partial allocation), the label-filter
-// fallback still finds and sweeps the leftovers (ADR-004).
+// instanceID is the GARM instance NAME — provider_id is the instance name (F6),
+// and GARM falls back to the instance Name when provider_id is empty
+// (research.md §1.E); both equal the instance name, resolved by the
+// instance-name label (NEW-H1: there is no raw container-ID resolution).
+// resolveInstanceName maps it to the instance-name label that scopes the
+// teardown; if the runner container is already gone but a network, volume, or
+// lingering DinD sidecar remains (a crashed/partial allocation), the label
+// fallback still finds and sweeps the leftovers (ADR-004 F6).
 func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error {
 	instanceName, found, err := p.resolveInstanceName(ctx, instanceID)
 	if err != nil {
@@ -41,14 +44,16 @@ func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error 
 	return nil
 }
 
-// resolveInstanceName maps a GARM_INSTANCE_ID (a runner container ID or the
-// instance Name) to the instance-name label that scopes an allocation's
-// teardown (ADR-004). It first resolves the owned runner container (validating
-// ownership, so a foreign container is never acted on); if none is found, it
-// falls back to treating instanceID as an instance-name and checking for any
-// lingering managed network/volume under that name — so a DeleteInstance for an
-// allocation whose runner container already exited still reaps its network and
-// volumes. found=false means nothing managed exists for this ID/name at all.
+// resolveInstanceName maps a GARM_INSTANCE_ID (always the instance NAME — F6,
+// NEW-H1) to the instance-name label that scopes an allocation's teardown
+// (ADR-004). It first resolves the owned runner container by the instance-name
+// label (validating ownership, so a foreign container is never acted on); if no
+// runner is found, it treats instanceID as the instance-name and checks for any
+// lingering managed container/network/volume under that name — so a
+// DeleteInstance for an allocation whose runner container already exited (or was
+// removed out of band, leaving only the DinD sidecar) still reaps its sidecar,
+// network, and volumes (F6). found=false means nothing managed exists for this
+// name at all.
 func (p *Provider) resolveInstanceName(ctx context.Context, instanceID string) (string, bool, error) {
 	c, found, err := p.resolve(ctx, instanceID)
 	if err != nil {
