@@ -1,0 +1,4 @@
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[flavors.default]
+runner_memory = "not-a-size"

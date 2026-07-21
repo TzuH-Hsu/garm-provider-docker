@@ -1,0 +1,25 @@
+# A full, valid M1-shaped config: every new field set to a legal,
+# non-default value so Load exercises real parsing rather than defaults.
+docker_host = "unix:///var/run/docker.sock"
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+dind_image = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
+dind_mode = "privileged-sidecar"
+allowed_dind_modes = ["none", "privileged-sidecar", "sysbox-runc"]
+storage_driver = "vfs"
+
+[resources]
+runner_memory = "8GiB"
+dind_memory = "4GiB"
+
+[network]
+enable_job_network = true
+internal = true
+
+[flavors.default]
+runner_memory = "8GiB"
+dind_memory = "4GiB"
+
+[flavors.small]
+runner_memory = "2GiB"
+dind_memory = "1GiB"
+runner_image = "ghcr.io/example/garm-runner-noble-small@sha256:cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"

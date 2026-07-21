@@ -91,7 +91,7 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{
 			name: "digest-pinned runner_image accepted",
-			cfg:  Config{DockerHost: defaultDockerHost, RunnerImage: digestRef},
+			cfg:  validBaseConfig(digestRef, false),
 		},
 		{
 			name:    "tag-only runner_image rejected by default",
@@ -100,7 +100,7 @@ func TestConfigValidate(t *testing.T) {
 		},
 		{
 			name: "tag-only runner_image accepted with the escape hatch",
-			cfg:  Config{DockerHost: defaultDockerHost, RunnerImage: "ghcr.io/example/runner:latest", AllowUnpinnedRunnerImage: true},
+			cfg:  validBaseConfig("ghcr.io/example/runner:latest", true),
 		},
 		{
 			name:    "malformed digest rejected",
@@ -129,5 +129,25 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("Validate() returned unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// validBaseConfig returns a Config that passes every M0+M1 Validate check
+// (dind_mode/allowed_dind_modes/storage_driver default to the same values
+// Load() applies), so a test focused on one field (e.g. RunnerImage here,
+// or a single M1 field in config_m1_test.go) does not have to separately
+// satisfy every other field's validation just to reach the check it cares
+// about. Tests that hand-build a Config directly (bypassing Load(), which
+// applies these same defaults from a bare TOML file) must start from this
+// baseline rather than a bare Config{} literal, or they fail on fields
+// unrelated to what they're testing.
+func validBaseConfig(runnerImage string, allowUnpinnedRunnerImage bool) Config {
+	return Config{
+		DockerHost:               defaultDockerHost,
+		RunnerImage:              runnerImage,
+		AllowUnpinnedRunnerImage: allowUnpinnedRunnerImage,
+		DindMode:                 DindModeNone,
+		AllowedDindModes:         []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc},
+		StorageDriver:            defaultStorageDriver,
 	}
 }

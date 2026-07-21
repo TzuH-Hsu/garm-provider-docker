@@ -1,0 +1,3 @@
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+dind_mode = "privileged-sidecar"
+dind_image = "docker:dind"
