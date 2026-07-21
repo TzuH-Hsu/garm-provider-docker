@@ -170,6 +170,12 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
+		// M2 persistent cache off: this test verifies the non-root DinD topology
+		// and teardown in isolation, and cache volumes deliberately survive
+		// DeleteInstance (covered by TestVerifyM2W1CacheHit), so leaving it on
+		// would break the post-delete zero-managed-resources assertions.
+		`[cache]`,
+		`enabled = false`,
 		"",
 	}, "\n"))
 

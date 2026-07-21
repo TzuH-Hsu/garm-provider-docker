@@ -151,6 +151,12 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
+		// M2 persistent cache off: this test verifies DinD topology/teardown in
+		// isolation, and cache volumes deliberately survive DeleteInstance
+		// (covered by TestVerifyM2W1CacheHit), so leaving it on would break the
+		// post-delete zero-managed-resources assertion.
+		`[cache]`,
+		`enabled = false`,
 		"",
 	}, "\n"))
 

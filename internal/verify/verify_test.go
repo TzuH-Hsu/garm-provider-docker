@@ -223,9 +223,17 @@ func TestVerifyM1WP2Allocation(t *testing.T) {
 	// actual defaults (ADR-001, amended 2026-07-21): enable_job_network=true,
 	// internal=false. See TestVerifyOwnerRulingEgressAndIsolation for the
 	// internal=true opt-in path and the cross-allocation isolation check.
+	// [cache] enabled = false: this test verifies the M1 allocation topology and
+	// teardown in isolation. The M2 persistent cache defaults ON, and its
+	// repo-scoped cache volumes deliberately SURVIVE DeleteInstance, so leaving it
+	// on would make them show up in the post-delete "zero managed resources"
+	// assertions below (those caches are covered by TestVerifyM2W1CacheHit).
 	writeFile(t, configFile, fmt.Sprintf(`docker_host = "unix:///var/run/docker.sock"
 runner_image = %q
 allow_unpinned_runner_image = true
+
+[cache]
+enabled = false
 `, imageTag))
 
 	// --- fake metadata HTTPS server ------------------------------------------
