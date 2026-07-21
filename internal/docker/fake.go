@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -30,6 +31,15 @@ type FakeClient struct {
 
 	// containers is keyed by container ID.
 	containers map[string]*fakeContainer
+
+	// networks is keyed by network ID (a network also has a name, matched
+	// via findNetworkByName — mirroring how containers are keyed by ID but
+	// also resolvable by name).
+	networks map[string]*fakeNetwork
+
+	// volumes is keyed by volume name: unlike containers/networks, Docker
+	// volumes have no separate ID — the name IS the identifier.
+	volumes map[string]*fakeVolume
 
 	// PulledImages records every ref passed to ImagePull, in call order,
 	// so tests can assert what (and how many times) was pulled.
@@ -123,10 +133,26 @@ type fakeContainer struct {
 	oomKilled bool
 }
 
+// fakeNetwork models an in-memory Docker network.
+type fakeNetwork struct {
+	id     string
+	name   string
+	labels map[string]string
+}
+
+// fakeVolume models an in-memory Docker volume. Volumes have no ID distinct
+// from their name (see FakeClient.volumes).
+type fakeVolume struct {
+	name   string
+	labels map[string]string
+}
+
 // NewFakeClient constructs an empty FakeClient.
 func NewFakeClient() *FakeClient {
 	return &FakeClient{
 		containers:    make(map[string]*fakeContainer),
+		networks:      make(map[string]*fakeNetwork),
+		volumes:       make(map[string]*fakeVolume),
 		PresentImages: make(map[string]bool),
 	}
 }
@@ -534,6 +560,149 @@ func (f *FakeClient) ContainerList(_ context.Context, options container.ListOpti
 		out = append(out, c.toContainerSummary())
 	}
 	return out, nil
+}
+
+// findNetwork resolves a network by ID first, then by exact Docker name,
+// mirroring find/findByName for containers. Returns nil when neither
+// matches. Callers hold f.mu.
+func (f *FakeClient) findNetwork(idOrName string) *fakeNetwork {
+	if n, ok := f.networks[idOrName]; ok {
+		return n
+	}
+	return f.findNetworkByName(idOrName)
+}
+
+// findNetworkByName resolves a network by its exact name. Returns nil when
+// none matches. Callers hold f.mu.
+func (f *FakeClient) findNetworkByName(name string) *fakeNetwork {
+	for _, n := range f.networks {
+		if n.name == name {
+			return n
+		}
+	}
+	return nil
+}
+
+// NetworkCreate models the real daemon's network create, including its
+// name-uniqueness enforcement: a live daemon (Docker Engine 29.6.1/API
+// 1.55, checked while building this interface) rejects a second
+// `docker network create` reusing an in-use name with a 409 Conflict
+// ("network with name %q already exists"), unconditionally — this is not
+// an opt-in check the caller can skip (see client.go's doc comment on
+// NetworkCreate). Modeling creation as silently succeeding for a
+// colliding name would hide exactly the kind of real-daemon-divergent bug
+// the M0 tmpfs-uid/gid lesson calls out.
+func (f *FakeClient) NetworkCreate(_ context.Context, name string, options network.CreateOptions) (network.CreateResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.findNetworkByName(name) != nil {
+		return network.CreateResponse{}, conflictf("network with name %q already exists", name)
+	}
+
+	f.nextID++
+	id := "fake-net-" + strconv.Itoa(f.nextID)
+	f.networks[id] = &fakeNetwork{id: id, name: name, labels: cloneLabels(options.Labels)}
+	return network.CreateResponse{ID: id}, nil
+}
+
+// NetworkRemove deletes a network (by ID or name) from the fake's in-memory
+// store, tolerating "not found" like ContainerRemove.
+func (f *FakeClient) NetworkRemove(_ context.Context, networkID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	n := f.findNetwork(networkID)
+	if n == nil {
+		return notFoundf("network %s not found", networkID)
+	}
+	delete(f.networks, n.id)
+	return nil
+}
+
+// NetworkList returns every network whose labels match options.Filters (a
+// "label" filter), exactly as ContainerList does for containers.
+func (f *FakeClient) NetworkList(_ context.Context, options network.ListOptions) ([]network.Summary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var out []network.Summary
+	for _, n := range f.networks {
+		if !options.Filters.MatchKVList("label", n.labels) {
+			continue
+		}
+		out = append(out, network.Summary{ID: n.id, Name: n.name, Labels: cloneLabels(n.labels)})
+	}
+	return out, nil
+}
+
+// VolumeCreate models the real daemon's volume create — which, UNLIKE
+// NetworkCreate/ContainerCreate, is idempotent on a duplicate name rather
+// than a conflict: a live daemon (Docker Engine 29.6.1/API 1.55, checked
+// while building this interface) given `docker volume create --label
+// foo=bar myvol` followed by `docker volume create --label foo=baz myvol`
+// returns exit 0 both times and keeps the ORIGINAL volume's labels — the
+// second call's Labels are silently discarded, no new volume is created,
+// and no error is returned. This directly contradicts the naive assumption
+// that Docker resource creation always rejects duplicate names (true for
+// containers and networks, false for volumes), which is exactly the kind
+// of real-daemon-divergent behavior the M0 tmpfs-uid/gid lesson warns
+// against silently getting wrong. Callers that need a guaranteed-fresh
+// volume per allocation (this provider's workspace/socket/dind-state
+// volumes, ADR-001) must treat a name collision as their own signal — e.g.
+// an orphaned leftover from a prior allocation reusing this instance name —
+// rather than relying on VolumeCreate to catch it; that is WP2/WP3's
+// concern, not this fake's.
+func (f *FakeClient) VolumeCreate(_ context.Context, options volume.CreateOptions) (volume.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	name := options.Name
+	if name == "" {
+		f.nextID++
+		name = "fake-vol-" + strconv.Itoa(f.nextID)
+	}
+
+	if existing, ok := f.volumes[name]; ok {
+		// Idempotent hit: the original volume's labels win, matching the
+		// real daemon's observed behavior above.
+		return volume.Volume{Name: existing.name, Labels: cloneLabels(existing.labels)}, nil
+	}
+
+	v := &fakeVolume{name: name, labels: cloneLabels(options.Labels)}
+	f.volumes[name] = v
+	return volume.Volume{Name: v.name, Labels: cloneLabels(v.labels)}, nil
+}
+
+// VolumeRemove deletes a volume by name from the fake's in-memory store,
+// tolerating "not found" like ContainerRemove/NetworkRemove. force is
+// accepted for interface parity with the real SDK but has no effect here:
+// the fake has no container-reference tracking for volumes to override.
+func (f *FakeClient) VolumeRemove(_ context.Context, volumeID string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.volumes[volumeID]; !ok {
+		return notFoundf("volume %s not found", volumeID)
+	}
+	delete(f.volumes, volumeID)
+	return nil
+}
+
+// VolumeList returns every volume whose labels match options.Filters (a
+// "label" filter), exactly as ContainerList/NetworkList do.
+func (f *FakeClient) VolumeList(_ context.Context, options volume.ListOptions) (volume.ListResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var out []*volume.Volume
+	for _, v := range f.volumes {
+		if !options.Filters.MatchKVList("label", v.labels) {
+			continue
+		}
+		out = append(out, &volume.Volume{Name: v.name, Labels: cloneLabels(v.labels)})
+	}
+	return volume.ListResponse{Volumes: out}, nil
 }
 
 func (c *fakeContainer) toContainerJSON() types.ContainerJSON {

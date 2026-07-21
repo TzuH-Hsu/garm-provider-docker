@@ -11,19 +11,22 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Client is the slice of the moby SDK this provider depends on.
 //
-// It is deliberately minimal for M0 "none" mode (ADR-001): create/start/
-// inspect/remove/list a runner container, nothing else. DinD modes (M1)
-// need NetworkCreate/NetworkRemove and VolumeCreate/VolumeRemove; those
-// are added to this interface then, not now. Adding methods to a Go
-// interface is purely additive — it does not break MobyClient (moby.go),
-// which embeds the real *client.Client and so already implements any
-// method the SDK exposes — so there is no forward-compat cost to
-// deferring them until M1 actually needs them.
+// M0 "none" mode (ADR-001) needed only create/start/inspect/remove/list a
+// runner container. M1 adds the Network*/Volume* methods below: the job
+// network, socket volume, and dind-state volume that ADR-001's DinD modes
+// and ADR-004's claim-marker teardown need. The topology code that actually
+// calls these (creating/tearing down a job's network and volumes as part of
+// CreateInstance/DeleteInstance) is WP2/WP3, not this work package — this
+// interface only needs to exist and be backed by a faithful fake so WP2/WP3
+// can build against it. Every method's signature is copied verbatim from the
+// moby SDK so *client.Client (embedded in mobyClient, moby.go) already
+// satisfies this interface unchanged, with no wrapper code required.
 type Client interface {
 	// ImagePull pulls refStr, honoring options (e.g. registry auth).
 	// Callers must read the returned ReadCloser to completion (and close
@@ -88,4 +91,49 @@ type Client interface {
 	// the tmpfs is visible, so the extracted files reach the real tmpfs.
 	// This is why CopyToContainer was removed from this interface entirely.
 	ExecStream(ctx context.Context, containerID string, cmd []string, stdin io.Reader) (exitCode int, err error)
+
+	// NetworkCreate creates a labeled bridge network — the per-job network
+	// ADR-001 requires in every mode, and ADR-004's claim marker (the first
+	// resource created for an allocation). It returns a Conflict error
+	// (errdefs.IsConflict) when a network with this name already exists,
+	// matching the real daemon: the API 1.44+ duplicate-name check on
+	// network create is unconditional, not opt-in (see the (removed)
+	// CheckDuplicate handling in the moby SDK's client.NetworkCreate),
+	// confirmed against a live daemon while building this interface (see
+	// fake.go's doc comment on network name uniqueness).
+	NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error)
+
+	// NetworkRemove removes a network by ID or name. It returns an
+	// errdefs.IsNotFound-satisfying error when no such network exists,
+	// which teardown ordering (ADR-004) tolerates like every other remove.
+	NetworkRemove(ctx context.Context, networkID string) error
+
+	// NetworkList lists networks, filtered by options.Filters — used with a
+	// "label" filter for the ADR-004 teardown/orphan-sweep predicate, same
+	// as ContainerList.
+	NetworkList(ctx context.Context, options network.ListOptions) ([]network.Summary, error)
+
+	// VolumeCreate creates a labeled volume — the workspace, socket, and
+	// dind-state volumes of ADR-001. Unlike NetworkCreate/ContainerCreate,
+	// the real daemon's volume create is idempotent on a duplicate name: it
+	// silently returns the EXISTING volume (original Labels/Driver kept,
+	// the new call's Labels discarded) rather than erroring or creating a
+	// second volume — confirmed against a live daemon while building this
+	// interface (see fake.go's doc comment on volume name idempotency).
+	// Callers that rely on a fresh, empty volume per allocation must treat a
+	// name collision as its own signal (e.g. an orphaned leftover from a
+	// prior allocation of the same instance name) rather than assuming
+	// VolumeCreate itself will catch it.
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+
+	// VolumeRemove removes a volume by name. force=true also removes a
+	// volume still referenced by a stopped container (teardown ordering
+	// removes containers before volumes, so force is a defense-in-depth
+	// knob more than a primary mechanism). It returns an
+	// errdefs.IsNotFound-satisfying error when no such volume exists.
+	VolumeRemove(ctx context.Context, volumeID string, force bool) error
+
+	// VolumeList lists volumes, filtered by options.Filters — used with a
+	// "label" filter, same as ContainerList/NetworkList.
+	VolumeList(ctx context.Context, options volume.ListOptions) (volume.ListResponse, error)
 }
