@@ -16,6 +16,10 @@ func newTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	cfg := config.Config{
 		DockerHost:  "unix:///var/run/docker.sock",
 		RunnerImage: "ghcr.io/example/runner@sha256:deadbeef",
+		// Match config.Load's [network] defaults (ADR-001): job network on,
+		// internal on. Exercising the real defaults keeps the warning path
+		// (enable_job_network=false) out of the common test config.
+		Network: config.Network{EnableJobNetwork: true, Internal: true},
 	}
 	return New(fake, cfg, "controller-abc"), fake
 }

@@ -9,6 +9,8 @@ import (
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
@@ -90,19 +92,36 @@ func (p *Provider) ownsRunner(c types.ContainerJSON) bool {
 	return spec.IsManagedRunner(c.Config.Labels, p.controllerID)
 }
 
-// removeContainer stops (best-effort) then force-removes a container along
-// with its anonymous volumes, following the ADR-004 delete ordering (stop,
-// then remove). A NotFound at any step is tolerated so teardown is fully
-// idempotent; any other removal error is returned.
-func (p *Provider) removeContainer(ctx context.Context, id string) error {
-	// Best-effort graceful stop first (ADR-004 ordering). The forced remove
-	// below reaps a still-running container regardless, so a stop error —
-	// including NotFound — is not fatal here.
-	_ = p.cli.ContainerStop(ctx, id, container.StopOptions{})
-	if err := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
-		return err
+// hasManagedAllocationResources reports whether any managed job-scoped network
+// or volume for this controller lingers under instanceName. DeleteInstance uses
+// it when no owned runner container resolves, so an allocation whose runner has
+// already exited but whose network/volumes still exist is still torn down
+// (ADR-004: "finds the runner container already gone but its network or volumes
+// still lingering"). Containers are not checked here — a live/owned runner is
+// already handled by resolve; this is the leftover-only fallback.
+func (p *Provider) hasManagedAllocationResources(ctx context.Context, instanceName string) (bool, error) {
+	f := p.managedByInstanceNameFilter(instanceName)
+
+	nets, err := p.cli.NetworkList(ctx, network.ListOptions{Filters: f})
+	if err != nil {
+		return false, fmt.Errorf("failed to list networks for %q: %w", instanceName, err)
 	}
-	return nil
+	for _, n := range nets {
+		if spec.MatchesPredicate(n.Labels, p.controllerID) {
+			return true, nil
+		}
+	}
+
+	vols, err := p.cli.VolumeList(ctx, volume.ListOptions{Filters: f})
+	if err != nil {
+		return false, fmt.Errorf("failed to list volumes for %q: %w", instanceName, err)
+	}
+	for _, v := range vols.Volumes {
+		if v != nil && spec.MatchesPredicate(v.Labels, p.controllerID) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // notFoundError builds the garm-provider-common not-found error, which

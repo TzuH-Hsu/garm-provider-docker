@@ -10,12 +10,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
@@ -299,9 +303,9 @@ func TestCreateInstancePullFailureLeavesNoLeftovers(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on image pull, got nil")
 	}
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("pull failure left %d containers behind, want 0", n)
-	}
+	// The claim network + workspace volume were created before the pull; the
+	// guard must roll back ALL kinds, not just the (absent) container.
+	assertNoLeftovers(t, fake)
 	if len(fake.Execs) != 0 {
 		t.Errorf("no credentials should have been delivered, got %d execs", len(fake.Execs))
 	}
@@ -313,20 +317,13 @@ func TestCreateInstanceDuplicateReturnsExit31(t *testing.T) {
 
 	p, fake := newTestProvider(t)
 
-	// Seed an existing managed container with the same instance-name label.
-	_, err := fake.ContainerCreate(context.Background(), &container.Config{
-		Labels: map[string]string{
-			spec.LabelManaged:      "true",
-			spec.LabelControllerID: "controller-abc",
-			spec.LabelInstanceName: "Test-Instance-01",
-			spec.LabelRole:         spec.RoleRunner,
-		},
-	}, nil, nil, nil, "test-instance-01")
-	if err != nil {
-		t.Fatalf("seed ContainerCreate returned unexpected error: %v", err)
-	}
+	// Seed an existing managed CLAIM-MARKER network for the same instance name
+	// (ADR-004): duplicate detection now keys off the network claim marker, not
+	// a runner container. A concurrent, still-in-flight CreateInstance that has
+	// not reached its container step yet is detected exactly this way.
+	seedClaimNetwork(t, fake, "Test-Instance-01", "peer-nonce")
 
-	_, err = p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err == nil {
 		t.Fatal("expected a duplicate error, got nil")
 	}
@@ -336,12 +333,38 @@ func TestCreateInstanceDuplicateReturnsExit31(t *testing.T) {
 	if code := execcommon.ResolveErrorToExitCode(err); code != execcommon.ExitCodeDuplicate {
 		t.Errorf("exit code = %d, want %d (duplicate)", code, execcommon.ExitCodeDuplicate)
 	}
-	// No new container / no image pull for a rejected duplicate.
+	// The losing create must not pull an image, create a container, or create a
+	// workspace volume — it stops at the claim-marker 409.
 	if len(fake.PulledImages) != 0 {
 		t.Errorf("duplicate must not pull an image, got %v", fake.PulledImages)
 	}
-	if n := listAll(t, p); n != 1 {
-		t.Errorf("container count = %d, want 1 (only the seeded one)", n)
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("container count = %d, want 0 (no runner created by the loser)", n)
+	}
+	if len(fake.Execs) != 0 {
+		t.Errorf("the losing create must not deliver credentials, got %d execs", len(fake.Execs))
+	}
+	// The peer's claim marker is untouched (still exactly one, original nonce).
+	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
+	if len(nets) != 1 || nets[0].Labels[spec.LabelCreateNonce] != "peer-nonce" {
+		t.Errorf("peer claim marker was clobbered: %+v", nets)
+	}
+	vols, _ := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if len(vols.Volumes) != 0 {
+		t.Errorf("the losing create left %d volumes, want 0", len(vols.Volumes))
+	}
+}
+
+// seedClaimNetwork seeds a managed claim-marker job network for instanceName
+// with the given nonce (this controller), as a concurrent peer's or a live
+// allocation's claim marker would appear.
+func seedClaimNetwork(t *testing.T, fake *docker.FakeClient, instanceName, nonce string) {
+	t.Helper()
+	id := spec.AllocationIdentity{ControllerID: "controller-abc", PoolID: "pool-xyz", InstanceName: instanceName}
+	labels := id.NetworkLabels(time.Now())
+	labels[spec.LabelCreateNonce] = nonce
+	if _, err := fake.NetworkCreate(context.Background(), spec.JobNetworkName(instanceName), network.CreateOptions{Labels: labels}); err != nil {
+		t.Fatalf("seed claim NetworkCreate returned unexpected error: %v", err)
 	}
 }
 
@@ -364,7 +387,7 @@ func TestCreateInstanceNonJITBadRepoURLFailsCleanly(t *testing.T) {
 	srv := newRegistrationTokenServer(t)
 	defer srv.Close()
 
-	p, _ := newTestProvider(t)
+	p, fake := newTestProvider(t)
 	b := jitBootstrap(srv.URL)
 	b.JitConfigEnabled = false
 	b.RepoURL = "https://github.com" // host only, no entity path
@@ -372,10 +395,9 @@ func TestCreateInstanceNonJITBadRepoURLFailsCleanly(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), b); err == nil {
 		t.Fatal("expected an error for an unparseable non-JIT repo_url, got nil")
 	}
-	// The env is built before the container is created, so nothing is left.
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("bad repo_url left %d containers behind, want 0", n)
-	}
+	// The env is built after the claim network + volume; the guard rolls back
+	// all kinds so nothing is left.
+	assertNoLeftovers(t, fake)
 }
 
 func TestCreateInstanceExecDeliveryFailureCleansUp(t *testing.T) {
@@ -388,10 +410,9 @@ func TestCreateInstanceExecDeliveryFailureCleansUp(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on credential delivery, got nil")
 	}
-	// The creation guard must have removed the container it created.
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("exec-delivery failure left %d containers behind, want 0 (guard should clean up)", n)
-	}
+	// The creation guard must have rolled back the container, network, and
+	// workspace volume it created.
+	assertNoLeftovers(t, fake)
 }
 
 func TestCreateInstanceExecNonZeroExitCleansUp(t *testing.T) {
@@ -404,9 +425,7 @@ func TestCreateInstanceExecNonZeroExitCleansUp(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on a non-zero delivery exit, got nil")
 	}
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("non-zero delivery exit left %d containers behind, want 0 (guard should clean up)", n)
-	}
+	assertNoLeftovers(t, fake)
 }
 
 func TestCreateInstanceStartFailureCleansUp(t *testing.T) {
@@ -419,33 +438,31 @@ func TestCreateInstanceStartFailureCleansUp(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on start, got nil")
 	}
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("start failure left %d containers behind, want 0 (guard should clean up)", n)
-	}
+	assertNoLeftovers(t, fake)
 	if len(fake.Execs) != 0 {
 		t.Errorf("a start failure must not deliver credentials, got %d execs", len(fake.Execs))
 	}
 }
 
-func TestCreateInstanceAmbiguousCreateRemovesLeakedContainer(t *testing.T) {
+func TestCreateInstanceAmbiguousContainerCreateCleansUpAllKinds(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
 	p, fake := newTestProvider(t)
 	// ContainerCreate errors but the daemon still created the container
-	// (ADR-004 F6): the guard must resolve it by name and remove it.
+	// (ADR-004 ambiguous create): since the leaked container carries THIS
+	// attempt's create-nonce, the nonce-keyed rollback must remove it along
+	// with the claim network and workspace volume created earlier in the flow.
 	fake.CreateErr = errors.New("transient daemon error")
 	fake.CreateErrLeaksContainer = true
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on create, got nil")
 	}
-	if n := listAll(t, p); n != 0 {
-		t.Errorf("ambiguous create leaked %d containers, want 0 (guard should clean up)", n)
-	}
+	assertNoLeftovers(t, fake)
 }
 
-func TestCreateInstanceAmbiguousCreateLeavesForeignUntouched(t *testing.T) {
+func TestCreateInstanceContainerCreateFailureLeavesForeignUntouched(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
@@ -454,80 +471,46 @@ func TestCreateInstanceAmbiguousCreateLeavesForeignUntouched(t *testing.T) {
 	// would use (RunnerContainerName lowercases to "test-instance-01").
 	foreignID := seedRunner(t, fake, "Test-Instance-01", "p1", "different-controller", "running")
 
-	// A clean create failure: the ambiguous-cleanup resolver must validate
-	// ownership and refuse to remove the foreign container.
+	// A clean container-create failure (name conflict): the nonce-keyed rollback
+	// must remove only our resources and never the foreign container.
 	fake.CreateErr = errors.New("name conflict")
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on create, got nil")
 	}
 	if _, err := fake.ContainerInspect(context.Background(), foreignID); err != nil {
-		t.Errorf("ambiguous-create cleanup removed a foreign container: %v", err)
+		t.Errorf("rollback removed a foreign container: %v", err)
+	}
+	// Our own claim network + workspace volume were rolled back; only the
+	// foreign container remains.
+	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
+	if len(nets) != 0 {
+		t.Errorf("rollback left %d networks, want 0", len(nets))
+	}
+	vols, _ := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if len(vols.Volumes) != 0 {
+		t.Errorf("rollback left %d volumes, want 0", len(vols.Volumes))
+	}
+	if n := listAll(t, p); n != 1 {
+		t.Errorf("container count = %d, want 1 (only the foreign container)", n)
 	}
 }
 
-// TestCreateInstanceOverlappingCreateReturnsDuplicate models two same-instance-
-// name CreateInstance calls racing through the non-atomic duplicate check
-// (NEW-2). The "winner" occupies the deterministic Docker name in the window
-// between this (losing) call's duplicate check and its own ContainerCreate. The
-// loser must NOT delete the winner's container: it must recognize the differing
-// create-nonce as a genuine duplicate and return exit 31, leaving the winner
-// intact.
-func TestCreateInstanceOverlappingCreateReturnsDuplicate(t *testing.T) {
-	srv := newJITMetadataServer(t)
-	defer srv.Close()
-
-	p, fake := newTestProvider(t)
-
-	// Inject the concurrent winner the first time this call reaches
-	// ContainerCreate: a managed runner for the SAME instance, occupying the
-	// same Docker name, but tagged with a DIFFERENT create-nonce.
-	var injected bool
-	var winnerID string
-	fake.CreateHook = func() {
-		if injected {
-			return
-		}
-		injected = true
-		resp, err := fake.ContainerCreate(context.Background(), &container.Config{
-			Labels: map[string]string{
-				spec.LabelManaged:      "true",
-				spec.LabelControllerID: "controller-abc",
-				spec.LabelInstanceName: "Test-Instance-01",
-				spec.LabelRole:         spec.RoleRunner,
-				spec.LabelCreateNonce:  "winner-nonce-differs",
-			},
-		}, nil, nil, nil, spec.RunnerContainerName("Test-Instance-01"))
-		if err != nil {
-			t.Errorf("seeding the concurrent winner failed: %v", err)
-			return
-		}
-		winnerID = resp.ID
-		fake.SetState(resp.ID, "running", false)
+// assertNoLeftovers asserts zero managed resources of ANY kind remain — the
+// creation-guard "zero leftovers of any kind" contract (ADR-004).
+func assertNoLeftovers(t *testing.T, fake *docker.FakeClient) {
+	t.Helper()
+	conts, _ := fake.ContainerList(context.Background(), container.ListOptions{All: true})
+	if len(conts) != 0 {
+		t.Errorf("leftover containers = %d, want 0", len(conts))
 	}
-
-	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
-	if err == nil {
-		t.Fatal("expected a duplicate error from the losing overlapping create, got nil")
+	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
+	if len(nets) != 0 {
+		t.Errorf("leftover networks = %d, want 0", len(nets))
 	}
-	if !errors.Is(err, gErrors.ErrDuplicateEntity) {
-		t.Errorf("error is not a duplicate error: %v", err)
-	}
-	if code := execcommon.ResolveErrorToExitCode(err); code != execcommon.ExitCodeDuplicate {
-		t.Errorf("exit code = %d, want %d (duplicate)", code, execcommon.ExitCodeDuplicate)
-	}
-
-	// The winner's container must survive: the loser must not have removed it.
-	if _, err := fake.ContainerInspect(context.Background(), winnerID); err != nil {
-		t.Errorf("the concurrent winner's container was removed by the loser: %v", err)
-	}
-	// Exactly one container exists — the winner — and no credentials were
-	// delivered by the loser.
-	if n := listAll(t, p); n != 1 {
-		t.Errorf("container count = %d, want 1 (only the winner)", n)
-	}
-	if len(fake.Execs) != 0 {
-		t.Errorf("the losing create must not deliver credentials, got %d execs", len(fake.Execs))
+	vols, _ := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if len(vols.Volumes) != 0 {
+		t.Errorf("leftover volumes = %d, want 0", len(vols.Volumes))
 	}
 }
 

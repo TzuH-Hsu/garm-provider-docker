@@ -46,6 +46,20 @@ func (m *Manager) TeardownAllocation(ctx context.Context, instanceName string) (
 	return m.teardown(ctx, m.instanceScopedFilter(instanceName), "")
 }
 
+// TeardownAll removes EVERY managed, job-scoped resource for this controller —
+// runner containers, DinD sidecars (WP3), job networks, and job-scoped volumes —
+// in the ADR-004 order (all containers first, then all networks, then all
+// volumes, so no network is removed while it still has active endpoints). It is
+// the manual-rescue teardown behind RemoveAllInstances (ADR-004): label-scoped
+// to this controller, never a global wipe, and it never touches cache or
+// diagnostic volumes (they carry no instance-name, so the predicate excludes
+// them structurally). Best-effort: per-resource errors are joined and the
+// teardown continues.
+func (m *Manager) TeardownAll(ctx context.Context) error {
+	_, err := m.teardown(ctx, spec.MatchPredicateFilters(m.controllerID), "")
+	return err
+}
+
 // Rollback is the creation-guard teardown (ADR-004): on any error during
 // CreateInstance after the claim marker exists, it removes only the resources
 // THIS attempt created — those carrying this attempt's create-nonce — in the

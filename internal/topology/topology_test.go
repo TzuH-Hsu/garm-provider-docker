@@ -467,6 +467,33 @@ func TestCreateWorkspaceVolumeStaleReplaceRemoveErrorSurfaces(t *testing.T) {
 	}
 }
 
+// --- TeardownAll (RemoveAllInstances) ----------------------------------------
+
+func TestTeardownAllRemovesEveryControllerAllocationButNotCacheOrForeign(t *testing.T) {
+	m, fake := newManager(t)
+	seedAllocation(t, fake, "job-a", time.Now(), "na", "running")
+	seedAllocation(t, fake, "job-b", time.Now(), "nb", "exited")
+	// Out of scope: another controller's allocation and a cache volume.
+	seedAllocationForController(t, fake, "other-controller", "job-c", time.Now(), "nc", "running")
+	seedCacheVolume(t, fake, "toolcache-generation-1")
+
+	if err := m.TeardownAll(context.Background()); err != nil {
+		t.Fatalf("TeardownAll returned unexpected error: %v", err)
+	}
+
+	// job-a and job-b are gone; the other controller's allocation + cache remain.
+	if countContainers(t, fake) != 1 {
+		t.Errorf("container count = %d, want 1 (other-controller runner)", countContainers(t, fake))
+	}
+	if countNetworks(t, fake) != 1 {
+		t.Errorf("network count = %d, want 1 (other-controller net)", countNetworks(t, fake))
+	}
+	if countVolumes(t, fake) != 2 {
+		t.Errorf("volume count = %d, want 2 (other-controller workspace + cache)", countVolumes(t, fake))
+	}
+	findVolume(t, fake, "toolcache-generation-1")
+}
+
 // --- Rollback (creation guard) -----------------------------------------------
 
 func TestRollbackIsNonceKeyed(t *testing.T) {

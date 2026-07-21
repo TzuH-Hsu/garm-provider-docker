@@ -3,40 +3,26 @@ package provider
 import (
 	"context"
 	"log"
-
-	"github.com/docker/docker/api/types/container"
-
-	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// RemoveAllInstances is the manual rescue operation (ADR-004): it removes
-// every job-scoped resource for this controller. It is label-scoped, never a
-// global wipe of the Docker host, and best-effort — a failure on one
-// container is logged and the sweep continues rather than failing fast.
+// RemoveAllInstances is the manual rescue operation (ADR-004): it removes every
+// job-scoped resource for this controller — runner containers, DinD sidecars
+// (WP3), job networks, and job-scoped volumes (workspace, and WP3's socket/
+// dind-state) — in the ADR-004 order (all containers before their networks, so
+// no network is removed while it still has active endpoints). It is
+// label-scoped to this controller, never a global wipe of the Docker host.
 //
 // It uses the single authoritative ADR-004 predicate (managed=true AND
 // controller-id AND has instance-name AND NOT cache=true), so cache and
-// diagnostic volumes (ADR-003) are never touched. In M0 "none" mode the only
-// job-scoped resources are runner containers and their anonymous volumes.
+// diagnostic volumes (ADR-003) are never touched — they carry no instance-name
+// label and are excluded structurally. Best-effort: per-resource errors are
+// joined and the teardown continues rather than failing fast on the first one.
+// As a manual rescue path, it never fails fast: a per-resource removal error is
+// logged (so an operator sees incomplete cleanup) and RemoveAllInstances still
+// returns nil, matching the established best-effort contract.
 func (p *Provider) RemoveAllInstances(ctx context.Context) error {
-	list, err := p.cli.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: spec.MatchPredicateFilters(p.controllerID),
-	})
-	if err != nil {
-		return err
-	}
-
-	for _, c := range list {
-		// Defense-in-depth: re-assert the full predicate (including the
-		// "NOT cache=true" conjunct Docker's filter API cannot express)
-		// against the labels in hand before deleting anything.
-		if !spec.MatchesPredicate(c.Labels, p.controllerID) {
-			continue
-		}
-		if err := p.removeContainer(ctx, c.ID); err != nil {
-			log.Printf("garm-provider-docker: RemoveAllInstances: failed to remove container %s: %v", c.ID, err)
-		}
+	if err := p.topo.TeardownAll(ctx); err != nil {
+		log.Printf("garm-provider-docker: RemoveAllInstances: best-effort teardown reported errors: %v", err)
 	}
 	return nil
 }

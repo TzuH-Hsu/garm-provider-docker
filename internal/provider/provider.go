@@ -9,6 +9,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
 
 // Provider implements executionv010.ExternalProvider against one Docker
@@ -23,6 +24,11 @@ type Provider struct {
 	cli          docker.Client
 	cfg          config.Config
 	controllerID string
+
+	// topo owns the per-allocation network/volume lifecycle, teardown, and
+	// orphan sweep (ADR-001/ADR-004). It is derived from the same cli and
+	// controllerID, so it shares the Provider's stateless label-driven view.
+	topo *topology.Manager
 }
 
 // New constructs a Provider from its injected dependencies: the Docker
@@ -33,6 +39,7 @@ func New(cli docker.Client, cfg config.Config, controllerID string) *Provider {
 		cli:          cli,
 		cfg:          cfg,
 		controllerID: controllerID,
+		topo:         topology.New(cli, controllerID),
 	}
 }
 
