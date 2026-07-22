@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -103,9 +103,9 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 
 	stale, err := p.topo.ListStaleCaches(ctx, decide)
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: stale-cache enumeration had errors (continuing): %v", err)
+		slog.WarnContext(ctx, "cache GC: stale-cache enumeration had errors (continuing)", "error", err)
 	}
-	p.logStaleCaches(stale)
+	p.logStaleCaches(ctx, stale)
 
 	p.pruneDiagVolumes(ctx, runnerImage)
 
@@ -128,7 +128,7 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 // operator-accepted, is the sanctioned destructive path opportunistic auto-GC is
 // not. `docker volume prune` itself skips any in-use volume, so a warm cache held
 // by a live job is never reclaimed even by the manual purge.
-func (p *Provider) logStaleCaches(stale []topology.StaleCache) {
+func (p *Provider) logStaleCaches(ctx context.Context, stale []topology.StaleCache) {
 	if len(stale) == 0 {
 		return
 	}
@@ -140,8 +140,10 @@ func (p *Provider) logStaleCaches(stale []topology.StaleCache) {
 	for _, s := range shown {
 		parts = append(parts, s.Name+" ("+s.Reason+")")
 	}
-	log.Printf("garm-provider-docker: cache GC: %d cache volume(s) are stale/superseded/aged and eligible for operator pruning; NOT auto-deleted (ADR-003: Docker has no atomic label-qualified volume delete, so opportunistic auto-GC of a volume is inherently TOCTOU/foreign-unsafe). Reclaim disk with an explicit, quiescent-moment purge: docker volume prune -a --filter label=%s=true --filter label=%s=%s. Stale caches: %s",
-		len(stale), spec.LabelCache, spec.LabelControllerID, p.controllerID, strings.Join(parts, ", "))
+	purgeCmd := fmt.Sprintf("docker volume prune -a --filter label=%s=true --filter label=%s=%s",
+		spec.LabelCache, spec.LabelControllerID, p.controllerID)
+	slog.InfoContext(ctx, "cache GC: cache volume(s) are stale/superseded/aged and eligible for operator pruning; NOT auto-deleted (ADR-003: opportunistic auto-GC of a volume is inherently TOCTOU/foreign-unsafe)",
+		"resource", "cache-volume", "count", len(stale), "purge_command", purgeCmd, "stale_caches", strings.Join(parts, ", "))
 }
 
 // logUnprovableCacheCruft logs (best-effort, bounded) the cache-named volumes that
@@ -151,7 +153,7 @@ func (p *Provider) logStaleCaches(stale []topology.StaleCache) {
 func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 	cruft, err := p.topo.ListUnprovableCacheCruft(ctx)
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: cruft-visibility scan failed (continuing): %v", err)
+		slog.WarnContext(ctx, "cache GC: cruft-visibility scan failed (continuing)", "error", err)
 		return
 	}
 	if len(cruft) == 0 {
@@ -161,7 +163,8 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 	if len(shown) > cacheGCCruftLogMax {
 		shown = shown[:cacheGCCruftLogMax]
 	}
-	log.Printf("garm-provider-docker: cache GC: %d cache-named volume(s) carry no managed cache labels (unlabeled auto-created replacements or foreign squatters); NOT deleting them (ADR-003 never-delete-unprovable) — an operator may reclaim disk manually if these are genuinely stale: %s", len(cruft), strings.Join(shown, ", "))
+	slog.InfoContext(ctx, "cache GC: cache-named volume(s) carry no managed cache labels (unlabeled auto-created replacements or foreign squatters); NOT deleting them (ADR-003 never-delete-unprovable) — an operator may reclaim disk manually if genuinely stale",
+		"resource", "cache-volume", "count", len(cruft), "cruft_volumes", strings.Join(shown, ", "))
 }
 
 // pruneDiagVolumes runs the retention prune helper against each of this
@@ -172,19 +175,20 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 	refs, err := p.topo.ListDiagVolumes(ctx)
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: failed to list diag volumes (continuing): %v", err)
+		slog.WarnContext(ctx, "cache GC: failed to list diag volumes (continuing)", "error", err)
 		return
 	}
 	if len(refs) == 0 {
 		return
 	}
 	if _, _, err := p.cli.ImageInspectWithRaw(ctx, runnerImage); err != nil {
-		log.Printf("garm-provider-docker: cache GC: runner image %q not present; skipping diag prune this pass", runnerImage)
+		slog.InfoContext(ctx, "cache GC: runner image not present; skipping diag prune this pass", "image", runnerImage)
 		return
 	}
 	for i, ref := range refs {
 		if i >= cacheGCMaxDiagPrunes {
-			log.Printf("garm-provider-docker: cache GC: hit the per-pass diag-prune cap (%d); remaining diag volumes pruned on a later pass", cacheGCMaxDiagPrunes)
+			slog.InfoContext(ctx, "cache GC: hit the per-pass diag-prune cap; remaining diag volumes pruned on a later pass",
+				"cap", cacheGCMaxDiagPrunes)
 			break
 		}
 		p.pruneDiagVolume(ctx, runnerImage, ref)
@@ -214,7 +218,7 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 	volumeName := ref.Name
 	nonce, err := newCreateNonce()
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: failed to name diag-prune helper for %q: %v", volumeName, err)
+		slog.WarnContext(ctx, "cache GC: failed to name diag-prune helper", "resource", "cache-volume", "volume", volumeName, "error", err)
 		return
 	}
 	cfg, hostCfg := spec.BuildDiagPruneContainer(spec.DiagPruneContainerSpec{
@@ -240,7 +244,8 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 			// Do NOT delete/prune it (never touch an unprovable volume — B2): leave
 			// it in place and skip the prune; the next EnsureCacheVolume reconciles
 			// around the slot.
-			log.Printf("garm-provider-docker: cache GC: diag prune target %q failed strict identity re-validation (%v); leaving it in place (ADR-003 never-delete-unprovable) and skipping the prune", volumeName, verr)
+			slog.WarnContext(vctx, "cache GC: diag prune target failed strict identity re-validation; leaving it in place and skipping the prune",
+				"resource", "cache-volume", "volume", volumeName, "error", verr)
 			return fmt.Errorf("diag prune target %q failed strict identity re-validation: %w", volumeName, verr)
 		}
 		return nil
@@ -248,14 +253,14 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 
 	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-diagprune-"+nonce, diagPruneTimeout, afterCreate)
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: skipping/failed diag prune of %q (continuing): %v", volumeName, err)
+		slog.WarnContext(ctx, "cache GC: skipping/failed diag prune (continuing)", "resource", "cache-volume", "volume", volumeName, "error", err)
 		return
 	}
 	if code != 0 {
-		log.Printf("garm-provider-docker: cache GC: diag prune of %q exited %d (continuing)", volumeName, code)
+		slog.WarnContext(ctx, "cache GC: diag prune exited non-zero (continuing)", "resource", "cache-volume", "volume", volumeName, "exit_code", code)
 		return
 	}
-	log.Printf("garm-provider-docker: cache GC: pruned diag volume %s (files older than %dd)", volumeName, p.cfg.Cache.DiagnosticLogRetentionDays)
+	slog.InfoContext(ctx, "cache GC: pruned diag volume", "resource", "cache-volume", "volume", volumeName, "retention_days", p.cfg.Cache.DiagnosticLogRetentionDays)
 }
 
 // reapLeakedHelpers force-removes a LEAKED cache-helper container for THIS
@@ -284,7 +289,7 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 	)
 	list, err := p.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: failed to list helper containers (continuing): %v", err)
+		slog.WarnContext(ctx, "cache GC: failed to list helper containers (continuing)", "error", err)
 		return
 	}
 	now := time.Now()
@@ -306,13 +311,13 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 			continue
 		}
 		if err := p.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-			log.Printf("garm-provider-docker: cache GC: failed to reap leaked helper %s (continuing): %v", c.ID, err)
+			slog.WarnContext(ctx, "cache GC: failed to reap leaked helper (continuing)", "resource", "container", "container_id", c.ID, "error", err)
 			continue
 		}
 		reaped++
 	}
 	if reaped > 0 {
-		log.Printf("garm-provider-docker: cache GC: reaped %d leaked cache-helper container(s)", reaped)
+		slog.InfoContext(ctx, "cache GC: reaped leaked cache-helper container(s)", "count", reaped)
 	}
 }
 
@@ -396,7 +401,7 @@ func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config
 		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
 		if rerr := p.cli.ContainerRemove(rmCtx, created.ID, container.RemoveOptions{Force: true}); rerr != nil && !errdefs.IsNotFound(rerr) {
-			log.Printf("garm-provider-docker: failed to remove helper %q (continuing): %v", name, rerr)
+			slog.WarnContext(rmCtx, "failed to remove helper container (continuing)", "resource", "container", "container_name", name, "error", rerr)
 		}
 	}()
 

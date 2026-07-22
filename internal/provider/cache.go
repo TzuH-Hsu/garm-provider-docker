@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
@@ -129,8 +129,8 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 
 	scope := spec.DetectCacheEntityScope(bootstrap.RepoURL)
 	if !spec.CacheScopeAllowed(scope, p.cfg.Cache.AllowOrgShared) {
-		log.Printf("garm-provider-docker: CreateInstance: %q is %s-scoped (allow_org_shared=%v); withholding persistent caches. RUNNER_TOOL_CACHE=%s is an ephemeral in-container toolcache.",
-			bootstrap.Name, scope, p.cfg.Cache.AllowOrgShared, plan.toolcachePath)
+		slog.InfoContext(ctx, "CreateInstance: entity scope withholds persistent caches; using an ephemeral in-container toolcache",
+			"instance", bootstrap.Name, "scope", scope, "allow_org_shared", p.cfg.Cache.AllowOrgShared, "toolcache_path", plan.toolcachePath)
 		return plan, nil
 	}
 
@@ -185,7 +185,10 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	plan.diagDir = spec.RunnerDiagDir
 	plan.addCacheRef(diagRes.Name, diagLabels)
 
-	log.Printf("garm-provider-docker: CreateInstance: %q repo-scoped caches (repokey=%s): toolcache=%s hit=%v, pnpm=%s hit=%v, diag=%s hit=%v",
-		bootstrap.Name, repoKey, toolName, toolRes.Hit, pnpmName, pnpmRes.Hit, diagName, diagRes.Hit)
+	slog.InfoContext(ctx, "CreateInstance: repo-scoped caches resolved",
+		"instance", bootstrap.Name, "repo_key", repoKey,
+		"toolcache_volume", toolName, "toolcache_hit", toolRes.Hit,
+		"pnpm_volume", pnpmName, "pnpm_hit", pnpmRes.Hit,
+		"diag_volume", diagName, "diag_hit", diagRes.Hit)
 	return plan, nil
 }

@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -108,7 +108,8 @@ func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName st
 			// replacement (or a foreign squatter). Do NOT delete it (never delete an
 			// unprovable volume — B2): leave it as cruft (logged) and abort; the
 			// retry reconciles around the slot.
-			log.Printf("garm-provider-docker: externals seed target %q is not our validated cache (%v); leaving it in place as cruft (ADR-003 never-delete-unprovable) and aborting this seed so GARM retries and reconciles around the slot", volumeName, verr)
+			slog.WarnContext(vctx, "externals seed target is not our validated cache; leaving it in place as cruft and aborting this seed so GARM retries and reconciles around the slot",
+				"resource", "cache-volume", "volume", volumeName, "error", verr)
 			return fmt.Errorf("externals seed target %q is not our seeded cache (a GC/create race auto-created it): %w", volumeName, verr)
 		}
 		return nil

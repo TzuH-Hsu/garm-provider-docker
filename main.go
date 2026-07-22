@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/cloudbase/garm-provider-common/execution"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/provider"
 )
 
@@ -26,38 +28,59 @@ func main() {
 func run() int {
 	ctx := context.Background()
 
+	// Structured logging (M3-W2) is wired up FIRST, before anything else in
+	// this process can log: slog.SetDefault installs the STDERR-only,
+	// env-level-controlled logger every internal/provider and
+	// internal/topology call site logs through (internal/logging's package
+	// doc explains why a process-wide default, not an injected dependency).
+	slog.SetDefault(logging.New())
+
+	command := os.Getenv("GARM_COMMAND")
+	slog.InfoContext(ctx, "starting garm-provider-docker", "command", command)
+
 	env, err := execution.GetEnvironment()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read execution environment: %s\n", err)
+		slog.ErrorContext(ctx, "failed to read execution environment", "command", command, "error", err)
 		return 1
 	}
 
 	cfg, err := config.Load(env.ProviderConfigFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load provider config: %s\n", err)
+		slog.ErrorContext(ctx, "failed to load provider config", "command", command, "error", err)
 		return 1
 	}
 
 	cli, err := docker.NewMobyClient(cfg.DockerHost)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create docker client: %s\n", err)
+		slog.ErrorContext(ctx, "failed to create docker client", "command", command, "error", err)
 		return 1
 	}
 
 	prov, err := provider.New(cli, cfg, env.ControllerID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to construct provider: %s\n", err)
+		slog.ErrorContext(ctx, "failed to construct provider", "command", command, "error", err)
 		return 1
 	}
 
 	result, err := env.Run(ctx, prov)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
-		return execcommon.ResolveErrorToExitCode(err)
+		exitCode := execcommon.ResolveErrorToExitCode(err)
+		// exit 30 (not-found on DeleteInstance) is GARM's OWN idempotent
+		// success signal, not an operational problem (research.md §1.F): log
+		// it at info, not error, so a normal reap does not read as a failure
+		// in stderr. Everything else (including exit 31 duplicate) logs at
+		// error — a duplicate create is still worth an operator's attention.
+		if exitCode == execcommon.ExitCodeNotFound {
+			slog.InfoContext(ctx, "command completed: instance already gone", "command", command, "exit_code", exitCode, "error", err)
+		} else {
+			slog.ErrorContext(ctx, "command failed", "command", command, "exit_code", exitCode, "error", err)
+		}
+		return exitCode
 	}
 
 	if result != "" {
 		fmt.Fprintln(os.Stdout, result)
 	}
+	slog.InfoContext(ctx, "command completed", "command", command, "exit_code", 0)
 	return 0
 }

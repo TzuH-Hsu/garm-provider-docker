@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
@@ -84,7 +84,8 @@ func (m *Manager) CreateClaimNetwork(ctx context.Context, identity spec.Allocati
 	defer cancel()
 	err = fmt.Errorf("failed to create job network for %q: %w", instanceName, cerr)
 	if cleanupErr := m.bestEffortRemoveOwnNetwork(cleanupCtx, nonce); cleanupErr != nil {
-		log.Printf("garm-provider-docker: CreateClaimNetwork: ambiguous-create cleanup for %q failed: %v", instanceName, cleanupErr)
+		slog.ErrorContext(ctx, "CreateClaimNetwork: ambiguous-create cleanup failed",
+			"instance", instanceName, "nonce", nonce, "error", cleanupErr)
 		err = errors.Join(err, fmt.Errorf("ambiguous-create network cleanup for %q failed: %w", instanceName, cleanupErr))
 	}
 	return "", nil, err

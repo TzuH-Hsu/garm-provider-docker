@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -35,12 +35,12 @@ func (m *Manager) SweepOrphans(ctx context.Context) error {
 	for name := range names {
 		swept, err := m.sweepInstance(ctx, name)
 		if err != nil {
-			log.Printf("garm-provider-docker: orphan sweep of %q failed: %v", name, err)
+			slog.WarnContext(ctx, "orphan sweep of instance failed", "instance", name, "error", err)
 			errs = append(errs, err)
 			continue
 		}
 		if swept {
-			log.Printf("garm-provider-docker: orphan sweep tore down abandoned allocation %q", name)
+			slog.InfoContext(ctx, "orphan sweep tore down abandoned allocation", "instance", name)
 		}
 	}
 	return errors.Join(errs...)
@@ -60,7 +60,7 @@ func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 		return err
 	}
 	if swept {
-		log.Printf("garm-provider-docker: pre-create sweep removed a stale allocation for %q", instanceName)
+		slog.InfoContext(ctx, "pre-create sweep removed a stale allocation", "instance", instanceName)
 	}
 	return nil
 }

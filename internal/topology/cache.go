@@ -3,7 +3,7 @@ package topology
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/docker/docker/api/types/volume"
 
@@ -106,7 +106,8 @@ func (m *Manager) EnsureCacheVolume(ctx context.Context, preferredName string, l
 		}
 		// The slot is occupied by a volume we cannot prove is ours. Leave it
 		// UNTOUCHED and reconcile to a deterministic alternate (B2/B3).
-		log.Printf("garm-provider-docker: cache slot %q is occupied by a volume that is not our validated cache (%v); reconciling to an alternate name rather than deleting it (ADR-003 label-as-identity)", candidate, verr)
+		slog.WarnContext(ctx, "cache slot occupied by a volume that is not our validated cache; reconciling to an alternate name",
+			"resource", "cache-volume", "volume", candidate, "error", verr)
 		next := spec.AlternateCacheVolumeName(preferredName, attempt)
 		if err := spec.ValidateDerivedName("reconciled cache volume", next); err != nil {
 			return CacheVolumeResult{}, fmt.Errorf("cache reconcile for %q could not derive a valid alternate name: %w", preferredName, err)

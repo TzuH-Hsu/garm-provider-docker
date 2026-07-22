@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
@@ -24,7 +24,7 @@ import (
 // failure must not fail the list GARM asked for.
 func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.ProviderInstance, error) {
 	if err := p.topo.SweepOrphans(ctx); err != nil {
-		log.Printf("garm-provider-docker: ListInstances: orphan sweep failed (continuing): %v", err)
+		slog.WarnContext(ctx, "ListInstances: orphan sweep failed (continuing)", "error", err)
 	}
 
 	// Opportunistic, best-effort cache GC (ADR-003 W2): ListInstances is the

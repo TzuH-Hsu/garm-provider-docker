@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -132,7 +132,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// VolumeCreate. Best-effort: a sweep failure must not block a legitimate
 	// create.
 	if err := p.topo.SweepOrphans(ctx); err != nil {
-		log.Printf("garm-provider-docker: CreateInstance: pre-create orphan sweep failed (continuing): %v", err)
+		slog.WarnContext(ctx, "CreateInstance: pre-create orphan sweep failed (continuing)",
+			"instance", instanceName, "error", err)
 	}
 
 	// Opportunistic, best-effort cache GC (ADR-003 W2): CreateInstance is one of
@@ -146,7 +147,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// network is ALWAYS created, because it is the isolation guarantee AND
 	// ADR-004's claim marker. Warn rather than weaken isolation.
 	if !p.cfg.Network.EnableJobNetwork {
-		log.Printf("garm-provider-docker: CreateInstance: [network].enable_job_network=false is reserved and not yet honored; creating the isolated per-job network for %q anyway (WP2 keeps job networks always on)", instanceName)
+		slog.WarnContext(ctx, "CreateInstance: [network].enable_job_network=false is reserved and not yet honored; creating the isolated per-job network anyway",
+			"instance", instanceName)
 	}
 
 	nonce, err := newCreateNonce()
@@ -198,7 +200,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
 		if cerr := p.topo.Rollback(cleanupCtx, instanceName, nonce); cerr != nil {
-			log.Printf("garm-provider-docker: CreateInstance: rollback for %q failed: %v", instanceName, cerr)
+			slog.ErrorContext(ctx, "CreateInstance: creation-guard rollback failed",
+				"instance", instanceName, "nonce", nonce, "error", cerr)
 			retErr = errors.Join(retErr, fmt.Errorf("creation-guard rollback for %q failed: %w", instanceName, cerr))
 		}
 		return params.ProviderInstance{}, retErr
@@ -464,7 +467,8 @@ func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePla
 			// unlabeled auto-created replacement, or a foreign/wrong-digest volume.
 			// We do NOT delete it (never delete an unprovable volume — B2); it is
 			// left as cruft and logged, and GARM's retry reconciles around the slot.
-			log.Printf("garm-provider-docker: CreateInstance: referenced cache volume %q is not our validated cache (%v); leaving it in place as cruft (ADR-003 never-delete-unprovable) and failing this allocation closed so GARM retries and reconciles around the slot", ref.name, verr)
+			slog.WarnContext(ctx, "CreateInstance: referenced cache volume is not our validated cache; leaving it in place as cruft and failing this allocation closed so GARM retries and reconciles around the slot",
+				"resource", "cache-volume", "volume", ref.name, "error", verr)
 			bad = append(bad, ref.name+" ("+verr.Error()+")")
 		}
 	}
@@ -482,7 +486,8 @@ func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 	if err := p.cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-		log.Printf("garm-provider-docker: cache-revalidation rollback: failed to remove runner container %s (continuing): %v", id, err)
+		slog.WarnContext(rmCtx, "cache-revalidation rollback: failed to remove runner container (continuing)",
+			"resource", "container", "container_id", id, "error", err)
 	}
 }
 
@@ -662,7 +667,8 @@ func mergeExtraEnv(env []string, extra map[string]string) []string {
 	sort.Strings(keys)
 	for _, k := range keys {
 		if present[k] {
-			log.Printf("garm-provider-docker: CreateInstance: extra_specs.extra_env %q collides with a provider-injected variable; keeping the provider's value (provider-injected env always wins)", k)
+			slog.Warn("CreateInstance: extra_specs.extra_env collides with a provider-injected variable; keeping the provider's value",
+				"env_key", k)
 			continue
 		}
 		env = append(env, k+"="+extra[k])
