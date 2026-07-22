@@ -645,11 +645,14 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 
 // mergeExtraEnv appends the pool's extra_specs.extra_env to env, but DROPS (and
 // logs) any key already set by a provider-injected variable — provider-injected
-// environment always wins the merge (ADR-005 F8). Reserved names (RUNNER_*,
-// DOCKER_*, JIT_CONFIG_ENABLED, GITHUB_URL, ACTIONS_RUNNER_INPUT_*) were already
-// hard-rejected in extraspecs.Parse, so a collision here is only a non-reserved
-// but still provider-injected name (e.g. npm_config_store_dir, GARM_DIAG_DIR).
-// Keys are applied in sorted order for a deterministic, testable env.
+// environment always wins the merge (ADR-005 H2). By the time env reaches here it
+// has already passed the full extra_specs gate: the charset check (H3), the
+// hard-reserved set (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) in
+// extraspecs.Parse, and the operator allowed_env allowlist in extraspecs.Resolve.
+// So a collision here is only a non-reserved, allowlisted name the provider ALSO
+// injects (e.g. npm_config_store_dir when a pnpm cache is mounted); GARM_* names
+// are hard-reserved and can never reach this point. Keys are applied in sorted
+// order for a deterministic, testable env.
 func mergeExtraEnv(env []string, extra map[string]string) []string {
 	if len(extra) == 0 {
 		return env

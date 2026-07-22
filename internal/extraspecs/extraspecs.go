@@ -2,12 +2,23 @@
 // extra_specs — the GARM-admin trust tier (ADR-005). It embeds a published
 // draft-07 JSON Schema (schema.json), validates every payload against it
 // FAIL-CLOSED with github.com/xeipuuv/gojsonschema (the garm-provider-lxd
-// pattern), enforces the reserved-environment denylist (F8) that the schema
-// alone cannot express, and resolves the accepted overrides against the live
-// provider config's EXISTING ceiling/flavor/memory machinery
-// (config.EffectiveDindMode, config.EffectiveRunnerImage,
-// config.Effective{Runner,Dind}MemoryBytes) rather than re-implementing any of
-// those bounds here.
+// pattern), and resolves the accepted overrides against the live provider
+// config's EXISTING ceiling/flavor/memory machinery (config.EffectiveDindMode,
+// config.EffectiveRunnerImage, config.Effective{Runner,Dind}MemoryBytes) rather
+// than re-implementing any of those bounds here.
+//
+// extra_env is governed by a two-layer, fail-closed model (ADR-005 H2/H3) the
+// schema alone cannot fully express:
+//   - Parse enforces, config-independently, the env-name charset (H3) and the
+//     HARD-RESERVED name set (H2) — names ALWAYS rejected regardless of any
+//     operator opt-in (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...).
+//   - Resolve enforces the operator ALLOWLIST ([extra_specs].allowed_env, H2):
+//     any name not explicitly opted in by the operator is rejected, so the
+//     default (empty allowlist) passes NOTHING extra to the runner container.
+//
+// Memory overrides are positive-only (H1): a zero request in any representation
+// is rejected, since Docker treats a 0 limit as unset (unlimited), which would
+// silently remove the operator's ceiling.
 package extraspecs
 
 import (
@@ -15,6 +26,8 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/xeipuuv/gojsonschema"
@@ -75,25 +88,60 @@ type ExtraSpecs struct {
 	// runner's label set (effective in non-JIT mode only — see schema.json).
 	RunnerLabels []string `json:"runner_labels,omitempty"`
 
-	// ExtraEnv are extra runner-container environment variables. Reserved names
-	// (reservedEnvName) are rejected in Parse (F8); provider-injected values
-	// always win any remaining collision, resolved at merge time in the provider.
+	// ExtraEnv are extra runner-container environment variables. Every key is
+	// charset-validated and hard-reserved-checked in Parse (H3/H2); the operator
+	// allowlist is enforced in Resolve (H2). Provider-injected values always win
+	// any remaining collision, resolved at merge time in the provider.
 	ExtraEnv map[string]string `json:"extra_env,omitempty"`
 }
 
-// reservedEnvPrefixes and reservedEnvExact are the F8 reserved-name denylist
-// (ADR-005): names extra_env may NEVER set, because the provider itself relies
-// on them for the runner contract (ADR-002) or connectivity control. This is
-// enforced in Go, not the schema, because JSON Schema's propertyNames/pattern
-// cannot express a case-insensitive prefix denylist under RE2 (no negative
-// lookahead). Matching is case-insensitive so a lower/mixed-case spelling
-// (docker_host, Runner_Ephemeral) cannot slip a reserved name past the check.
+// envNameRE is the strict environment-variable NAME charset (H3): a POSIX-ish
+// name — a leading letter or underscore, then letters/digits/underscores. A key
+// containing '=', whitespace, unicode, or a leading digit fails it. This closes
+// the bypass where a key like "JIT_CONFIG_ENABLED=false" is emitted to Docker as
+// "JIT_CONFIG_ENABLED=false=<value>" and Docker parses the NAME as
+// "JIT_CONFIG_ENABLED", flipping a reserved variable straight past the
+// exact-name reserved/allowlist checks and the provider-wins merge. It mirrors
+// the schema's extra_env propertyNames.pattern and is enforced in Go too, as
+// defense-in-depth, BEFORE the reserved/allowlist checks and before any merge.
+var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validEnvName reports whether name is a syntactically valid environment
+// variable name (H3).
+func validEnvName(name string) bool { return envNameRE.MatchString(name) }
+
+// reservedEnvPrefixes and reservedEnvExact are the HARD-RESERVED name set
+// (ADR-005 H2): names extra_env may NEVER set, ALWAYS rejected regardless of the
+// operator's allowed_env allowlist, because the provider — or the runner-image
+// entrypoint / the interpreter — relies on them for the runner contract
+// (ADR-002), connectivity control, privilege control, or shell/loader safety.
+// This is enforced in Go, not the schema, because JSON Schema's
+// propertyNames/pattern cannot express a case-insensitive prefix denylist under
+// RE2 (no negative lookahead). Matching is case-insensitive so a lower/mixed-case
+// spelling (docker_host, Runner_Ephemeral) cannot slip a reserved name past the
+// check.
+//
+// The set is broader than the original F8 runner-contract denylist. It also
+// hard-reserves interpreter/entrypoint controls that would be a privilege-
+// escalation or code-execution vector if a pool could set them (H2):
+//   - RUN_AS_ROOT: the runner-image entrypoint runs registration AND the job as
+//     ROOT when this is "true", defeating the non-root isolation the whole M1
+//     model rests on.
+//   - GARM_* and WAIT_FOR_DOCKER_SECONDS: the entrypoint reads these timeout
+//     vars straight into Bash arithmetic ((( elapsed >= timeout ))), where a
+//     value like "a[$(cmd)]" is an arithmetic command-substitution RCE as root.
+//   - BASH_ENV/ENV/IFS/PATH/LD_*/NODE_OPTIONS: classic shell/loader/interpreter
+//     hijack vectors — a settable BASH_ENV or LD_PRELOAD runs attacker code in
+//     every shell/dynamically-linked process the container starts.
 var (
-	reservedEnvPrefixes = []string{"RUNNER_", "DOCKER_", "ACTIONS_RUNNER_INPUT_"}
-	reservedEnvExact    = []string{"JIT_CONFIG_ENABLED", "GITHUB_URL"}
+	reservedEnvPrefixes = []string{"RUNNER_", "DOCKER_", "ACTIONS_RUNNER_INPUT_", "GARM_", "LD_"}
+	reservedEnvExact    = []string{
+		"JIT_CONFIG_ENABLED", "GITHUB_URL", "RUN_AS_ROOT",
+		"WAIT_FOR_DOCKER_SECONDS", "BASH_ENV", "ENV", "IFS", "PATH", "NODE_OPTIONS",
+	}
 )
 
-// reservedEnvName reports whether name is on the F8 reserved denylist.
+// reservedEnvName reports whether name is on the hard-reserved set (H2).
 func reservedEnvName(name string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(name))
 	for _, p := range reservedEnvPrefixes {
@@ -110,10 +158,12 @@ func reservedEnvName(name string) bool {
 }
 
 // Parse schema-validates raw (draft-07, additionalProperties:false) FAIL-CLOSED,
-// decodes it into an ExtraSpecs, and enforces the reserved-env denylist (F8).
-// It performs no config-dependent bounding — that is Resolve's job — so it is a
-// pure structural gate usable wherever only the shape matters (e.g. the
-// v0.1.1 ValidatePoolInfo self-check also calls Resolve for the ceilings).
+// decodes it into an ExtraSpecs, and enforces the two CONFIG-INDEPENDENT env
+// gates: the env-name charset (H3) and the hard-reserved set (H2). It performs
+// no config-dependent bounding — the operator allowed_env allowlist and the
+// ceilings are Resolve's job — so it is a pure structural gate usable wherever
+// only the shape matters (the v0.1.1 ValidatePoolInfo self-check calls Resolve
+// afterward for the allowlist + ceilings).
 //
 // An empty/nil payload is treated as {} (garm-provider-common initializes a
 // missing extra_specs to {} anyway), so a pool with no extra_specs parses to
@@ -148,9 +198,22 @@ func Parse(raw json.RawMessage) (ExtraSpecs, error) {
 	}
 
 	for name := range s.ExtraEnv {
+		// H3: charset FIRST, before the reserved check, so a malformed key like
+		// "JIT_CONFIG_ENABLED=false" (which would otherwise slip past the
+		// exact-name reserved match and be emitted to Docker as
+		// "JIT_CONFIG_ENABLED=false=<value>", flipping the reserved variable) is
+		// rejected on its shape before it can smuggle anything.
+		if !validEnvName(name) {
+			return ExtraSpecs{}, fmt.Errorf(
+				"extra_specs.extra_env key %q is not a valid environment variable name: names must match %s (no '=', whitespace, unicode, or leading digit) (H3)",
+				name, envNameRE.String())
+		}
+		// H2: hard-reserved names are ALWAYS rejected, regardless of the
+		// operator's allowed_env allowlist (the allowlist is checked later, in
+		// Resolve). This is config-independent, so it belongs here in Parse.
 		if reservedEnvName(name) {
 			return ExtraSpecs{}, fmt.Errorf(
-				"extra_specs.extra_env may not set the reserved variable %q: the provider owns %v and prefixes %v (F8); provider-injected environment always wins",
+				"extra_specs.extra_env may not set the hard-reserved variable %q: the provider hard-reserves %v and prefixes %v regardless of allowed_env (H2); provider-injected environment always wins",
 				name, reservedEnvExact, reservedEnvPrefixes)
 		}
 	}
@@ -237,6 +300,27 @@ func (s ExtraSpecs) Resolve(cfg config.Config) (Resolved, error) {
 		return Resolved{}, err
 	}
 
+	// H2 allowlist: every extra_env NAME must be on the operator's
+	// [extra_specs].allowed_env allowlist, which defaults to EMPTY (fail-closed:
+	// no extra env passes unless the operator opts a name in). Charset and the
+	// hard-reserved set were already enforced in Parse; this is the config-
+	// dependent operator gate, so it lives here in Resolve. Keys are iterated in
+	// sorted order so the rejection error is deterministic and testable.
+	if len(s.ExtraEnv) > 0 {
+		names := make([]string, 0, len(s.ExtraEnv))
+		for name := range s.ExtraEnv {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if !cfg.ExtraSpecs.EnvAllowed(name) {
+				return Resolved{}, fmt.Errorf(
+					"extra_specs.extra_env key %q is not on the operator's allowlist ([extra_specs].allowed_env); extra env is fail-closed and rejected by default unless the operator opts the name in (H2)",
+					name)
+			}
+		}
+	}
+
 	storageDriver := cfg.StorageDriver
 	if s.StorageDriver != "" {
 		storageDriver = s.StorageDriver
@@ -258,11 +342,18 @@ func (s ExtraSpecs) Resolve(cfg config.Config) (Resolved, error) {
 // no override is given, else the parsed override — REJECTED if it exceeds a
 // finite ceiling (reject-not-clamp). A ceiling of 0 means the operator set no
 // limit (unlimited), so any finite override is within it and accepted.
+//
+// The override is parsed with config.ParsePositiveByteSize (H1), so a
+// NON-POSITIVE request — "0" in any representation, or a negative value — is
+// rejected here in Go as well as by the schema pattern. Docker treats a memory
+// limit of 0 as UNSET (unlimited), so silently accepting "0GiB" from a pool
+// would REMOVE the operator's finite ceiling; a memory override must be a
+// genuine positive value within the ceiling.
 func boundMemory(field, override string, ceilingBytes int64) (int64, error) {
 	if override == "" {
 		return ceilingBytes, nil
 	}
-	req, err := config.ParseByteSize(override)
+	req, err := config.ParsePositiveByteSize(override)
 	if err != nil {
 		return 0, fmt.Errorf("extra_specs.%s %q: %w", field, override, err)
 	}

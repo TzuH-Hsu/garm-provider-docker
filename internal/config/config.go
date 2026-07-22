@@ -116,6 +116,13 @@ type Config struct {
 	// and pnpm-store caches (M2-W1). Defaulted to enabled with the ADR-005
 	// values by Load; see cache.go.
 	Cache Cache `toml:"cache"`
+
+	// ExtraSpecs is the [extra_specs] table (ADR-005 H2): operator-owned
+	// controls over the GARM-admin extra_specs trust tier. Its allowed_env
+	// allowlist governs which environment-variable names a pool's
+	// extra_specs.extra_env may set — defaulting to EMPTY (fail-closed: no
+	// extra env passes unless the operator opts a name in). See extra_specs.go.
+	ExtraSpecs ExtraSpecsPolicy `toml:"extra_specs"`
 }
 
 // Load reads the TOML config file at path, applies defaults, and validates

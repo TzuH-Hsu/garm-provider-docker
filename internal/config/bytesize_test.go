@@ -50,6 +50,35 @@ func TestParseByteSize(t *testing.T) {
 	}
 }
 
+// TestParsePositiveByteSize covers the H1 positive-only parse used by the
+// extra_specs memory-override channel: every zero representation and any
+// negative is rejected, while a genuine positive value parses as usual.
+func TestParsePositiveByteSize(t *testing.T) {
+	rejected := []string{"0", "00", "0GiB", "0 B", "0KiB", "-1GiB", "-8GiB", ""}
+	for _, in := range rejected {
+		if got, err := ParsePositiveByteSize(in); err == nil {
+			t.Errorf("ParsePositiveByteSize(%q) = %d, nil; want a rejection (non-positive)", in, got)
+		}
+	}
+	accepted := map[string]int64{
+		"1":      1,
+		"1B":     1,
+		"512MiB": 512 * 1024 * 1024,
+		"8GiB":   8 * 1024 * 1024 * 1024,
+		"4GB":    4_000_000_000,
+	}
+	for in, want := range accepted {
+		got, err := ParsePositiveByteSize(in)
+		if err != nil {
+			t.Errorf("ParsePositiveByteSize(%q) returned unexpected error: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParsePositiveByteSize(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
 func TestParseByteSizeGBAndGiBAreNotAliased(t *testing.T) {
 	// The load-bearing distinction this parser exists for: unlike
 	// github.com/docker/go-units' RAMInBytes, "GB" must NOT parse to the

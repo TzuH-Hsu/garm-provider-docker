@@ -301,6 +301,9 @@ func TestResolveStorageDriverOverrideAndDefault(t *testing.T) {
 
 func TestResolvePassesThroughLabelsAndEnv(t *testing.T) {
 	cfg := testConfig()
+	// H2: extra_env is fail-closed — FOO must be on the operator's allowlist to
+	// pass through. runner_labels carry no such gate.
+	cfg.ExtraSpecs = config.ExtraSpecsPolicy{AllowedEnv: []string{"FOO"}}
 	specs, _ := Parse(json.RawMessage(`{"runner_labels": ["gpu"], "extra_env": {"FOO": "bar"}}`))
 	res, err := specs.Resolve(cfg)
 	if err != nil {
@@ -311,6 +314,116 @@ func TestResolvePassesThroughLabelsAndEnv(t *testing.T) {
 	}
 	if res.ExtraEnv["FOO"] != "bar" {
 		t.Errorf("ExtraEnv = %v, want FOO=bar", res.ExtraEnv)
+	}
+}
+
+// --- H1: memory overrides must be POSITIVE (0 in any representation rejected) --
+
+func TestResolveRejectsNonPositiveMemoryOverride(t *testing.T) {
+	// Every zero representation, and a negative, must be rejected for BOTH
+	// runner_memory and dind_memory — a pool must never be able to zero out (=
+	// unset = unlimited, on Docker) the operator's finite memory ceiling.
+	for _, bad := range []string{"0", "00", "0GiB", "0 B", "-1GiB"} {
+		t.Run("runner_memory="+bad, func(t *testing.T) {
+			cfg := testConfig() // runner ceiling 8GiB
+			specs, err := Parse(json.RawMessage(`{"runner_memory": "` + bad + `"}`))
+			if err != nil {
+				// The schema pattern already rejects these at Parse — that is a
+				// valid fail-closed outcome and is exactly what we want.
+				return
+			}
+			if _, err := specs.Resolve(cfg); err == nil {
+				t.Errorf("Resolve runner_memory %q = nil error, want reject (non-positive memory must not remove the operator ceiling)", bad)
+			}
+		})
+		t.Run("dind_memory="+bad, func(t *testing.T) {
+			cfg := testConfig() // dind ceiling 4GiB
+			specs, err := Parse(json.RawMessage(`{"dind_memory": "` + bad + `"}`))
+			if err != nil {
+				return
+			}
+			if _, err := specs.Resolve(cfg); err == nil {
+				t.Errorf("Resolve dind_memory %q = nil error, want reject", bad)
+			}
+		})
+	}
+}
+
+func TestResolveAcceptsPositiveMemoryWithinCeiling(t *testing.T) {
+	cfg := testConfig() // runner ceiling 8GiB
+	specs, err := Parse(json.RawMessage(`{"runner_memory": "4GiB"}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	res, err := specs.Resolve(cfg)
+	if err != nil {
+		t.Fatalf("Resolve of a positive within-ceiling override: %v", err)
+	}
+	if want := int64(4) * 1024 * 1024 * 1024; res.RunnerMemoryBytes != want {
+		t.Errorf("RunnerMemoryBytes = %d, want %d", res.RunnerMemoryBytes, want)
+	}
+}
+
+// --- H3: env-name charset (keys with '=', whitespace, unicode, leading digit) --
+
+func TestParseRejectsMalformedEnvNames(t *testing.T) {
+	// Each of these keys is invalid at the CHARSET level, so Parse rejects it
+	// BEFORE the reserved/allowlist checks — closing the bypass where a key like
+	// "JIT_CONFIG_ENABLED=false" would be emitted to Docker as
+	// "JIT_CONFIG_ENABLED=false=<value>" and flip the reserved variable.
+	for _, badKey := range []string{"JIT_CONFIG_ENABLED=false", "A B", "1ABC", "clé", "DISABLE_RUNNER_UPDATE=false", "FOO=BAR"} {
+		t.Run(badKey, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"extra_env": map[string]string{badKey: "x"}})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if _, err := Parse(raw); err == nil {
+				t.Errorf("Parse extra_env key %q = nil error, want charset rejection (H3)", badKey)
+			}
+		})
+	}
+}
+
+// --- H2: operator allowlist + hard-reserved set --------------------------------
+
+func TestResolveRejectsNonAllowlistedEnvByDefault(t *testing.T) {
+	cfg := testConfig() // no [extra_specs].allowed_env => empty => fail-closed
+	specs, err := Parse(json.RawMessage(`{"extra_env": {"MY_BENIGN_VAR": "x"}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, err := specs.Resolve(cfg); err == nil {
+		t.Fatal("Resolve of a non-allowlisted extra_env by default = nil error, want fail-closed reject (H2)")
+	}
+}
+
+func TestResolveAcceptsAllowlistedEnv(t *testing.T) {
+	cfg := testConfig()
+	cfg.ExtraSpecs = config.ExtraSpecsPolicy{AllowedEnv: []string{"MY_BENIGN_VAR"}}
+	specs, err := Parse(json.RawMessage(`{"extra_env": {"MY_BENIGN_VAR": "hello"}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	res, err := specs.Resolve(cfg)
+	if err != nil {
+		t.Fatalf("Resolve of an operator-allowlisted var: %v", err)
+	}
+	if res.ExtraEnv["MY_BENIGN_VAR"] != "hello" {
+		t.Errorf("ExtraEnv = %v, want MY_BENIGN_VAR=hello", res.ExtraEnv)
+	}
+}
+
+func TestParseRejectsHardReservedEvenIfAllowlisted(t *testing.T) {
+	// The hard-reserved check runs in Parse (config-independent), so an operator
+	// mistakenly allowlisting a reserved name can NEVER make it settable: Parse
+	// rejects it before Resolve's allowlist ever runs.
+	for _, name := range []string{"RUN_AS_ROOT", "GARM_CRED_WAIT_SECONDS", "WAIT_FOR_DOCKER_SECONDS", "PATH", "LD_PRELOAD", "BASH_ENV", "IFS", "NODE_OPTIONS", "RUNNER_EPHEMERAL", "DOCKER_HOST"} {
+		t.Run(name, func(t *testing.T) {
+			raw := json.RawMessage(`{"extra_env": {"` + name + `": "x"}}`)
+			if _, err := Parse(raw); err == nil {
+				t.Fatalf("Parse hard-reserved %q = nil error, want reject regardless of allowlist (H2)", name)
+			}
+		})
 	}
 }
 

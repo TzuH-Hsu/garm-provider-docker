@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/TzuH-Hsu/garm-provider-docker/schemas/extra_specs.json",
   "title": "garm-provider-docker extra_specs",
-  "description": "The pool/scale-set extra_specs contract for garm-provider-docker (ADR-005). extra_specs is the GARM-admin trust tier: narrower and more dynamic than the operator's provider config, and read from the stdin BootstrapInstance.extra_specs field (never GARM_POOL_EXTRASPECS, which is empty for scale sets). Only the fields below are accepted; any other property is rejected (additionalProperties:false), which is what structurally keeps a raw image reference, docker_host, the privileged flag, or a managed Docker label out of this channel. Every accepted field is further bounded at CreateInstance time against the live provider config: dind_mode by allowed_dind_modes, runner_memory/dind_memory by the configured ceiling (rejected, not clamped, if exceeded), and flavor by the [flavors.*] map. extra_env may never name a provider-reserved variable (RUNNER_*, DOCKER_*, JIT_CONFIG_ENABLED, GITHUB_URL, ACTIONS_RUNNER_INPUT_*); provider-injected environment always wins.",
+  "description": "The pool/scale-set extra_specs contract for garm-provider-docker (ADR-005). extra_specs is the GARM-admin trust tier: narrower and more dynamic than the operator's provider config, and read from the stdin BootstrapInstance.extra_specs field (never GARM_POOL_EXTRASPECS, which is empty for scale sets). Only the fields below are accepted; any other property is rejected (additionalProperties:false), which is what structurally keeps a raw image reference, docker_host, the privileged flag, or a managed Docker label out of this channel. Every accepted field is further bounded at CreateInstance time against the live provider config: dind_mode by allowed_dind_modes, runner_memory/dind_memory by the configured ceiling (positive-only, rejected not clamped if exceeded), and flavor by the [flavors.*] map. extra_env is governed by an OPERATOR ALLOWLIST (config [extra_specs].allowed_env, default EMPTY/fail-closed): only allowlisted NAMES may be set, each name must match the env-name charset ^[A-Za-z_][A-Za-z0-9_]*$, and a hard-reserved set (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) is rejected even if allowlisted; provider-injected environment always wins.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -18,13 +18,13 @@
     },
     "runner_memory": {
       "type": "string",
-      "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
-      "description": "Runner container memory limit as a human byte size (e.g. \"4GiB\", \"512MiB\", \"2GB\"). Bounded by the effective configured runner_memory: a request exceeding the operator's ceiling is rejected (reject-not-clamp, owner ruling), not silently reduced."
+      "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
+      "description": "Runner container memory limit as a human byte size (e.g. \"4GiB\", \"512MiB\", \"2GB\"). Must be POSITIVE: a zero value in any representation (\"0\", \"0GiB\", \"0 B\") is rejected, because Docker treats a 0 memory limit as UNSET, which would silently remove the operator's ceiling (H1). Bounded by the effective configured runner_memory: a request exceeding the operator's ceiling is rejected (reject-not-clamp, owner ruling), not silently reduced."
     },
     "dind_memory": {
       "type": "string",
-      "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
-      "description": "DinD sidecar memory limit as a human byte size. Bounded by the effective configured dind_memory exactly like runner_memory; unused when the effective dind_mode is \"none\"."
+      "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
+      "description": "DinD sidecar memory limit as a human byte size. Must be POSITIVE (a zero value is rejected, same as runner_memory — H1). Bounded by the effective configured dind_memory exactly like runner_memory; unused when the effective dind_mode is \"none\"."
     },
     "storage_driver": {
       "type": "string",
@@ -39,7 +39,8 @@
     "extra_env": {
       "type": "object",
       "additionalProperties": { "type": "string" },
-      "description": "Extra environment variables for the runner container. A name that is provider-reserved (any RUNNER_*, DOCKER_*, ACTIONS_RUNNER_INPUT_* prefix, or JIT_CONFIG_ENABLED / GITHUB_URL) is rejected (F8); a name that merely collides with another provider-injected variable is dropped in favor of the provider's value. Provider-injected environment always wins the merge."
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "description": "Extra environment variables for the runner container. Each NAME must match a strict env-name charset ^[A-Za-z_][A-Za-z0-9_]*$ (H3): a key containing '=', whitespace, unicode, or a leading digit is rejected, so a key like \"JIT_CONFIG_ENABLED=false\" can never smuggle a value past the exact-name reserved/allowlist checks and the provider-wins merge. Beyond the charset, extra_env is governed by an operator ALLOWLIST (config [extra_specs].allowed_env, default EMPTY): a name not on the allowlist is rejected at CreateInstance time (H2). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if allowlisted. A non-reserved allowlisted name that merely collides with a provider-injected variable is dropped in favor of the provider's value — provider-injected environment always wins the merge."
     }
   }
 }

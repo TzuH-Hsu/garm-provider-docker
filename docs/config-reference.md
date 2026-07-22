@@ -33,7 +33,8 @@ GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=GetConfigJSONSchema \
 
 # Validate a pool's extra_specs early (what `garm-cli pool update --extra-specs`
 # would call): exits non-zero with a descriptive error if it violates the schema,
-# the allowed_dind_modes ceiling, a memory ceiling, or the reserved-env denylist.
+# the allowed_dind_modes ceiling, a memory ceiling, the extra_env allowlist, or a
+# hard-reserved env name.
 GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=ValidatePoolInfo \
   GARM_CONTROLLER_ID=x GARM_PROVIDER_CONFIG_FILE=/path/config.toml \
   GARM_POOL_EXTRASPECS='{"dind_mode":"privileged-sidecar"}' \
@@ -50,21 +51,23 @@ and the `privileged` flag out of this channel: they have no field at all.
 |---|---|---|
 | `flavor` | string | Must name a `[flavors.<name>]` entry in the provider config. The **only** channel that varies the runner image (ADR-002) — `extra_specs` never accepts a raw image ref. |
 | `dind_mode` | `none` \| `privileged-sidecar` \| `sysbox-runc` | Bounded by the operator's `allowed_dind_modes` **ceiling**: a mode outside that list is rejected. |
-| `runner_memory` | byte-size string (`"4GiB"`, `"512MiB"`, `"2GB"`) | Bounded by the effective configured `runner_memory`. **Rejected if it exceeds the ceiling** (reject, not clamp). |
-| `dind_memory` | byte-size string | Bounded by the effective configured `dind_memory`, same rule. |
+| `runner_memory` | byte-size string (`"4GiB"`, `"512MiB"`, `"2GB"`) | Bounded by the effective configured `runner_memory`. Must be **positive** (a zero value in any form is rejected — H1). **Rejected if it exceeds the ceiling** (reject, not clamp). |
+| `dind_memory` | byte-size string | Bounded by the effective configured `dind_memory`, same rules (positive-only; reject-not-clamp). |
 | `storage_driver` | `overlay2` \| `vfs` | Defaults to the configured `storage_driver`. |
 | `runner_labels` | array of strings | Appended to the runner's labels. **Non-JIT mode only** — in JIT mode GARM bakes the label set server-side, so these are inert. |
-| `extra_env` | object of string→string | Extra runner-container env. **Reserved names are rejected** (see below). |
+| `extra_env` | object of string→string | Extra runner-container env. Governed by an **operator allowlist** and a **hard-reserved** set (see below). |
 
-### Ceilings and the reserved-env denylist (read this)
+### Ceilings, the extra_env allowlist, and the hard-reserved set (read this)
 
 - **`allowed_dind_modes` ceiling (ADR-001 F7).** The operator's `allowed_dind_modes` is the final word on `dind_mode`. On a shared or sensitive host set `allowed_dind_modes = ["none"]` to forbid privileged workloads outright — no pool's `extra_specs.dind_mode` can escalate past it, full stop.
-- **Memory is reject-not-clamp.** A `runner_memory`/`dind_memory` over the configured (or flavor-resolved) ceiling is rejected with a clear error; it is never silently reduced. A request at or below the ceiling is accepted; an unset ceiling (unlimited) accepts any finite request.
-- **Reserved `extra_env` names (F8) — always rejected, case-insensitive:**
-  - prefixes `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*`
-  - exact `JIT_CONFIG_ENABLED`, `GITHUB_URL`
+- **Memory is positive-only and reject-not-clamp (H1).** A `runner_memory`/`dind_memory` over the configured (or flavor-resolved) ceiling is rejected with a clear error; it is never silently reduced. A request at or below the ceiling is accepted; an unset ceiling (unlimited) accepts any finite request. A **zero** value in any representation (`"0"`, `"0GiB"`, `"0 B"`) is rejected — Docker treats a 0 memory limit as *unset* (unlimited), so accepting it would silently remove the operator's ceiling.
+- **`extra_env` is fail-closed via an operator ALLOWLIST (H2).** The operator lists the env NAMES a pool may set in `[extra_specs].allowed_env` (default **empty**). A name not on the allowlist is **rejected** — by default a pool can inject **no** extra environment at all.
+- **`extra_env` names must match a strict charset (H3):** `^[A-Za-z_][A-Za-z0-9_]*$`. A key containing `=`, whitespace, unicode, or a leading digit is rejected — this closes the bypass where `JIT_CONFIG_ENABLED=false` would be emitted as `JIT_CONFIG_ENABLED=false=<value>` and flip a reserved variable.
+- **Hard-reserved `extra_env` names — always rejected, even if allowlisted, case-insensitive:**
+  - prefixes `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*`, `GARM_*`, `LD_*`
+  - exact `JIT_CONFIG_ENABLED`, `GITHUB_URL`, `RUN_AS_ROOT`, `WAIT_FOR_DOCKER_SECONDS`, `BASH_ENV`, `ENV`, `IFS`, `PATH`, `NODE_OPTIONS`
 
-  These are names the provider itself relies on for the runner contract (ADR-002) or connectivity control; letting a pool set `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=…` would break the single-job teardown model or the DinD socket-reachability guarantees. A non-reserved `extra_env` name that merely collides with another provider-injected variable is dropped in favor of the provider's value — **provider-injected environment always wins**.
+  These are names the provider, the runner-image entrypoint, or the interpreter relies on. Letting a pool set `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=…` would break the single-job teardown model or the DinD socket-reachability guarantees; `RUN_AS_ROOT=true` would run the runner and its job as **root** (defeating non-root isolation); the entrypoint reads `GARM_CRED_WAIT_SECONDS`/`WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic where a crafted value is a command-substitution RCE as root; and `BASH_ENV`/`LD_*`/`PATH`/… are classic shell/loader hijack vectors. A non-reserved, allowlisted `extra_env` name that merely collides with another provider-injected variable is dropped in favor of the provider's value — **provider-injected environment always wins**.
 
 ### Never settable from `extra_specs` (structurally)
 
@@ -87,14 +90,23 @@ This is the exact schema the binary validates against (`internal/extraspecs/sche
   "properties": {
     "flavor": { "type": "string", "minLength": 1 },
     "dind_mode": { "type": "string", "enum": ["none", "privileged-sidecar", "sysbox-runc"] },
-    "runner_memory": { "type": "string", "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
-    "dind_memory": { "type": "string", "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
+    "runner_memory": { "type": "string", "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
+    "dind_memory": { "type": "string", "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
     "storage_driver": { "type": "string", "enum": ["overlay2", "vfs"] },
     "runner_labels": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-    "extra_env": { "type": "object", "additionalProperties": { "type": "string" } }
+    "extra_env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+    }
   }
 }
 ```
+
+The memory patterns are positive-only (`^[1-9][0-9]*…`, no leading-zero value), and
+`extra_env.propertyNames.pattern` enforces the env-name charset; the operator
+allowlist and hard-reserved set are enforced in Go (they cannot be expressed as a
+case-insensitive prefix denylist in JSON Schema under RE2).
 
 Field descriptions are carried inline in the emitted schema
 (`GetExtraSpecsJSONSchema`); they are elided here for brevity.
@@ -107,7 +119,8 @@ Select a bigger flavor and a DinD mode the operator allows:
 { "flavor": "large", "dind_mode": "privileged-sidecar", "runner_memory": "12GiB" }
 ```
 
-Add extra labels and a couple of safe environment variables:
+Add extra labels and a couple of environment variables (each name must be on the
+operator's `[extra_specs].allowed_env` allowlist):
 
 ```json
 { "runner_labels": ["gpu", "cuda"], "extra_env": { "MY_CI_FLAG": "on", "TZ": "UTC" } }
@@ -119,7 +132,11 @@ Rejected examples (each fails closed, before any container is created):
 { "image": "attacker/evil:latest" }              // unknown key — raw image is not a channel
 { "dind_mode": "privileged-sidecar" }            // if allowed_dind_modes = ["none"]
 { "runner_memory": "64GiB" }                     // if the ceiling is 8GiB
-{ "extra_env": { "RUNNER_EPHEMERAL": "false" } } // reserved name
+{ "runner_memory": "0GiB" }                      // H1 — zero is not a valid limit
+{ "extra_env": { "RUNNER_EPHEMERAL": "false" } } // hard-reserved name
+{ "extra_env": { "RUN_AS_ROOT": "true" } }       // hard-reserved — would run the job as root
+{ "extra_env": { "MY_CI_FLAG": "on" } }          // if MY_CI_FLAG is not on [extra_specs].allowed_env
+{ "extra_env": { "JIT_CONFIG_ENABLED=false": "x" } } // H3 — '=' in the key
 ```
 
 ## Provider config (TOML)
@@ -128,4 +145,16 @@ See ADR-005 for the full illustrative config and rationale, and emit the
 authoritative schema with `GetConfigJSONSchema`. The keys most relevant to the
 `extra_specs` bounds above are `allowed_dind_modes` (the `dind_mode` ceiling),
 `[resources].runner_memory`/`dind_memory` (the memory ceilings), `storage_driver`
-(the default), and the `[flavors.*]` map (the only image-varying channel).
+(the default), the `[flavors.*]` map (the only image-varying channel), and
+`[extra_specs].allowed_env` (the `extra_env` allowlist).
+
+The `extra_env` allowlist is an operator opt-in. It defaults to empty (a pool can
+set no extra env at all); add the names you trust a pool admin to set:
+
+```toml
+[extra_specs]
+# Environment-variable NAMES a pool's extra_specs.extra_env may set. Default empty.
+# Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) are
+# rejected even if listed here.
+allowed_env = ["MY_CI_FLAG", "TZ"]
+```

@@ -67,6 +67,75 @@ func TestCreateInstanceRejectsReservedExtraEnvBeforeAnyDockerOp(t *testing.T) {
 	assertNoResources(t, p, fake)
 }
 
+// TestCreateInstanceRejectsRunAsRootExtraEnv: RUN_AS_ROOT is hard-reserved (H2)
+// — setting it via extra_env would run the runner AND its job as ROOT, defeating
+// the non-root isolation M1 established. It is rejected fail-closed before any
+// Docker op, even though the operator set no allowlist (hard-reserved always wins).
+func TestCreateInstanceRejectsRunAsRootExtraEnv(t *testing.T) {
+	p, fake := newTestProvider(t)
+
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"RUN_AS_ROOT": "true"}}`)
+
+	_, err := p.CreateInstance(context.Background(), b)
+	if err == nil {
+		t.Fatal("CreateInstance with RUN_AS_ROOT extra_env = nil error, want fail-closed reject (H2)")
+	}
+	if !strings.Contains(err.Error(), "RUN_AS_ROOT") {
+		t.Errorf("error %q should name the rejected hard-reserved variable", err.Error())
+	}
+	assertNoResources(t, p, fake)
+}
+
+// TestCreateInstanceRejectsGarmTimeoutExtraEnv: GARM_CRED_WAIT_SECONDS is
+// hard-reserved (GARM_* prefix, H2). The runner-image entrypoint reads it into
+// Bash arithmetic, where a value like "a[$(cmd)]" is a command-substitution RCE
+// as root — so it must never be settable from a pool. Rejected before any Docker op.
+func TestCreateInstanceRejectsGarmTimeoutExtraEnv(t *testing.T) {
+	p, fake := newTestProvider(t)
+
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"GARM_CRED_WAIT_SECONDS": "a[$(touch /tmp/pwned)]"}}`)
+
+	_, err := p.CreateInstance(context.Background(), b)
+	if err == nil {
+		t.Fatal("CreateInstance with GARM_CRED_WAIT_SECONDS extra_env = nil error, want fail-closed reject (H2)")
+	}
+	assertNoResources(t, p, fake)
+}
+
+// TestCreateInstanceRejectsNonAllowlistedEnvByDefault: with no operator
+// allowed_env (the default), a pool cannot inject ANY extra env — even a benign
+// name is rejected fail-closed before any Docker op (H2).
+func TestCreateInstanceRejectsNonAllowlistedEnvByDefault(t *testing.T) {
+	p, fake := newTestProvider(t) // no ExtraSpecs.AllowedEnv => empty => fail-closed
+
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"MY_BENIGN_VAR": "x"}}`)
+
+	_, err := p.CreateInstance(context.Background(), b)
+	if err == nil {
+		t.Fatal("CreateInstance with a non-allowlisted extra_env = nil error, want fail-closed reject (H2)")
+	}
+	assertNoResources(t, p, fake)
+}
+
+// TestCreateInstanceRejectsEqualsInEnvKey: an env key containing '=' (H3) is
+// rejected before any Docker op — it must not smuggle a reserved variable (e.g.
+// "JIT_CONFIG_ENABLED=false") past the exact-name reserved/allowlist checks.
+func TestCreateInstanceRejectsEqualsInEnvKey(t *testing.T) {
+	p, fake := newTestProvider(t)
+
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"JIT_CONFIG_ENABLED=false": "x"}}`)
+
+	_, err := p.CreateInstance(context.Background(), b)
+	if err == nil {
+		t.Fatal("CreateInstance with an '='-in-key extra_env = nil error, want charset reject (H3)")
+	}
+	assertNoResources(t, p, fake)
+}
+
 // TestCreateInstanceRejectsRawImageInExtraSpecs: a raw image reference has no
 // field in the schema (additionalProperties:false), so a pool that tries to
 // smuggle one via extra_specs is rejected before any Docker op — image
@@ -154,20 +223,30 @@ func TestCreateInstanceFlavorSelectsImage(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceExtraEnvMergedProviderWins: an allowlisted extra_env value
-// reaches the runner container; a non-reserved but provider-injected name
+// TestCreateInstanceExtraEnvMergedProviderWins: an operator-ALLOWLISTED extra_env
+// value reaches the runner container; a non-reserved but provider-injected name
 // (DISABLE_RUNNER_UPDATE) that collides is DROPPED in favor of the provider's
-// value — provider-injected environment always wins the merge (ADR-005).
+// value — provider-injected environment always wins the merge (ADR-005 H2).
 func TestCreateInstanceExtraEnvMergedProviderWins(t *testing.T) {
-	p, fake := newTestProvider(t)
+	// H2: both names must be on the operator's allowed_env allowlist to pass the
+	// fail-closed extra_env gate; neither is hard-reserved.
+	cfg := config.Config{
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeNone,
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
+		Network:          config.Network{EnableJobNetwork: true, Internal: false},
+		ExtraSpecs:       config.ExtraSpecsPolicy{AllowedEnv: []string{"MY_CI_FLAG", "DISABLE_RUNNER_UPDATE"}},
+	}
+	p, fake := providerWithConfig(t, cfg)
 
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
 	b := jitBootstrap(srv.URL)
-	// MY_CI_FLAG is allowlisted (merges); DISABLE_RUNNER_UPDATE is not on the
-	// reserved denylist (no RUNNER_/DOCKER_ prefix) so it passes Parse, but the
-	// provider injects it as =true, so the pool's =false must be dropped.
+	// MY_CI_FLAG is allowlisted and provider-injects nothing under that name, so
+	// it merges; DISABLE_RUNNER_UPDATE is allowlisted too, but the provider injects
+	// it as =true, so the pool's =false must be dropped (provider wins).
 	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"MY_CI_FLAG": "on", "DISABLE_RUNNER_UPDATE": "false"}}`)
 
 	inst, err := p.CreateInstance(context.Background(), b)

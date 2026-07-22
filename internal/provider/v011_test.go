@@ -59,7 +59,18 @@ func TestGetConfigJSONSchemaIsParseable(t *testing.T) {
 }
 
 func TestValidatePoolInfoAcceptsGood(t *testing.T) {
-	p, _ := newTestProvider(t) // ceiling allows all three modes, no flavors
+	// H2: extra_env is fail-closed, so a "good" payload's env NAME must be on the
+	// operator's allowed_env allowlist. FOO is benign and opted in here.
+	cfg := config.Config{
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeNone,
+		StorageDriver:    "overlay2",
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
+		Network:          config.Network{EnableJobNetwork: true},
+		ExtraSpecs:       config.ExtraSpecsPolicy{AllowedEnv: []string{"FOO"}},
+	}
+	p, _ := providerWithConfig(t, cfg)
 	err := p.ValidatePoolInfo(context.Background(), "", "", "", `{"dind_mode": "privileged-sidecar", "extra_env": {"FOO": "bar"}}`)
 	if err != nil {
 		t.Errorf("ValidatePoolInfo of a good extra_specs = %v, want nil", err)

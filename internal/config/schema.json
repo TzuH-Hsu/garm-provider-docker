@@ -90,6 +90,18 @@
         "stale_cache_eviction_days": { "type": "integer" },
         "diagnostic_log_retention_days": { "type": "integer" }
       }
+    },
+    "extra_specs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Operator-owned controls over the GARM-admin extra_specs trust tier (ADR-005 H2). Governs what a pool's extra_specs may do beyond what the schema alone allows.",
+      "properties": {
+        "allowed_env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
+        }
+      }
     }
   }
 }

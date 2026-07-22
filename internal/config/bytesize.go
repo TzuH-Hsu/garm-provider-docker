@@ -79,3 +79,24 @@ func ParseByteSize(s string) (int64, error) {
 	}
 	return n * mult, nil
 }
+
+// ParsePositiveByteSize parses s exactly like ParseByteSize but additionally
+// rejects a NON-POSITIVE result — any zero representation ("0", "00", "0GiB",
+// "0 B") or, since ParseByteSize already refuses a leading "-", a negative
+// magnitude. It exists for the extra_specs memory-override channel (ADR-005 H1):
+// a pool's runner_memory/dind_memory override must be a genuine, positive limit,
+// because Docker treats a memory limit of 0 as UNSET (unlimited), so accepting
+// "0GiB" from a pool would SILENTLY REMOVE the operator's finite memory ceiling.
+// The operator's own "no limit" intent is expressed by an EMPTY value, never a
+// literal 0, so this stricter parse is safe for that channel while ParseByteSize
+// keeps its 0-is-a-valid-count semantics for the operator-config tier.
+func ParsePositiveByteSize(s string) (int64, error) {
+	n, err := ParseByteSize(s)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("byte size %q must be a positive value (0 is not a valid limit — Docker treats a 0 memory limit as unset/unlimited, which would remove the operator's ceiling)", s)
+	}
+	return n, nil
+}
