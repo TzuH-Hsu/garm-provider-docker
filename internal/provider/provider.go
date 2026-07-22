@@ -5,7 +5,7 @@ package provider
 import (
 	"fmt"
 
-	executionv010 "github.com/cloudbase/garm-provider-common/execution/v0.1.0"
+	executionv011 "github.com/cloudbase/garm-provider-common/execution/v0.1.1"
 	"github.com/docker/docker/api/types/filters"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
@@ -55,13 +55,15 @@ func New(cli docker.Client, cfg config.Config, controllerID string) (*Provider, 
 	}, nil
 }
 
-// Compile-time assertion that *Provider satisfies the interface main.go
-// wires into execution.Run. GARM only requires the v0.1.1 method surface
-// (GetSupportedInterfaceVersions, ValidatePoolInfo, GetConfigJSONSchema,
-// GetExtraSpecsJSONSchema) when GARM_INTERFACE_VERSION=v0.1.1 is set; that
-// surface is deferred per ADR-005, and current GARM leaves the interface
-// version defaulting to v0.1.0.
-var _ executionv010.ExternalProvider = (*Provider)(nil)
+// Compile-time assertion that *Provider satisfies the FULL v0.1.1
+// ExternalProvider interface main.go wires into the top-level execution.Run.
+// executionv011.ExternalProvider embeds the common (v0.1.0) eight methods and
+// adds the four self-description methods (GetSupportedInterfaceVersions,
+// ValidatePoolInfo, GetConfigJSONSchema, GetExtraSpecsJSONSchema — see v011.go,
+// M3-W1). Satisfying v0.1.1 also satisfies the v0.1.0 assertion the execution
+// dispatch makes by default, so the one binary serves BOTH: v0.1.1 when
+// GARM_INTERFACE_VERSION=v0.1.1 is set, v0.1.0 (current GARM's default) otherwise.
+var _ executionv011.ExternalProvider = (*Provider)(nil)
 
 // managedByInstanceNameFilter builds the Docker label filter that selects ALL
 // of this controller's managed, job-scoped resources for a given instance name,
