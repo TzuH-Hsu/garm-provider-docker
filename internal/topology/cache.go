@@ -3,8 +3,8 @@ package topology
 import (
 	"context"
 	"fmt"
+	"log"
 
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
@@ -21,86 +21,129 @@ type CacheVolumeResult struct {
 	Hit bool
 }
 
-// EnsureCacheVolume idempotently creates or reuses a persistent cache volume
-// (ADR-003). This is fundamentally DIFFERENT from createFreshVolume (create.go):
-// a job-scoped volume must be guaranteed fresh and empty per allocation (so a
-// name collision is a stale leftover to replace), whereas a cache volume is
-// MEANT to outlive allocations — a name collision is the whole point, the cache
-// HIT, and its contents must be preserved, never removed-and-recreated.
+// maxCacheReconcileAttempts bounds how many alternate slots EnsureCacheVolume
+// will try when the preferred deterministic name — and successive
+// deterministic alternates — are each occupied by a foreign/unlabeled/
+// wrong-identity squatter. Reaching it means an implausible number of distinct
+// non-ours volumes squat our deterministic-and-hashed names on one host; the
+// allocation then fails (GARM retries) rather than the provider deleting anything
+// it cannot prove is ours (ADR-003 never-delete-unprovable).
+const maxCacheReconcileAttempts = 8
+
+// EnsureCacheVolume create-or-reuses a persistent cache volume under ADR-003's
+// structural redesign (2026-07-22): a cache's identity is its LABEL SET, not its
+// name; the name is just a SLOT. This is fundamentally DIFFERENT from
+// createFreshVolume (create.go): a job-scoped volume must be guaranteed fresh
+// per allocation, whereas a cache is MEANT to outlive allocations — its contents
+// must be preserved, never removed-and-recreated.
 //
-// Because the real daemon's VolumeCreate is idempotent on a duplicate name —
-// it returns the EXISTING volume with its ORIGINAL labels, discarding the new
-// call's labels (verified against Docker Engine 29.6.1; see docker/client.go) —
-// a single VolumeCreate call both creates-on-miss and reuses-on-hit with the
-// contents intact.
+// Two-phase, and it NEVER deletes a volume it cannot POSITIVELY prove is ours:
 //
-// Hit vs. miss is determined by whether the volume already EXISTED before this
-// call (a label-scoped pre-check), NOT by comparing the returned last-used
-// label: that label has 1-second RFC3339 resolution, so two allocations for the
-// same repo landing in the same second would carry an identical timestamp and a
-// genuine reuse would misreport as a miss. The pre-check is exact and
-// timestamp-independent, giving operators an accurate "cache hit" signal. (A
-// concurrent first-create race could have both see "absent" and both report a
-// miss — harmless, since the create is idempotent and the reported bool is only
-// informational.)
+//  1. DISCOVER BY LABEL. If a volume carrying our FULL identity already exists
+//     (spec.CacheIdentityFilter — managed+cache + cache-kind + repo/repo-url-digest
+//     or image-digest + generation/pnpm-major), reuse it under WHATEVER name it
+//     lives at — including an alternate a prior reconcile chose. This is the cache
+//     HIT. Discovery-by-label is what makes reconciled alternates transparently
+//     reusable: the name the caller PREFERRED is irrelevant once a labeled cache
+//     for this identity exists.
+//
+//  2. CLAIM A FREE-OR-OURS SLOT, reconciling AROUND a squatter. With no
+//     label-match, VolumeCreate the preferred name (idempotent on a duplicate:
+//     the real daemon returns the EXISTING volume with its ORIGINAL labels,
+//     discarding this call's — verified on Engine 29.6.1). If the returned volume
+//     validates as ours, adopt it (a fresh create, or a concurrent peer that
+//     created the identical-identity volume first). If it does NOT — the slot is
+//     held by a foreign volume, a Moby auto-created UNLABELED volume, or a
+//     DIFFERENT cache that collided on the name — do NOT delete it (a Moby
+//     auto-created unlabeled volume and a genuinely foreign one are
+//     INDISTINGUISHABLE, so name-based deletion can never be foreign-safe — B2)
+//     and do NOT wedge forever on the occupied name (B3): route AROUND it to a
+//     deterministic alternate (spec.AlternateCacheVolumeName) and re-check the
+//     alternate the same way. Because discovery is by label (phase 1), the
+//     alternate-named volume is found and reused on the next allocation.
+//
+// The idempotent cross-controller/cross-repo sharing path is UNCHANGED — two
+// controllers issuing VolumeCreate on the same deterministic name both get the
+// same volume and validate it as ours; reconciliation triggers ONLY on a genuine
+// foreign/unlabeled/wrong-identity squatter.
 //
 // last-used is deliberately NOT re-stamped on a hit: the daemon cannot mutate a
-// local volume's labels after creation (same probe: re-VolumeCreate keeps the
-// original labels; `docker volume update` is cluster-only), and removing-and-
-// recreating to refresh a label would destroy the cache. The label therefore
-// records the volume's creation instant; W2's opportunistic GC ages a warm cache
-// by AGE-since-that-creation-timestamp plus SALT SUPERSESSION (spec.gc.go) — NOT
-// by filesystem mtime, which the provider cannot portably stat from outside the
-// Docker Desktop VM. See ADR-003's W2 amendment (point 3).
+// local volume's labels after creation (re-VolumeCreate keeps the original
+// labels; `docker volume update` is cluster-only), and removing-and-recreating to
+// refresh a label would destroy the cache. The label records the volume's
+// creation instant; W2's opportunistic GC ages a warm cache by AGE-since-creation
+// plus SALT SUPERSESSION (spec/gc.go) — NOT by filesystem mtime, which the
+// provider cannot portably stat from outside the Docker Desktop VM.
 //
-// M6/L7: because VolumeCreate is idempotent on a duplicate name (it returns the
-// EXISTING volume with its ORIGINAL labels, discarding this call's labels), a
-// deterministically-named volume that already exists but ISN'T ours — a foreign
-// volume squatting the name, or a DIFFERENT repository that collided on the
-// repokey — would otherwise be silently adopted and mounted as this repo's
-// writable cache (or, for externals, run as executable runtime). This validates
-// the RETURNED volume's ownership+identity labels and fails CLOSED on a
-// mismatch, so only a genuinely-ours (or an intended cross-controller shared)
-// cache is ever adopted.
-//
-// The provider (create path) is what builds `name` and `labels` from the
+// The provider (create path) builds `preferredName` and `labels` from the
 // spec.CacheVolumeIdentity/ToolcacheVolumeName/PnpmVolumeName builders and calls
 // this once per cache kind; keeping this helper name+labels-generic keeps the
 // toolcache-vs-pnpm shaping in one place there.
-func (m *Manager) EnsureCacheVolume(ctx context.Context, name string, labels map[string]string) (CacheVolumeResult, error) {
-	existed, err := m.cacheVolumeExists(ctx, name)
-	if err != nil {
+func (m *Manager) EnsureCacheVolume(ctx context.Context, preferredName string, labels map[string]string) (CacheVolumeResult, error) {
+	// Phase 1: discover our cache by IDENTITY, under any name.
+	if name, found, err := m.discoverCacheByIdentity(ctx, labels); err != nil {
 		return CacheVolumeResult{}, err
+	} else if found {
+		return CacheVolumeResult{Name: name, Hit: true}, nil
 	}
-	created, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
-	if err != nil {
-		return CacheVolumeResult{}, fmt.Errorf("failed to ensure cache volume %q: %w", name, err)
+
+	// Phase 2: claim a free-or-ours slot, reconciling around any squatter.
+	candidate := preferredName
+	for attempt := 1; ; attempt++ {
+		created, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: candidate, Labels: labels})
+		if err != nil {
+			return CacheVolumeResult{}, fmt.Errorf("failed to ensure cache volume %q: %w", candidate, err)
+		}
+		verr := spec.ValidateAdoptedCacheVolume(candidate, created.Labels, labels)
+		if verr == nil {
+			// Freshly created, or a concurrent peer created the identical-identity
+			// volume first — either way it is ours to use. (A concurrent first-create
+			// race reporting a MISS here is harmless: the bool is informational.)
+			return CacheVolumeResult{Name: candidate, Hit: false}, nil
+		}
+		if attempt >= maxCacheReconcileAttempts {
+			return CacheVolumeResult{}, fmt.Errorf("cache slot %q and %d deterministic alternates are each occupied by a volume that is not our validated cache; refusing to delete any of them (ADR-003 never-delete-unprovable) and failing this allocation so GARM retries: %w", preferredName, attempt-1, verr)
+		}
+		// The slot is occupied by a volume we cannot prove is ours. Leave it
+		// UNTOUCHED and reconcile to a deterministic alternate (B2/B3).
+		log.Printf("garm-provider-docker: cache slot %q is occupied by a volume that is not our validated cache (%v); reconciling to an alternate name rather than deleting it (ADR-003 label-as-identity)", candidate, verr)
+		next := spec.AlternateCacheVolumeName(preferredName, attempt)
+		if err := spec.ValidateDerivedName("reconciled cache volume", next); err != nil {
+			return CacheVolumeResult{}, fmt.Errorf("cache reconcile for %q could not derive a valid alternate name: %w", preferredName, err)
+		}
+		candidate = next
 	}
-	if err := spec.ValidateAdoptedCacheVolume(name, created.Labels, labels); err != nil {
-		return CacheVolumeResult{}, err
-	}
-	return CacheVolumeResult{Name: name, Hit: existed}, nil
 }
 
-// cacheVolumeExists reports whether a cache volume named `name` already exists
-// for this controller. It filters on managed=true + this controller-id +
-// cache=true, so it only ever inspects THIS provider's own cache volumes — never
-// a foreign or job-scoped volume — and then matches the exact name.
-func (m *Manager) cacheVolumeExists(ctx context.Context, name string) (bool, error) {
-	list, err := m.cli.VolumeList(ctx, volume.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("label", spec.LabelManaged+"=true"),
-			filters.Arg("label", spec.LabelControllerID+"="+m.controllerID),
-			filters.Arg("label", spec.LabelCache+"=true"),
-		),
-	})
+// discoverCacheByIdentity finds a cache volume carrying our FULL identity
+// (ADR-003 label-as-identity), regardless of the NAME it lives under — so a cache
+// a prior allocation reconciled onto an alternate name is still found and reused.
+// It lists by the identity label filter (spec.CacheIdentityFilter) and
+// re-validates each candidate with spec.ValidateAdoptedCacheVolume, returning the
+// matching volume's ACTUAL name. When several match (a pathological duplicate from
+// two peers reconciling around the same squatter concurrently), the
+// lexicographically smallest name is chosen — a stable, deterministic pick, and
+// the rare duplicate is harmless (both are valid caches for this identity; one
+// wins going forward). It deliberately does NOT filter on controller-id
+// (cross-controller shared caches are expected — ADR-003 W1/W2).
+func (m *Manager) discoverCacheByIdentity(ctx context.Context, want map[string]string) (string, bool, error) {
+	list, err := m.cli.VolumeList(ctx, volume.ListOptions{Filters: spec.CacheIdentityFilter(want)})
 	if err != nil {
-		return false, fmt.Errorf("failed to list cache volumes to detect a hit for %q: %w", name, err)
+		return "", false, fmt.Errorf("failed to discover cache volume by identity: %w", err)
 	}
+	best := ""
 	for _, v := range list.Volumes {
-		if v != nil && v.Name == name {
-			return true, nil
+		if v == nil {
+			continue
+		}
+		// Defense-in-depth on top of the daemon's filter: only adopt a volume that
+		// passes the exact identity check.
+		if spec.ValidateAdoptedCacheVolume(v.Name, v.Labels, want) != nil {
+			continue
+		}
+		if best == "" || v.Name < best {
+			best = v.Name
 		}
 	}
-	return false, nil
+	return best, best != "", nil
 }

@@ -100,45 +100,154 @@ func TestEnsureCacheVolumeMissThenHit(t *testing.T) {
 	}
 }
 
-// TestEnsureCacheVolumeRejectsForeignSquatter is the M6 fail-closed guard: a
-// FOREIGN volume that already holds the deterministic cache name (no cache
-// labels) must NOT be adopted and mounted as this repo's cache. VolumeCreate is
-// idempotent on a duplicate name and returns the existing (foreign) volume with
-// its ORIGINAL labels, so without validation the provider would silently mount
-// someone else's data (or, for externals, run preexisting content).
-func TestEnsureCacheVolumeRejectsForeignSquatter(t *testing.T) {
+// rawVolumeLabels inspects a volume by name directly (bypassing the cache=true
+// label filter), so a test can assert a FOREIGN/UNLABELED volume the reconcile
+// must PRESERVE is still present with its ORIGINAL labels.
+func rawVolumeLabels(t *testing.T, fake *docker.FakeClient, name string) (map[string]string, bool) {
+	t.Helper()
+	v, err := fake.VolumeInspect(context.Background(), name)
+	if err != nil {
+		return nil, false
+	}
+	return v.Labels, true
+}
+
+// TestEnsureCacheVolumeReconcilesAroundForeignSquatter is the B2 structural guard:
+// a FOREIGN volume squatting the deterministic cache name is NEVER deleted (a
+// Moby auto-created unlabeled volume and a genuinely foreign one are
+// indistinguishable, so name-based deletion can never be foreign-safe) and NEVER
+// wedges creation. EnsureCacheVolume reconciles AROUND it to a deterministic
+// alternate name; the foreign volume is PRESERVED verbatim, our cache is created
+// under the alternate, and — because discovery is by LABEL — the alternate is
+// found and reused on the next allocation.
+func TestEnsureCacheVolumeReconcilesAroundForeignSquatter(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
 	name := spec.ToolcacheVolumeName(testRepoKey, "1")
-	// A foreign volume squats the name with no managed/cache labels.
-	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{"someone": "else"}}); err != nil {
+	foreignLabels := map[string]string{"someone": "else"}
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: foreignLabels}); err != nil {
 		t.Fatalf("seed foreign volume: %v", err)
 	}
 
-	_, err := m.EnsureCacheVolume(ctx, name, cacheIdentity().ToolcacheLabels("1", time.Now()))
-	if err == nil {
-		t.Fatal("EnsureCacheVolume adopted a foreign volume squatting the cache name, want a fail-closed error")
+	want := cacheIdentity().ToolcacheLabels("1", time.Now())
+	res, err := m.EnsureCacheVolume(ctx, name, want)
+	if err != nil {
+		t.Fatalf("EnsureCacheVolume must reconcile around a foreign squatter, not error: %v", err)
+	}
+	if res.Name == name {
+		t.Fatalf("EnsureCacheVolume returned the squatted deterministic name %q; want a reconciled alternate", name)
+	}
+	if res.Hit {
+		t.Error("EnsureCacheVolume reported a HIT for a freshly reconciled cache; want a MISS")
+	}
+
+	// The foreign volume is PRESERVED verbatim — never deleted, never adopted.
+	lbls, ok := rawVolumeLabels(t, fake, name)
+	if !ok {
+		t.Fatalf("the foreign volume %q was DELETED — the provider must never delete a volume it cannot prove is ours", name)
+	}
+	if lbls["someone"] != "else" || lbls[spec.LabelCache] == "true" {
+		t.Errorf("the foreign volume %q was mutated/adopted (labels=%v)", name, lbls)
+	}
+
+	// Our cache exists under the ALTERNATE name with our identity.
+	altLabels, ok := cacheVolumeByName(t, fake, res.Name)
+	if !ok {
+		t.Fatalf("our cache was not created under the reconciled name %q", res.Name)
+	}
+	if altLabels[spec.LabelRepo] != testRepoKey {
+		t.Errorf("reconciled cache lost its identity: %v", altLabels)
+	}
+
+	// Discovery-by-label finds the alternate on the next allocation → HIT, same name.
+	res2, err := m.EnsureCacheVolume(ctx, name, cacheIdentity().ToolcacheLabels("1", time.Now()))
+	if err != nil {
+		t.Fatalf("second EnsureCacheVolume errored: %v", err)
+	}
+	if !res2.Hit {
+		t.Error("second EnsureCacheVolume did not report a HIT; the reconciled cache was not discovered by label")
+	}
+	if res2.Name != res.Name {
+		t.Errorf("second EnsureCacheVolume returned %q, want the reconciled %q (label discovery must be name-stable)", res2.Name, res.Name)
 	}
 }
 
-// TestEnsureCacheVolumeRejectsRepokeyCollision is the L7 guard: a DIFFERENT
-// repository whose cache volume collided on the (truncated) repokey — same name,
-// same managed+cache markers, but a DIFFERENT full repo-url-digest — must be
-// rejected, so one repo never adopts another's cache.
-func TestEnsureCacheVolumeRejectsRepokeyCollision(t *testing.T) {
+// TestEnsureCacheVolumeReconcilesAroundRepokeyCollision is the L7-as-reconcile
+// case: a DIFFERENT repository whose cache collided on the truncated repokey (same
+// name and managed+cache markers, but a DIFFERENT full repo-url-digest) is NEVER
+// adopted (one repo must not mount another's cache) and NEVER deleted — the
+// provider reconciles around it to an alternate name, and the colliding cache is
+// preserved.
+func TestEnsureCacheVolumeReconcilesAroundRepokeyCollision(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
 	name := spec.ToolcacheVolumeName(testRepoKey, "1")
 	other := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "digest-of-a-DIFFERENT-repo"}
-	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: other.ToolcacheLabels("1", time.Now())}); err != nil {
+	otherLabels := other.ToolcacheLabels("1", time.Now())
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: otherLabels}); err != nil {
 		t.Fatalf("seed colliding cache volume: %v", err)
 	}
 
 	ours := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "digest-of-OUR-repo"}
-	if _, err := m.EnsureCacheVolume(ctx, name, ours.ToolcacheLabels("1", time.Now())); err == nil {
-		t.Fatal("EnsureCacheVolume adopted a repokey-colliding foreign repo's cache, want a fail-closed error")
+	res, err := m.EnsureCacheVolume(ctx, name, ours.ToolcacheLabels("1", time.Now()))
+	if err != nil {
+		t.Fatalf("EnsureCacheVolume must reconcile around a repokey collision, not error: %v", err)
+	}
+	if res.Name == name {
+		t.Fatalf("EnsureCacheVolume adopted the colliding name %q; want a reconciled alternate", name)
+	}
+
+	// The colliding repo's cache is PRESERVED with its own digest.
+	lbls, ok := rawVolumeLabels(t, fake, name)
+	if !ok {
+		t.Fatalf("the colliding cache %q was deleted — never delete another repo's cache", name)
+	}
+	if lbls[spec.LabelRepoURLDigest] != "digest-of-a-DIFFERENT-repo" {
+		t.Errorf("the colliding cache %q was mutated (labels=%v)", name, lbls)
+	}
+
+	// Our cache under the alternate carries OUR digest.
+	altLabels, ok := cacheVolumeByName(t, fake, res.Name)
+	if !ok {
+		t.Fatalf("our cache was not created under the reconciled name %q", res.Name)
+	}
+	if altLabels[spec.LabelRepoURLDigest] != "digest-of-OUR-repo" {
+		t.Errorf("reconciled cache carries the wrong digest: %v", altLabels)
+	}
+}
+
+// TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge is the B3 no-wedge guard: an
+// UNLABELED volume holding the deterministic name (e.g. a Moby auto-created
+// replacement left behind by an evict/create race) must NOT permanently block
+// creation the way the old M6 adoption guard did (which rejected the name
+// forever). EnsureCacheVolume reconciles around it, so a subsequent create for the
+// same identity succeeds — no wedge — while the unlabeled volume is left as
+// (logged) cruft, never deleted.
+func TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{}}); err != nil {
+		t.Fatalf("seed unlabeled volume: %v", err)
+	}
+
+	res, err := m.EnsureCacheVolume(ctx, name, cacheIdentity().ToolcacheLabels("1", time.Now()))
+	if err != nil {
+		t.Fatalf("[B3] an unlabeled deterministic-named volume WEDGED creation: %v", err)
+	}
+	if res.Name == name {
+		t.Fatalf("[B3] EnsureCacheVolume adopted the unlabeled squatter %q instead of reconciling", name)
+	}
+	// The unlabeled volume is left as cruft (not deleted).
+	if _, ok := rawVolumeLabels(t, fake, name); !ok {
+		t.Errorf("[B3] the unlabeled volume %q was deleted — cruft must be left, not deleted", name)
+	}
+	// A cache for our identity now exists (creation is not wedged).
+	if _, ok := cacheVolumeByName(t, fake, res.Name); !ok {
+		t.Errorf("[B3] no cache was created after reconciling around the unlabeled squatter")
 	}
 }
 

@@ -4,8 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types/filters"
 )
 
 // This file holds ADR-003's persistent-cache pure functions (M2-W1): the
@@ -245,11 +248,79 @@ func ValidateAdoptedCacheVolume(name string, got, want map[string]string) error 
 	return nil
 }
 
+// CacheIdentityFilter builds the Docker label filter that discovers a cache
+// volume by its IDENTITY, the load-bearing primitive of ADR-003's structural
+// redesign (2026-07-22): a cache's identity is its LABEL SET, not its name. It
+// selects managed=true + cache=true plus every identity-discriminating label
+// present in `want` (cacheIdentityLabelKeys — cache-kind, repo, repo-url-digest,
+// image-digest, generation, pnpm-major). Because Docker ANDs multiple same-key
+// "label" filters (MatchKVList), a volume matches only if it carries our FULL
+// identity — so discovery finds OUR cache under WHATEVER name it lives at
+// (including an alternate a prior reconcile chose), never a foreign or
+// wrong-identity volume.
+//
+// It deliberately OMITS controller-id and last-used: cache volumes are shared
+// across controllers (ADR-003 W1/W2), so a peer controller's id and a different
+// creation timestamp are EXPECTED on a legitimate shared reuse; keying discovery
+// on either would miss a legitimately shared cache. The caller
+// (topology.EnsureCacheVolume) still re-validates each returned volume with
+// ValidateAdoptedCacheVolume, defense-in-depth against the daemon's filter.
+func CacheIdentityFilter(want map[string]string) filters.Args {
+	f := filters.NewArgs(
+		filters.Arg("label", LabelManaged+"=true"),
+		filters.Arg("label", LabelCache+"=true"),
+	)
+	for _, k := range cacheIdentityLabelKeys {
+		if v := want[k]; v != "" {
+			f.Add("label", k+"="+v)
+		}
+	}
+	return f
+}
+
+// cacheReconcileSuffixLen is the hex length of the deterministic,
+// collision-avoiding suffix AlternateCacheVolumeName appends. 8 hex = 32 bits,
+// ample to route around a handful of squatters on one host while keeping the
+// reconciled name well within Docker's 255-byte resource-name limit.
+const cacheReconcileSuffixLen = 8
+
+// AlternateCacheVolumeName derives a DETERMINISTIC, collision-avoiding alternate
+// name for a cache volume whose preferred deterministic slot is occupied by a
+// volume that is NOT our validated cache (a foreign, unlabeled, or wrong-identity
+// squatter). It implements ADR-003's never-delete-unprovable rule: rather than
+// delete the squatter (a Moby auto-created unlabeled volume and a genuinely
+// foreign volume are INDISTINGUISHABLE, so name-based deletion can never be
+// foreign-safe — B2) or wedge forever on the occupied name (B3), the provider
+// routes AROUND the squatter to this alternate. Because cache discovery is by
+// LABEL (CacheIdentityFilter), a volume created under the alternate is still
+// found and reused on the next allocation.
+//
+// The suffix is sha256(preferred + ":" + attempt) truncated:
+//   - DETERMINISTIC — the same preferred+attempt always yields the same
+//     alternate, so two provider processes reconciling around the same squatter
+//     converge on ONE shared slot rather than fragmenting the cache;
+//   - COLLISION-AVOIDING — a later attempt yields a different slot when an
+//     alternate is ALSO squatted (EnsureCacheVolume re-checks each the same way);
+//   - Docker-name-safe — [a-z0-9-] only. attempt is 1-based.
+func AlternateCacheVolumeName(preferred string, attempt int) string {
+	sum := sha256.Sum256([]byte(preferred + ":" + strconv.Itoa(attempt)))
+	return preferred + "-x" + hex.EncodeToString(sum[:])[:cacheReconcileSuffixLen]
+}
+
 // cacheVolumeNamePrefix is the shared prefix for every cache volume, so a
 // label-blind operator can still spot cache volumes by name (`docker volume ls`
 // | grep garm-cache-). ADR-003's authoritative selector is still the label set,
 // not the name.
 const cacheVolumeNamePrefix = "garm-cache-"
+
+// HasCacheVolumeNamePrefix reports whether name carries this provider's cache
+// volume name prefix (garm-cache-). The GC's cruft-visibility log uses it to spot
+// unlabeled/foreign volumes squatting a cache-shaped name that the provider will
+// NOT delete (ADR-003 never-delete-unprovable) but surfaces for operator
+// awareness. It is a NAME heuristic only; ownership is always decided by labels.
+func HasCacheVolumeNamePrefix(name string) bool {
+	return strings.HasPrefix(name, cacheVolumeNamePrefix)
+}
 
 // CacheKind names the persistent cache kinds this provider provisions
 // (ADR-003). Toolcache and pnpm are repo-scoped (M2-W1); externals is
