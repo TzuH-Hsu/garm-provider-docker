@@ -1,0 +1,129 @@
+# M3-W2: the first CI workflow for this repository. Kept minimal and
+# comment-heavy on purpose — see plan.md §3 M3, item 2.
+#
+# The `build` job is the required gate for every push/PR: go build, go vet,
+# gofmt, and `go test ./... -race` (unit tests only — the internal/verify
+# package's live-daemon scenarios are gated behind the `dockerverify` build
+# tag, so a plain `go test ./...` never compiles or runs them; see that
+# package's own doc comment). shellcheck runs against the repo's shell
+# scripts last.
+#
+# The `dockerverify` job is OPTIONAL and manual-only (workflow_dispatch) —
+# see its own comment below for why it is not part of the required gate.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel a superseded run on the same ref so a rapid string of pushes to one
+# PR doesn't queue up redundant CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build, vet, fmt, unit tests, shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1 # v7.0.1
+
+      # go.mod is this repo's single source of truth for the Go version; CI
+      # must never drift from it by hardcoding a version here.
+      - name: Read Go version from go.mod
+        id: goversion
+        run: echo "version=$(grep -m1 '^go ' go.mod | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0 # v7.0.0
+        with:
+          go-version: ${{ steps.goversion.outputs.version }}
+
+      - name: go build ./...
+        run: go build ./...
+
+      - name: go vet ./...
+        run: go vet ./...
+
+      - name: gofmt -l (fail if any file is unformatted)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      # Unit tests only. The dockerverify-tagged live-daemon suite
+      # (internal/verify) is NOT compiled or run by this command — it is
+      # gated behind `-tags dockerverify` specifically so a plain `go test
+      # ./...` (what this step runs) never needs a Docker daemon.
+      - name: go test ./... -race (unit)
+        run: go test ./... -race -count=1
+
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
+
+      - name: shellcheck
+        run: shellcheck runner-images/noble/entrypoint.sh scripts/*.sh
+
+  # OPTIONAL, manual-only: the -tags dockerverify live-Docker-daemon
+  # integration suite (internal/verify). Gated behind workflow_dispatch
+  # rather than push/pull_request — NOT part of the required gate — because:
+  #
+  #   1. Several of these scenarios deliberately run for real wall-clock
+  #      minutes rather than mocking the clock (e.g. the credential-timeout
+  #      scenario waits out CreateInstance's own 60s credentialFetchDeadline,
+  #      and the crash-orphan-sweep scenario waits past the orphan sweep's
+  #      ~2-minute exited-runner grace window — see
+  #      internal/verify/verify_m3_scenarios_test.go). That is appropriate for
+  #      a manual/nightly run, not for gating every push/PR.
+  #   2. This suite drives the REAL provider binary against a REAL Docker
+  #      daemon. GitHub's hosted ubuntu-latest runners ship Docker Engine
+  #      pre-installed and already running, so no separate docker:dind
+  #      service container is needed here — the tests exec the provider
+  #      directly against the runner's OWN daemon at
+  #      unix:///var/run/docker.sock (see internal/docker.Client /
+  #      config.DockerHost's default). A docker:dind SERVICE would only be
+  #      needed if this job itself ran inside a container without Docker
+  #      access; the standard GitHub-hosted runner already has it.
+  #   3. This project's own dev/verification daemon is Docker Engine 29.6.1 on
+  #      linux/arm64 (Docker Desktop on Apple silicon); GitHub's hosted
+  #      ubuntu-latest runners are linux/amd64 on whatever Docker Engine
+  #      version ships with that image. Image availability, storage-driver
+  #      defaults, and DinD/sysbox-runc runtime availability are NOT
+  #      guaranteed identical across that gap (docs/research.md §3.C already
+  #      flags DinD storage-driver behavior as host-dependent) — this suite
+  #      has not yet been validated against the GitHub-hosted amd64
+  #      environment, so it is kept manual/advisory rather than a blocking
+  #      gate until it has.
+  dockerverify:
+    name: dockerverify (live-daemon integration suite; manual only)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1 # v7.0.1
+
+      - name: Read Go version from go.mod
+        id: goversion
+        run: echo "version=$(grep -m1 '^go ' go.mod | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0 # v7.0.0
+        with:
+          go-version: ${{ steps.goversion.outputs.version }}
+
+      - name: Verify Docker is reachable
+        run: docker version
+
+      # This job's own timeout-minutes below is the real backstop; -timeout
+      # here just makes `go test` itself fail cleanly with a Go-native
+      # timeout report instead of being hard-killed by the runner.
+      - name: go test -tags dockerverify (live daemon)
+        run: go test -tags dockerverify -v -timeout 25m ./internal/verify/...
+        timeout-minutes: 30
