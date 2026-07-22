@@ -21,8 +21,8 @@ The design rationale behind every major decision below is recorded in `research.
 - `internal/docker` — a narrow, mockable `DockerClient` interface wrapping the moby SDK, so `internal/provider` and `internal/topology` never talk to the SDK directly.
 - `internal/topology` — `createAllocation`, `teardownAllocation`, `sweepOrphans`: the orchestration logic from ADR-001 and ADR-004.
 - `internal/spec` — pure functions: label builders, environment builders, name builders, cache-key derivation (ADR-003), and JIT config plumbing (ADR-002). Kept pure and side-effect-free specifically so they are cheap to table-test.
-- `internal/config` — TOML loading, defaults, and validation (ADR-005).
-- `internal/schema` — the two `go:embed`-ed JSON Schema files (provider config, `extra_specs`) from ADR-005.
+- `internal/config` — TOML loading, defaults, and validation (ADR-005), plus the `go:embed`-ed provider-config JSON Schema (`schema.json`, exposed via `JSONSchema()`).
+- `internal/extraspecs` — the `extra_specs` Go struct, its `go:embed`-ed draft-07 JSON Schema (`schema.json`), fail-closed `gojsonschema` validation, the reserved-env denylist, and `Resolve` against the config ceiling/flavor/memory machinery (ADR-005, M3-W1). The two JSON Schemas from ADR-005 are co-located with the structs they describe (config schema in `internal/config`, extra_specs schema here) rather than in a single `internal/schema` package, to keep each next to its struct and minimize drift.
 - `internal/version` — build-time version metadata injected via `-ldflags`.
 - `runner-images/noble/` — the `Dockerfile` and `entrypoint.sh` for the runner image (ADR-002).
 - `docs/` — this plan, the ADRs, and `research.md`.

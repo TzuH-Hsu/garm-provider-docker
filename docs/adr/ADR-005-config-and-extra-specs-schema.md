@@ -1,6 +1,6 @@
 # ADR-005: Config and extra_specs Schema
 
-Status: Accepted (2026-07-19)
+Status: Accepted (2026-07-19); amended 2026-07-22 (M3-W1 — see Amendment below)
 
 ## Context
 
@@ -87,10 +87,31 @@ TOML keeps this provider consistent with the rest of the `garm` provider ecosyst
 
 ## Open questions
 
-- Whether out-of-range `runner_memory`/`dind_memory` requests from `extra_specs` should be rejected outright or clamped to the configured maximum.
-- Whether `storage_driver` should remain operator-only (config-only) rather than being on the `extra_specs` allowlist at all.
+- ~~Whether out-of-range `runner_memory`/`dind_memory` requests from `extra_specs` should be rejected outright or clamped to the configured maximum.~~ **Resolved (M3-W1, owner ruling): rejected, not clamped** — see the Amendment below.
+- ~~Whether `storage_driver` should remain operator-only (config-only) rather than being on the `extra_specs` allowlist at all.~~ **Resolved (M3-W1): `storage_driver` IS on the `extra_specs` allowlist** (bounded to the `overlay2`/`vfs` enum) — see the Amendment below.
 - The final shape of the `[flavors.*]` map, including whether flavors may inherit from one another.
 - The exact default value of `allowed_dind_modes` (currently all three modes, matching the previously-documented default `dind_mode` behavior) versus a more conservative out-of-the-box ceiling — see ADR-001's Open questions for the same trade-off framed from the residual-risk angle.
 - Whether the reserved-env denylist should be operator-extensible (an allowlist of additional reserved names beyond the fixed provider-contract set) or kept fixed and provider-defined only, as specified above.
 
 See research.md §1 for the `GARM_POOL_EXTRASPECS` environment-variable gap that governs where `extra_specs` must be read from, and §2 for the schema-validation practices of prior-art providers this ADR responds to. See ADR-001 for `dind_mode`/`allowed_dind_modes`/`storage_driver` semantics and the residual-risk framing behind the ceiling, ADR-002 for the flavor-map-only image-selection ruling and the full reserved runner-contract environment names, ADR-003 for the `[cache]` block fields including `allow_org_shared`, and ADR-004 for the `garm.docker/*` managed-label set that `extra_specs` can never touch.
+
+## Amendment (2026-07-22) — M3-W1: extra_specs schema, validation, and v0.1.1 self-description implemented
+
+This Decision is now implemented. The pieces landed in M3-W1:
+
+- **`extra_specs` schema + validation** — `internal/extraspecs` embeds a published draft-07 JSON Schema (`schema.json`, `go:embed`) and validates every `CreateInstance`'s `extra_specs` against it with `xeipuuv/gojsonschema`, **failing closed** on any error, before any Docker operation (so a rejection is a `provider_fault` with zero partial allocation). The accepted allowlist is exactly this ADR's: `flavor`, `dind_mode`, `runner_memory`, `dind_memory`, `storage_driver`, `runner_labels`, `extra_env`. `additionalProperties: false` makes a raw image reference, `docker_host`, and the `privileged` flag **structurally absent** (rejected as unknown keys), not merely denied.
+- **Ceiling/denylist/flavor reuse (not reinvented)** — `extraspecs.Resolve` bounds the payload through the EXISTING config machinery: `dind_mode` through `config.EffectiveDindMode(poolMode)` (this ADR's single ceiling enforcement point, with the pool's requested mode threaded in as `poolMode`, exactly as the Decision mandated); `flavor` through the `[flavors.*]` map + `EffectiveRunnerImage`; memory through `Effective{Runner,Dind}MemoryBytes` as the ceiling. There is no second, parallel ceiling check.
+- **v0.1.1 self-description** — `internal/provider/v011.go` implements all four methods: `GetSupportedInterfaceVersions` → `["v0.1.0", "v0.1.1"]`; `GetConfigJSONSchema` / `GetExtraSpecsJSONSchema` return the two `go:embed`'ed schemas (config schema in `internal/config/schema.json`, exposed via `config.JSONSchema()`); `ValidatePoolInfo` runs the same `Parse`+`Resolve` path a create runs, so a GARM admin's `garm-cli pool update --extra-specs` fails early on exactly what a create would reject. `*Provider` now satisfies `executionv011.ExternalProvider`; the one binary serves v0.1.1 when `GARM_INTERFACE_VERSION=v0.1.1` and v0.1.0 by default (the top-level `execution` dispatch type-asserts against the versioned interface, and a v0.1.1 provider satisfies both).
+
+**Open questions resolved:**
+
+1. **Memory over-range: reject, not clamp (owner ruling).** A `runner_memory`/`dind_memory` request from `extra_specs` that exceeds the effective configured ceiling (flavor-resolved, or the `[resources]` default) is **rejected**, never silently clamped. A request equal to or below the ceiling is accepted; a ceiling of "unset" (unlimited) accepts any finite request. Rejecting is the honest posture — a pool asking for more than the operator allows should hear "no", not be quietly given less than it asked for and behave as if it succeeded.
+2. **`storage_driver` is on the `extra_specs` allowlist**, bounded to the `overlay2`/`vfs` enum by the schema, defaulting to the configured `storage_driver` when omitted.
+
+**Reserved-env denylist — reconciliation (stricter than originally worded).** The Decision above said an `extra_specs` env override that names a reserved key is "dropped (and logged), never silently accepted". M3-W1 implements this as a **fail-closed reject**: a reserved `extra_env` name (any `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*` prefix, or `JIT_CONFIG_ENABLED`/`GITHUB_URL`, matched case-insensitively) causes the whole `extra_specs` to be rejected at parse time, rather than the single key being dropped. This is the more conservative reading and is consistent with the fail-closed stance the rest of validation takes. The "dropped (and logged), provider-injected value wins" behavior the Decision describes now covers the **residual** case: a *non*-reserved but still provider-injected name (e.g. `npm_config_store_dir`, `GARM_DIAG_DIR`) that an `extra_env` entry happens to collide with is dropped in favor of the provider's value at merge time — provider-injected environment always wins.
+
+**Notes for implementers / operators:**
+
+- The **flavor a pool selects is `extra_specs.flavor`**, not `BootstrapInstance.Flavor`; `ValidatePoolInfo` therefore ignores its positional `image`/`flavor` arguments (image selection is named-flavor-only per ADR-002) and validates the `extra_specs` payload. `extra_specs.runner_labels` are appended to the runner label set in **non-JIT** mode only (in JIT mode GARM bakes the label set into the runner config server-side, so they are inert there).
+- The two schemas are **co-located with the structs they describe** (`internal/extraspecs/schema.json`, `internal/config/schema.json`) rather than in a single `internal/schema` package as plan.md §2 sketched, to keep each schema next to its struct and minimize the drift this ADR's Consequences warn about.
+- The published `extra_specs` schema and an operator-facing summary of the allowlist, reserved denylist, and ceiling live in [docs/config-reference.md](../config-reference.md).
