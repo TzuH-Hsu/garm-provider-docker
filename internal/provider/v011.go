@@ -46,8 +46,9 @@ func (p *Provider) GetExtraSpecsJSONSchema(_ context.Context) (string, error) {
 }
 
 // ValidatePoolInfo validates a pool's extra_specs against the schema AND the
-// live config's ceiling/denylist/flavor rules, returning nil on success and a
-// descriptive error otherwise — the same Parse+Resolve path CreateInstance runs,
+// live config's ceiling/allowlist/flavor rules (the extra_env operator allowlist
+// and hard-reserved set included), returning nil on success and a descriptive
+// error otherwise — the same Parse+Resolve path CreateInstance runs,
 // so what this accepts is exactly what a create would accept (and what it
 // rejects, a create would reject before any Docker op).
 //

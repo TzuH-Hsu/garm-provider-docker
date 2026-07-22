@@ -223,8 +223,9 @@ func Parse(raw json.RawMessage) (ExtraSpecs, error) {
 
 // Resolved is the outcome of bounding an ExtraSpecs against the live provider
 // config: the concrete values CreateInstance provisions with. Every field has
-// already been ceiling/flavor/denylist checked, so the provider can consume it
-// directly without re-validating.
+// already been ceiling/flavor/allowlist checked (and, in Parse, charset- and
+// hard-reserved checked), so the provider can consume it directly without
+// re-validating.
 type Resolved struct {
 	// Flavor is the validated flavor name ("" = config default), threaded into
 	// config.Effective* so the flavor's own image/memory overrides apply.
