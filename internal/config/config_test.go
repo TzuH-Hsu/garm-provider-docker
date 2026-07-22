@@ -1,8 +1,31 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 )
+
+// TestJSONSchemaIsValidDraft07 asserts the embedded provider-config schema
+// (returned by the v0.1.1 GetConfigJSONSchema command) is valid, parseable JSON
+// declaring draft-07 and describing the top-level config keys.
+func TestJSONSchemaIsValidDraft07(t *testing.T) {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(JSONSchema()), &m); err != nil {
+		t.Fatalf("JSONSchema() is not valid JSON: %v", err)
+	}
+	if m["$schema"] != "http://json-schema.org/draft-07/schema#" {
+		t.Errorf("config schema is not draft-07: $schema=%v", m["$schema"])
+	}
+	props, ok := m["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("config schema has no properties object")
+	}
+	for _, want := range []string{"docker_host", "runner_image", "dind_mode", "allowed_dind_modes", "storage_driver", "resources", "network", "flavors", "cache"} {
+		if _, ok := props[want]; !ok {
+			t.Errorf("config schema is missing property %q", want)
+		}
+	}
+}
 
 func TestLoad(t *testing.T) {
 	tests := []struct {

@@ -11,31 +11,6 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// resolveDindMode returns the DinD mode CreateInstance provisions for this
-// allocation, and ERRORS if it falls outside the operator's
-// allowed_dind_modes ceiling (ADR-001 F7). config.Load's Validate already
-// enforces this for the config file's own dind_mode default at load time,
-// but CreateInstance calls config.Config.EffectiveDindMode here too,
-// defensively, so a misconfiguration fails closed with a clear message even
-// for a Config that reached this provider without going through Load/Validate
-// (e.g. a hand-built one) — this is the ceiling's single enforcement point on
-// the create path.
-//
-// Per-pool extra_specs mode selection (ADR-005 — a pool requesting a narrower
-// mode within allowed_dind_modes) is deferred to M3's extra_specs schema
-// validation, exactly like flavor selection is (config.Config.Effective*
-// take a flavorName WP3 does not yet thread through either). Until then every
-// pool on this host uses the config default (EffectiveDindMode("")); wiring
-// a pool's requested mode in later is a one-argument change here, and it
-// will be bounded by the SAME ceiling check this method already performs.
-func (p *Provider) resolveDindMode() (string, error) {
-	mode, err := p.cfg.EffectiveDindMode("")
-	if err != nil {
-		return "", fmt.Errorf("cannot resolve dind_mode for this allocation: %w", err)
-	}
-	return mode, nil
-}
-
 // startDindSidecar pulls the dind image if missing, then builds, creates, and
 // starts the DinD sidecar for this allocation (ADR-001), returning its
 // container ID. It is called ONLY in DinD modes (dindMode != "none").
@@ -48,7 +23,12 @@ func (p *Provider) resolveDindMode() (string, error) {
 // later failure. Its Privileged/Runtime pair comes from
 // spec.DindRuntimeSelection — Privileged=true for privileged-sidecar — so
 // WP4's sysbox-runc support is a thin flip with no change here.
-func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode string, createdAt time.Time) (string, error) {
+//
+// storageDriver and dindMemoryBytes are the extra_specs-resolved values
+// (resolved.StorageDriver / resolved.DindMemoryBytes): the pool's overrides
+// bounded against the operator's config (storage_driver enum, dind_memory
+// ceiling), or the config defaults when extra_specs sets neither.
+func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode, storageDriver string, dindMemoryBytes int64, createdAt time.Time) (string, error) {
 	instanceName := identity.InstanceName
 
 	privileged, runtime, err := spec.DindRuntimeSelection(dindMode)
@@ -64,19 +44,14 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		return "", err
 	}
 
-	memoryBytes, err := p.cfg.EffectiveDindMemoryBytes("")
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve DinD memory limit for %q: %w", instanceName, err)
-	}
-
 	labels := identity.DindContainerLabels(createdAt)
 	labels[spec.LabelCreateNonce] = nonce
 
 	cfg, hostCfg := spec.BuildDindContainer(spec.DindContainerSpec{
 		Image:               dindImage,
 		Labels:              labels,
-		MemoryBytes:         memoryBytes,
-		StorageDriver:       p.cfg.StorageDriver,
+		MemoryBytes:         dindMemoryBytes,
+		StorageDriver:       storageDriver,
 		Privileged:          privileged,
 		Runtime:             runtime,
 		NetworkName:         spec.JobNetworkName(instanceName),

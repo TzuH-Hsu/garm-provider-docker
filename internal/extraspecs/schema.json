@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/TzuH-Hsu/garm-provider-docker/schemas/extra_specs.json",
+  "title": "garm-provider-docker extra_specs",
+  "description": "The pool/scale-set extra_specs contract for garm-provider-docker (ADR-005). extra_specs is the GARM-admin trust tier: narrower and more dynamic than the operator's provider config, and read from the stdin BootstrapInstance.extra_specs field (never GARM_POOL_EXTRASPECS, which is empty for scale sets). Only the fields below are accepted; any other property is rejected (additionalProperties:false), which is what structurally keeps a raw image reference, docker_host, the privileged flag, or a managed Docker label out of this channel. Every accepted field is further bounded at CreateInstance time against the live provider config: dind_mode by allowed_dind_modes, runner_memory/dind_memory by the configured ceiling (rejected, not clamped, if exceeded), and flavor by the [flavors.*] map. extra_env may never name a provider-reserved variable (RUNNER_*, DOCKER_*, JIT_CONFIG_ENABLED, GITHUB_URL, ACTIONS_RUNNER_INPUT_*); provider-injected environment always wins.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "flavor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of a [flavors.<name>] entry in the provider config. This is the ONLY channel that varies the runner image per pool (ADR-002/ADR-005); extra_specs never accepts a raw image reference. An unknown flavor name is rejected at CreateInstance time."
+    },
+    "dind_mode": {
+      "type": "string",
+      "enum": ["none", "privileged-sidecar", "sysbox-runc"],
+      "description": "The Docker-in-Docker mode this pool requests (ADR-001). Bounded by the operator's allowed_dind_modes ceiling: a mode outside that list is rejected, so a pool can select within the operator's allowed set but never escalate beyond it."
+    },
+    "runner_memory": {
+      "type": "string",
+      "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
+      "description": "Runner container memory limit as a human byte size (e.g. \"4GiB\", \"512MiB\", \"2GB\"). Bounded by the effective configured runner_memory: a request exceeding the operator's ceiling is rejected (reject-not-clamp, owner ruling), not silently reduced."
+    },
+    "dind_memory": {
+      "type": "string",
+      "pattern": "^[0-9]+\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
+      "description": "DinD sidecar memory limit as a human byte size. Bounded by the effective configured dind_memory exactly like runner_memory; unused when the effective dind_mode is \"none\"."
+    },
+    "storage_driver": {
+      "type": "string",
+      "enum": ["overlay2", "vfs"],
+      "description": "The explicit --storage-driver dockerd flag for the DinD sidecar (ADR-001). Defaults to the configured storage_driver when omitted."
+    },
+    "runner_labels": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Additional GitHub Actions runner labels, appended to the runner's label set. Takes effect only in non-JIT delivery mode; in JIT mode GARM bakes the label set into the runner config server-side, so these are inert there."
+    },
+    "extra_env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Extra environment variables for the runner container. A name that is provider-reserved (any RUNNER_*, DOCKER_*, ACTIONS_RUNNER_INPUT_* prefix, or JIT_CONFIG_ENABLED / GITHUB_URL) is rejected (F8); a name that merely collides with another provider-injected variable is dropped in favor of the provider's value. Provider-injected environment always wins the merge."
+    }
+  }
+}

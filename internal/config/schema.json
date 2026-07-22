@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/TzuH-Hsu/garm-provider-docker/schemas/config.json",
+  "title": "garm-provider-docker provider config",
+  "description": "The operator-set provider configuration for garm-provider-docker (ADR-005), written as TOML. This schema describes the same structure in JSON form for self-documentation (the v0.1.1 GetConfigJSONSchema command); the on-disk file is TOML and unknown keys are tolerated by the loader. This is the most-trusted trust tier (ADR-001): it strictly outranks pool extra_specs, which can never override docker_host, the privileged flag (derived from dind_mode only), a raw image reference, or a managed label.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "docker_host": {
+      "type": "string",
+      "description": "Address of the Docker daemon this provider manages allocations on. Defaults to unix:///var/run/docker.sock. Never overridable from extra_specs."
+    },
+    "runner_image": {
+      "type": "string",
+      "description": "Runner image reference, required, digest-pinned (name@sha256:<64-hex>) unless allow_unpinned_runner_image is set. A named flavor may override it per pool; no extra_specs field accepts a raw image."
+    },
+    "allow_unpinned_runner_image": {
+      "type": "boolean",
+      "description": "Dev-only escape hatch: allow a tag-only runner_image. Never set in a real deployment."
+    },
+    "dind_mode": {
+      "type": "string",
+      "enum": ["none", "privileged-sidecar", "sysbox-runc"],
+      "description": "Operator default DinD mode (ADR-001). Defaults to \"none\" (DinD off unless the operator opts in). A pool's extra_specs.dind_mode may select within allowed_dind_modes but never beyond it."
+    },
+    "allowed_dind_modes": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["none", "privileged-sidecar", "sysbox-runc"] },
+      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to all three. Set to [\"none\"] to forbid privileged workloads on this host outright. dind_mode must be a member."
+    },
+    "dind_image": {
+      "type": "string",
+      "description": "DinD sidecar image reference, digest-pinned like runner_image. Required when dind_mode != \"none\". Config-only; never varied by flavor or extra_specs."
+    },
+    "allow_unpinned_dind_image": {
+      "type": "boolean",
+      "description": "Dev-only escape hatch for dind_image, independent of allow_unpinned_runner_image."
+    },
+    "storage_driver": {
+      "type": "string",
+      "enum": ["overlay2", "vfs"],
+      "description": "Explicit --storage-driver for the DinD sidecar's dockerd (ADR-001). Defaults to overlay2; vfs is the slower, more compatible fallback. A pool may override within this enum via extra_specs.storage_driver."
+    },
+    "enable_runner_callbacks": {
+      "type": "boolean",
+      "description": "Whether the runner may reach GARM's callback endpoint (ADR-002 F10). Defaults to false."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Container memory limits. No cpu or pids limits by design (ADR-005).",
+      "properties": {
+        "runner_memory": { "type": "string", "description": "Runner memory ceiling as a human byte size (e.g. \"8GiB\"). Empty means unlimited. Bounds extra_specs.runner_memory." },
+        "dind_memory": { "type": "string", "description": "DinD sidecar memory ceiling. Bounds extra_specs.dind_memory." }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-job bridge network behavior (ADR-001). Config-only, never an extra_specs channel.",
+      "properties": {
+        "enable_job_network": { "type": "boolean", "description": "Reserved; the isolated per-job network is always created. Defaults to true." },
+        "internal": { "type": "boolean", "description": "Docker's internal flag on each per-job network. Defaults to false (2026-07-21 owner ruling): the runner needs egress to reach GitHub and DinD needs it for registry pulls. Job-to-job isolation comes from each allocation's own separate network, not this flag." }
+      }
+    },
+    "flavors": {
+      "type": "object",
+      "description": "Named [flavors.<name>] entries. A flavor is selected per pool by name via extra_specs.flavor and is the ONLY channel that varies the runner image (ADR-002).",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "runner_memory": { "type": "string", "description": "Per-flavor runner memory ceiling override." },
+          "dind_memory": { "type": "string", "description": "Per-flavor dind memory ceiling override." },
+          "runner_image": { "type": "string", "description": "Per-flavor runner image override, digest-pinned under the same rule as top-level runner_image." }
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Persistent, repo-scoped toolcache/pnpm caches (ADR-003).",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "generation": { "type": "string" },
+        "pnpm_major": { "type": "string" },
+        "toolcache_path": { "type": "string" },
+        "pnpm_store_path": { "type": "string" },
+        "allow_org_shared": { "type": "boolean" },
+        "stale_cache_eviction_days": { "type": "integer" },
+        "diagnostic_log_retention_days": { "type": "integer" }
+      }
+    }
+  }
+}

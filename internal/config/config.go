@@ -23,9 +23,13 @@ const defaultDockerHost = "unix:///var/run/docker.sock"
 // file may carry keys from a newer or older provider version without a
 // parse error.
 //
-// TODO(M3): switch to strict/schema-validated parsing against ADR-005's
-// go:embed'ed JSON Schema, and add the extra_specs reserved-env denylist,
-// once that milestone lands.
+// A published, go:embed'ed JSON Schema for this config is exposed for
+// self-documentation via JSONSchema() (schema.go / schema.json), returned by
+// the v0.1.1 GetConfigJSONSchema command (M3-W1). The loader still tolerates
+// unknown TOML keys and does not validate the file against that schema. The
+// extra_specs reserved-env denylist and schema validation landed in M3-W1 too,
+// but live in package internal/extraspecs (the extra_specs trust tier), not
+// here — this struct is the operator-config tier.
 type Config struct {
 	// DockerHost is the address of the Docker daemon this provider talks
 	// to. Defaults to the local Unix socket when omitted or empty.

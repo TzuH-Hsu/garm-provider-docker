@@ -31,60 +31,6 @@ func TestNewRejectsEmptyOrMalformedCeiling(t *testing.T) {
 	}
 }
 
-// TestResolveDindModeWithinCeiling confirms resolveDindMode passes through
-// the config's dind_mode unchanged when it is within allowed_dind_modes —
-// the ordinary case (config.Load's own Validate already guarantees this for
-// every Config that went through Load).
-func TestResolveDindModeWithinCeiling(t *testing.T) {
-	fake := docker.NewFakeClient()
-	cfg := config.Config{
-		DindMode:         config.DindModePrivilegedSidecar,
-		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
-	}
-	p, err := New(fake, cfg, "controller-abc")
-	if err != nil {
-		t.Fatalf("New returned unexpected error: %v", err)
-	}
-
-	got, err := p.resolveDindMode()
-	if err != nil {
-		t.Fatalf("resolveDindMode() returned unexpected error: %v", err)
-	}
-	if got != config.DindModePrivilegedSidecar {
-		t.Errorf("resolveDindMode() = %q, want %q", got, config.DindModePrivilegedSidecar)
-	}
-}
-
-// TestResolveDindModeOutsideCeilingErrors is the provider-level counterpart
-// to config.TestConfigEffectiveDindMode: a Config whose dind_mode falls
-// outside its own allowed_dind_modes (ADR-001 F7) — the kind of
-// misconfiguration Validate would already reject at Load time, but which
-// this method re-checks defensively for any Config that reaches the
-// provider without going through Load/Validate — must fail closed with a
-// clear, non-nil error naming the mode.
-func TestResolveDindModeOutsideCeilingErrors(t *testing.T) {
-	fake := docker.NewFakeClient()
-	cfg := config.Config{
-		DindMode:         config.DindModePrivilegedSidecar,
-		AllowedDindModes: []string{config.DindModeNone}, // ceiling excludes DindMode
-	}
-	// The ceiling is well-formed (non-empty, valid entries), so construction
-	// succeeds; the DindMode-outside-ceiling violation is caught on the create
-	// path by resolveDindMode, not at construction (F10 keeps that split).
-	p, err := New(fake, cfg, "controller-abc")
-	if err != nil {
-		t.Fatalf("New returned unexpected error: %v", err)
-	}
-
-	_, err = p.resolveDindMode()
-	if err == nil {
-		t.Fatal("resolveDindMode() succeeded, want an error (dind_mode outside allowed_dind_modes)")
-	}
-	if !strings.Contains(err.Error(), config.DindModePrivilegedSidecar) {
-		t.Errorf("resolveDindMode() error = %q, want it to name the rejected mode %q", err.Error(), config.DindModePrivilegedSidecar)
-	}
-}
-
 // TestCreateInstanceFailsClosedWhenDindModeOutsideCeiling drives the ceiling
 // violation through the real CreateInstance path (not just resolveDindMode
 // in isolation): a constructed Config whose dind_mode falls outside its own

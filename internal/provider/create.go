@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/extraspecs"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/metadata"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -96,14 +98,28 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, err
 	}
 
-	// Resolve dind_mode before ANY Docker operation too (ADR-001 F7): a
-	// misconfiguration that would escalate past the operator's
-	// allowed_dind_modes ceiling must fail closed with a clear message, not
-	// after a network/volume has already been created for the attempt.
-	dindMode, err := p.resolveDindMode()
+	// Parse, schema-validate, and resolve the pool's extra_specs (ADR-005) —
+	// the GARM-admin trust tier — against this operator's config BEFORE any
+	// Docker operation, so an over-broad, malformed, or escalating payload
+	// (a dind_mode outside allowed_dind_modes, a memory request over the
+	// ceiling, an unknown flavor, a reserved extra_env name) fails closed as a
+	// provider_fault before a network or volume ever exists for the attempt.
+	// extra_specs is read from the STDIN BootstrapInstance.extra_specs field,
+	// NOT GARM_POOL_EXTRASPECS, which is empty for scale sets (research.md §1).
+	specs, err := extraspecs.Parse(bootstrap.ExtraSpecs)
 	if err != nil {
-		return params.ProviderInstance{}, err
+		return params.ProviderInstance{}, fmt.Errorf("invalid extra_specs for %q: %w", instanceName, err)
 	}
+	resolved, err := specs.Resolve(p.cfg)
+	if err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("invalid extra_specs for %q: %w", instanceName, err)
+	}
+	// The effective DinD mode is resolved through config.EffectiveDindMode with
+	// the pool's requested mode threaded in as poolMode (ADR-005's single ceiling
+	// enforcement point, ADR-001 F7): allowed_dind_modes bounds it here, before
+	// any Docker op, without a second parallel check — so a misconfiguration that
+	// would escalate past the operator's ceiling never leaves a partial allocation.
+	dindMode := resolved.DindMode
 
 	// Opportunistic pre-create orphan sweep (ADR-004, F9): CreateInstance is one
 	// of the two host-wide sweep hooks (the other being ListInstances), so it
@@ -230,8 +246,10 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("failed to build credential archive for %q: %w", instanceName, err))
 	}
 
-	// 4. Pull the runner image if missing (image comes from config/flavor).
-	runnerImage := p.cfg.EffectiveRunnerImage("")
+	// 4. Pull the runner image if missing (image comes from config/flavor;
+	// resolved.RunnerImage is EffectiveRunnerImage(extra_specs.flavor) — the
+	// named flavor is the ONLY image-varying channel, ADR-002).
+	runnerImage := resolved.RunnerImage
 	if err := p.ensureImage(ctx, runnerImage); err != nil {
 		return guarded(err)
 	}
@@ -266,7 +284,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	socketVolumeName := ""
 	var dindID string
 	if dindEnabled {
-		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, createdAt)
+		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt)
 		if derr != nil {
 			return guarded(derr)
 		}
@@ -294,15 +312,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	if plan.externalsVolume != "" {
 		externalsSeededMarker = spec.RunnerExternalsSeededMarkerPath
 	}
-	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker)
+	// extra_specs.runner_labels are appended to the runner label set and
+	// extra_specs.extra_env is merged into the container env, both from the
+	// validated/resolved payload (reserved env names already rejected in
+	// extraspecs.Parse; provider-injected env wins any remaining collision).
+	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker, resolved.ExtraRunnerLabels, resolved.ExtraEnv)
 	if err != nil {
 		return guarded(err)
 	}
 
-	memoryBytes, err := p.cfg.EffectiveRunnerMemoryBytes("")
-	if err != nil {
-		return guarded(fmt.Errorf("failed to resolve runner memory limit for %q: %w", instanceName, err))
-	}
+	// resolved.RunnerMemoryBytes is the extra_specs override bounded by the
+	// configured/flavor ceiling (reject-not-clamp), already validated above.
+	memoryBytes := resolved.RunnerMemoryBytes
 
 	cfg, hostCfg := spec.BuildRunnerContainer(spec.RunnerContainerSpec{
 		Image:               runnerImage,
@@ -568,14 +589,25 @@ func validatePlatform(b params.BootstrapInstance) error {
 // persistent diag volume is mounted), becomes GARM_DIAG_DIR so the entrypoint
 // can own the mounted _diag dir before dropping privileges. Any being "" omits
 // its env var.
-func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker string) ([]string, error) {
+// extraRunnerLabels (extra_specs.runner_labels) are appended to the GARM-supplied
+// runner labels; like GARM's own Labels they only feed RUNNER_LABELS, which
+// spec.BuildRunnerEnv emits in NON-JIT mode only (in JIT mode GARM bakes the
+// label set into the runner config server-side), so they are inert in JIT mode
+// by construction — documented on the schema field. extraEnv (extra_specs.extra_env)
+// is merged AFTER the provider's own env with provider-injected values winning any
+// collision (mergeExtraEnv); reserved names were already rejected in extraspecs.Parse.
+func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker string, extraRunnerLabels []string, extraEnv map[string]string) ([]string, error) {
+	labels := b.Labels
+	if len(extraRunnerLabels) > 0 {
+		labels = append(append([]string{}, b.Labels...), extraRunnerLabels...)
+	}
 	opts := spec.RunnerEnvOptions{
 		JITConfigEnabled: b.JitConfigEnabled,
 		GitHubURL:        githubBaseURL(b.RepoURL),
 		RunnerWorkDir:    spec.RunnerWorkDir,
 		RunnerName:       b.Name,
 		RunnerGroup:      b.GitHubRunnerGroup,
-		Labels:           b.Labels,
+		Labels:           labels,
 		DockerHost:       dockerHost,
 		ToolCacheDir:     toolCacheDir,
 		PnpmStoreDir:     pnpmStoreDir,
@@ -602,7 +634,40 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 	if externalsSeededMarker != "" {
 		env = append(env, spec.RunnerExternalsSeededMarkerEnv+"="+externalsSeededMarker)
 	}
-	return env, nil
+	// extra_specs.extra_env is merged LAST so provider-injected env always wins.
+	return mergeExtraEnv(env, extraEnv), nil
+}
+
+// mergeExtraEnv appends the pool's extra_specs.extra_env to env, but DROPS (and
+// logs) any key already set by a provider-injected variable — provider-injected
+// environment always wins the merge (ADR-005 F8). Reserved names (RUNNER_*,
+// DOCKER_*, JIT_CONFIG_ENABLED, GITHUB_URL, ACTIONS_RUNNER_INPUT_*) were already
+// hard-rejected in extraspecs.Parse, so a collision here is only a non-reserved
+// but still provider-injected name (e.g. npm_config_store_dir, GARM_DIAG_DIR).
+// Keys are applied in sorted order for a deterministic, testable env.
+func mergeExtraEnv(env []string, extra map[string]string) []string {
+	if len(extra) == 0 {
+		return env
+	}
+	present := make(map[string]bool, len(env))
+	for _, e := range env {
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			present[e[:i]] = true
+		}
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if present[k] {
+			log.Printf("garm-provider-docker: CreateInstance: extra_specs.extra_env %q collides with a provider-injected variable; keeping the provider's value (provider-injected env always wins)", k)
+			continue
+		}
+		env = append(env, k+"="+extra[k])
+	}
+	return env
 }
 
 // githubBaseURL derives the GitHub server base (scheme://host) from a
