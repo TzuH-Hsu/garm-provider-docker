@@ -2,12 +2,9 @@ package topology
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/volume"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
@@ -15,9 +12,21 @@ import (
 )
 
 // gcTime is an arbitrary fixed creation instant for seeded cache volumes; the
-// GC-mechanics tests below decide by NAME, so the exact value is immaterial (the
-// age/supersession decision itself is unit-tested in package spec).
+// log-only GC tests below decide by the repo label, so the exact value is
+// immaterial (the age/supersession decision itself is unit-tested in package spec).
 func gcTime() time.Time { return time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC) }
+
+// fullCacheID returns a COMPLETE cache identity (controller + repokey + full
+// repo-url-digest) so the strict kind-aware validation the log-only enumeration
+// applies accepts the seeded volume as provably ours. The repo-url-digest is
+// derived from a synthetic URL so it is valid 64-hex.
+func fullCacheID(repoKey string) spec.CacheVolumeIdentity {
+	return spec.CacheVolumeIdentity{
+		ControllerID:  testControllerID,
+		RepoKey:       repoKey,
+		RepoURLDigest: spec.RepoURLDigest("https://github.com/garm-topology-test/" + repoKey),
+	}
+}
 
 // seedRawCacheVolume creates a cache volume with an explicit label set, so a GC
 // test can place volumes of any kind/generation/controller directly.
@@ -28,189 +37,135 @@ func seedRawCacheVolume(t *testing.T, fake *docker.FakeClient, name string, labe
 	}
 }
 
-// evictByName returns a decide func that evicts volumes whose repo label is in
-// the given set (each seeded volume gets a unique repo label used as its handle).
-func evictByName(names ...string) func(map[string]string) (bool, string) {
+// evictByRepo returns a decide func that flags volumes whose repo label is in the
+// given set (each seeded volume gets a unique repo label used as its handle).
+func evictByRepo(repoKeys ...string) func(map[string]string) (bool, string) {
 	set := map[string]bool{}
-	for _, n := range names {
+	for _, n := range repoKeys {
 		set[n] = true
 	}
 	return func(labels map[string]string) (bool, string) {
-		return set[labels[spec.LabelRepo]], "test-evict"
+		return set[labels[spec.LabelRepo]], "test-stale"
 	}
 }
 
-// TestEvictCachesRemovesDecidedKeepsOthers: EvictCaches removes exactly the
-// volumes decide selects and leaves the rest.
-func TestEvictCachesRemovesDecidedKeepsOthers(t *testing.T) {
+// failIfVolumeRemoved installs a hook that fails the test if ANY VolumeRemove is
+// issued — the load-bearing NEW-H1 assertion that the log-only eviction path never
+// removes a cache volume.
+func failIfVolumeRemoved(t *testing.T, fake *docker.FakeClient) {
+	t.Helper()
+	fake.VolumeRemoveHook = func(name string) {
+		t.Errorf("VolumeRemove(%q) was called on the log-only eviction path — cache GC must be NON-DESTRUCTIVE (NEW-H1)", name)
+	}
+}
+
+// TestListStaleCachesReturnsDecidedKeepsOthers: ListStaleCaches RETURNS exactly
+// the volumes decide flags stale, LEAVES every volume in place (log-only), and
+// never issues a VolumeRemove.
+func TestListStaleCachesReturnsDecidedKeepsOthers(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
+	failIfVolumeRemoved(t, fake)
 
-	id := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "keep"}
-	victim := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
 	keepName := spec.ToolcacheVolumeName("keep", "1")
-	evictName := spec.ToolcacheVolumeName("evict", "1")
-	seedRawCacheVolume(t, fake, keepName, id.ToolcacheLabels("1", gcTime()))
-	seedRawCacheVolume(t, fake, evictName, victim.ToolcacheLabels("1", gcTime()))
+	staleName := spec.ToolcacheVolumeName("stale", "1")
+	seedRawCacheVolume(t, fake, keepName, fullCacheID("keep").ToolcacheLabels("1", gcTime()))
+	seedRawCacheVolume(t, fake, staleName, fullCacheID("stale").ToolcacheLabels("1", gcTime()))
 
-	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
+	stale, err := m.ListStaleCaches(ctx, evictByRepo("stale"))
 	if err != nil {
-		t.Fatalf("EvictCaches: %v", err)
+		t.Fatalf("ListStaleCaches: %v", err)
 	}
-	if len(evicted) != 1 || evicted[0].Name != evictName {
-		t.Fatalf("evicted = %+v, want just %q", evicted, evictName)
+	if len(stale) != 1 || stale[0].Name != staleName {
+		t.Fatalf("stale = %+v, want just %q", stale, staleName)
 	}
-	if _, ok := cacheVolumeByName(t, fake, evictName); ok {
-		t.Error("the decided-evict volume was not removed")
-	}
-	if _, ok := cacheVolumeByName(t, fake, keepName); !ok {
-		t.Error("a kept volume was removed")
-	}
-}
-
-// TestEvictCachesReInspectsBeforeRemove is the H3 stale-name TOCTOU guard: a
-// volume the label-scoped snapshot flagged for eviction is replaced by a FRESH
-// foreign volume under the SAME name (a remove/recreate) before the physical
-// removal. EvictCaches RE-INSPECTS by name immediately before removing, sees the
-// replacement is not this controller's cache, and skips it — so a freshly created
-// foreign (or new same-repo) volume is never deleted by a stale snapshot.
-func TestEvictCachesReInspectsBeforeRemove(t *testing.T) {
-	m, fake := newManager(t)
-	ctx := context.Background()
-
-	victim := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
-	name := spec.ToolcacheVolumeName("evict", "1")
-	seedRawCacheVolume(t, fake, name, victim.ToolcacheLabels("1", gcTime()))
-
-	// Between the snapshot list and the re-inspect of this candidate, a concurrent
-	// actor removes the stale cache and creates a FRESH foreign volume under the
-	// same name.
-	var once sync.Once
-	fake.VolumeInspectHook = func(n string) {
-		if n != name {
-			return
+	// BOTH volumes must survive — the GC only reports, never removes.
+	for _, n := range []string{keepName, staleName} {
+		if !rawVolumePresent(t, fake, n) {
+			t.Errorf("volume %q was removed by the log-only GC; it must survive", n)
 		}
-		once.Do(func() {
-			if err := fake.VolumeRemove(ctx, name, true); err != nil {
-				t.Errorf("swap remove: %v", err)
-			}
-			if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{"foreign": "yes"}}); err != nil {
-				t.Errorf("swap create: %v", err)
-			}
-		})
-	}
-
-	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
-	if err != nil {
-		t.Fatalf("EvictCaches: %v", err)
-	}
-	if len(evicted) != 0 {
-		t.Errorf("EvictCaches evicted %+v, want none — the snapshot candidate was replaced by a foreign volume before removal", evicted)
-	}
-	// The fresh foreign volume under the same name must SURVIVE (it was never ours).
-	fake.VolumeInspectHook = nil // stop the swap on this final inspect
-	v, err := fake.VolumeInspect(ctx, name)
-	if err != nil {
-		t.Fatalf("the freshly-created foreign volume %q was wrongly deleted by the GC: %v", name, err)
-	}
-	if v.Labels[spec.LabelCache] == "true" {
-		t.Errorf("expected the foreign replacement (no cache label) to survive, got %v", v.Labels)
 	}
 }
 
-// TestEvictCachesReInspectRequiresManaged is the H3(c) full-ownership-tuple guard
-// at the destructive boundary: a snapshot candidate is replaced under the same name
-// by a volume carrying cache=true + this controller-id + a matching repo label but
-// MISSING managed=true — the shape an UNLABELED auto-created replacement that later
-// acquired a stray cache label could take. Re-checking only cache/controller-id
-// would let the eviction decision re-fire and delete it; asserting the FULL
-// ownership tuple (managed AND cache AND controller-id) skips it.
-func TestEvictCachesReInspectRequiresManaged(t *testing.T) {
+// TestListStaleCachesNeverRemovesEvenWhenAllStale: with decide flagging every
+// cache stale, ListStaleCaches STILL removes nothing (no VolumeRemove) and every
+// volume survives — the operator, not the opportunistic GC, does the purge.
+func TestListStaleCachesNeverRemovesEvenWhenAllStale(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
+	failIfVolumeRemoved(t, fake)
 
-	name := spec.ToolcacheVolumeName("evict", "1")
-	victim := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
-	seedRawCacheVolume(t, fake, name, victim.ToolcacheLabels("1", gcTime()))
+	names := []string{
+		spec.ToolcacheVolumeName("a", "1"),
+		spec.ToolcacheVolumeName("b", "1"),
+		spec.ToolcacheVolumeName("c", "1"),
+	}
+	for i, key := range []string{"a", "b", "c"} {
+		seedRawCacheVolume(t, fake, names[i], fullCacheID(key).ToolcacheLabels("1", gcTime()))
+	}
 
-	// Between the snapshot and the re-inspect, the stale cache is replaced by a
-	// same-name volume that carries cache=true + this controller-id + repo=evict
-	// but NO managed=true.
-	var once sync.Once
-	fake.VolumeInspectHook = func(n string) {
-		if n != name {
-			return
+	evictAll := func(map[string]string) (bool, string) { return true, "all-stale" }
+	stale, err := m.ListStaleCaches(ctx, evictAll)
+	if err != nil {
+		t.Fatalf("ListStaleCaches: %v", err)
+	}
+	if len(stale) != len(names) {
+		t.Errorf("stale count = %d, want %d (all flagged)", len(stale), len(names))
+	}
+	for _, n := range names {
+		if !rawVolumePresent(t, fake, n) {
+			t.Errorf("volume %q was removed; the log-only GC must never delete a cache volume", n)
 		}
-		once.Do(func() {
-			if err := fake.VolumeRemove(ctx, name, true); err != nil {
-				t.Errorf("swap remove: %v", err)
-			}
-			if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{
-				spec.LabelCache:        "true",
-				spec.LabelControllerID: testControllerID,
-				spec.LabelRepo:         "evict",
-				// deliberately NO managed=true — the destructive-boundary conjunct
-				// H3(c) adds must be what protects this volume.
-			}}); err != nil {
-				t.Errorf("swap create: %v", err)
-			}
-		})
-	}
-
-	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
-	if err != nil {
-		t.Fatalf("EvictCaches: %v", err)
-	}
-	if len(evicted) != 0 {
-		t.Errorf("EvictCaches evicted %+v, want none — the same-name replacement lacks managed=true", evicted)
-	}
-	fake.VolumeInspectHook = nil // stop the swap on this final inspect
-	if _, err := fake.VolumeInspect(ctx, name); err != nil {
-		t.Fatalf("the unmanaged same-name replacement %q was wrongly deleted at the destructive boundary: %v", name, err)
 	}
 }
 
-// TestEvictCachesSkipsInUse: a cache volume mounted into a container returns a
-// Conflict on removal, which EvictCaches SKIPS (never yanks a warm cache from a
-// live job) without erroring.
-func TestEvictCachesSkipsInUse(t *testing.T) {
+// TestListStaleCachesRequiresFullIdentity: a cache-name volume for this controller
+// that decide WOULD flag stale but is missing a required identity key (no
+// repo-url-digest) is NOT reported — strict kind-aware validation keeps the
+// operator log accurate (never naming a volume that is not provably ours). A
+// complete sibling IS reported.
+func TestListStaleCachesRequiresFullIdentity(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
+	failIfVolumeRemoved(t, fake)
 
-	inUse := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "evict"}
-	name := spec.ToolcacheVolumeName("evict", "1")
-	seedRawCacheVolume(t, fake, name, inUse.ToolcacheLabels("1", gcTime()))
+	// Complete identity → reported.
+	completeName := spec.ToolcacheVolumeName("complete", "1")
+	seedRawCacheVolume(t, fake, completeName, fullCacheID("complete").ToolcacheLabels("1", gcTime()))
 
-	// A container references the cache volume → the fake rejects its removal with
-	// a Conflict ("volume is in use"), modeling a live job holding the cache.
-	if _, err := fake.ContainerCreate(ctx, &container.Config{Image: "runner"},
-		&container.HostConfig{Mounts: []mount.Mount{{Type: mount.TypeVolume, Source: name, Target: "/opt/hostedtoolcache"}}},
-		nil, nil, "live-runner"); err != nil {
-		t.Fatalf("seed in-use container: %v", err)
-	}
+	// Incomplete identity (no repo-url-digest) → skipped even though decide matches.
+	incompleteName := spec.ToolcacheVolumeName("incomplete", "1")
+	seedRawCacheVolume(t, fake, incompleteName, map[string]string{
+		spec.LabelManaged:      "true",
+		spec.LabelControllerID: testControllerID,
+		spec.LabelCache:        "true",
+		spec.LabelCacheKind:    string(spec.CacheKindToolcache),
+		spec.LabelRepo:         "incomplete",
+		spec.LabelGeneration:   "1",
+		spec.LabelLastUsed:     gcTime().Format(time.RFC3339),
+		// deliberately NO repo-url-digest
+	})
 
-	evicted, err := m.EvictCaches(ctx, evictByName("evict"), 0)
+	stale, err := m.ListStaleCaches(ctx, evictByRepo("complete", "incomplete"))
 	if err != nil {
-		t.Fatalf("EvictCaches returned error for an in-use volume, want a best-effort skip: %v", err)
+		t.Fatalf("ListStaleCaches: %v", err)
 	}
-	if len(evicted) != 0 {
-		t.Errorf("evicted = %+v, want none (the volume is in use)", evicted)
-	}
-	if _, ok := cacheVolumeByName(t, fake, name); !ok {
-		t.Error("an in-use cache volume was removed — GC must never yank a warm cache from a live job")
+	if len(stale) != 1 || stale[0].Name != completeName {
+		t.Errorf("stale = %+v, want just the complete-identity volume %q (the incomplete one must be skipped)", stale, completeName)
 	}
 }
 
-// TestEvictCachesNeverTouchesForeignOrNonCache: a foreign-controller cache
+// TestListStaleCachesNeverTouchesForeignOrNonCache: a foreign-controller cache
 // volume and a non-cache (job-scoped) volume are never even listed, so decide is
-// never consulted for them and they are never removed — even when decide would
-// say "evict".
-func TestEvictCachesNeverTouchesForeignOrNonCache(t *testing.T) {
+// never consulted for them and they are never reported — even when decide would
+// flag everything.
+func TestListStaleCachesNeverTouchesForeignOrNonCache(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
+	failIfVolumeRemoved(t, fake)
 
 	// Foreign controller's cache volume (different controller-id label).
-	foreign := spec.CacheVolumeIdentity{ControllerID: "other-controller", RepoKey: "evict"}
+	foreign := spec.CacheVolumeIdentity{ControllerID: "other-controller", RepoKey: "evict", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/evict")}
 	foreignName := spec.ToolcacheVolumeName("evict", "1") + "-foreign"
 	seedRawCacheVolume(t, fake, foreignName, foreign.ToolcacheLabels("1", gcTime()))
 
@@ -219,69 +174,56 @@ func TestEvictCachesNeverTouchesForeignOrNonCache(t *testing.T) {
 	jobVolName := "job-1-abc-workspace"
 	seedRawCacheVolume(t, fake, jobVolName, alloc.WorkspaceVolumeLabels(gcTime()))
 
-	// decide says "evict everything" — the point is these two are never even
-	// passed to it.
 	evictAll := func(map[string]string) (bool, string) { return true, "evict-all" }
-	evicted, err := m.EvictCaches(ctx, evictAll, 0)
+	stale, err := m.ListStaleCaches(ctx, evictAll)
 	if err != nil {
-		t.Fatalf("EvictCaches: %v", err)
+		t.Fatalf("ListStaleCaches: %v", err)
 	}
-	for _, e := range evicted {
-		if e.Name == foreignName || e.Name == jobVolName {
-			t.Errorf("EvictCaches removed a foreign/non-cache volume %q — it must only touch this controller's cache=true volumes", e.Name)
-		}
-	}
-	for _, n := range []string{foreignName, jobVolName} {
-		if !rawVolumePresent(t, fake, n) {
-			t.Errorf("volume %q was removed by GC, must never be", n)
+	for _, s := range stale {
+		if s.Name == foreignName || s.Name == jobVolName {
+			t.Errorf("ListStaleCaches reported a foreign/non-cache volume %q — it must only see this controller's cache=true volumes", s.Name)
 		}
 	}
 }
 
-// TestEvictCachesRespectsCap: maxEvictions bounds a single pass.
-func TestEvictCachesRespectsCap(t *testing.T) {
-	m, fake := newManager(t)
-	ctx := context.Background()
-
-	for _, key := range []string{"a", "b", "c", "d"} {
-		id := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: key}
-		seedRawCacheVolume(t, fake, spec.ToolcacheVolumeName(key, "1"), id.ToolcacheLabels("1", gcTime()))
-	}
-	evictAll := func(map[string]string) (bool, string) { return true, "all" }
-	evicted, err := m.EvictCaches(ctx, evictAll, 2)
-	if err != nil {
-		t.Fatalf("EvictCaches: %v", err)
-	}
-	if len(evicted) != 2 {
-		t.Errorf("evicted %d, want the cap of 2", len(evicted))
-	}
-}
-
-// TestListDiagVolumes returns only the diag-logs cache volumes for this
-// controller.
+// TestListDiagVolumes returns only the COMPLETE diag-logs cache volumes for this
+// controller: a foreign diag volume, a toolcache volume, and an incomplete diag
+// volume (missing repo-url-digest, which the strict enumeration gate rejects) are
+// all excluded.
 func TestListDiagVolumes(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	id := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "repo-a"}
+	id := fullCacheID("repo-a")
 	diagName := spec.DiagVolumeName("repo-a")
 	seedRawCacheVolume(t, fake, diagName, id.DiagLabels(gcTime()))
 	// A toolcache volume (different kind) and a foreign diag volume must be excluded.
 	seedRawCacheVolume(t, fake, spec.ToolcacheVolumeName("repo-a", "1"), id.ToolcacheLabels("1", gcTime()))
-	foreign := spec.CacheVolumeIdentity{ControllerID: "other", RepoKey: "repo-b"}
+	foreign := spec.CacheVolumeIdentity{ControllerID: "other", RepoKey: "repo-b", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/repo-b")}
 	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-b"), foreign.DiagLabels(gcTime()))
+	// An INCOMPLETE diag volume (no repo-url-digest) for this controller — the
+	// strict enumeration gate (NEW-H2) must exclude it so the destructive prune
+	// never even enumerates it.
+	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-incomplete"), map[string]string{
+		spec.LabelManaged:      "true",
+		spec.LabelControllerID: testControllerID,
+		spec.LabelCache:        "true",
+		spec.LabelCacheKind:    string(spec.CacheKindDiagLogs),
+		spec.LabelRepo:         "repo-incomplete",
+		spec.LabelLastUsed:     gcTime().Format(time.RFC3339),
+	})
 
 	refs, err := m.ListDiagVolumes(ctx)
 	if err != nil {
 		t.Fatalf("ListDiagVolumes: %v", err)
 	}
 	if len(refs) != 1 || refs[0].Name != diagName {
-		t.Errorf("ListDiagVolumes = %v, want just %q", refs, diagName)
+		t.Fatalf("ListDiagVolumes = %v, want just %q (foreign, wrong-kind, and incomplete-identity excluded)", refs, diagName)
 	}
 	// The snapshot carries the diag volume's full identity labels for the
 	// provider's pin-then-validate re-check.
-	if refs[0].Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) || refs[0].Labels[spec.LabelRepo] != "repo-a" {
-		t.Errorf("ListDiagVolumes snapshot labels = %v, want cache-kind=diag-logs repo=repo-a", refs[0].Labels)
+	if refs[0].Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) || refs[0].Labels[spec.LabelRepo] != "repo-a" || refs[0].Labels[spec.LabelRepoURLDigest] == "" {
+		t.Errorf("ListDiagVolumes snapshot labels = %v, want a full diag identity (cache-kind, repo, repo-url-digest)", refs[0].Labels)
 	}
 }
 
@@ -294,7 +236,7 @@ func TestListUnprovableCacheCruft(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	id := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "repo-a"}
+	id := fullCacheID("repo-a")
 	oursName := spec.ToolcacheVolumeName("repo-a", "1")
 	seedRawCacheVolume(t, fake, oursName, id.ToolcacheLabels("1", gcTime()))
 

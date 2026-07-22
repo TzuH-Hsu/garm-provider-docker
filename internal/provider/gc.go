@@ -26,9 +26,11 @@ const (
 	// bootstrap timeout, the outer bound on how long a create can be in flight.
 	cacheEvictionGrace = 30 * time.Minute
 
-	// cacheGCMaxEvictions / cacheGCMaxDiagPrunes / helperReapMax bound one GC
-	// pass's removals, prune-helper runs, and leaked-helper reaps respectively.
-	cacheGCMaxEvictions  = 50
+	// cacheGCStaleLogMax / cacheGCMaxDiagPrunes / helperReapMax bound one GC
+	// pass's stale-cache log entries, prune-helper runs, and leaked-helper reaps
+	// respectively. (Cache eviction is non-destructive/log-only — NEW-H1 — so
+	// there is no removal cap; the cap bounds the operator-visibility log line.)
+	cacheGCStaleLogMax   = 50
 	cacheGCMaxDiagPrunes = 20
 	helperReapMax        = 50
 
@@ -66,12 +68,15 @@ const (
 //
 //  1. reaps any leaked cache-helper containers (a prior seed/prune whose provider
 //     process died before its own defer removed it);
-//  2. evicts superseded/aged cache volumes for THIS controller (age since
-//     creation + generation/pnpm-major/image-digest supersession — the immutable
-//     last-used label records creation, so eviction is coarse-but-self-healing;
-//     an in-use cache is skipped, never yanked from a live job);
+//  2. LOGS (never removes — NEW-H1) superseded/aged cache volumes for THIS
+//     controller so an operator can reclaim disk with a deliberate purge. Cache-
+//     volume auto-eviction is non-destructive because Docker has no atomic
+//     label-qualified volume delete, making an opportunistic by-name delete
+//     inherently TOCTOU/foreign-unsafe (see ListStaleCaches / logStaleCaches);
 //  3. prunes each diagnostic-logs volume to its retention window via a
-//     provider-run helper (retention stays OUT of the untrusted runner, F14).
+//     provider-run helper (the one remaining destructive cache action — it
+//     deletes FILES, strict-identity-gated; retention stays OUT of the untrusted
+//     runner, F14).
 func (p *Provider) runCacheGC(ctx context.Context) {
 	p.reapLeakedHelpers(ctx)
 
@@ -96,13 +101,11 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 		return spec.EvaluateCacheEviction(labels, gcCfg, now)
 	}
 
-	evicted, err := p.topo.EvictCaches(ctx, decide, cacheGCMaxEvictions)
+	stale, err := p.topo.ListStaleCaches(ctx, decide)
 	if err != nil {
-		log.Printf("garm-provider-docker: cache GC: eviction pass had errors (continuing): %v", err)
+		log.Printf("garm-provider-docker: cache GC: stale-cache enumeration had errors (continuing): %v", err)
 	}
-	for _, e := range evicted {
-		log.Printf("garm-provider-docker: cache GC: evicted %s (%s)", e.Name, e.Reason)
-	}
+	p.logStaleCaches(stale)
 
 	p.pruneDiagVolumes(ctx, runnerImage)
 
@@ -112,6 +115,33 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 	// delete (a Moby auto-created unlabeled volume and a foreign one are
 	// indistinguishable), so an operator can reclaim genuinely-stale disk manually.
 	p.logUnprovableCacheCruft(ctx)
+}
+
+// logStaleCaches surfaces (best-effort, bounded, in ONE consolidated line) the
+// cache volumes the GC found stale/superseded/aged, so an operator can reclaim
+// disk with a DELIBERATE purge. It removes nothing: ADR-003's cache-volume GC is
+// non-destructive (NEW-H1) because Docker has no atomic label-qualified volume
+// delete, so an opportunistic auto-delete of a volume is inherently TOCTOU and
+// cannot be made foreign-safe. The line names the exact controller-scoped,
+// label-filtered `docker volume prune` an operator can run at a quiet moment —
+// which, being operator-invoked (no concurrent-create race in practice) and
+// operator-accepted, is the sanctioned destructive path opportunistic auto-GC is
+// not. `docker volume prune` itself skips any in-use volume, so a warm cache held
+// by a live job is never reclaimed even by the manual purge.
+func (p *Provider) logStaleCaches(stale []topology.StaleCache) {
+	if len(stale) == 0 {
+		return
+	}
+	shown := stale
+	if len(shown) > cacheGCStaleLogMax {
+		shown = shown[:cacheGCStaleLogMax]
+	}
+	parts := make([]string, 0, len(shown))
+	for _, s := range shown {
+		parts = append(parts, s.Name+" ("+s.Reason+")")
+	}
+	log.Printf("garm-provider-docker: cache GC: %d cache volume(s) are stale/superseded/aged and eligible for operator pruning; NOT auto-deleted (ADR-003: Docker has no atomic label-qualified volume delete, so opportunistic auto-GC of a volume is inherently TOCTOU/foreign-unsafe). Reclaim disk with an explicit, quiescent-moment purge: docker volume prune -a --filter label=%s=true --filter label=%s=%s. Stale caches: %s",
+		len(stale), spec.LabelCache, spec.LabelControllerID, p.controllerID, strings.Join(parts, ", "))
 }
 
 // logUnprovableCacheCruft logs (best-effort, bounded) the cache-named volumes that
@@ -197,18 +227,21 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 	afterCreate := func(vctx context.Context) error {
 		v, err := p.cli.VolumeInspect(vctx, volumeName)
 		if err != nil {
-			// inspect failed → don't know → don't delete, skip closed.
+			// inspect failed → don't know → don't prune, abort closed.
 			return fmt.Errorf("diag prune target %q could not be re-inspected: %w", volumeName, err)
 		}
-		// FULL identity re-check against the snapshot (label identity keys —
-		// cache-kind, repo, repo-url-digest) PLUS this controller-id. A same-name
-		// replacement of a different repo, or a foreign/unlabeled volume, fails here.
-		if verr := spec.ValidateAdoptedCacheVolume(volumeName, v.Labels, ref.Labels); verr != nil || v.Labels[spec.LabelControllerID] != p.controllerID {
-			// Do NOT delete it (never delete an unprovable volume — B2): leave it as
-			// cruft (logged) and skip the prune; the next EnsureCacheVolume reconciles
+		// STRICT kind-aware full-identity re-validation of the PINNED volume before
+		// the destructive `find -delete` (NEW-H2): it must carry the FULL diag-logs
+		// identity (managed+cache+cache-kind=diag-logs+repo+repo-url-digest), be
+		// THIS controller's, and match the enumeration snapshot's repo +
+		// repo-url-digest. A same-name replacement of a DIFFERENT repo, an unlabeled
+		// Moby auto-created volume, or a foreign volume fails here.
+		if verr := spec.ValidateDiagPruneTarget(v.Labels, ref.Labels, p.controllerID); verr != nil {
+			// Do NOT delete/prune it (never touch an unprovable volume — B2): leave
+			// it in place and skip the prune; the next EnsureCacheVolume reconciles
 			// around the slot.
-			log.Printf("garm-provider-docker: cache GC: diag prune target %q is not this controller's snapshot diag volume (a same-name replacement since the snapshot); leaving it in place (ADR-003 never-delete-unprovable) and skipping the prune", volumeName)
-			return fmt.Errorf("diag prune target %q is no longer this controller's diag volume (a same-name replacement since the snapshot)", volumeName)
+			log.Printf("garm-provider-docker: cache GC: diag prune target %q failed strict identity re-validation (%v); leaving it in place (ADR-003 never-delete-unprovable) and skipping the prune", volumeName, verr)
+			return fmt.Errorf("diag prune target %q failed strict identity re-validation: %w", volumeName, verr)
 		}
 		return nil
 	}

@@ -158,6 +158,14 @@ func bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 // stdout and the process exit code (which the provider maps from its error via
 // execution.ResolveErrorToExitCode: duplicate=31, not-found=30).
 func runProvider(t *testing.T, bin, configFile, controllerID, command, instanceID string, b *params.BootstrapInstance) (string, int) {
+	stdout, _, code := runProviderIO(t, bin, configFile, controllerID, command, instanceID, b)
+	return stdout, code
+}
+
+// runProviderIO is runProvider but also returns the provider's STDERR, where its
+// log.Printf lines (e.g. the log-only GC's stale-cache operator-visibility line)
+// go — so a live test can assert on them.
+func runProviderIO(t *testing.T, bin, configFile, controllerID, command, instanceID string, b *params.BootstrapInstance) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(bin)
 	env := append(os.Environ(),
@@ -191,7 +199,7 @@ func runProvider(t *testing.T, bin, configFile, controllerID, command, instanceI
 	}
 	t.Logf("[cmd] GARM_COMMAND=%s GARM_INSTANCE_ID=%q -> exit=%d\n  stdout: %s\n  stderr: %s",
 		command, instanceID, exitCode, strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()))
-	return strings.TrimSpace(stdout.String()), exitCode
+	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), exitCode
 }
 
 func TestVerifyM1WP2Allocation(t *testing.T) {

@@ -2,32 +2,43 @@ package topology
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log"
 
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// This file holds the topology side of ADR-003's opportunistic cache GC (M2-W2):
-// listing this controller's cache volumes and removing the ones a
-// caller-supplied decision evicts, plus enumerating the diagnostic-logs volumes
-// the provider runs its prune helper against. The DECISION (age/supersession)
-// lives in spec.EvaluateCacheEviction — a pure function the provider threads in
-// here — so this layer stays about the label-scoped listing and the in-use-safe
-// removal.
+// This file holds the topology side of ADR-003's opportunistic cache GC (M2-W2),
+// now NON-DESTRUCTIVE for cache volumes (NEW-H1): listing this controller's
+// stale/superseded/aged cache volumes for the provider to LOG (never remove),
+// plus enumerating the diagnostic-logs volumes the provider runs its file-prune
+// helper against (the one remaining destructive cache action — it deletes FILES
+// inside a volume, strict-identity-gated, not the volume itself). The staleness
+// DECISION (age/supersession) lives in spec.EvaluateCacheEviction — a pure
+// function the provider threads in here — so this layer stays about the
+// label-scoped listing and strict-identity validation.
+//
+// Why cache-volume eviction is log-only (NEW-H1): Docker's VolumeRemove is BY
+// NAME with no atomic label-qualified variant, and you cannot pin-then-delete a
+// volume (a referencing container blocks removal), so a client-side
+// inspect-then-delete-by-name is inherently TOCTOU — a concurrent delete plus a
+// foreign volume taking the freed name means a by-name VolumeRemove could delete
+// a FOREIGN volume (a red-line violation). Another inspection only narrows the
+// race; it cannot close it. There is therefore no safe client-side atomic
+// destructive path for a cache volume, so the provider never auto-deletes one;
+// caches persist until an EXPLICIT operator purge (documented in ADR-003, and
+// surfaced with the exact `docker volume prune` command in the provider's
+// stale-cache log).
 
 // cacheVolumeFilter selects THIS controller's cache volumes: managed=true +
 // this controller-id + cache=true. It is the only label scope the GC ever
 // operates in, so a non-cache (job-scoped or foreign) or other-controller volume
-// is never even listed — never mind removed. A consequence of the cache NAMES
-// omitting controller-id (ADR-003) is that a volume first created (and thus
-// LABELED) by another controller carries that controller's id and so is invisible
-// to this controller's GC — documented in ADR-003.
+// is never even listed. A consequence of the cache NAMES omitting controller-id
+// (ADR-003) is that a volume first created (and thus LABELED) by another
+// controller carries that controller's id and so is invisible to this
+// controller's GC — documented in ADR-003.
 func (m *Manager) cacheVolumeFilter() filters.Args {
 	return filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
@@ -36,103 +47,54 @@ func (m *Manager) cacheVolumeFilter() filters.Args {
 	)
 }
 
-// CacheEviction records one evicted cache volume for the GC log.
-type CacheEviction struct {
+// StaleCache records one stale/superseded/aged cache volume the LOG-ONLY GC
+// surfaces for operator visibility (NEW-H1). Name is the volume's name; Reason is
+// the short human string from the staleness decision (why it is stale). Nothing
+// is removed — the provider LOGS these so an operator can reclaim disk with a
+// deliberate purge.
+type StaleCache struct {
 	Name   string
 	Reason string
 }
 
-// EvictCaches lists this controller's cache volumes and removes those `decide`
-// returns (true, reason) for, best-effort and bounded by maxEvictions (a stale
-// backlog is simply caught over successive opportunistic passes). It is the
-// removal half of ADR-003's opportunistic GC; `decide` is
-// spec.EvaluateCacheEviction bound to the current config + clock by the provider.
+// ListStaleCaches enumerates this controller's cache volumes that `decide` flags
+// as stale/superseded/aged AND that pass STRICT kind-aware full-identity
+// validation, returning them for the provider to LOG. It removes NOTHING.
 //
-// It NEVER force-removes: a cache volume mounted into a running container returns
-// a Conflict ("volume is in use") which is treated as SKIP, so GC can never yank
-// a warm cache out from under a live runner — an active job pins its own cache.
-// NotFound is tolerated (a concurrent removal won the race). Every candidate is
-// re-checked to be a cache volume for THIS controller before `decide` is even
-// consulted, defense-in-depth on top of the label filter, so this can only ever
-// touch this controller's own cache=true volumes and never a job-scoped or
-// foreign resource.
-//
-// H3 (stale-name TOCTOU): the list above is a snapshot. Between it and the
-// physical removal, a remove/recreate-under-the-same-name could replace a stale
-// cache with a FRESH foreign, or a brand-new same-repo, volume that a by-name
-// VolumeRemove would then wrongly delete. So immediately before removing, the
-// volume is RE-INSPECTED by name and its FULL ownership+cache labels re-validated
-// and the eviction decision re-run against those live labels — a candidate that
-// is no longer ours, or no longer evictable, is skipped.
-func (m *Manager) EvictCaches(ctx context.Context, decide func(labels map[string]string) (bool, string), maxEvictions int) ([]CacheEviction, error) {
+// ADR-003's opportunistic cache-volume GC is deliberately NON-DESTRUCTIVE
+// (NEW-H1) — see this file's header for why a client-side by-name VolumeRemove is
+// inherently TOCTOU/foreign-unsafe for a volume. Caches persist until an explicit
+// operator purge. `decide` is spec.EvaluateCacheEviction bound to the current
+// config + clock by the provider; the strict validation (spec.ValidateCacheVolumeKind
+// plus a controller-id re-assertion) keeps the log ACCURATE: only a volume
+// carrying the FULL per-kind identity is reported as ours to prune, so an
+// incomplete/foreign volume that slipped the label filter is never named.
+func (m *Manager) ListStaleCaches(ctx context.Context, decide func(labels map[string]string) (bool, string)) ([]StaleCache, error) {
 	list, err := m.cli.VolumeList(ctx, volume.ListOptions{Filters: m.cacheVolumeFilter()})
 	if err != nil {
 		return nil, fmt.Errorf("cache GC: failed to list cache volumes: %w", err)
 	}
 
-	var (
-		evicted []CacheEviction
-		errs    []error
-	)
+	var stale []StaleCache
 	for _, v := range list.Volumes {
 		if v == nil {
 			continue
 		}
-		if maxEvictions > 0 && len(evicted) >= maxEvictions {
-			log.Printf("garm-provider-docker: cache GC: hit the per-pass eviction cap (%d); remaining stale caches will be reaped on a later pass", maxEvictions)
-			break
-		}
-		// Defense-in-depth re-assertion on the SNAPSHOT labels: only THIS
-		// controller's cache volumes, and only ones the snapshot flags as evictable
-		// (a cheap pre-filter so we re-inspect only genuine candidates).
-		if v.Labels[spec.LabelCache] != "true" || v.Labels[spec.LabelControllerID] != m.controllerID {
+		// Defense-in-depth on the label filter: only THIS controller's cache
+		// volumes carrying the FULL per-kind identity are ours to report.
+		if v.Labels[spec.LabelControllerID] != m.controllerID {
 			continue
 		}
-		if evict, _ := decide(v.Labels); !evict {
+		if err := spec.ValidateCacheVolumeKind(v.Labels); err != nil {
 			continue
 		}
-
-		// RE-VALIDATE against LIVE labels immediately before removing by name.
-		fresh, err := m.cli.VolumeInspect(ctx, v.Name)
-		if err != nil {
-			if errdefs.IsNotFound(err) {
-				continue // raced with a removal — already gone
-			}
-			errs = append(errs, fmt.Errorf("cache GC: failed to re-inspect %q before eviction: %w", v.Name, err))
-			continue
-		}
-		if fresh.Labels[spec.LabelManaged] != "true" || fresh.Labels[spec.LabelCache] != "true" || fresh.Labels[spec.LabelControllerID] != m.controllerID {
-			// A different/foreign volume now holds this name (remove+recreate since
-			// the snapshot); do NOT delete it. The full ownership tuple is asserted
-			// at this destructive boundary — managed=true AND cache=true AND this
-			// controller-id (H3c): an UNLABELED auto-created replacement (a
-			// concurrent evict+ContainerCreate race that stripped the labels) is
-			// missing managed=true, so re-checking only cache/controller-id here
-			// would let an auto-created volume that somehow carried a stray
-			// cache=true slip through — the managed conjunct closes that.
-			continue
-		}
-		evict, reason := decide(fresh.Labels)
+		evict, reason := decide(v.Labels)
 		if !evict {
-			// A freshly re-created same-name cache that is no longer evictable.
 			continue
 		}
-		// force=false so an in-use (mounted) cache is protected — the daemon
-		// returns Conflict, which we SKIP rather than escalate.
-		if err := m.cli.VolumeRemove(ctx, v.Name, false); err != nil {
-			switch {
-			case errdefs.IsNotFound(err):
-				// Raced with another removal — already gone.
-			case errdefs.IsConflict(err):
-				log.Printf("garm-provider-docker: cache GC: %q is in use (a live job holds it); skipping", v.Name)
-			default:
-				errs = append(errs, fmt.Errorf("cache GC: failed to evict %q: %w", v.Name, err))
-			}
-			continue
-		}
-		evicted = append(evicted, CacheEviction{Name: v.Name, Reason: reason})
+		stale = append(stale, StaleCache{Name: v.Name, Reason: reason})
 	}
-	return evicted, errors.Join(errs...)
+	return stale, nil
 }
 
 // DiagVolumeRef is one diagnostic-logs cache volume returned by ListDiagVolumes:
@@ -141,8 +103,7 @@ func (m *Manager) EvictCaches(ctx context.Context, decide func(labels map[string
 // can re-assert the FULL identity (managed+cache+controller+cache-kind+repo+
 // repo-url-digest) of the volume the helper actually pinned — catching a
 // reincarnated/foreign same-name diag volume that a name-and-kind-only check would
-// miss (2026-07-22 structural amendment; the earlier check validated
-// controller/kind but not repo/repo-url-digest).
+// miss (spec.ValidateDiagPruneTarget).
 type DiagVolumeRef struct {
 	Name   string
 	Labels map[string]string
@@ -152,7 +113,10 @@ type DiagVolumeRef struct {
 // (cache=true + cache-kind=diag-logs) with their identity labels, so the provider
 // can run its retention prune helper against each (ADR-003 F14 keeps retention
 // provider-side, out of the untrusted runner) and re-validate the FULL identity of
-// the volume the helper pins. It re-asserts the kind + controller on each hit,
+// the volume the helper pins. It applies the STRICT kind-aware full-identity
+// validation (NEW-H2) at enumeration — a diag volume missing repo/repo-url-digest
+// is skipped — so the snapshot the destructive prune re-validates against is
+// itself complete, and re-asserts the kind + controller on each hit,
 // defense-in-depth on top of the label filter.
 func (m *Manager) ListDiagVolumes(ctx context.Context) ([]DiagVolumeRef, error) {
 	f := m.cacheVolumeFilter()
@@ -168,6 +132,13 @@ func (m *Manager) ListDiagVolumes(ctx context.Context) ([]DiagVolumeRef, error) 
 			continue
 		}
 		if v.Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) || v.Labels[spec.LabelControllerID] != m.controllerID {
+			continue
+		}
+		// STRICT full-identity gate (NEW-H2): only a complete diag-logs volume
+		// (repo + repo-url-digest present) is a valid prune target. An
+		// incomplete/unlabeled volume that squats the diag name is skipped here so
+		// the destructive prune never enumerates it in the first place.
+		if err := spec.ValidateCacheVolumeKind(v.Labels); err != nil {
 			continue
 		}
 		refs = append(refs, DiagVolumeRef{Name: v.Name, Labels: cloneLabelMap(v.Labels)})

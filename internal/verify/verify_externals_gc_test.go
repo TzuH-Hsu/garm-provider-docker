@@ -20,9 +20,11 @@ import (
 //     image's own externals, mounted READ-ONLY (a runner `touch` in it fails),
 //     and SHARED across two allocations for the same image digest;
 //   - a DIFFERENT runner-image digest gets a SEPARATE externals volume;
-//   - the opportunistic GC evicts a superseded-generation cache volume and keeps
-//     a current one;
-//   - the diagnostic-log prune helper deletes an aged file and keeps a recent one;
+//   - the opportunistic GC is NON-DESTRUCTIVE (NEW-H1): a superseded-generation
+//     cache is LOGGED for operator pruning but SURVIVES the GC pass;
+//   - the diagnostic-log prune helper deletes an aged file in a genuinely-ours
+//     (full-identity) diag volume and keeps a recent one, but does NOT prune a
+//     same-shaped diag volume of INCOMPLETE identity (NEW-H2 strict validation);
 //   - the built runner image has a working pnpm honoring the provider's store.
 //
 // Isolation: a unique controller-id + unique repo_url, so cache volume names
@@ -183,11 +185,14 @@ stale_cache_eviction_days = 30
 	}
 
 	// =========================================================================
-	// (3) GC evicts a superseded-generation cache, keeps a current one
+	// (3) log-only GC: a superseded-generation cache is LOGGED but SURVIVES
 	// =========================================================================
-	// A current toolcache (generation "1") already exists from job a1 and is
-	// mounted in a live runner. Pre-create a SUPERSEDED one (generation "old",
-	// created 2h ago, past the 30-min grace) for the same controller/repo.
+	// NEW-H1: cache-volume GC is NON-DESTRUCTIVE (Docker has no atomic
+	// label-qualified volume delete, so an opportunistic by-name delete is
+	// inherently TOCTOU/foreign-unsafe). A superseded cache is surfaced in the
+	// operator log — with the exact `docker volume prune` purge command — but never
+	// auto-deleted. Pre-create a SUPERSEDED, FULL-IDENTITY toolcache (generation
+	// "old", created 2h ago, past the 30-min grace) for the same controller/repo.
 	supersededVol := "garm-cache-toolcache-" + repoKey + "-old"
 	twoHoursAgo := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
 	if out, err := dockerTry("volume", "create",
@@ -196,6 +201,7 @@ stale_cache_eviction_days = 30
 		"--label", "garm.docker/cache=true",
 		"--label", "garm.docker/cache-kind=toolcache",
 		"--label", "garm.docker/repo="+repoKey,
+		"--label", "garm.docker/repo-url-digest="+spec.RepoURLDigest(repoURL),
 		"--label", "garm.docker/generation=old",
 		"--label", "garm.docker/last-used="+twoHoursAgo,
 		supersededVol); err != nil {
@@ -203,17 +209,28 @@ stale_cache_eviction_days = 30
 	}
 	currentVol := spec.ToolcacheVolumeName(repoKey, "1")
 
-	// Trigger an opportunistic GC pass via ListInstances (it runs runCacheGC).
-	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
-		t.Fatalf("(3) ListInstances exit=%d, want 0", code)
+	// Trigger an opportunistic GC pass via ListInstances (it runs runCacheGC) and
+	// capture the provider's stderr, where the stale-cache operator log line goes.
+	_, gcStderr, gcCode := runProviderIO(t, bin, configA, controllerID, "ListInstances", "", nil)
+	if gcCode != 0 {
+		t.Fatalf("(3) ListInstances exit=%d, want 0", gcCode)
 	}
-	if _, err := dockerTry("volume", "inspect", supersededVol); err == nil {
-		t.Errorf("(3) GC did NOT evict the superseded-generation volume %q", supersededVol)
+	// The superseded cache SURVIVES the GC pass (log-only, never evicted).
+	if _, err := dockerTry("volume", "inspect", supersededVol); err != nil {
+		t.Errorf("(3) the log-only GC REMOVED the superseded-generation volume %q — cache GC must be non-destructive (NEW-H1): %v", supersededVol, err)
 	} else {
-		t.Logf("[3] GC evicted the superseded-generation cache volume %s", supersededVol)
+		t.Logf("[3] the superseded-generation cache %s SURVIVED the GC pass (log-only)", supersededVol)
+	}
+	// ...and it is LOGGED for operator pruning, with the purge command named.
+	if !strings.Contains(gcStderr, supersededVol) || !strings.Contains(gcStderr, "eligible for operator pruning") {
+		t.Errorf("(3) the superseded cache %q was not logged for operator pruning; stderr:\n%s", supersededVol, gcStderr)
+	} else if !strings.Contains(gcStderr, "docker volume prune") {
+		t.Errorf("(3) the stale-cache log did not name the operator purge command; stderr:\n%s", gcStderr)
+	} else {
+		t.Logf("[3] the superseded cache was logged for operator pruning with a docker-volume-prune command")
 	}
 	if _, err := dockerTry("volume", "inspect", currentVol); err != nil {
-		t.Errorf("(3) GC evicted the CURRENT-generation toolcache %q — it must survive: %v", currentVol, err)
+		t.Errorf("(3) GC removed the CURRENT-generation toolcache %q — it must survive: %v", currentVol, err)
 	} else {
 		t.Logf("[3] the current-generation toolcache %s survived GC", currentVol)
 	}
@@ -244,6 +261,42 @@ stale_cache_eviction_days = 30
 	}
 	if !strings.Contains(diagLs, "recent.log") {
 		t.Errorf("(4) the diag prune wrongly deleted the recent file recent.log: %s", diagLs)
+	}
+
+	// =========================================================================
+	// (4b) NEW-H2: an INCOMPLETE-identity same-shaped diag volume is NOT pruned
+	// =========================================================================
+	// A diag-NAMED volume for this controller missing a required identity key (no
+	// repo-url-digest) is NOT provably ours: the strict kind-aware enumeration
+	// excludes it, so the destructive find-delete never runs against it. Seed one
+	// with an aged file and confirm the file SURVIVES a GC pass. Cleaned up
+	// label-scoped by cleanupController (it carries this controller-id).
+	incompleteDiagVol := spec.DiagVolumeName("incomplete-" + token)
+	if out, err := dockerTry("volume", "create",
+		"--label", "garm.docker/managed=true",
+		"--label", "garm.docker/controller-id="+controllerID,
+		"--label", "garm.docker/cache=true",
+		"--label", "garm.docker/cache-kind=diag-logs",
+		"--label", "garm.docker/repo=incomplete-"+token,
+		// deliberately NO repo-url-digest → incomplete identity, not a prune target
+		"--label", "garm.docker/last-used="+time.Now().UTC().Format(time.RFC3339),
+		incompleteDiagVol); err != nil {
+		t.Fatalf("(4b) seed incomplete diag volume: %v\n%s", err, out)
+	}
+	oldStamp2 := time.Now().AddDate(0, 0, -10).Format("200601021504")
+	if out, err := dockerTry("run", "--rm", "-v", incompleteDiagVol+":/logs", "alpine:3.20", "sh", "-c",
+		"touch -t "+oldStamp2+" /logs/old-incomplete.log && ls -la /logs"); err != nil {
+		t.Fatalf("(4b) seed incomplete diag file: %v\n%s", err, out)
+	}
+	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
+		t.Fatalf("(4b) ListInstances exit=%d, want 0", code)
+	}
+	incompleteLs := dockerOut(t, "run", "--rm", "-v", incompleteDiagVol+":/logs", "alpine:3.20", "ls", "-A", "/logs")
+	t.Logf("[4b] incomplete-identity diag volume after GC: %s", strings.ReplaceAll(incompleteLs, "\n", " "))
+	if !strings.Contains(incompleteLs, "old-incomplete.log") {
+		t.Errorf("(4b) the diag prune deleted a file in an INCOMPLETE-identity volume %q — strict validation must exclude it from the destructive prune (NEW-H2): %s", incompleteDiagVol, incompleteLs)
+	} else {
+		t.Logf("[4b] the incomplete-identity diag volume's aged file SURVIVED — strict validation excluded it from the destructive prune")
 	}
 
 	// =========================================================================

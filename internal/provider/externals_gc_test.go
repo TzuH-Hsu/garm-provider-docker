@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,19 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
+
+// captureLog redirects the standard logger to a buffer for the duration of the
+// test, so a test can assert the operator-visibility lines the log-only GC and
+// the strict-identity diag-prune abort emit. It restores the previous writer via
+// t.Cleanup.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
 
 // seedHelperContainer creates a cache-helper container with the given created-at
 // label and Docker state, returning its ID — so the H5 leaked-helper reaper can
@@ -171,29 +186,93 @@ func TestCreateInstanceSeedFailureFailsCreate(t *testing.T) {
 	}
 }
 
-// TestRunCacheGCEvictsSupersededKeepsCurrent: the opportunistic GC evicts a
-// superseded-generation toolcache volume (aged past the grace) while keeping the
-// current-generation one — proving the eviction wiring end-to-end via the fake.
-func TestRunCacheGCEvictsSupersededKeepsCurrent(t *testing.T) {
+// TestRunCacheGCLogsSupersededKeepsAll: the opportunistic GC is NON-DESTRUCTIVE
+// for cache volumes (NEW-H1). A superseded-generation toolcache volume (aged past
+// the grace) is LOGGED for operator visibility but SURVIVES the GC pass — as does
+// the current-generation one — and no VolumeRemove is ever issued on the pass.
+func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 	p, fake := newCacheProvider(t, false) // current generation "1"
 	ctx := context.Background()
 
-	// Directly seed two toolcache volumes for the same repo: a superseded
-	// generation "0" created 2h ago (past the 30m grace) and the current
+	// The GC pass must never issue a cache-volume removal (NEW-H1).
+	fake.VolumeRemoveHook = func(name string) {
+		t.Errorf("runCacheGC issued VolumeRemove(%q) — cache GC must be non-destructive (NEW-H1)", name)
+	}
+
+	// Directly seed two FULL-identity toolcache volumes for the same repo: a
+	// superseded generation "0" created 2h ago (past the 30m grace) and the current
 	// generation "1" created just now.
-	id := spec.CacheVolumeIdentity{ControllerID: "controller-abc", RepoKey: "repo-x"}
+	id := spec.CacheVolumeIdentity{ControllerID: "controller-abc", RepoKey: "repo-x", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/repo-x")}
 	superseded := spec.ToolcacheVolumeName("repo-x", "0")
 	current := spec.ToolcacheVolumeName("repo-x", "1")
 	seedVol(t, fake, superseded, id.ToolcacheLabels("0", time.Now().Add(-2*time.Hour)))
 	seedVol(t, fake, current, id.ToolcacheLabels("1", time.Now()))
 
+	logs := captureLog(t)
 	p.runCacheGC(ctx)
 
-	if volPresent(t, fake, superseded) {
-		t.Error("GC did not evict the superseded-generation toolcache volume")
+	// Both volumes SURVIVE — the log-only GC evicts nothing.
+	if !volPresent(t, fake, superseded) {
+		t.Error("GC removed the superseded-generation toolcache volume — cache GC must be log-only (NEW-H1)")
 	}
 	if !volPresent(t, fake, current) {
-		t.Error("GC evicted the CURRENT-generation toolcache volume — it must be kept")
+		t.Error("GC removed the CURRENT-generation toolcache volume")
+	}
+	// The superseded volume is surfaced for operator pruning with the purge command.
+	out := logs.String()
+	if !strings.Contains(out, superseded) || !strings.Contains(out, "eligible for operator pruning") {
+		t.Errorf("the superseded cache was not logged for operator pruning; log was:\n%s", out)
+	}
+	if !strings.Contains(out, "docker volume prune") {
+		t.Errorf("the stale-cache log does not name the operator purge command; log was:\n%s", out)
+	}
+}
+
+// TestPruneDiagVolumeAbortsOnForeignIdentity is the NEW-H2 strict-identity gate at
+// the destructive boundary: a concurrent actor replaces the pinned diag volume, in
+// the ContainerCreate window, with a same-NAME diag volume of a DIFFERENT repo
+// identity (a repokey/name collision — same repo label, different repo-url-digest).
+// The pin-then-validate step re-inspects the pinned volume, detects the identity
+// mismatch against the enumeration snapshot, and ABORTS the prune WITHOUT the
+// destructive find-delete running and WITHOUT deleting the foreign volume (B2).
+func TestPruneDiagVolumeAbortsOnForeignIdentity(t *testing.T) {
+	p, fake := newCacheProvider(t, false)
+	ctx := context.Background()
+
+	repoKey := "repo-diag-foreign"
+	diagName := spec.DiagVolumeName(repoKey)
+	oursID := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey, RepoURLDigest: spec.RepoURLDigest("https://github.com/x/" + repoKey)}
+	seedVol(t, fake, diagName, oursID.DiagLabels(time.Now()))
+	ref := topology.DiagVolumeRef{Name: diagName, Labels: oursID.DiagLabels(time.Now())}
+
+	// At the prune helper's ContainerCreate (the pin), a concurrent actor swaps in a
+	// same-name diag volume for a DIFFERENT repository (same repokey/name, different
+	// full repo-url-digest — the exact truncated-key collision the full-identity
+	// check defends). The find-delete must NOT run against it.
+	otherID := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey, RepoURLDigest: spec.RepoURLDigest("https://github.com/x/DIFFERENT-" + repoKey)}
+	var once sync.Once
+	fake.CreateHook = func() {
+		once.Do(func() {
+			_ = fake.VolumeRemove(ctx, diagName, true)
+			seedVol(t, fake, diagName, otherID.DiagLabels(time.Now()))
+		})
+	}
+
+	logs := captureLog(t)
+	p.pruneDiagVolume(ctx, "ghcr.io/example/runner@sha256:deadbeef", ref)
+	fake.CreateHook = nil
+
+	// The different-repo (foreign-identity) replacement SURVIVES — never deleted.
+	v, ok := volByName(t, fake, diagName)
+	if !ok {
+		t.Fatalf("the different-repo diag volume %q was DELETED — never touch an unprovable volume (B2)", diagName)
+	}
+	if v.Labels[spec.LabelRepoURLDigest] != otherID.RepoURLDigest {
+		t.Errorf("the surviving diag volume is not the foreign replacement (repo-url-digest=%q)", v.Labels[spec.LabelRepoURLDigest])
+	}
+	// The prune ABORTED on strict identity re-validation (the find-delete never ran).
+	if !strings.Contains(logs.String(), "failed strict identity re-validation") {
+		t.Errorf("expected the diag prune to abort on strict identity re-validation; log was:\n%s", logs.String())
 	}
 }
 
