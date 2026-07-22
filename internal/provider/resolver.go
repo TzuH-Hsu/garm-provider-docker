@@ -145,6 +145,16 @@ func notFoundError(instanceID string) error {
 // name as provider_id, so GetInstance/ListInstances MUST report the same stable
 // identity, or GARM could overwrite its stored provider_id with a container ID
 // and reintroduce the delete-by-stale-container-id leak this fix closes.
+//
+// ProviderFault (research.md §1.E's ProviderInstance.provider_fault) is
+// populated whenever status maps to InstanceError: this is the one channel
+// through which the container's fault detail can legitimately reach GARM
+// (M3-W2 error-taxonomy audit, see taxonomy.go's package doc for why
+// CreateInstance's OWN failures cannot use this same field). It never
+// includes anything from the container's Config (env, labels, credentials
+// tmpfs contents) — only c.State fields the daemon itself reports (exit
+// code, OOM flag, dead flag, its own Error string, FinishedAt), so it can
+// never carry a credential this provider handled.
 func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 	labels := map[string]string{}
 	if c.Config != nil {
@@ -157,17 +167,42 @@ func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 	}
 
 	status := params.InstanceStatusUnknown
+	var fault []byte
 	if c.State != nil {
 		status = mapContainerStatus(c.State.Status, c.State.OOMKilled, c.State.Dead)
+		if status == params.InstanceError {
+			fault = []byte(containerFaultMessage(c.State))
+		}
 	}
 
 	return params.ProviderInstance{
-		ProviderID: name,
-		Name:       name,
-		OSType:     params.OSType(labels[spec.LabelOSType]),
-		OSArch:     params.OSArch(labels[spec.LabelOSArch]),
-		Status:     status,
-		Addresses:  addressesFromInspect(c),
+		ProviderID:    name,
+		Name:          name,
+		OSType:        params.OSType(labels[spec.LabelOSType]),
+		OSArch:        params.OSArch(labels[spec.LabelOSArch]),
+		Status:        status,
+		Addresses:     addressesFromInspect(c),
+		ProviderFault: fault,
+	}
+}
+
+// containerFaultMessage builds a short, credential-free diagnostic string
+// from an inspected container's daemon-reported state, for
+// ProviderInstance.ProviderFault. Called only when the container's status has
+// already mapped to InstanceError (OOM-killed or daemon-"dead"), state is
+// guaranteed non-nil by that caller.
+func containerFaultMessage(state *types.ContainerState) string {
+	switch {
+	case state.OOMKilled:
+		return fmt.Sprintf("container was killed for out-of-memory (exit_code=%d, finished_at=%s)", state.ExitCode, state.FinishedAt)
+	case state.Dead:
+		msg := "container is in the daemon's dead state"
+		if state.Error != "" {
+			msg += ": " + state.Error
+		}
+		return msg
+	default:
+		return "container reported an error state"
 	}
 }
 
@@ -175,7 +210,10 @@ func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 // ProviderInstance. It uses the summary's state string only; OOM detail is
 // not available in a list summary, so a caller needing exact error status
 // for an OOM-killed container should GetInstance it. A "dead" state still
-// maps to error via the state string.
+// maps to error via the state string, and ProviderFault is populated
+// best-effort from the summary's own human-readable Status field (already in
+// hand — no extra inspect call, which would defeat the point of a lightweight
+// list) — e.g. a daemon-supplied dead-state description.
 //
 // ProviderID is the GARM instance NAME, matching CreateInstance and
 // toProviderInstance (F6): a stable identity resolvable by label independently
@@ -185,12 +223,18 @@ func toProviderInstanceFromSummary(c types.Container) params.ProviderInstance {
 	if name == "" && len(c.Names) > 0 {
 		name = strings.TrimPrefix(c.Names[0], "/")
 	}
+	status := mapContainerStatus(c.State, false, c.State == "dead")
+	var fault []byte
+	if status == params.InstanceError && c.Status != "" {
+		fault = []byte(c.Status)
+	}
 	return params.ProviderInstance{
-		ProviderID: name,
-		Name:       name,
-		OSType:     params.OSType(c.Labels[spec.LabelOSType]),
-		OSArch:     params.OSArch(c.Labels[spec.LabelOSArch]),
-		Status:     mapContainerStatus(c.State, false, c.State == "dead"),
+		ProviderID:    name,
+		Name:          name,
+		OSType:        params.OSType(c.Labels[spec.LabelOSType]),
+		OSArch:        params.OSArch(c.Labels[spec.LabelOSArch]),
+		Status:        status,
+		ProviderFault: fault,
 	}
 }
 
