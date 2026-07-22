@@ -68,6 +68,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,15 +109,44 @@ enabled = false
 	return f
 }
 
-// runProviderKillMidway starts a REAL DeleteInstance subprocess for
-// instanceID and SIGKILLs it after killAfter — simulating a cancellation
-// (GARM's own exec timing out) or a provider-process crash mid-teardown. It
-// returns whether the kill actually raced a still-running process (false
-// means the subprocess had already exited on its own before the kill fired,
-// in which case there is nothing left to prove about mid-run interruption for
-// this particular attempt, but the caller's retry-converges assertion still
-// holds either way).
-func runProviderKillMidway(t *testing.T, bin, configFile, controllerID, instanceID string, killAfter time.Duration) bool {
+// teardownBarrierMarker is the line the trap-term runner image prints to stdout
+// when it receives SIGTERM. DeleteInstance's teardown STOPS the runner
+// (ContainerStop) before it removes it, delivering SIGTERM; observing this
+// marker in the runner's logs proves teardown has entered its FIRST destructive
+// Docker op. The image traps and IGNORES SIGTERM (it keeps running), so
+// ContainerStop then blocks for the daemon's full stop timeout (~10s) — a wide,
+// deterministic window in which the provider is provably mid-teardown.
+const teardownBarrierMarker = "GARM-TEARDOWN-BARRIER-SIGTERM"
+
+// buildTrapTermImage builds a tiny alpine runner image whose PID 1 shell traps
+// SIGTERM, prints teardownBarrierMarker, and keeps running (it does NOT exit on
+// SIGTERM). This turns DeleteInstance's ContainerStop into a deterministic
+// barrier: the marker proves the destructive stop was entered, and because the
+// container ignores SIGTERM the provider stays blocked in ContainerStop long
+// enough for a mid-teardown SIGKILL to land provably before ContainerRemove
+// runs. alpine's busybox ships tar, so the provider's credential-delivery exec
+// still succeeds during create.
+func buildTrapTermImage(t *testing.T, tag string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "Dockerfile"),
+		"FROM alpine:3.20\n"+
+			"ENTRYPOINT [\"sh\",\"-c\",\"trap 'echo "+teardownBarrierMarker+"' TERM; while true; do sleep 1; done\"]\n")
+	cmd := exec.Command("docker", "build", "-t", tag, dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build trap-term image: %v\n%s", err, out)
+	}
+}
+
+// runDeleteKillOnTeardownBarrier starts a REAL DeleteInstance subprocess, waits
+// until teardown provably ENTERS its first destructive Docker op — the runner's
+// logs show teardownBarrierMarker, i.e. ContainerStop delivered SIGTERM — and
+// only THEN SIGKILLs the provider, so the kill lands mid-teardown by
+// construction rather than by a hopeful fixed sleep. It returns whether the
+// SIGKILL raced a still-running process (killedLive) and whether the barrier was
+// actually observed (sawBarrier); the caller asserts both, so a vacuous
+// "teardown already finished" pass is impossible.
+func runDeleteKillOnTeardownBarrier(t *testing.T, bin, configFile, controllerID, instanceID, runnerName string) (killedLive, sawBarrier bool) {
 	t.Helper()
 	cmd := exec.Command(bin)
 	cmd.Env = append(os.Environ(),
@@ -129,10 +159,20 @@ func runProviderKillMidway(t *testing.T, bin, configFile, controllerID, instance
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start DeleteInstance subprocess: %v", err)
 	}
-	time.Sleep(killAfter)
+	// Poll the runner's logs for the SIGTERM barrier marker, bounded well under
+	// the daemon's ~10s stop timeout so the kill still lands while ContainerStop
+	// is blocked (before it completes and ContainerRemove could run).
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if logs, err := dockerTry("logs", runnerName); err == nil && strings.Contains(logs, teardownBarrierMarker) {
+			sawBarrier = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	killErr := cmd.Process.Kill()
 	_ = cmd.Wait() // reap regardless of whether Kill raced a natural exit
-	return killErr == nil
+	return killErr == nil, sawBarrier
 }
 
 // =============================================================================
@@ -197,19 +237,32 @@ func TestVerifyM3ImagePullFailureLeavesNoOrphans(t *testing.T) {
 // never delivering the JIT config, as opposed to TestVerifyM1WP2Allocation's
 // (e), which uses a fast 401 for a WRONG token. The handler selects on
 // r.Context().Done() so it never leaks a goroutine once the client (bounded
-// by CreateInstance's own credentialFetchDeadline, 60s) gives up.
-func newHangingCredentialsServer(t *testing.T) *httptest.Server {
+// by CreateInstance's own credentialFetchDeadline, 60s) gives up. It also
+// RECORDS whether a /credentials/* request was ever received, returned by the
+// second value's closure, so the H6 test can assert the timeout was reached on
+// the credential path specifically (not a generic earlier failure).
+func newHangingCredentialsServer(t *testing.T) (*httptest.Server, func() bool) {
 	t.Helper()
-	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var mu sync.Mutex
+	credsRequested := false
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/credentials/") {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		mu.Lock()
+		credsRequested = true
+		mu.Unlock()
 		select {
 		case <-r.Context().Done():
 		case <-time.After(2 * time.Minute): // safety valve well past the 60s deadline
 		}
 	}))
+	return srv, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return credsRequested
+	}
 }
 
 // TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete serves a metadata
@@ -217,11 +270,16 @@ func newHangingCredentialsServer(t *testing.T) *httptest.Server {
 // JIT config entirely). fetchCredentials is bounded by CreateInstance's own
 // credentialFetchDeadline (60s, create.go) — this test genuinely waits that
 // out on the real daemon rather than mocking the clock, so it runs for
-// roughly a minute. After the create fails and the guard rolls back, it
-// invokes DeleteInstance for the same instance name — the exact shape of
-// GARM's OWN reaper deleting an instance it gave up bootstrapping
-// (research.md §1.F) — and asserts idempotent teardown: exit 30 (nothing
-// left to delete), never an error.
+// roughly a minute.
+//
+// It asserts the failure was CAUSED by the credential timeout, not something
+// incidental: (1) the fake metadata server actually RECEIVED a /credentials/*
+// request; (2) the create's wall-time is NEAR the configured 60s deadline (it
+// genuinely waited it out, not an immediate generic failure); and (3) the
+// provider's stderr names the credential-fetch path as the failure cause. Then,
+// exactly as GARM's OWN reaper would (research.md §1.F), it invokes
+// DeleteInstance for the same instance name and asserts idempotent teardown:
+// exit 30 (nothing left to delete), never an error, with zero orphans.
 func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	controllerID := randControllerID(t)
 	bin := buildM3ProviderBinary(t)
@@ -230,7 +288,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	buildSleepImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
-	srv := newHangingCredentialsServer(t)
+	srv, credsRequested := newHangingCredentialsServer(t)
 	defer srv.Close()
 	caBundle := caBundlePEM(t, srv)
 
@@ -242,7 +300,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 
 	b := bootstrapFor("m3-timeout-01", srv.URL, caBundle)
 	start := time.Now()
-	out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
+	out, stderr, code := runProviderIO(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	elapsed := time.Since(start)
 	t.Logf("CreateInstance with a withheld JIT config took %s to fail (bounded by the 60s credentialFetchDeadline)", elapsed)
 	if code == 0 {
@@ -251,6 +309,35 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	if code != 1 {
 		t.Errorf("timed-out CreateInstance exit=%d, want 1 (generic failure)", code)
 	}
+
+	// (1) The failure must be on the CREDENTIAL path: the metadata server must
+	// have received the /credentials/* request that then hung.
+	if !credsRequested() {
+		t.Errorf("the metadata server never received a /credentials/ request — the create failed BEFORE the credential fetch, so this does not prove the credential timeout was the cause")
+	}
+
+	// (2) The create must have genuinely WAITED OUT the ~60s deadline, not
+	// failed immediately for some other reason. Allow generous slack on the
+	// upper bound (build/pull/teardown overhead) but require it to be near 60s.
+	const deadline = 60 * time.Second
+	if elapsed < deadline-5*time.Second {
+		t.Errorf("CreateInstance failed after only %s, well before the %s credential deadline — the timeout was NOT the cause", elapsed, deadline)
+	}
+	if elapsed > deadline+45*time.Second {
+		t.Errorf("CreateInstance took %s, far beyond the %s deadline — something other than the bounded credential fetch is at play", elapsed, deadline)
+	}
+
+	// (3) The provider's stderr must name the credential-fetch path as the
+	// cause (create.go wraps it "failed to fetch credentials ..."), and a
+	// timeout/deadline indicator, distinguishing it from a generic exit 1.
+	lowerErr := strings.ToLower(stderr)
+	if !strings.Contains(lowerErr, "fetch credentials") {
+		t.Errorf("provider stderr does not name the credential-fetch failure cause; got:\n%s", stderr)
+	}
+	if !strings.Contains(lowerErr, "deadline") && !strings.Contains(lowerErr, "timeout") && !strings.Contains(lowerErr, "giving up") && !strings.Contains(lowerErr, "context") {
+		t.Errorf("provider stderr does not indicate a timeout/deadline as the cause; got:\n%s", stderr)
+	}
+
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Fatalf("timed-out create's guard left %d orphaned resources, want 0 (a simulated GARM delete has nothing to reconcile if this is nonzero)", n)
 	}
@@ -270,22 +357,25 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 // idempotent teardown on retry.
 // =============================================================================
 
-// TestVerifyM3CancelDeleteInstanceIdempotent creates one allocation, starts a
-// REAL DeleteInstance subprocess, and SIGKILLs it shortly after it begins
-// (simulating GARM's own exec timing out, or a provider-process crash,
-// mid-teardown — ADR-004's creation guard has no analogous "delete guard",
-// so the safety property under test is idempotency-on-retry, not
-// atomicity-of-a-single-run). It does not assert a specific mid-teardown
-// state (the exact interruption point is inherently timing-dependent and not
-// meaningful to pin down); it asserts the property that actually matters: a
-// FRESH DeleteInstance run after the kill converges to zero leftover
-// resources, with no dangling half-removed state that a retry cannot clean up.
+// TestVerifyM3CancelDeleteInstanceIdempotent creates one allocation, then starts
+// a REAL DeleteInstance subprocess and SIGKILLs it PROVABLY MID-TEARDOWN
+// (simulating GARM's own exec timing out, or a provider-process crash — ADR-004's
+// creation guard has no analogous "delete guard", so the safety property under
+// test is idempotency-on-retry). Rather than a hopeful fixed sleep, it uses a
+// deterministic barrier: the runner image traps and ignores SIGTERM, so
+// DeleteInstance's ContainerStop (teardown's FIRST destructive op) delivers
+// SIGTERM, the runner logs a barrier marker, and ContainerStop then blocks ~10s
+// — the kill is timed to that marker. The test asserts the barrier was observed,
+// the kill raced a still-running process, and the runner container STILL EXISTS
+// right after the kill (ContainerRemove had not run) — so the destructive
+// teardown provably did NOT complete — then asserts a FRESH DeleteInstance
+// converges to zero leftover resources.
 func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 	controllerID := randControllerID(t)
 	bin := buildM3ProviderBinary(t)
 
-	imageTag := "garm-m3-cancel-sleep:latest"
-	buildSleepImage(t, imageTag)
+	imageTag := "garm-m3-cancel-trapterm:latest"
+	buildTrapTermImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
 	srv := newMetadataServer(t)
@@ -303,11 +393,23 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("CreateInstance exit=%d, want 0; stdout=%s", code, out)
 	}
+	runnerName := spec.RunnerContainerName("m3-cancel-01")
 
-	// Start a real DeleteInstance subprocess and kill it shortly after launch
-	// — simulating a cancellation/crash mid-teardown.
-	killedLive := runProviderKillMidway(t, bin, cfg, controllerID, "m3-cancel-01", 60*time.Millisecond)
-	t.Logf("first DeleteInstance was interrupted mid-run (killed a still-running process=%v)", killedLive)
+	// Interrupt DeleteInstance PROVABLY mid-teardown, gated on the SIGTERM barrier.
+	killedLive, sawBarrier := runDeleteKillOnTeardownBarrier(t, bin, cfg, controllerID, "m3-cancel-01", runnerName)
+	if !sawBarrier {
+		t.Fatalf("never observed teardown enter its first destructive op (SIGTERM to the runner %q) before the kill — the barrier did not engage, so this run would prove nothing", runnerName)
+	}
+	if !killedLive {
+		t.Fatalf("SIGKILL did not race a still-running DeleteInstance — the process had already exited, so nothing mid-teardown was interrupted")
+	}
+	// The runner container must STILL EXIST right after the kill: teardown was
+	// interrupted after ContainerStop began but before ContainerRemove ran, so
+	// the destructive teardown provably did NOT complete.
+	if _, err := dockerTry("inspect", runnerName); err != nil {
+		t.Fatalf("runner container %q is gone immediately after a mid-teardown kill — the kill did not actually interrupt an in-progress teardown: %v", runnerName, err)
+	}
+	t.Logf("SIGKILL landed mid-teardown: ContainerStop had delivered SIGTERM (barrier marker observed) but ContainerRemove had not completed (runner %q still present)", runnerName)
 
 	// A fresh, uninterrupted DeleteInstance must now converge to a clean
 	// state — either it finds resources still there and removes them (exit
@@ -316,7 +418,7 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 	// that would mean the kill left an unrecoverable wedge.
 	_, retryCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-cancel-01", nil)
 	if retryCode != 0 && retryCode != 30 {
-		t.Errorf("retry DeleteInstance after a mid-run kill: exit=%d, want 0 or 30 (idempotent convergence)", retryCode)
+		t.Errorf("retry DeleteInstance after a mid-teardown kill: exit=%d, want 0 or 30 (idempotent convergence)", retryCode)
 	}
 
 	// Whichever path the retry took, one more DeleteInstance must now be a
