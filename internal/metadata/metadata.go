@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
 )
 
 // Default HTTP behavior. These are deliberately conservative: the metadata
@@ -140,6 +143,24 @@ func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Optio
 	return c, nil
 }
 
+// redact returns err with the client's bearer instance token scrubbed from its
+// message (ADR-002 F5, H4). A hostile or misbehaving metadata endpoint can
+// reflect the Bearer token into a redirect Location, and net/http surfaces that
+// redirect URL inside the transport/redirect error it returns; embedding such an
+// error verbatim in a wrapped error — which main.go then logs to stderr — would
+// leak the token into logs. EVERY error this Client hands back to a caller is
+// passed through redact first, so no metadata error can carry the raw token
+// regardless of what the endpoint echoes. It flattens the (possibly token-
+// bearing) wrapped error into a token-free message; the %w chain is not needed
+// for control flow, because retryability is signaled out of band by doGet's
+// bool, not by error identity.
+func (c *Client) redact(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(logging.Redact(err.Error(), c.instanceToken))
+}
+
 // checkRedirect is the http.Client redirect policy: it re-applies the
 // initial-URL transport-security invariant (https required; plain http only
 // for a loopback host; no userinfo) on every hop AND rejects any redirect
@@ -151,7 +172,10 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 		return fmt.Errorf("stopped after %d redirects fetching metadata", maxRedirects)
 	}
 	if err := validateMetadataURL(req.URL.String()); err != nil {
-		return fmt.Errorf("refusing metadata redirect: %w", err)
+		// validateMetadataURL embeds the raw redirect URL, which a hostile
+		// endpoint may have stuffed the bearer token into — redact it before it
+		// becomes part of any error net/http surfaces to us (H4).
+		return c.redact(fmt.Errorf("refusing metadata redirect: %w", err))
 	}
 	if got := originKey(req.URL); got != c.origin {
 		return fmt.Errorf("refusing cross-origin metadata redirect from %s to %s", c.origin, got)
@@ -240,10 +264,14 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
 		}
 		lastErr = err
 		if !retryable {
-			return nil, err
+			// H4: doGet's error can wrap a net/http redirect error carrying a
+			// token-bearing redirect URL — scrub the token before returning.
+			return nil, c.redact(err)
 		}
 	}
-	return nil, fmt.Errorf("giving up after %d attempts: %w", c.maxRetries+1, lastErr)
+	// H4: lastErr (a transport/redirect failure) can likewise carry a
+	// token-bearing redirect URL — scrub before returning.
+	return nil, c.redact(fmt.Errorf("giving up after %d attempts: %w", c.maxRetries+1, lastErr))
 }
 
 // doGet performs one HTTP GET. The bool reports whether the failure is
