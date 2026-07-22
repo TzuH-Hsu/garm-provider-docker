@@ -248,6 +248,97 @@ func ValidateAdoptedCacheVolume(name string, got, want map[string]string) error 
 	return nil
 }
 
+// requiredCacheIdentityKeys returns the identity label keys a cache volume of
+// this kind MUST carry (beyond the managed+cache markers) to be provably ours —
+// the STRICT schema behind ValidateCacheVolumeKind (NEW-H2). It is the full
+// per-kind identity of ADR-003:
+//
+//   - toolcache: cache-kind + repo + repo-url-digest + generation
+//   - pnpm:      cache-kind + repo + repo-url-digest + pnpm-major
+//   - diag-logs: cache-kind + repo + repo-url-digest
+//   - externals: cache-kind + image-digest (shared across repos, so NO repo)
+//
+// An unrecognised or absent cache-kind returns nil, which ValidateCacheVolumeKind
+// treats as "not provably ours" and rejects.
+func requiredCacheIdentityKeys(kind CacheKind) []string {
+	switch kind {
+	case CacheKindToolcache:
+		return []string{LabelRepo, LabelRepoURLDigest, LabelGeneration}
+	case CacheKindPnpm:
+		return []string{LabelRepo, LabelRepoURLDigest, LabelPnpmMajor}
+	case CacheKindDiagLogs:
+		return []string{LabelRepo, LabelRepoURLDigest}
+	case CacheKindExternals:
+		return []string{LabelImageDigest}
+	default:
+		return nil
+	}
+}
+
+// ValidateCacheVolumeKind is the STRICT, kind-aware full-identity check the cache
+// subsystem applies before ANY destructive cache work (the diag file-prune) and
+// when enumerating cache volumes for the log-only GC, so a foreign or
+// incomplete-identity volume is never acted on or reported as ours.
+//
+// Unlike ValidateAdoptedCacheVolume — which SKIPS any identity key the caller's
+// `want` set does not specify (the right rule for the reuse-adoption path, where a
+// spec-only builder may legitimately omit repo-url-digest) — this REQUIRES every
+// identity key the volume's own cache-kind demands to be PRESENT and non-empty. A
+// volume that is not managed+cache, carries an unknown/absent cache-kind, or is
+// missing any required key for its kind FAILS validation: it is not provably ours.
+// It compares only the volume's OWN labels (no expected set), so it is the check
+// used where there is no `want` to compare against — the log-only enumeration and
+// the destructive diag-prune's pin re-inspect.
+func ValidateCacheVolumeKind(labels map[string]string) error {
+	if labels[LabelManaged] != "true" || labels[LabelCache] != "true" {
+		return fmt.Errorf("volume is not a managed cache volume (managed=%q cache=%q)", labels[LabelManaged], labels[LabelCache])
+	}
+	kind := CacheKind(labels[LabelCacheKind])
+	required := requiredCacheIdentityKeys(kind)
+	if required == nil {
+		return fmt.Errorf("cache volume has unknown or missing cache-kind %q", labels[LabelCacheKind])
+	}
+	for _, k := range required {
+		if labels[k] == "" {
+			return fmt.Errorf("cache volume of kind %q is missing required identity label %q", kind, k)
+		}
+	}
+	return nil
+}
+
+// ValidateDiagPruneTarget is the STRICT identity gate the diagnostic-log file
+// prune runs against the volume its helper actually PINNED, immediately before
+// the destructive `find -delete` (NEW-H2 — the one remaining destructive cache
+// action; it deletes FILES inside the diag volume, not the volume). The pinned
+// volume must:
+//
+//   - pass the strict kind-aware full-identity check (ValidateCacheVolumeKind);
+//   - be a diag-logs volume for THIS controller; and
+//   - match the enumeration SNAPSHOT's repo + repo-url-digest identity,
+//
+// so a same-name replacement of a DIFFERENT repo, an unlabeled Moby auto-created
+// volume, or a foreign volume is REJECTED and the prune aborts WITHOUT deleting
+// anything (never delete/prune an unprovable volume — B2). snapshot is the
+// DiagVolumeRef label set captured when the volume was enumerated (itself strict-
+// validated at enumeration, so its repo/repo-url-digest are present).
+func ValidateDiagPruneTarget(got, snapshot map[string]string, controllerID string) error {
+	if err := ValidateCacheVolumeKind(got); err != nil {
+		return fmt.Errorf("diag prune target failed strict identity validation: %w", err)
+	}
+	if got[LabelCacheKind] != string(CacheKindDiagLogs) {
+		return fmt.Errorf("diag prune target is cache-kind %q, not %q", got[LabelCacheKind], CacheKindDiagLogs)
+	}
+	if got[LabelControllerID] != controllerID {
+		return fmt.Errorf("diag prune target controller-id %q is not this controller %q", got[LabelControllerID], controllerID)
+	}
+	for _, k := range []string{LabelRepo, LabelRepoURLDigest} {
+		if got[k] != snapshot[k] {
+			return fmt.Errorf("diag prune target %s=%q does not match the enumerated snapshot %q (a same-name replacement since the snapshot)", k, got[k], snapshot[k])
+		}
+	}
+	return nil
+}
+
 // CacheIdentityFilter builds the Docker label filter that discovers a cache
 // volume by its IDENTITY, the load-bearing primitive of ADR-003's structural
 // redesign (2026-07-22): a cache's identity is its LABEL SET, not its name. It
