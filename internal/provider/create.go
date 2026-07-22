@@ -286,7 +286,15 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	labels[spec.LabelOSArch] = string(bootstrap.OSArch)
 	labels[spec.LabelCreateNonce] = nonce
 
-	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir)
+	// Consumer-side externals seed gate (ADR-003 W2, 2026-07-22): when an
+	// externals cache is mounted, tell the runner entrypoint the in-mount marker
+	// path to BLOCK on until externals is fully seeded, so a half-seeded start is
+	// impossible at the point of use regardless of provider-side seed/pin timing.
+	externalsSeededMarker := ""
+	if plan.externalsVolume != "" {
+		externalsSeededMarker = spec.RunnerExternalsSeededMarkerPath
+	}
+	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker)
 	if err != nil {
 		return guarded(err)
 	}
@@ -330,22 +338,22 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("failed to create container for %q: %w", instanceName, err))
 	}
 
-	// 5b. Revalidate the cache volumes the runner now references (ADR-003 W2, H3).
-	// The externals volume was ensured+seeded, and the toolcache/pnpm/diag volumes
-	// ensured, BEFORE this ContainerCreate. A concurrent, opportunistic age-based
-	// GC (a peer CreateInstance/ListInstances) could have evicted a still-current
-	// cache in that ensure→mount gap — before this container pins it in use — and
-	// real Moby then AUTO-CREATES the missing named volume UNLABELED during
-	// ContainerCreate, so the runner would mount an EMPTY read-only externals tree
-	// (or an empty cache) and leave a GC-invisible orphan behind. Confirm every
-	// referenced cache volume still carries our cache labels; if any was replaced
-	// by an auto-created empty volume, remove the just-created (not-yet-started)
-	// runner so the empty replacement can be reclaimed, reap the orphan(s) by name,
-	// and FAIL the allocation CLOSED — never run a runner against an empty
-	// externals tree.
-	if orphans, rerr := p.revalidateReferencedCaches(ctx, plan); rerr != nil {
+	// 5b. Revalidate the cache volumes the runner now references (ADR-003 W2
+	// structural redesign). The externals volume was ensured+seeded, and the
+	// toolcache/pnpm/diag volumes ensured, BEFORE this ContainerCreate. A
+	// concurrent, opportunistic age-based GC (a peer CreateInstance/ListInstances)
+	// could have evicted a still-current cache in that ensure→mount gap — before
+	// this container pins it in use — and real Moby then AUTO-CREATES the missing
+	// named volume UNLABELED during ContainerCreate, so the runner would mount an
+	// EMPTY read-only externals tree (or an empty cache). Confirm every referenced
+	// cache volume still carries our full identity; if any does not, remove the
+	// just-created (not-yet-started) runner and FAIL the allocation CLOSED —
+	// WITHOUT deleting the mismatched volume (it is left as cruft, never
+	// name-deleted — a Moby auto-created unlabeled volume and a foreign one are
+	// indistinguishable, B2). GARM's retry then reconciles AROUND the slot
+	// (EnsureCacheVolume label-as-identity), so there is no wedge.
+	if rerr := p.revalidateReferencedCaches(ctx, plan); rerr != nil {
 		p.bestEffortRemoveContainer(ctx, created.ID)
-		p.bestEffortRemoveOrphanVolumes(ctx, orphans)
 		return guarded(rerr)
 	}
 
@@ -403,94 +411,57 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 
 // revalidateReferencedCaches confirms every persistent cache volume the runner
 // container now references is STILL the fully-identified cache the provider
-// ensured+seeded (ADR-003 W2; NEW-H1 / H3b). After ContainerCreate pins the
-// volumes, each is re-inspected and its LIVE labels validated against the expected
-// identity via spec.ValidateAdoptedCacheVolume — the full cache-kind/repo/digest/
-// salt tuple, NOT merely cache=true — so a wrong-digest externals volume or a
-// foreign same-name squatter is caught as well as an UNLABELED auto-created
-// replacement (a concurrent GC evicted the original in the ensure→mount window and
-// Moby recreated it empty). It returns two distinct outcomes, both fail-closed:
+// ensured+seeded (ADR-003 W2 structural redesign, 2026-07-22). After
+// ContainerCreate pins the volumes, each is re-inspected and its LIVE labels
+// validated against the expected identity via spec.ValidateAdoptedCacheVolume —
+// the full cache-kind/repo/digest/salt tuple, NOT merely cache=true — so a
+// wrong-digest externals volume or a foreign same-name squatter is caught as well
+// as an UNLABELED auto-created replacement (a concurrent GC evicted the original
+// in the ensure→mount window and Moby recreated it empty).
 //
-//   - inspect SUCCEEDED and the volume is NOT ours → the volume name is returned
-//     as a reap-able orphan (the SUCCESSFUL inspect PROVES it is the unlabeled/
-//     wrong replacement, safe to reclaim by name);
-//   - inspect FAILED (context cancellation, a transient daemon error, NotFound) →
-//     the allocation fails closed, but the volume is NOT authorized for deletion
-//     ("don't know → don't delete"): a transient post-create inspect error must
-//     never delete a valid warm cache (NEW-H1). Such names are omitted from the
-//     returned orphan list entirely.
-//
-// A non-nil error (fail closed) is returned whenever ANY referenced cache could
-// not be confirmed, so the caller never starts the runner against an unverified
-// (possibly empty) cache tree.
-func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePlan) ([]string, error) {
-	var orphans, bad []string
+// It fails CLOSED — a non-nil error — whenever ANY referenced cache cannot be
+// confirmed (an identity mismatch OR an inspect failure: context cancellation, a
+// transient daemon error, NotFound), so the caller rolls back only THIS attempt's
+// own runner/allocation and never starts the runner against an unverified
+// (possibly empty) cache tree. It NEVER deletes the mismatched volume: a Moby
+// auto-created unlabeled volume and a genuinely foreign one are indistinguishable,
+// so name-based deletion can never be foreign-safe (B2). An unprovable volume is
+// left in place as disk cruft (logged once for operator visibility). On GARM's
+// retry, EnsureCacheVolume reconciles AROUND the unlabeled slot (label-as-identity),
+// so there is no permanent wedge and no foreign deletion.
+func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePlan) error {
+	var bad []string
 	for _, ref := range plan.cacheRefs {
 		v, err := p.cli.VolumeInspect(ctx, ref.name)
 		if err != nil {
-			// inspect failed → don't know → don't delete, fail closed (NEW-H1). Do
-			// NOT record it as an orphan: a transient inspect error must not
-			// authorize deleting a valid warm cache.
+			// inspect failed → don't know → don't delete, fail closed.
 			bad = append(bad, fmt.Sprintf("%s (inspect failed, not deleting: %v)", ref.name, err))
 			continue
 		}
 		if verr := spec.ValidateAdoptedCacheVolume(ref.name, v.Labels, ref.want); verr != nil {
 			// A SUCCESSFUL inspect PROVES this is not our seeded cache — an
-			// unlabeled auto-created replacement or a foreign/wrong-digest volume.
-			// Safe to reap THIS specific orphan by name.
-			orphans = append(orphans, ref.name)
+			// unlabeled auto-created replacement, or a foreign/wrong-digest volume.
+			// We do NOT delete it (never delete an unprovable volume — B2); it is
+			// left as cruft and logged, and GARM's retry reconciles around the slot.
+			log.Printf("garm-provider-docker: CreateInstance: referenced cache volume %q is not our validated cache (%v); leaving it in place as cruft (ADR-003 never-delete-unprovable) and failing this allocation closed so GARM retries and reconciles around the slot", ref.name, verr)
 			bad = append(bad, ref.name+" ("+verr.Error()+")")
 		}
 	}
 	if len(bad) > 0 {
-		return orphans, fmt.Errorf("cache volume(s) could not be confirmed as our seeded cache during create (a GC/create race or a transient inspect failure); refusing to run the runner against an unverified cache: %s", strings.Join(bad, ", "))
+		return fmt.Errorf("cache volume(s) could not be confirmed as our seeded cache during create (a GC/create race or a transient inspect failure); refusing to run the runner against an unverified cache: %s", strings.Join(bad, ", "))
 	}
-	return nil, nil
+	return nil
 }
 
 // bestEffortRemoveContainer force-removes a container under a detached context,
-// tolerating NotFound. Used to drop the just-created (not-yet-started) runner so
-// an empty auto-created replacement cache volume it references can be reclaimed
-// before the allocation is rolled back (H3).
+// tolerating NotFound. Used to drop the just-created (not-yet-started) runner when
+// a referenced cache fails post-create revalidation, before the allocation is
+// rolled back — so the runner never starts against an unverified cache tree.
 func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 	if err := p.cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 		log.Printf("garm-provider-docker: cache-revalidation rollback: failed to remove runner container %s (continuing): %v", id, err)
-	}
-}
-
-// bestEffortRemoveOrphanVolumes reaps the empty, unlabeled cache volumes the
-// daemon auto-created during a GC/create race, by name, under a detached context
-// (H3). Every name here was proven an orphan by a SUCCESSFUL inspect at the call
-// site, but it RE-CHECKS ownership at this destructive boundary immediately before
-// each delete (NEW-H1): only a volume a fresh inspect STILL shows is NOT a cache
-// (no cache=true — an unlabeled auto-created replacement) is removed. If a peer has
-// since recreated/reseeded a labeled cache under this name, it is SKIPPED rather
-// than yanked out from under a live job. It tolerates NotFound (already gone) and
-// Conflict (a peer's create still references the auto-created name) so it never
-// turns a best-effort cleanup into a hard failure.
-func (p *Provider) bestEffortRemoveOrphanVolumes(ctx context.Context, names []string) {
-	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	for _, name := range names {
-		// Destructive-boundary ownership re-check: never delete a volume a fresh
-		// inspect shows is a labeled cache. A NotFound means it is already gone;
-		// any other inspect error means "don't know → don't delete".
-		v, err := p.cli.VolumeInspect(rmCtx, name)
-		if err != nil {
-			if !errdefs.IsNotFound(err) {
-				log.Printf("garm-provider-docker: cache-revalidation rollback: skipping reap of %q (re-inspect failed, not deleting): %v", name, err)
-			}
-			continue
-		}
-		if v.Labels[spec.LabelCache] == "true" {
-			log.Printf("garm-provider-docker: cache-revalidation rollback: %q now carries cache=true (a peer reseeded it); not reaping a labeled cache", name)
-			continue
-		}
-		if err := p.cli.VolumeRemove(rmCtx, name, false); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsConflict(err) {
-			log.Printf("garm-provider-docker: cache-revalidation rollback: failed to reap empty auto-created cache volume %q (continuing): %v", name, err)
-		}
 	}
 }
 
@@ -597,7 +568,7 @@ func validatePlatform(b params.BootstrapInstance) error {
 // persistent diag volume is mounted), becomes GARM_DIAG_DIR so the entrypoint
 // can own the mounted _diag dir before dropping privileges. Any being "" omits
 // its env var.
-func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir string) ([]string, error) {
+func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker string) ([]string, error) {
 	opts := spec.RunnerEnvOptions{
 		JITConfigEnabled: b.JitConfigEnabled,
 		GitHubURL:        githubBaseURL(b.RepoURL),
@@ -617,11 +588,19 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 		opts.Entity = entity
 	}
 	env := spec.BuildRunnerEnv(opts)
-	// GARM_DIAG_DIR is a plain path (never a secret), appended here rather than
-	// threaded through the credential-invisibility-audited spec.BuildRunnerEnv, so
-	// that function's structural "no secret can be emitted" property is untouched.
+	// GARM_DIAG_DIR and GARM_EXTERNALS_SEEDED_MARKER are plain paths (never
+	// secrets), appended here rather than threaded through the
+	// credential-invisibility-audited spec.BuildRunnerEnv, so that function's
+	// structural "no secret can be emitted" property is untouched.
 	if diagDir != "" {
 		env = append(env, spec.RunnerDiagDirEnv+"="+diagDir)
+	}
+	// The consumer-side externals seed gate: the entrypoint blocks on this marker
+	// until externals is fully seeded before launching the runner (ADR-003 W2).
+	// Set only when an externals cache is actually mounted, so the entrypoint's
+	// wait runs only when externals seeding is expected.
+	if externalsSeededMarker != "" {
+		env = append(env, spec.RunnerExternalsSeededMarkerEnv+"="+externalsSeededMarker)
 	}
 	return env, nil
 }

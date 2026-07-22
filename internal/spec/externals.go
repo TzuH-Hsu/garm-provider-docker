@@ -25,6 +25,33 @@ import (
 // the shared, seeded Node runtimes instead of its own image-baked copy.
 const RunnerExternalsDir = "/actions-runner/externals"
 
+// externalsSeededMarkerBasename is the atomic "seeding complete" sentinel's file
+// name (written LAST by the seed script, inside the externals volume). It is the
+// single source of truth for the marker's name, shared by the provider-side seed
+// (externalsSeededMarker, at the seed staging path) and the CONSUMER-side gate
+// (RunnerExternalsSeededMarkerPath, at the runner's read-only mount path). Keeping
+// one basename is what guarantees the runner waits for exactly the file the seeder
+// writes.
+const externalsSeededMarkerBasename = ".garm-seeded"
+
+// RunnerExternalsSeededMarkerPath is where the externals seed-completion marker
+// appears INSIDE THE RUNNER: the externals volume is mounted read-only at
+// RunnerExternalsDir, so the marker the seed script wrote at
+// <staging>/.garm-seeded surfaces here. The provider passes this path to the
+// runner entrypoint as RunnerExternalsSeededMarkerEnv so the entrypoint can BLOCK
+// until externals is fully seeded before launching the runner (ADR-003 W2
+// consumer-side seed gate, 2026-07-22) — the robust backstop that makes a
+// half-seeded start impossible AT THE POINT OF USE, regardless of provider-side
+// pin timing.
+const RunnerExternalsSeededMarkerPath = RunnerExternalsDir + "/" + externalsSeededMarkerBasename
+
+// RunnerExternalsSeededMarkerEnv carries RunnerExternalsSeededMarkerPath to the
+// runner-image entrypoint. The provider sets it ONLY when an externals cache is
+// actually mounted (cache enabled), so the entrypoint's seed-wait runs only when
+// externals seeding is expected; when unset the entrypoint skips the wait
+// entirely (a cache-disabled runner has no externals mount to wait on).
+const RunnerExternalsSeededMarkerEnv = "GARM_EXTERNALS_SEEDED_MARKER"
+
 // externalsSeedStagingDir is where the externals volume is mounted READ-WRITE
 // inside the short-lived seed container. It is deliberately NOT
 // RunnerExternalsDir: mounting the volume over the image's own externals would
@@ -38,7 +65,7 @@ const externalsSeedStagingDir = "/garm-externals-seed"
 // re-seeding, so it never mounts a half-copied externals tree. It lives inside
 // the volume (as a dotfile alongside the Node runtime dirs) so every container
 // sharing the volume sees the same marker.
-const externalsSeededMarker = externalsSeedStagingDir + "/.garm-seeded"
+const externalsSeededMarker = externalsSeedStagingDir + "/" + externalsSeededMarkerBasename
 
 // externalsSeedLock is the flock lock file inside the volume. Two concurrent
 // first-jobs for the same image digest both open and flock it; because both

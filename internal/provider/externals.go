@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -67,13 +68,17 @@ func (p *Provider) planExternals(ctx context.Context, runnerImage string) (strin
 // so two concurrent provider processes seeding the same digest do not collide on
 // the container NAME — the in-volume flock, not the name, is the seeding mutex.
 //
-// Pin-then-validate (H3c): the seed helper's ContainerCreate PINS the externals
-// volume; if a concurrent GC evicted it in the ensure→seed window, real Moby
-// AUTO-CREATES it UNLABELED and the seeder would otherwise copy ~380MB into an
-// unlabeled volume that M6 adoption then rejects forever (a wedge). An afterCreate
+// Pin-then-validate (ADR-003 W2 structural redesign): the seed helper's
+// ContainerCreate PINS the externals volume; if a concurrent GC evicted it in the
+// ensure→seed window, real Moby AUTO-CREATES it UNLABELED and the seeder would
+// otherwise copy ~380MB into a volume the runner should not mount. An afterCreate
 // hook re-inspects the pinned volume and, only if a SUCCESSFUL inspect PROVES it is
-// no longer our seeded cache, marks it for reaping and aborts the seed BEFORE the
-// copy. An inspect FAILURE aborts closed WITHOUT authorizing any delete (NEW-H1).
+// no longer our seeded cache, aborts the seed BEFORE the copy — WITHOUT deleting
+// the mismatched volume (a Moby auto-created unlabeled volume and a foreign one are
+// indistinguishable, so name-based deletion can never be foreign-safe — B2). The
+// unprovable volume is left as cruft (logged); GARM's retry reconciles AROUND the
+// slot (EnsureCacheVolume label-as-identity), so there is no wedge. An inspect
+// FAILURE also aborts closed WITHOUT any delete ("don't know → don't delete").
 func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName string, wantLabels map[string]string) error {
 	nonce, err := newCreateNonce()
 	if err != nil {
@@ -85,27 +90,24 @@ func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName st
 		Labels:     p.helperLabels(),
 	})
 
-	var orphan string
 	afterCreate := func(vctx context.Context) error {
 		v, err := p.cli.VolumeInspect(vctx, volumeName)
 		if err != nil {
-			// inspect failed → don't know → don't delete, fail closed (NEW-H1).
+			// inspect failed → don't know → don't delete, fail closed.
 			return fmt.Errorf("externals seed target %q could not be re-inspected before seeding: %w", volumeName, err)
 		}
 		if verr := spec.ValidateAdoptedCacheVolume(volumeName, v.Labels, wantLabels); verr != nil {
 			// A SUCCESSFUL inspect proves this is an unlabeled auto-created
-			// replacement (or a foreign squatter): reap this specific orphan by
-			// name rather than seed into it and wedge future adoption.
-			orphan = volumeName
+			// replacement (or a foreign squatter). Do NOT delete it (never delete an
+			// unprovable volume — B2): leave it as cruft (logged) and abort; the
+			// retry reconciles around the slot.
+			log.Printf("garm-provider-docker: externals seed target %q is not our validated cache (%v); leaving it in place as cruft (ADR-003 never-delete-unprovable) and aborting this seed so GARM retries and reconciles around the slot", volumeName, verr)
 			return fmt.Errorf("externals seed target %q is not our seeded cache (a GC/create race auto-created it): %w", volumeName, verr)
 		}
 		return nil
 	}
 
 	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-seed-"+nonce, externalsSeedTimeout, afterCreate)
-	if orphan != "" {
-		p.bestEffortRemoveOrphanVolumes(ctx, []string{orphan})
-	}
 	if err != nil {
 		return fmt.Errorf("externals seed for %q failed: %w", volumeName, err)
 	}

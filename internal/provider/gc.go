@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -11,6 +12,7 @@ import (
 	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
 
 // Opportunistic cache-GC tuning (ADR-003 W2). The pass is bounded so a large
@@ -29,6 +31,11 @@ const (
 	cacheGCMaxEvictions  = 50
 	cacheGCMaxDiagPrunes = 20
 	helperReapMax        = 50
+
+	// cacheGCCruftLogMax caps how many unprovable cache-named volumes one GC pass
+	// names in its operator-visibility log line, so a large backlog of cruft cannot
+	// produce an unbounded log entry.
+	cacheGCCruftLogMax = 50
 
 	// diagPruneTimeout bounds one diagnostic-log prune helper (a `find -delete`
 	// over one volume — fast; this is generous headroom).
@@ -98,6 +105,33 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 	}
 
 	p.pruneDiagVolumes(ctx, runnerImage)
+
+	// Cruft visibility (ADR-003 never-delete-unprovable): surface any
+	// cache-name-prefixed volumes that lack our managed cache labels — unlabeled
+	// Moby auto-created replacements or foreign squatters the provider will NOT
+	// delete (a Moby auto-created unlabeled volume and a foreign one are
+	// indistinguishable), so an operator can reclaim genuinely-stale disk manually.
+	p.logUnprovableCacheCruft(ctx)
+}
+
+// logUnprovableCacheCruft logs (best-effort, bounded) the cache-named volumes that
+// carry no managed cache labels, for operator visibility. It never deletes
+// anything — under ADR-003's label-as-identity rule the provider only ever removes
+// volumes it can POSITIVELY prove are ours (managed + full identity).
+func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
+	cruft, err := p.topo.ListUnprovableCacheCruft(ctx)
+	if err != nil {
+		log.Printf("garm-provider-docker: cache GC: cruft-visibility scan failed (continuing): %v", err)
+		return
+	}
+	if len(cruft) == 0 {
+		return
+	}
+	shown := cruft
+	if len(shown) > cacheGCCruftLogMax {
+		shown = shown[:cacheGCCruftLogMax]
+	}
+	log.Printf("garm-provider-docker: cache GC: %d cache-named volume(s) carry no managed cache labels (unlabeled auto-created replacements or foreign squatters); NOT deleting them (ADR-003 never-delete-unprovable) — an operator may reclaim disk manually if these are genuinely stale: %s", len(cruft), strings.Join(shown, ", "))
 }
 
 // pruneDiagVolumes runs the retention prune helper against each of this
@@ -106,44 +140,48 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 // image is not present locally this pass, the prune is skipped (best-effort) and
 // runs on a later pass once the image is present. Bounded per pass.
 func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
-	names, err := p.topo.ListDiagVolumes(ctx)
+	refs, err := p.topo.ListDiagVolumes(ctx)
 	if err != nil {
 		log.Printf("garm-provider-docker: cache GC: failed to list diag volumes (continuing): %v", err)
 		return
 	}
-	if len(names) == 0 {
+	if len(refs) == 0 {
 		return
 	}
 	if _, _, err := p.cli.ImageInspectWithRaw(ctx, runnerImage); err != nil {
 		log.Printf("garm-provider-docker: cache GC: runner image %q not present; skipping diag prune this pass", runnerImage)
 		return
 	}
-	for i, name := range names {
+	for i, ref := range refs {
 		if i >= cacheGCMaxDiagPrunes {
 			log.Printf("garm-provider-docker: cache GC: hit the per-pass diag-prune cap (%d); remaining diag volumes pruned on a later pass", cacheGCMaxDiagPrunes)
 			break
 		}
-		p.pruneDiagVolume(ctx, runnerImage, name)
+		p.pruneDiagVolume(ctx, runnerImage, ref)
 	}
 }
 
 // pruneDiagVolume runs one diagnostic-log prune helper to completion against a
 // single diag volume (best-effort: a prune failure is logged, never fatal).
 //
-// H3c (pin-then-validate): the volume NAME came from a ListDiagVolumes snapshot; a
-// concurrent GC could remove it in the gap before this runs, and the OLD flow —
-// inspect, THEN create the helper — left a wedge window: between that inspect and
-// the helper's ContainerCreate the volume could be removed, Moby would AUTO-CREATE
-// an UNLABELED volume of the same name, the helper would prune it (harmlessly) and
-// be removed, but the unlabeled (GC-invisible) volume would PERSIST — and M6's
-// adoption guard then REJECTS that deterministic name on every future CreateInstance
-// for that repo, a permanent wedge. Instead we now create the helper FIRST (pinning
-// the volume, or pinning the unlabeled auto-created replacement), then validate the
-// pinned volume's identity in the afterCreate hook BEFORE the prune runs. If it is
-// an unlabeled auto-created replacement (or a foreign same-name volume), the prune
-// is aborted, the helper removed, and that specific orphan reaped by name — never
-// wedging future adoption. An inspect FAILURE aborts closed WITHOUT deleting (NEW-H1).
-func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName string) {
+// Pin-then-validate (ADR-003 W2 structural redesign): the volume NAME and its
+// IDENTITY LABELS came from a ListDiagVolumes snapshot; a concurrent GC could
+// remove the volume in the gap before this runs, and the OLD inspect-then-create
+// flow left a wedge window (the removed volume would be Moby-AUTO-CREATED UNLABELED
+// and the deterministic name rejected forever by the retired M6 guard). Instead we
+// create the helper FIRST (pinning the volume, or the unlabeled auto-created
+// replacement), then re-validate the pinned volume's FULL identity in the
+// afterCreate hook BEFORE the prune runs — the whole managed+cache+controller+
+// cache-kind+repo+repo-url-digest tuple against the snapshot, so a reincarnated or
+// foreign same-name diag volume of a DIFFERENT repo is not pruned as if it were
+// ours (the earlier check compared only controller/kind, not repo/repo-url-digest).
+// If the pinned volume is not provably the snapshot's identity, the prune is
+// aborted WITHOUT deleting it — a Moby auto-created unlabeled volume and a foreign
+// one are indistinguishable, so name-based deletion can never be foreign-safe (B2);
+// the volume is left as cruft (logged) and GARM's next EnsureCacheVolume reconciles
+// around the slot. An inspect FAILURE aborts closed WITHOUT any delete.
+func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref topology.DiagVolumeRef) {
+	volumeName := ref.Name
 	nonce, err := newCreateNonce()
 	if err != nil {
 		log.Printf("garm-provider-docker: cache GC: failed to name diag-prune helper for %q: %v", volumeName, err)
@@ -156,31 +194,26 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage, volumeName 
 		Labels:        p.helperLabels(),
 	})
 
-	var orphan string
 	afterCreate := func(vctx context.Context) error {
 		v, err := p.cli.VolumeInspect(vctx, volumeName)
 		if err != nil {
-			// inspect failed → don't know → don't delete, skip closed (NEW-H1).
+			// inspect failed → don't know → don't delete, skip closed.
 			return fmt.Errorf("diag prune target %q could not be re-inspected: %w", volumeName, err)
 		}
-		if v.Labels[spec.LabelManaged] != "true" ||
-			v.Labels[spec.LabelCache] != "true" ||
-			v.Labels[spec.LabelControllerID] != p.controllerID ||
-			v.Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) {
-			// A SUCCESSFUL inspect proves this is no longer this controller's diag
-			// volume — an unlabeled auto-created replacement (a remove/create race
-			// since the snapshot) or a foreign same-name volume. Reap the specific
-			// orphan rather than wedge future adoption of the deterministic name.
-			orphan = volumeName
+		// FULL identity re-check against the snapshot (label identity keys —
+		// cache-kind, repo, repo-url-digest) PLUS this controller-id. A same-name
+		// replacement of a different repo, or a foreign/unlabeled volume, fails here.
+		if verr := spec.ValidateAdoptedCacheVolume(volumeName, v.Labels, ref.Labels); verr != nil || v.Labels[spec.LabelControllerID] != p.controllerID {
+			// Do NOT delete it (never delete an unprovable volume — B2): leave it as
+			// cruft (logged) and skip the prune; the next EnsureCacheVolume reconciles
+			// around the slot.
+			log.Printf("garm-provider-docker: cache GC: diag prune target %q is not this controller's snapshot diag volume (a same-name replacement since the snapshot); leaving it in place (ADR-003 never-delete-unprovable) and skipping the prune", volumeName)
 			return fmt.Errorf("diag prune target %q is no longer this controller's diag volume (a same-name replacement since the snapshot)", volumeName)
 		}
 		return nil
 	}
 
 	code, err := p.runHelperContainer(ctx, cfg, hostCfg, "garm-diagprune-"+nonce, diagPruneTimeout, afterCreate)
-	if orphan != "" {
-		p.bestEffortRemoveOrphanVolumes(ctx, []string{orphan})
-	}
 	if err != nil {
 		log.Printf("garm-provider-docker: cache GC: skipping/failed diag prune of %q (continuing): %v", volumeName, err)
 		return

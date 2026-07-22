@@ -12,6 +12,7 @@ import (
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
 
 // seedHelperContainer creates a cache-helper container with the given created-at
@@ -137,6 +138,13 @@ func TestCreateInstanceExternalsSeededAndMountedReadOnly(t *testing.T) {
 	if !envHas(c, spec.RunnerDiagDirEnv+"="+spec.RunnerDiagDir) {
 		t.Errorf("%s env not set to %s", spec.RunnerDiagDirEnv, spec.RunnerDiagDir)
 	}
+
+	// The consumer-side externals seed gate: because externals is mounted, the
+	// runner carries the marker env the entrypoint blocks on until seeding
+	// completes (ADR-003 W2 consumer-side gate).
+	if !envHas(c, spec.RunnerExternalsSeededMarkerEnv+"="+spec.RunnerExternalsSeededMarkerPath) {
+		t.Errorf("%s env not set to %s (consumer-side externals seed gate)", spec.RunnerExternalsSeededMarkerEnv, spec.RunnerExternalsSeededMarkerPath)
+	}
 }
 
 // TestCreateInstanceSeedFailureFailsCreate: a seed helper that exits non-zero
@@ -244,17 +252,18 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	}
 }
 
-// TestPruneDiagVolumePinThenValidateReapsAutoCreatedOrphan is the H3(c) guard for
-// the diag-prune path: a concurrent GC removes the diag volume in the window
-// between the prune helper's ContainerCreate pinning it and the prune running.
-// Real Moby then AUTO-CREATES an UNLABELED volume of the same (deterministic) name.
-// The OLD flow (inspect-then-create) would prune that unlabeled volume and leave it
-// behind — a GC-invisible orphan M6's adoption guard then REJECTS on every future
-// CreateInstance for that repo (a permanent wedge). The pin-then-validate flow
-// instead inspects the PINNED volume, detects the unlabeled replacement, aborts the
-// prune, and reaps that specific orphan by name — so the deterministic name is
-// adoptable again (no wedge).
-func TestPruneDiagVolumePinThenValidateReapsAutoCreatedOrphan(t *testing.T) {
+// TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge is the
+// structural-redesign guard for the diag-prune path: a concurrent GC removes the
+// diag volume in the window between the prune helper's ContainerCreate pinning it
+// and the prune running. Real Moby then AUTO-CREATES an UNLABELED volume of the
+// same (deterministic) name. The pin-then-validate flow inspects the PINNED volume,
+// detects the unlabeled replacement (a FULL-identity check against the snapshot),
+// and ABORTS the prune WITHOUT deleting the unlabeled volume — never delete a
+// volume we cannot prove is ours (B2). The unlabeled volume is left in place as
+// cruft, and — because discovery is by label — a subsequent EnsureCacheVolume for
+// the same identity is NOT wedged: it reconciles around the squatted name to an
+// alternate.
+func TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 	ctx := context.Background()
 
@@ -262,33 +271,36 @@ func TestPruneDiagVolumePinThenValidateReapsAutoCreatedOrphan(t *testing.T) {
 	diagName := spec.DiagVolumeName(repoKey)
 	id := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey}
 	seedVol(t, fake, diagName, id.DiagLabels(time.Now()))
+	ref := topology.DiagVolumeRef{Name: diagName, Labels: id.DiagLabels(time.Now())}
 
 	// At the prune helper's ContainerCreate, a concurrent GC removes the diag
 	// volume; ContainerCreate then AUTO-CREATES it UNLABELED (modeled by the fake's
-	// missing-named-volume auto-create). This is the exact wedge window.
+	// missing-named-volume auto-create). This is the exact race window.
 	var once sync.Once
 	fake.CreateHook = func() {
 		once.Do(func() { _ = fake.VolumeRemove(ctx, diagName, true) })
 	}
 
-	p.pruneDiagVolume(ctx, "ghcr.io/example/runner@sha256:deadbeef", diagName)
+	p.pruneDiagVolume(ctx, "ghcr.io/example/runner@sha256:deadbeef", ref)
 	fake.CreateHook = nil
 
-	// No GC-invisible orphan persists: the unlabeled auto-created replacement was
-	// reaped, so the deterministic diag name is GONE entirely.
-	if v, ok := volByName(t, fake, diagName); ok {
-		t.Fatalf("[H3c] the unlabeled auto-created diag orphan %q was NOT reaped (labels=%v) — a permanent wedge", diagName, v.Labels)
+	// The unlabeled auto-created replacement is PRESERVED (never deleted).
+	v, ok := volByName(t, fake, diagName)
+	if !ok {
+		t.Fatalf("the unlabeled auto-created diag volume %q was DELETED — never delete a volume we cannot prove is ours (B2)", diagName)
+	}
+	if v.Labels[spec.LabelCache] == "true" {
+		t.Errorf("the auto-created diag volume unexpectedly carries cache=true: %v", v.Labels)
 	}
 
-	// Prove NO wedge: EnsureCacheVolume for the same deterministic name now adopts
-	// cleanly (creates fresh labeled), rather than being rejected forever by M6's
-	// adoption guard.
+	// Prove NO wedge: EnsureCacheVolume for the same identity reconciles AROUND the
+	// unlabeled squatter to an alternate name rather than being rejected forever.
 	res, err := p.topo.EnsureCacheVolume(ctx, diagName, id.DiagLabels(time.Now()))
 	if err != nil {
-		t.Fatalf("[H3c] the diag name is WEDGED — EnsureCacheVolume rejected it after the prune race: %v", err)
+		t.Fatalf("the diag name is WEDGED — EnsureCacheVolume did not reconcile around the unlabeled squatter: %v", err)
 	}
-	if res.Hit {
-		t.Errorf("[H3c] EnsureCacheVolume reported a hit; the orphan was not fully reclaimed")
+	if res.Name == diagName {
+		t.Errorf("EnsureCacheVolume adopted the unlabeled squatter %q instead of reconciling to an alternate", diagName)
 	}
 }
 

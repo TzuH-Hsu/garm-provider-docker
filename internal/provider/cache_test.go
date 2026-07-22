@@ -117,15 +117,18 @@ func cacheVolsByKind(t *testing.T, fake *docker.FakeClient, kind spec.CacheKind)
 
 const cacheRepoURL = "https://github.com/example-org/example-repo"
 
-// TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate is the H3
-// ensure→mount-window guard: a concurrent age-based GC evicts the (already
-// ensured+seeded) externals cache in the gap before the runner container pins it
-// in use; real Moby then AUTO-CREATES the missing named volume UNLABELED when the
-// runner references it (modeled by the fake). The provider revalidates the
-// referenced caches after ContainerCreate, detects the empty unlabeled
-// replacement, and FAILS the allocation CLOSED — no runner is left against an
-// empty externals tree, and the empty auto-created orphan is reaped (not left
-// GC-invisible).
+// TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate is the
+// ensure→mount-window guard under the structural redesign: a concurrent age-based
+// GC evicts the (already ensured+seeded) externals cache in the gap before the
+// runner container pins it in use; real Moby then AUTO-CREATES the missing named
+// volume UNLABELED when the runner references it (modeled by the fake). The
+// provider revalidates the referenced caches after ContainerCreate, detects the
+// empty unlabeled replacement, and FAILS the allocation CLOSED — no runner is left
+// against an empty externals tree. Critically, under ADR-003's
+// never-delete-unprovable rule the unlabeled auto-created volume is NOT deleted (a
+// Moby auto-created unlabeled volume and a genuinely foreign one are
+// indistinguishable): it is left in place as cruft, and GARM's retry reconciles
+// around the slot by label.
 func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -164,26 +167,32 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 		t.Error("[H3] the runner container was left present after a fail-closed create")
 	}
 
-	// The empty auto-created externals volume must be reaped — no labeled externals
-	// cache remains, and the deterministic externals name is gone entirely (no
-	// GC-invisible unlabeled orphan).
+	// No LABELED externals cache remains (the original was evicted), but the
+	// unlabeled auto-created replacement is NOT deleted (never delete unprovable):
+	// it lingers as cruft under the deterministic externals name.
 	if out, _ := fake.VolumeList(context.Background(), externalsFilter); len(out.Volumes) != 0 {
-		t.Errorf("[H3] a labeled externals cache unexpectedly remains: %d", len(out.Volumes))
+		t.Errorf("a labeled externals cache unexpectedly remains: %d", len(out.Volumes))
 	}
 	insp, _, err := fake.ImageInspectWithRaw(context.Background(), "ghcr.io/example/runner@sha256:deadbeef")
 	if err != nil {
-		t.Fatalf("[H3] runner image inspect: %v", err)
+		t.Fatalf("runner image inspect: %v", err)
 	}
 	extName := spec.ExternalsVolumeName(strings.TrimPrefix(insp.ID, "sha256:"))
-	if _, ok := volByName(t, fake, extName); ok {
-		t.Errorf("[H3] the empty auto-created externals orphan %q was not reaped", extName)
+	ev, ok := volByName(t, fake, extName)
+	if !ok {
+		t.Fatalf("the unlabeled auto-created externals volume %q was DELETED — the provider must never delete a volume it cannot prove is ours (B2)", extName)
+	}
+	if ev.Labels[spec.LabelCache] == "true" {
+		t.Errorf("the auto-created externals volume unexpectedly carries cache=true: %v", ev.Labels)
 	}
 }
 
-// TestRevalidateReferencedCachesClassification directly proves NEW-H1's core rule
-// at the classification boundary: an inspect FAILURE yields NO orphan (fail closed,
-// don't authorize any delete), while an inspect that SUCCEEDS and proves the volume
-// is unlabeled/wrong yields exactly that name as a reap-able orphan.
+// TestRevalidateReferencedCachesClassification proves the structural-redesign rule
+// at the classification boundary: revalidate fails CLOSED on BOTH a transient
+// inspect failure AND a proven identity mismatch (an unlabeled auto-created
+// replacement), and in NEITHER case does it delete the volume — never delete a
+// volume we cannot prove is ours (B2). The mismatched volume is left in place as
+// cruft; GARM's retry reconciles around the slot.
 func TestRevalidateReferencedCachesClassification(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 	ctx := context.Background()
@@ -197,34 +206,36 @@ func TestRevalidateReferencedCachesClassification(t *testing.T) {
 	var plan cachePlan
 	plan.addCacheRef(warmName, want)
 
-	// (a) Transient inspect failure → fail closed, NO orphan authorized for deletion.
+	// (a) Transient inspect failure → fail closed. The volume must survive.
 	fake.VolumeInspectErrHook = func(name string) error {
 		if name == warmName {
 			return errors.New("transient daemon error: i/o timeout")
 		}
 		return nil
 	}
-	orphans, err := p.revalidateReferencedCaches(ctx, plan)
-	if err == nil {
-		t.Fatal("[NEW-H1] revalidate returned nil error on a transient inspect failure; want fail-closed")
+	if err := p.revalidateReferencedCaches(ctx, plan); err == nil {
+		t.Fatal("revalidate returned nil error on a transient inspect failure; want fail-closed")
 	}
-	if len(orphans) != 0 {
-		t.Errorf("[NEW-H1] revalidate authorized deleting %v on a transient inspect failure; want NO orphan", orphans)
+	fake.VolumeInspectErrHook = nil
+	if _, ok := volByName(t, fake, warmName); !ok {
+		t.Error("a transient inspect failure deleted the warm cache; it must never delete")
 	}
 
 	// (b) Inspect succeeds but the volume is UNLABELED (auto-created replacement) →
-	// that specific name is returned as a reap-able orphan.
-	fake.VolumeInspectErrHook = nil
+	// fail closed, and the unlabeled volume is PRESERVED (never deleted).
 	if err := fake.VolumeRemove(ctx, warmName, true); err != nil {
 		t.Fatalf("remove warm: %v", err)
 	}
 	seedVol(t, fake, warmName, map[string]string{}) // unlabeled auto-created replacement
-	orphans, err = p.revalidateReferencedCaches(ctx, plan)
-	if err == nil {
-		t.Fatal("[NEW-H1] revalidate returned nil error for an unlabeled replacement; want fail-closed")
+	if err := p.revalidateReferencedCaches(ctx, plan); err == nil {
+		t.Fatal("revalidate returned nil error for an unlabeled replacement; want fail-closed")
 	}
-	if len(orphans) != 1 || orphans[0] != warmName {
-		t.Errorf("[NEW-H1] revalidate orphans = %v, want exactly [%s]", orphans, warmName)
+	uv, ok := volByName(t, fake, warmName)
+	if !ok {
+		t.Fatalf("the unlabeled replacement %q was DELETED — never delete a volume we cannot prove is ours (B2)", warmName)
+	}
+	if uv.Labels[spec.LabelCache] == "true" {
+		t.Errorf("the unlabeled replacement unexpectedly carries cache=true: %v", uv.Labels)
 	}
 }
 
@@ -501,5 +512,9 @@ func TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes(t *testing.T) {
 	}
 	if envHasPrefix(c, "npm_config_store_dir=") {
 		t.Error("npm_config_store_dir must be absent when the cache feature is disabled")
+	}
+	// No externals mount ⇒ no consumer-side seed-gate env either.
+	if envHasPrefix(c, spec.RunnerExternalsSeededMarkerEnv+"=") {
+		t.Errorf("%s must be absent when the cache feature is disabled (no externals mount to wait on)", spec.RunnerExternalsSeededMarkerEnv)
 	}
 }

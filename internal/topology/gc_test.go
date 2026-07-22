@@ -271,12 +271,54 @@ func TestListDiagVolumes(t *testing.T) {
 	foreign := spec.CacheVolumeIdentity{ControllerID: "other", RepoKey: "repo-b"}
 	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-b"), foreign.DiagLabels(gcTime()))
 
-	names, err := m.ListDiagVolumes(ctx)
+	refs, err := m.ListDiagVolumes(ctx)
 	if err != nil {
 		t.Fatalf("ListDiagVolumes: %v", err)
 	}
-	if len(names) != 1 || names[0] != diagName {
-		t.Errorf("ListDiagVolumes = %v, want just %q", names, diagName)
+	if len(refs) != 1 || refs[0].Name != diagName {
+		t.Errorf("ListDiagVolumes = %v, want just %q", refs, diagName)
+	}
+	// The snapshot carries the diag volume's full identity labels for the
+	// provider's pin-then-validate re-check.
+	if refs[0].Labels[spec.LabelCacheKind] != string(spec.CacheKindDiagLogs) || refs[0].Labels[spec.LabelRepo] != "repo-a" {
+		t.Errorf("ListDiagVolumes snapshot labels = %v, want cache-kind=diag-logs repo=repo-a", refs[0].Labels)
+	}
+}
+
+// TestListUnprovableCacheCruft surfaces cache-name-prefixed volumes that lack our
+// cache=true label (unlabeled auto-created replacements / foreign squatters) for
+// operator-visibility logging, WITHOUT ever deleting them (ADR-003
+// never-delete-unprovable). A provably-ours cache and an unrelated foreign volume
+// are excluded.
+func TestListUnprovableCacheCruft(t *testing.T) {
+	m, fake := newManager(t)
+	ctx := context.Background()
+
+	id := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: "repo-a"}
+	oursName := spec.ToolcacheVolumeName("repo-a", "1")
+	seedRawCacheVolume(t, fake, oursName, id.ToolcacheLabels("1", gcTime()))
+
+	cruftName := spec.ToolcacheVolumeName("repo-b", "1") // cache-named but UNLABELED
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: cruftName, Labels: map[string]string{}}); err != nil {
+		t.Fatalf("seed cruft: %v", err)
+	}
+	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: "some-foreign-vol", Labels: map[string]string{"x": "y"}}); err != nil {
+		t.Fatalf("seed foreign: %v", err)
+	}
+
+	cruft, err := m.ListUnprovableCacheCruft(ctx)
+	if err != nil {
+		t.Fatalf("ListUnprovableCacheCruft: %v", err)
+	}
+	if len(cruft) != 1 || cruft[0] != cruftName {
+		t.Errorf("ListUnprovableCacheCruft = %v, want just %q", cruft, cruftName)
+	}
+	// Nothing was deleted — cruft is surfaced, never removed.
+	if !rawVolumePresent(t, fake, cruftName) {
+		t.Error("the unprovable cruft volume was deleted; it must be left in place")
+	}
+	if !rawVolumePresent(t, fake, oursName) {
+		t.Error("our labeled cache was deleted")
 	}
 }
 
