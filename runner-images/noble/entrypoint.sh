@@ -46,6 +46,11 @@ readonly READY_MARKER=".delivered"
 
 readonly CRED_WAIT_SECONDS="${GARM_CRED_WAIT_SECONDS:-120}"
 readonly DOCKER_WAIT_SECONDS="${WAIT_FOR_DOCKER_SECONDS:-120}"
+# The externals seed can copy ~380MB on a cold volume (the provider bounds its own
+# seed at 10 min), so this consumer-side wait is generous headroom over that while
+# still bounding a wedged seed. On the common warm path the marker is already
+# present and the wait returns immediately.
+readonly EXTERNALS_WAIT_SECONDS="${GARM_EXTERNALS_WAIT_SECONDS:-600}"
 readonly POLL_INTERVAL_SECONDS=1
 
 log() {
@@ -155,6 +160,33 @@ maybe_wait_for_docker() {
   log "waiting up to ${DOCKER_WAIT_SECONDS}s for Docker daemon at ${DOCKER_HOST}"
   wait_for_docker_ready "${DOCKER_WAIT_SECONDS}" \
     || fail "timed out waiting for Docker daemon readiness at ${DOCKER_HOST}"
+}
+
+# wait_for_externals_seeded is the CONSUMER-side externals seed gate (ADR-003 W2):
+# it blocks until the seed-completion marker (GARM_EXTERNALS_SEEDED_MARKER, set by
+# the provider ONLY when an externals cache is mounted) exists in the read-only
+# externals mount, bounded by $EXTERNALS_WAIT_SECONDS. The provider seeds the
+# externals volume under an in-volume flock and writes the atomic `.garm-seeded`
+# marker LAST, so the marker's presence proves the tree is fully populated — and the
+# flock guarantees the marker EVENTUALLY appears even if a peer/GC reincarnated the
+# volume in the provider's unpin→runner-pin gap. Waiting here, at the point of use,
+# makes a half-seeded start IMPOSSIBLE regardless of provider-side pin timing — the
+# robust backstop the provider-side seed alone cannot guarantee. No-op when the env
+# is unset (cache disabled / no externals mount). Fails CLOSED on timeout so a
+# never-seeded externals tree never runs the runner against empty Node runtimes.
+wait_for_externals_seeded() {
+  local marker="${GARM_EXTERNALS_SEEDED_MARKER:-}"
+  [[ -z "${marker}" ]] && return 0
+
+  log "waiting up to ${EXTERNALS_WAIT_SECONDS}s for the externals seed marker ${marker}"
+  local elapsed=0
+  while [[ ! -e "${marker}" ]]; do
+    (( elapsed >= EXTERNALS_WAIT_SECONDS )) \
+      && fail "timed out waiting for the externals cache to be seeded (marker ${marker} absent after ${EXTERNALS_WAIT_SECONDS}s); refusing to start the runner against a half-seeded externals tree"
+    sleep "${POLL_INTERVAL_SECONDS}"
+    elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
+  done
+  log "externals cache is fully seeded (${marker} present)"
 }
 
 # run_concurrent_waits backgrounds both waits and fails fast: as soon as
@@ -494,6 +526,11 @@ main() {
   else
     install_non_jit_registration
   fi
+
+  # W2 consumer-side externals seed gate: block until the read-only externals
+  # cache is fully seeded (ADR-003) before launching run.sh, which executes the
+  # Node runtimes THROUGH that mount. No-op when no externals cache is mounted.
+  wait_for_externals_seeded
 
   exec_as_runner ./run.sh
 }
