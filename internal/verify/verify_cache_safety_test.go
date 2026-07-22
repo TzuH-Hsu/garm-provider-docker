@@ -6,9 +6,10 @@
 //
 //   - H2: a non-canonical/reserved cache path is rejected at config load;
 //
-//   - M6: a FOREIGN volume squatting a deterministic cache name is NOT adopted —
-//     CreateInstance fails CLOSED and never mounts it (the same detection the H3
-//     GC-during-create fail-closed rests on);
+//   - RECONCILE (structural redesign 2026-07-22): a FOREIGN volume squatting a
+//     deterministic cache name is NEITHER adopted NOR deleted — CreateInstance
+//     reconciles AROUND it to an alternate name and succeeds, and an UNLABELED
+//     reincarnation of the name does NOT wedge a subsequent create;
 //
 //   - the real-daemon FACT the H3 fail-closed premise rests on: ContainerCreate
 //     AUTO-CREATES a missing named volume UNLABELED (so the provider can detect
@@ -141,11 +142,22 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
+	// reconciledExternalsByLabel returns this controller's externals cache volume
+	// names discovered BY LABEL (cache-kind=externals + image-digest) — the same
+	// discovery EnsureCacheVolume uses, so a reconciled alternate name is found.
+	reconciledExternalsByLabel := func(t *testing.T, controllerID, digest string) []string {
+		return lines(dockerOut(t, "volume", "ls", "-q",
+			"--filter", "label=garm.docker/controller-id="+controllerID,
+			"--filter", "label=garm.docker/cache-kind="+string(spec.CacheKindExternals),
+			"--filter", "label=garm.docker/image-digest="+digest))
+	}
+
 	// =========================================================================
-	// M6: a FOREIGN volume squatting a deterministic cache name is NOT adopted;
-	// CreateInstance fails CLOSED and leaves the foreign volume untouched.
+	// RECONCILE: a FOREIGN volume squatting the deterministic externals name is
+	// NEITHER adopted NOR deleted — CreateInstance reconciles AROUND it to an
+	// alternate name and SUCCEEDS; the foreign volume is left untouched (B2).
 	// =========================================================================
-	t.Run("foreign_externals_squatter_fails_closed", func(t *testing.T) {
+	t.Run("foreign_externals_squatter_reconciled_not_deleted", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		cfg := cacheConfig(t)
 		digest := imageDigestHex(t, imageTag)
@@ -160,25 +172,74 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 			_, _ = dockerTry("volume", "rm", "-f", extName)
 		}()
 
-		repoURL := "https://github.com/garm-m6-verify/repo-" + randHex(t)
-		b := cacheBootstrapPayload("m6-squatter", repoURL, srv.URL, caBundle)
+		repoURL := "https://github.com/garm-reconcile-verify/repo-" + randHex(t)
+		b := cacheBootstrapPayload("reconcile-squatter", repoURL, srv.URL, caBundle)
 		out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
-		if code == 0 {
-			t.Fatalf("[M6] CreateInstance adopted a foreign externals volume and succeeded; want a fail-closed error. stdout=%s", out)
+		if code != 0 {
+			t.Fatalf("[reconcile] CreateInstance must reconcile around a foreign squatter and SUCCEED, exit=%d\n%s", code, out)
 		}
-		t.Logf("[M6] CreateInstance failed closed against a foreign externals squatter (exit=%d)", code)
+		t.Logf("[reconcile] CreateInstance succeeded by reconciling around the foreign squatter (exit=%d)", code)
 
-		// No runner container was left behind.
-		if _, err := dockerTry("inspect", spec.RunnerContainerName("m6-squatter")); err == nil {
-			t.Error("[M6] a runner container was left after the fail-closed create")
+		// The foreign volume is PRESERVED and still UNLABELED (never adopted, never
+		// deleted — it is not ours to touch, B2).
+		if _, err := dockerTry("volume", "inspect", extName); err != nil {
+			t.Fatalf("[reconcile] the foreign externals volume %q was DELETED — never delete a volume we cannot prove is ours", extName)
 		}
-		// The foreign volume must still exist and remain UNLABELED (never adopted,
-		// never deleted — it is not ours to touch).
 		got := strings.TrimSpace(dockerOut(t, "volume", "inspect", extName, "-f", "{{index .Labels \"garm.docker/cache\"}}"))
 		if got == "true" {
-			t.Errorf("[M6] the foreign externals volume was relabeled as our cache — it must be left untouched")
+			t.Errorf("[reconcile] the foreign externals volume was relabeled as our cache — it must be left untouched")
 		} else {
-			t.Logf("[M6] the foreign externals volume was left untouched (not adopted, not deleted)")
+			t.Logf("[reconcile] the foreign externals volume was PRESERVED unlabeled (not adopted, not deleted)")
+		}
+
+		// Our externals cache exists under an ALTERNATE name, discoverable by label.
+		ours := reconciledExternalsByLabel(t, controllerID, digest)
+		if len(ours) != 1 {
+			t.Fatalf("[reconcile] want exactly 1 reconciled externals cache by label, got %v", ours)
+		}
+		if ours[0] == extName {
+			t.Errorf("[reconcile] our externals cache took the squatted name %q; want a reconciled alternate", extName)
+		} else {
+			t.Logf("[reconcile] our externals cache reconciled to alternate %q (foreign %q untouched)", ours[0], extName)
+		}
+	})
+
+	// =========================================================================
+	// NO WEDGE: an UNLABELED reincarnation of the deterministic externals name
+	// (as Moby auto-creates after an evict) does NOT permanently block a
+	// subsequent create — it reconciles around it and succeeds (B3).
+	// =========================================================================
+	t.Run("unlabeled_reincarnation_does_not_wedge", func(t *testing.T) {
+		controllerID := randControllerID(t)
+		cfg := cacheConfig(t)
+		digest := imageDigestHex(t, imageTag)
+		extName := spec.ExternalsVolumeName(digest)
+
+		if out, err := dockerTry("volume", "create", extName); err != nil {
+			t.Fatalf("seed unlabeled reincarnation: %v\n%s", err, out)
+		}
+		defer func() {
+			cleanupController(t, controllerID)
+			_, _ = dockerTry("volume", "rm", "-f", extName)
+		}()
+
+		repoURL := "https://github.com/garm-nowedge-verify/repo-" + randHex(t)
+		b := cacheBootstrapPayload("nowedge", repoURL, srv.URL, caBundle)
+		if out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b); code != 0 {
+			t.Fatalf("[no-wedge] CreateInstance WEDGED on an unlabeled deterministic externals name, exit=%d\n%s", code, out)
+		}
+		t.Logf("[no-wedge] CreateInstance reconciled around the unlabeled reincarnation and succeeded")
+
+		// The unlabeled squatter is preserved; our cache is under an alternate name.
+		got := strings.TrimSpace(dockerOut(t, "volume", "inspect", extName, "-f", "{{index .Labels \"garm.docker/cache\"}}"))
+		if got == "true" {
+			t.Errorf("[no-wedge] the unlabeled reincarnation was adopted/relabeled; must be left untouched")
+		}
+		ours := reconciledExternalsByLabel(t, controllerID, digest)
+		if len(ours) != 1 || ours[0] == extName {
+			t.Errorf("[no-wedge] want exactly 1 reconciled externals cache under an alternate name, got %v", ours)
+		} else {
+			t.Logf("[no-wedge] our externals cache is under the alternate %q; the unlabeled name %q is left as cruft", ours[0], extName)
 		}
 	})
 
