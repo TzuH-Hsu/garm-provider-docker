@@ -26,6 +26,7 @@
 package verify
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -60,7 +61,13 @@ func m3Bootstrap(metadataURL string, caBundle []byte, extraSpecs string) params.
 
 // runProviderSelfDescribe execs the binary for a v0.1.1 self-description command
 // (no stdin, no instance id) with GARM_INTERFACE_VERSION=v0.1.1 and, when set,
-// GARM_POOL_EXTRASPECS. Returns stdout and the exit code.
+// GARM_POOL_EXTRASPECS. Returns STDOUT ONLY (not combined with stderr) and the
+// exit code: stdout is reserved for the command's JSON/text result (research.md
+// §1.E), while stderr now ALWAYS carries this provider's structured slog output
+// (M3-W2), including on a fully successful run — capturing them together would
+// interleave a log line into the middle of a JSON payload a caller then tries
+// to json.Unmarshal, corrupting the parse. Every other helper in this package
+// (runProviderIO) already keeps the two streams separate for the same reason.
 func runProviderSelfDescribe(t *testing.T, bin, configFile, controllerID, command, extraSpecs string) (string, int) {
 	t.Helper()
 	env := append(os.Environ(),
@@ -75,7 +82,10 @@ func runProviderSelfDescribe(t *testing.T, bin, configFile, controllerID, comman
 	}
 	cmd := exec.Command(bin)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	code := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -84,7 +94,10 @@ func runProviderSelfDescribe(t *testing.T, bin, configFile, controllerID, comman
 			t.Fatalf("exec provider (%s): %v", command, err)
 		}
 	}
-	return strings.TrimSpace(string(out)), code
+	if s := strings.TrimSpace(stderr.String()); s != "" {
+		t.Logf("[cmd] GARM_COMMAND=%s stderr: %s", command, s)
+	}
+	return strings.TrimSpace(stdout.String()), code
 }
 
 func TestVerifyM3W1ExtraSpecs(t *testing.T) {
