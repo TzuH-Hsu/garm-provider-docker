@@ -41,9 +41,16 @@ func (p *Provider) planExternals(ctx context.Context, runnerImage string) (strin
 
 	id := spec.ExternalsVolumeIdentity{ControllerID: p.controllerID, ImageDigest: digest}
 	wantLabels := id.ExternalsLabels(time.Now())
-	if _, err := p.topo.EnsureCacheVolume(ctx, name, wantLabels); err != nil {
+	res, err := p.topo.EnsureCacheVolume(ctx, name, wantLabels)
+	if err != nil {
 		return "", nil, fmt.Errorf("failed to ensure externals volume %q: %w", name, err)
 	}
+	// Use the name EnsureCacheVolume actually resolved to — which may be a
+	// reconciled ALTERNATE when the preferred deterministic slot was occupied by a
+	// foreign/unlabeled squatter (ADR-003 label-as-identity). Seeding and mounting
+	// the preferred slot instead would pin the squatter and abort; the reconciled
+	// volume is the one we created labeled and must seed+mount.
+	name = res.Name
 
 	// Seed to completion BEFORE the runner mounts it read-only. Idempotent and
 	// concurrency-safe via the in-volume flock + atomic marker: a warm volume is
