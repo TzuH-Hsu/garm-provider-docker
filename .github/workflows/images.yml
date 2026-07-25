@@ -1,20 +1,38 @@
 # M4-W1: builds and publishes this repo's two container images to GHCR.
 #
-# Triggered ONLY by version tags (`v*`) — a normal release, tagged with the
-# tag itself plus `latest` — or manually via `workflow_dispatch`, which is
-# the dry-run path: it runs the exact same multi-arch build but with
-# `push: false`, so nothing ever reaches GHCR. No `pull_request` trigger:
-# this workflow only ever runs against a ref that has already been reviewed
-# and merged (a pushed tag) or an explicit manual invocation.
+# Two structurally separate jobs, never both selected for one run:
+#
+#   publish — the ONLY job that can reach GHCR. Gated on
+#     `github.event_name == 'push' && github.ref_type == 'tag'`, so it can
+#     only ever run for a genuinely pushed `v*` tag, and it is the only job
+#     carrying `packages: write`.
+#   dry-run — everything else (i.e. `workflow_dispatch`). Runs the exact
+#     same multi-arch build with `push: false`, holds NO `packages` scope at
+#     all, and has no registry-login step to skip in the first place.
+#
+# The split is deliberate and load-bearing: `workflow_dispatch` accepts a
+# `--ref` of any kind, INCLUDING a tag (`gh workflow run --ref v1.2.3`), in
+# which case `github.ref_type` is `tag` even though nothing was pushed. A
+# single job that keyed its login/push decision on `ref_type` alone would
+# therefore publish semver+latest from a manual invocation — breaking the
+# dry-run promise. Requiring `event_name == 'push'` as well, and scoping
+# `packages: write` to that job only, means there is no path by which a
+# manual run can authenticate to or write to the registry: even if the
+# `push` input were somehow forced true, the dispatch job's token has no
+# packages scope to push with.
+#
+# No `pull_request` trigger: this workflow only ever runs against a ref that
+# has already been reviewed and merged (a pushed tag) or an explicit manual
+# invocation.
 #
 # Script-injection hygiene (same rationale as release.yml): git tag names
 # are not restricted to a safe shell-metacharacter-free set, so
-# $GITHUB_REF_NAME/$GITHUB_REF_TYPE (GitHub's own built-in env vars) are
-# read as quoted shell variables inside `run:` steps below, never spliced
-# via `${{ }}` into script text. Values that end up in `with:` inputs to the
-# pinned Docker actions (image tags, build-args) are not run through a
-# shell at all, and Docker's own tag-name validation rejects anything a
-# malicious ref could smuggle in there regardless.
+# $GITHUB_REF_NAME (GitHub's own built-in env var) is read as a quoted shell
+# variable inside `run:` steps below, never spliced via `${{ }}` into script
+# text. Values that end up in `with:` inputs to the pinned Docker actions
+# (image tags, build-args) are not run through a shell at all, and Docker's
+# own tag-name validation rejects anything a malicious ref could smuggle in
+# there regardless.
 name: Container Images
 
 on:
@@ -27,14 +45,20 @@ concurrency:
   group: images-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# Workflow-level default is read-only. `packages: write` is granted ONLY to
+# the publish job below; the dry-run job explicitly holds none.
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  build:
-    name: build (${{ matrix.name }})
+  # Real publish: a pushed vX.Y.Z tag, and nothing else.
+  publish:
+    name: publish (${{ matrix.name }})
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -65,48 +89,36 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      # A pushed vX.Y.Z tag IS the version, and the only trigger that
-      # actually pushes. workflow_dispatch (dry run) gets a synthetic
-      # version and push=false. "tags" is written via the GITHUB_OUTPUT
-      # heredoc form to carry a real newline (this repo's convention for
-      # multi-line step outputs) rather than being reconstructed later with
-      # `${{ }}` splicing.
+      # A pushed vX.Y.Z tag IS the version — this job's `if:` guarantees
+      # $GITHUB_REF_NAME is that tag, so there is no branching left to do.
+      # "tags" is written via the GITHUB_OUTPUT heredoc form to carry a real
+      # newline (this repo's convention for multi-line step outputs) rather
+      # than being reconstructed later with `${{ }}` splicing.
       - name: Determine build metadata
         id: meta
         env:
           IMAGE: ${{ matrix.image }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            version="${GITHUB_REF_NAME}"
-            push=true
-            # printf, not a quoted multi-line string literal, so no YAML
-            # indentation whitespace ends up baked into the second line.
-            tags="$(printf '%s:%s\n%s:latest' "${IMAGE}" "${version}" "${IMAGE}")"
-          else
-            version="v0.0.0-dryrun+${GITHUB_SHA::12}"
-            push=false
-            tags="${IMAGE}:${version}"
-          fi
+          version="${GITHUB_REF_NAME}"
+          # printf, not a quoted multi-line string literal, so no YAML
+          # indentation whitespace ends up baked into the second line.
+          tags="$(printf '%s:%s\n%s:latest' "${IMAGE}" "${version}" "${IMAGE}")"
           {
             echo "version=${version}"
-            echo "push=${push}"
             echo "tags<<EOF"
             echo "${tags}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # Only log in when this run will actually push — a dry run needs no
-      # registry credentials at all.
       - name: Log in to GHCR
-        if: steps.meta.outputs.push == 'true'
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # provenance: mode=max / sbom: true are unconditional (verified
-      # locally: buildx happily generates both for a multi-platform build
+      # provenance: mode=max / sbom: true match the dry-run job exactly
+      # (verified locally: buildx generates both for a multi-platform build
       # even with push: false, so the dry run exercises the identical
       # attestation path a real release does).
       #
@@ -125,8 +137,87 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
-          push: ${{ steps.meta.outputs.push == 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: ${{ matrix.needs_version_arg && format('VERSION={0}', steps.meta.outputs.version) || '' }}
           provenance: mode=max
           sbom: true
+
+  # Dry run: every trigger that is NOT a pushed tag — in practice
+  # workflow_dispatch, including a dispatch aimed at a tag ref. Builds only.
+  # It holds no `packages` scope, performs no registry login, and passes
+  # `push: false`, so there is no path from here to GHCR.
+  dry-run:
+    name: dry-run (${{ matrix.name }})
+    if: github.event_name != 'push' || github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: none
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: garm-runner-noble
+            image: ghcr.io/tzuh-hsu/garm-runner-noble
+            context: runner-images/noble
+            dockerfile: runner-images/noble/Dockerfile
+            needs_version_arg: false
+          - name: garm-provider-docker
+            image: ghcr.io/tzuh-hsu/garm-provider-docker
+            context: .
+            dockerfile: Dockerfile
+            needs_version_arg: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # A synthetic version that can never collide with a real release tag,
+      # while still exercising the identical build-arg/-ldflags path. The
+      # ref name is deliberately NOT consulted here: a dispatch may point at
+      # a tag, and treating that as a release version is exactly the
+      # confusion this job's separation exists to prevent.
+      - name: Determine build metadata
+        id: meta
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          version="v0.0.0-dryrun+${GITHUB_SHA::12}"
+          {
+            echo "version=${version}"
+            echo "tags=${IMAGE}:${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: ${{ matrix.needs_version_arg && format('VERSION={0}', steps.meta.outputs.version) || '' }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Dry-run summary
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Container image dry run"
+            echo
+            echo "No registry login was performed and nothing was pushed."
+            echo "This job holds no \`packages\` permission."
+            echo
+            echo "- Synthetic version: \`${VERSION}\`"
+            echo "- Tag that WOULD have been built: \`${TAGS}\`"
+            echo "- A real release publishes \`<image>:<tag>\` plus \`<image>:latest\`."
+          } >> "$GITHUB_STEP_SUMMARY"
