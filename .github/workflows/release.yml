@@ -3,10 +3,19 @@
 # Triggered ONLY by version tags (`v*`) — a normal release — or manually via
 # `workflow_dispatch`, which exercises the exact same build+checksum steps
 # as a dry run: it builds and hashes the binaries but never creates or
-# publishes a GitHub Release (see the `release` job's `if:` conditions
+# publishes a GitHub Release (see the `publish` job's `if:` conditions
 # below). No `pull_request` trigger: this workflow only ever runs against a
 # ref that has already been reviewed and merged (a pushed tag) or an
 # explicit manual invocation — never against untrusted PR content.
+#
+# The release gate is `github.event_name == 'push' && github.ref_type ==
+# 'tag'`, NOT `ref_type` alone: `workflow_dispatch` accepts a --ref of any
+# kind, including a tag (`gh workflow run --ref v1.2.3`), which sets
+# ref_type=tag even though nothing was pushed. Keying on ref_type alone let
+# a manual run reach `gh release create` — a remote write — on the supposed
+# dry-run path. `contents: write` is likewise scoped to the publish job
+# only, so the dispatch path's token cannot create a release even if the
+# guard were bypassed.
 #
 # Script-injection hygiene: git tag/ref names are NOT restricted to a safe
 # shell-metacharacter-free set (git's own ref-format rules permit `$`,
@@ -63,17 +72,23 @@ jobs:
         with:
           go-version: ${{ steps.goversion.outputs.version }}
 
-      # A pushed vX.Y.Z tag IS the version. workflow_dispatch (the dry-run
-      # path) has no tag, so it gets a synthetic version that can never
-      # collide with a real release tag, but still exercises the exact same
-      # -ldflags injection path. $GITHUB_REF_NAME/$GITHUB_REF_TYPE are
-      # GitHub Actions' own built-in env vars (equal to github.ref_name /
-      # github.ref_type) — read here as shell variables, never spliced via
+      # A pushed vX.Y.Z tag IS the version. Every other trigger — including
+      # a workflow_dispatch aimed at a tag ref, which sets ref_type=tag
+      # without anything having been pushed — gets a synthetic version that
+      # can never collide with a real release tag, while still exercising
+      # the exact same -ldflags injection path. IS_RELEASE is computed from
+      # the same `event_name == 'push' && ref_type == 'tag'` predicate the
+      # publish job below gates on, so a dry run can never even produce
+      # release-NAMED artifacts to be mistaken for one.
+      # $GITHUB_REF_NAME is GitHub Actions' own built-in env var (equal to
+      # github.ref_name) — read here as a shell variable, never spliced via
       # `${{ }}`, so a crafted tag name cannot inject shell commands.
       - name: Determine version
         id: version
+        env:
+          IS_RELEASE: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ "${IS_RELEASE}" = "true" ]; then
             version="${GITHUB_REF_NAME}"
           else
             version="v0.0.0-dryrun+${GITHUB_SHA::12}"
@@ -110,12 +125,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
+  # Real release: a pushed vX.Y.Z tag, and nothing else. This is the ONLY
+  # job in this workflow with `contents: write`, and the only one that
+  # performs a remote write of any kind.
+  publish:
     name: checksum and publish
     needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    # Only this job needs write access, and only to create the draft
-    # release below — the build job above stays read-only.
     permissions:
       contents: write
     steps:
@@ -132,30 +149,22 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            version="${GITHUB_REF_NAME}"
-          else
-            version="v0.0.0-dryrun+${GITHUB_SHA::12}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      # Real release: only on a pushed vX.Y.Z tag. `gh release create` (the
-      # GitHub CLI, preinstalled on every GitHub-hosted runner) is used
-      # directly instead of a third-party release action: it needs no extra
-      # SHA pin, is maintained by GitHub itself, and this workflow's needs
-      # (a draft release with file attachments) are exactly its job — no
-      # goreleaser config to maintain for two static binaries plus a
-      # checksum file. `--draft` so the owner reviews and publishes
-      # manually; nothing here makes the release public. VERSION is passed
-      # via env, not `${{ }}` splicing — see the file-level comment above.
+      # This job's `if:` guarantees $GITHUB_REF_NAME is the pushed tag, so
+      # no branching is left to do.
+      #
+      # `gh release create` (the GitHub CLI, preinstalled on every
+      # GitHub-hosted runner) is used directly instead of a third-party
+      # release action: it needs no extra SHA pin, is maintained by GitHub
+      # itself, and this workflow's needs (a draft release with file
+      # attachments) are exactly its job — no goreleaser config to maintain
+      # for two static binaries plus a checksum file. `--draft` so the owner
+      # reviews and publishes manually; nothing here makes the release
+      # public. VERSION is passed via env, not `${{ }}` splicing — see the
+      # file-level comment above.
       - name: Create draft GitHub Release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ github.ref_name }}
         run: |
           gh release create "${VERSION}" \
             dist/* \
@@ -164,14 +173,49 @@ jobs:
             --draft \
             --generate-notes
 
-      # workflow_dispatch dry run: prove the build + checksum steps work
-      # end to end without creating or touching anything on GitHub.
-      - name: Dry-run summary (workflow_dispatch)
-        if: github.ref_type != 'tag'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
+  # Dry run: every trigger that is NOT a pushed tag — in practice
+  # workflow_dispatch, including a dispatch aimed at a tag ref. It proves
+  # the build + checksum steps work end to end and reports what a real
+  # release WOULD have published, while holding only `contents: read`, so
+  # it has no token scope with which to create a release.
+  dry-run:
+    name: checksum dry run
+    needs: build
+    if: github.event_name != 'push' || github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS
+        working-directory: dist
         run: |
-          echo "Dry run (workflow_dispatch): no GitHub Release created."
-          echo "Version that would have been used: ${VERSION}"
-          echo "Artifacts that would have been attached:"
-          ls -la dist
+          ls -la
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Dry-run summary
+        run: |
+          {
+            echo "### Release dry run"
+            echo
+            echo "No GitHub Release was created; nothing was written remotely."
+            echo "This job holds \`contents: read\` only."
+            echo
+            echo "Artifacts that WOULD have been attached to a draft release:"
+            echo
+            echo '```'
+            ls -1 dist
+            echo '```'
+            echo
+            echo "SHA256SUMS:"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
