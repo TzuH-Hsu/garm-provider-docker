@@ -518,9 +518,9 @@ func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
 		osArch params.OSArch
 	}{
 		{"windows rejected", params.Windows, params.Amd64},
-		{"arm64 rejected in M0", params.Linux, params.Arm64},
 		{"empty os rejected", "", params.Amd64},
 		{"empty arch rejected", params.Linux, ""},
+		{"unknown arch rejected", params.Linux, params.OSArch("riscv64")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -544,6 +544,53 @@ func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
 				t.Errorf("platform rejection must not deliver credentials, got %d execs", len(fake.Execs))
 			}
 		})
+	}
+}
+
+// TestCreateInstanceAcceptsArm64 is the multi-arch counterpart to the
+// rejection table above. linux/arm64 is a first-class supported platform as
+// of M4 — the release binaries, the provider image, and the runner image are
+// all built for both arches — so a full create must SUCCEED on an arm64
+// bootstrap, not merely pass the gate.
+//
+// Driving the whole allocation (not just validatePlatform) is the point: the
+// arch gate was the only thing that had ever stopped an arm64 payload, so
+// exercising every step behind it is what proves there was no second,
+// hidden amd64-only assumption further down the create path.
+func TestCreateInstanceAcceptsArm64(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	b := jitBootstrap(srv.URL)
+	b.OSArch = params.Arm64
+
+	inst, err := p.CreateInstance(context.Background(), b)
+	if err != nil {
+		t.Fatalf("CreateInstance(linux/arm64) returned unexpected error: %v", err)
+	}
+	if inst.Status != params.InstanceRunning {
+		t.Errorf("Status = %q, want running", inst.Status)
+	}
+	if inst.OSType != params.Linux || inst.OSArch != params.Arm64 {
+		t.Errorf("os fields = %q/%q, want linux/arm64", inst.OSType, inst.OSArch)
+	}
+
+	// The arch is carried through to the informational label unchanged, so
+	// ListInstances' label-driven reconstruction (resolver.go) reports arm64
+	// rather than defaulting back to amd64.
+	got := inspectRunner(t, fake, inst.Name)
+	if lbl := got.Config.Labels[spec.LabelOSArch]; lbl != "arm64" {
+		t.Errorf("%s label = %q, want arm64", spec.LabelOSArch, lbl)
+	}
+
+	// The rest of the allocation completed too: the image was pulled and the
+	// credentials were delivered through the same tmpfs + exec path.
+	if len(fake.PulledImages) != 1 {
+		t.Errorf("PulledImages = %v, want the runner image pulled once", fake.PulledImages)
+	}
+	if len(fake.Execs) == 0 {
+		t.Error("credential-delivery exec did not run on the arm64 path")
 	}
 }
 

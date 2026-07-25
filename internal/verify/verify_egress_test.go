@@ -169,7 +169,7 @@ func bootstrapFor(name, metadataURL string, caBundle []byte) params.BootstrapIns
 		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}

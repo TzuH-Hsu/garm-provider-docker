@@ -53,7 +53,7 @@ func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}

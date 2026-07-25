@@ -55,7 +55,7 @@ func wp3Bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance 
 		InstanceToken:    instanceToken, // shared WP2 const
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID, // shared WP2 const
 		JitConfigEnabled: true,
 	}

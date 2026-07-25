@@ -270,7 +270,7 @@ func cacheBootstrapPayload(name, repoURL, metadataURL string, caBundle []byte) p
 		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}

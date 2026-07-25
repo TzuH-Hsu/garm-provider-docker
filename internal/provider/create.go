@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -563,19 +564,29 @@ func newCreateNonce() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// validatePlatform rejects bootstrap payloads outside the M0/M1 target
-// (linux/amd64) before any Docker operation, so an unsupported platform
-// surfaces as a provider_fault rather than a partially-created allocation
-// (ADR F8).
+// supportedOSArches is the set of architectures this provider accepts in a
+// bootstrap payload: the same two the release binaries, the provider image,
+// and the runner image are all built for (ADR-002's multi-arch release, and
+// the NAS-first linux/arm64 targets in the README — Raspberry Pi, arm64
+// Synology/generic Linux hosts).
 //
-// TODO(M4): accept params.Arm64 once the runner image ships a linux/arm64
-// manifest (ADR-002 multi-arch release).
+// The provider itself has no architecture-specific logic: OSArch is carried
+// through to the informational garm.docker/os-arch label and echoed back on
+// the returned ProviderInstance, and image selection is by digest-pinned
+// reference whose multi-arch manifest the daemon resolves to the host's own
+// platform. This gate is therefore purely a statement of which platforms the
+// project ships and tests for, not a functional constraint.
+var supportedOSArches = []params.OSArch{params.Amd64, params.Arm64}
+
+// validatePlatform rejects bootstrap payloads outside the supported platform
+// set before any Docker operation, so an unsupported platform surfaces as a
+// provider_fault rather than a partially-created allocation (ADR F8).
 func validatePlatform(b params.BootstrapInstance) error {
 	if b.OSType != params.Linux {
 		return fmt.Errorf("unsupported OS type %q for instance %q: only %q is supported", b.OSType, b.Name, params.Linux)
 	}
-	if b.OSArch != params.Amd64 {
-		return fmt.Errorf("unsupported architecture %q for instance %q: only %q is supported", b.OSArch, b.Name, params.Amd64)
+	if !slices.Contains(supportedOSArches, b.OSArch) {
+		return fmt.Errorf("unsupported architecture %q for instance %q: only %v are supported", b.OSArch, b.Name, supportedOSArches)
 	}
 	return nil
 }

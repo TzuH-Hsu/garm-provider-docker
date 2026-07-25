@@ -49,7 +49,7 @@ func m3Bootstrap(metadataURL string, caBundle []byte, extraSpecs string) params.
 		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}

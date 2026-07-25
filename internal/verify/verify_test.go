@@ -139,6 +139,34 @@ func caBundlePEM(t *testing.T, srv *httptest.Server) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 }
 
+// hostOSArch maps the harness process's own GOARCH onto the params.OSArch
+// value GARM would carry in a BootstrapInstance for this host, and is what
+// every bootstrap payload in this package uses.
+//
+// It is deliberately NOT a hardcoded params.Amd64: this harness drives the
+// REAL provider binary against the LOCAL Docker daemon, so a hardcoded arch
+// meant that on an arm64 host the live suite asserted an amd64 allocation
+// while the daemon actually ran arm64 containers — the linux/arm64 support
+// the project advertises was never proven end to end by any live run. Using
+// the runtime arch makes each host's suite exercise that host's real
+// platform.
+//
+// An unrecognised GOARCH panics rather than falling back to amd64: a silent
+// fallback here would be a false PASS claiming a platform was verified when
+// it was not. Only the two platforms this project ships binaries and images
+// for are accepted.
+func hostOSArch() params.OSArch {
+	switch runtime.GOARCH {
+	case "amd64":
+		return params.Amd64
+	case "arm64":
+		return params.Arm64
+	default:
+		panic("verify harness: unsupported host GOARCH " + runtime.GOARCH +
+			"; only linux/amd64 and linux/arm64 are supported platforms")
+	}
+}
+
 func bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	return params.BootstrapInstance{
 		Name:             instanceName,
@@ -147,7 +175,7 @@ func bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
-		OSArch:           params.Amd64,
+		OSArch:           hostOSArch(),
 		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}
