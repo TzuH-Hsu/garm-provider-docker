@@ -5,6 +5,16 @@
   "description": "The operator-set provider configuration for garm-provider-docker (ADR-005), written as TOML. This schema describes the same structure in JSON form for self-documentation (the v0.1.1 GetConfigJSONSchema command); the on-disk file is TOML and unknown keys are tolerated by the loader. This is the most-trusted trust tier (ADR-001): it strictly outranks pool extra_specs, which can never override docker_host, the privileged flag (derived from dind_mode only), a raw image reference, or a managed label.",
   "type": "object",
   "additionalProperties": true,
+  "required": ["runner_image"],
+  "if": {
+    "properties": { "dind_mode": { "enum": ["privileged-sidecar", "sysbox-runc"] } },
+    "required": ["dind_mode"]
+  },
+  "then": {
+    "description": "dind_image is required, and must be non-empty, exactly when dind_mode is present and is not \"none\" — mirroring internal/config's validateDindMode. Three further loader rules are NOT expressible in draft-07 and are enforced in Go only: (1) dind_mode must be a member of allowed_dind_modes, which itself defaults to [\"none\"], so a non-\"none\" dind_mode ALSO requires allowed_dind_modes to be widened explicitly or the config is rejected at load; (2) runner_image, dind_image, and each flavor's runner_image must be pinned by a sha256 digest (name@sha256:<64-hex>) unless the corresponding allow_unpinned_*_image flag is set; (3) a pool's extra_specs may select a DinD mode within a widened ceiling even when the config's own dind_mode is \"none\" — in that case CreateInstance rejects the allocation before any Docker operation if dind_image is empty, a runtime condition no schema over this file alone can express.",
+    "required": ["dind_image"],
+    "properties": { "dind_image": { "type": "string", "minLength": 1 } }
+  },
   "properties": {
     "docker_host": {
       "type": "string",
@@ -12,7 +22,8 @@
     },
     "runner_image": {
       "type": "string",
-      "description": "Runner image reference, required, digest-pinned (name@sha256:<64-hex>) unless allow_unpinned_runner_image is set. A named flavor may override it per pool; no extra_specs field accepts a raw image."
+      "minLength": 1,
+      "description": "Runner image reference, required (see the top-level \"required\"), digest-pinned (name@sha256:<64-hex>) unless allow_unpinned_runner_image is set. A named flavor may override it per pool; no extra_specs field accepts a raw image."
     },
     "allow_unpinned_runner_image": {
       "type": "boolean",

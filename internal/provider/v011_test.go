@@ -56,6 +56,20 @@ func TestGetConfigJSONSchemaIsParseable(t *testing.T) {
 	if m["$schema"] != "http://json-schema.org/draft-07/schema#" {
 		t.Errorf("config schema is not draft-07: %v", m["$schema"])
 	}
+	// The schema GARM receives over this command must carry the loader's real
+	// constraints, not just its key names — otherwise a caller validating a
+	// config against the provider's own published schema gets a false PASS on
+	// a config the provider would refuse to load. The full schema-vs-loader
+	// agreement is pinned in internal/config's
+	// TestJSONSchemaMatchesLoaderOnRequiredKeys; this asserts the wiring
+	// delivers that same schema rather than a stripped one.
+	req, ok := m["required"].([]any)
+	if !ok || len(req) == 0 || req[0] != "runner_image" {
+		t.Errorf("config schema from GetConfigJSONSchema has required=%v, want [runner_image]", m["required"])
+	}
+	if _, ok := m["if"]; !ok {
+		t.Error("config schema from GetConfigJSONSchema lost its dind_image conditional")
+	}
 }
 
 func TestValidatePoolInfoAcceptsGood(t *testing.T) {

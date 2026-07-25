@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/xeipuuv/gojsonschema"
 )
 
 // TestJSONSchemaIsValidDraft07 asserts the embedded provider-config schema
@@ -24,6 +26,116 @@ func TestJSONSchemaIsValidDraft07(t *testing.T) {
 		if _, ok := props[want]; !ok {
 			t.Errorf("config schema is missing property %q", want)
 		}
+	}
+
+	// The schema must state the constraints the loader actually enforces, not
+	// merely list the key names: a self-describing schema that accepts `{}`
+	// while Load rejects it is worse than none, because a consumer validating
+	// against it gets a false PASS.
+	req, ok := m["required"].([]any)
+	if !ok || len(req) == 0 {
+		t.Fatalf("config schema declares no top-level required keys, but Load requires runner_image: required=%v", m["required"])
+	}
+	if req[0] != "runner_image" {
+		t.Errorf("config schema required = %v, want runner_image", req)
+	}
+	if _, ok := m["if"]; !ok {
+		t.Error("config schema has no if/then conditional for the dind_image rule")
+	}
+	if _, ok := m["then"]; !ok {
+		t.Error("config schema has an if with no matching then")
+	}
+}
+
+// TestJSONSchemaMatchesLoaderOnRequiredKeys compiles the published schema and
+// runs real instance documents through it, asserting the schema AGREES with
+// the loader on which configs are acceptable. Structural assertions alone
+// (does an "if" key exist?) would not catch a conditional that is present but
+// wrong, which is exactly how the schema drifted into accepting `{}`.
+//
+// gojsonschema is the same validator internal/extraspecs uses for the
+// extra_specs contract, so compiling successfully here also proves the schema
+// is well-formed draft-07 rather than merely well-formed JSON.
+func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
+	schema, err := gojsonschema.NewSchema(gojsonschema.NewStringLoader(JSONSchema()))
+	if err != nil {
+		t.Fatalf("config schema does not compile as draft-07: %v", err)
+	}
+
+	const runnerRef = "ghcr.io/example/runner@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	const dindRef = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
+
+	tests := []struct {
+		name     string
+		instance string
+		wantOK   bool
+	}{
+		{
+			name:     "empty object rejected (runner_image is required)",
+			instance: `{}`,
+			wantOK:   false,
+		},
+		{
+			name:     "empty runner_image rejected",
+			instance: `{"runner_image": ""}`,
+			wantOK:   false,
+		},
+		{
+			name:     "runner_image alone is a complete minimal config",
+			instance: `{"runner_image": "` + runnerRef + `"}`,
+			wantOK:   true,
+		},
+		{
+			name:     "explicit dind_mode none needs no dind_image",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none"}`,
+			wantOK:   true,
+		},
+		{
+			name:     "privileged-sidecar without dind_image rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "privileged-sidecar with an EMPTY dind_image rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": ""}`,
+			wantOK:   false,
+		},
+		{
+			name:     "privileged-sidecar with a dind_image accepted",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": "` + dindRef + `"}`,
+			wantOK:   true,
+		},
+		{
+			name:     "sysbox-runc without dind_image rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "sysbox-runc"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "unknown dind_mode rejected by the enum",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "bogus"}`,
+			wantOK:   false,
+		},
+		{
+			// additionalProperties stays true at the top level on purpose:
+			// the loader tolerates unknown TOML keys for forward/backward
+			// compatibility, and the schema must not claim otherwise.
+			name:     "unknown top-level key tolerated, matching the loader",
+			instance: `{"runner_image": "` + runnerRef + `", "some_future_key": 1}`,
+			wantOK:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := schema.Validate(gojsonschema.NewStringLoader(tt.instance))
+			if err != nil {
+				t.Fatalf("validating %s: %v", tt.instance, err)
+			}
+			if got := result.Valid(); got != tt.wantOK {
+				t.Errorf("schema.Validate(%s) valid = %v, want %v (errors: %v)",
+					tt.instance, got, tt.wantOK, result.Errors())
+			}
+		})
 	}
 }
 
