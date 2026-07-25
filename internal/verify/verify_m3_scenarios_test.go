@@ -69,6 +69,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -142,10 +143,13 @@ func buildTrapTermImage(t *testing.T, tag string) {
 // until teardown provably ENTERS its first destructive Docker op — the runner's
 // logs show teardownBarrierMarker, i.e. ContainerStop delivered SIGTERM — and
 // only THEN SIGKILLs the provider, so the kill lands mid-teardown by
-// construction rather than by a hopeful fixed sleep. It returns whether the
-// SIGKILL raced a still-running process (killedLive) and whether the barrier was
-// actually observed (sawBarrier); the caller asserts both, so a vacuous
-// "teardown already finished" pass is impossible.
+// construction rather than by a hopeful fixed sleep. It reaps the killed
+// process with cmd.Wait() and fails the test outright unless the exit status
+// itself proves SIGKILL was the actual cause of death (a nil Wait error, i.e.
+// a clean exit, means the kill landed too late and the run is vacuous). It
+// returns whether the SIGKILL raced a still-running process (killedLive) and
+// whether the barrier was actually observed (sawBarrier); the caller asserts
+// both, so a vacuous "teardown already finished" pass is impossible.
 func runDeleteKillOnTeardownBarrier(t *testing.T, bin, configFile, controllerID, instanceID, runnerName string) (killedLive, sawBarrier bool) {
 	t.Helper()
 	cmd := exec.Command(bin)
@@ -171,7 +175,18 @@ func runDeleteKillOnTeardownBarrier(t *testing.T, bin, configFile, controllerID,
 		time.Sleep(100 * time.Millisecond)
 	}
 	killErr := cmd.Process.Kill()
-	_ = cmd.Wait() // reap regardless of whether Kill raced a natural exit
+	waitErr := cmd.Wait() // reap, and verify below that SIGKILL was the actual cause of death
+	if waitErr == nil {
+		t.Fatalf("DeleteInstance subprocess exited cleanly (Wait returned nil) — the SIGKILL landed too late, so this run proves nothing")
+	}
+	exitErr, ok := waitErr.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("Wait returned a non-ExitError: %v (%T)", waitErr, waitErr)
+	}
+	ws, ok := exitErr.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("DeleteInstance subprocess was not terminated by SIGKILL: sys=%#v", exitErr.ProcessState.Sys())
+	}
 	return killErr == nil, sawBarrier
 }
 
