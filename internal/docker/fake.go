@@ -657,11 +657,14 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	// Model the real daemon AUTO-CREATING any referenced NAMED volume that does
 	// not exist (verified on Docker Engine 29.6.1: `docker create -v missing:/x`
 	// creates `missing` as an UNLABELED local volume). This is the M2-W2 H3
-	// failure mode: if a concurrent GC evicted a cache volume in the window
-	// between the provider ensuring/seeding it and this create referencing it, the
-	// daemon silently materializes an EMPTY, UNLABELED replacement here rather than
-	// failing — so the runner would mount an empty (read-only externals) tree and a
-	// GC-invisible orphan is left behind. Modeling it UNLABELED is what lets the
+	// failure mode: if an operator-run manual `docker volume prune` (or some
+	// other external actor — never the provider's own GC, which is log-only and
+	// never removes a volume itself, ADR-003's cache-GC-safety amendment)
+	// removed a cache volume in the window between the provider ensuring/seeding
+	// it and this create referencing it, the daemon silently materializes an
+	// EMPTY, UNLABELED replacement here rather than failing — so the runner
+	// would mount an empty (read-only externals) tree and an orphan invisible
+	// to the log-only GC is left behind. Modeling it UNLABELED is what lets the
 	// provider's post-create revalidation detect and fail closed in unit tests.
 	for _, m := range c.mounts {
 		if m.Type == mount.TypeVolume && m.Source != "" {

@@ -57,9 +57,12 @@ var reservedMountPaths = []string{
 // Cache is the [cache] table (ADR-003/ADR-005): the persistent repo-scoped
 // toolcache and pnpm-store caches, plus the shared externals cache, the per-repo
 // diagnostic-logs volume, and the opportunistic GC — all wired as of M2-W2.
-// stale_cache_eviction_days drives the GC's age-since-creation eviction and
-// diagnostic_log_retention_days the provider-side diag prune; both are
-// range-validated here.
+// stale_cache_eviction_days drives the GC's age-since-creation staleness
+// DETECTION — the GC only LOGS a stale/superseded cache volume for the
+// operator's own manual `docker volume prune`; it never deletes one itself
+// (ADR-003's cache-GC-safety amendment) — and diagnostic_log_retention_days the
+// provider-side diag prune (which does delete aged FILES inside the diag
+// volume, not the volume itself); both windows are range-validated here.
 type Cache struct {
 	// Enabled toggles the whole persistent-cache feature. Default true. When
 	// false, CreateInstance provisions no cache volumes and sets no cache env
@@ -103,7 +106,9 @@ type Cache struct {
 
 	// StaleCacheEvictionDays and DiagnosticLogRetentionDays are ADR-003's GC/
 	// log-retention windows, consumed by M2-W2's opportunistic GC (age-since-
-	// creation eviction) and provider-side diag prune respectively. Both are
+	// creation staleness detection — log-only, never auto-deletes a cache
+	// volume; ADR-003's cache-GC-safety amendment) and provider-side diag prune
+	// (which does delete aged files) respectively. Both are
 	// range-validated (non-negative) so an operator's ADR-005-shaped config loads
 	// and a typo (a negative window) is caught rather than silently ignored.
 	// Defaults 30 / 7.

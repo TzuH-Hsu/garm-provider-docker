@@ -140,10 +140,13 @@ type Client interface {
 	// VolumeInspect returns one volume by name, including its Labels. It
 	// returns an errdefs.IsNotFound-satisfying error when no such volume
 	// exists. Used to RE-VALIDATE a cache volume's ownership+identity labels
-	// against a snapshot immediately before the GC removes it by name, and to
-	// confirm — after the runner container is created — that a referenced cache
-	// volume is still the labeled one this provider ensured, not an UNLABELED
-	// volume the daemon auto-created because a concurrent GC evicted the
+	// against a snapshot immediately before the destructive diagnostic-log
+	// file-prune runs inside it (the GC's own cache-volume pass is log-only and
+	// never removes a volume itself — ADR-003's cache-GC-safety amendment), and
+	// to confirm — after the runner container is created — that a referenced
+	// cache volume is still the labeled one this provider ensured, not an
+	// UNLABELED volume the daemon auto-created because an operator-run manual
+	// `docker volume prune` (or some other external actor) removed the
 	// original in the ensure→mount window (ADR-003 W2, H3).
 	VolumeInspect(ctx context.Context, volumeID string) (volume.Volume, error)
 

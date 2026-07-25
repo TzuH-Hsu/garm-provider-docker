@@ -199,7 +199,9 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 // single diag volume (best-effort: a prune failure is logged, never fatal).
 //
 // Pin-then-validate (ADR-003 W2 structural redesign): the volume NAME and its
-// IDENTITY LABELS came from a ListDiagVolumes snapshot; a concurrent GC could
+// IDENTITY LABELS came from a ListDiagVolumes snapshot; an operator-run manual
+// `docker volume prune` (or some other external actor — the provider's own GC
+// never removes a cache volume itself, only logs it as stale) could still
 // remove the volume in the gap before this runs, and the OLD inspect-then-create
 // flow left a wedge window (the removed volume would be Moby-AUTO-CREATED UNLABELED
 // and the deterministic name rejected forever by the retired M6 guard). Instead we
@@ -376,8 +378,10 @@ func (p *Provider) helperLabels() map[string]string {
 // on removal is tolerated. A per-helper timeout bounds the run.
 //
 // Pin-then-validate (H3c): the ContainerCreate PINS every named volume the helper
-// references — or, if a concurrent GC removed a referenced cache volume since the
-// caller's snapshot, real Moby AUTO-CREATES it UNLABELED and the helper pins THAT
+// references — or, if an operator-run manual `docker volume prune` (or some
+// other external actor; the provider's own GC never removes a cache volume,
+// only logs it as stale) removed a referenced cache volume since the caller's
+// snapshot, real Moby AUTO-CREATES it UNLABELED and the helper pins THAT
 // empty replacement. afterCreate, when non-nil, runs AFTER the create but BEFORE
 // the start: it inspects the now-pinned target and returns an error to abort the
 // run WITHOUT executing the helper's payload (the seed's copy, the prune's

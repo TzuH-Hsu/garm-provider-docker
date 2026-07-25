@@ -46,11 +46,13 @@ const (
 	//     daemon cannot mutate a local volume's labels after creation (verified
 	//     against Docker Engine 29.6.1: re-VolumeCreate keeps the ORIGINAL
 	//     labels, and `docker volume update` is cluster-volumes-only), so this
-	//     records the volume's creation instant. W2's opportunistic GC evicts by
-	//     AGE-since-this-creation-timestamp plus SALT SUPERSESSION (a toolcache
+	//     records the volume's creation instant. W2's opportunistic GC IDENTIFIES
+	//     (never auto-deletes — ADR-003's cache-GC-safety amendment) stale caches
+	//     by AGE-since-this-creation-timestamp plus SALT SUPERSESSION (a toolcache
 	//     generation / pnpm-major / externals image-digest that no longer matches
 	//     the current config, past a grace) — NOT by filesystem mtime, which the
-	//     provider cannot portably stat from outside the Docker Desktop VM. See
+	//     provider cannot portably stat from outside the Docker Desktop VM — and
+	//     LOGS them for the operator's own manual `docker volume prune`. See
 	//     spec/gc.go, cache.go, and ADR-003's W2 amendment (point 3).
 	//   - LabelCacheKind  = "toolcache" | "pnpm" | "externals" | "diag-logs", so a
 	//     GC/purge pass (W2) can tell the cache kinds apart without parsing the name.
@@ -68,7 +70,8 @@ const (
 	// the runner image's version, not repository data), and the opportunistic
 	// cache GC keys externals supersession on it (an externals volume whose
 	// image-digest is not the currently-configured runner image's, past a grace,
-	// is evicted). Like every cache label it is carried ONLY by cache volumes
+	// is FLAGGED as stale and logged — never auto-deleted). Like every cache
+	// label it is carried ONLY by cache volumes
 	// and never alongside LabelInstanceName, so it is structurally excluded from
 	// ADR-004's teardown/sweep predicate. The builder that stamps it is
 	// ExternalsVolumeIdentity.ExternalsLabels in externals.go.

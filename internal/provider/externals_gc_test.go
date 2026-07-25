@@ -332,8 +332,10 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 }
 
 // TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge is the
-// structural-redesign guard for the diag-prune path: a concurrent GC removes the
-// diag volume in the window between the prune helper's ContainerCreate pinning it
+// structural-redesign guard for the diag-prune path: an operator-run manual
+// `docker volume prune` (or some other external actor — never the provider's
+// own GC, which is log-only and never removes a cache volume itself) removes
+// the diag volume in the window between the prune helper's ContainerCreate pinning it
 // and the prune running. Real Moby then AUTO-CREATES an UNLABELED volume of the
 // same (deterministic) name. The pin-then-validate flow inspects the PINNED volume,
 // detects the unlabeled replacement (a FULL-identity check against the snapshot),
@@ -352,7 +354,8 @@ func TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge(t *testing
 	seedVol(t, fake, diagName, id.DiagLabels(time.Now()))
 	ref := topology.DiagVolumeRef{Name: diagName, Labels: id.DiagLabels(time.Now())}
 
-	// At the prune helper's ContainerCreate, a concurrent GC removes the diag
+	// At the prune helper's ContainerCreate, simulate an operator-run manual
+	// `docker volume prune` (or some other external actor) removing the diag
 	// volume; ContainerCreate then AUTO-CREATES it UNLABELED (modeled by the fake's
 	// missing-named-volume auto-create). This is the exact race window.
 	var once sync.Once

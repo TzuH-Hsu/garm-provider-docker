@@ -185,10 +185,13 @@ func TestFakeContainerStartRejectsMissingNetwork(t *testing.T) {
 // fake-fidelity guard: referencing a NAMED volume that does not exist must make
 // ContainerCreate AUTO-CREATE it UNLABELED, matching the real daemon (verified on
 // Docker Engine 29.6.1: `docker create -v missing:/x …` materializes `missing`
-// with empty labels). This is the exact failure mode a concurrent GC-during-create
-// triggers — the provider must be able to detect the unlabeled replacement and
-// fail closed, which it can only test if the fake models the auto-create rather
-// than pretending the start fails.
+// with empty labels). This is the exact failure mode an operator-run manual
+// `docker volume prune` (or some other external actor) racing a create
+// triggers — never the provider's own GC, which is log-only and never removes a
+// cache volume itself (ADR-003's cache-GC-safety amendment) — the provider must
+// be able to detect the unlabeled replacement and fail closed, which it can
+// only test if the fake models the auto-create rather than pretending the
+// start fails.
 func TestFakeContainerCreateAutoCreatesMissingNamedVolume(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()

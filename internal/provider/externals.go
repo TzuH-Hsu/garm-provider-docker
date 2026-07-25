@@ -76,7 +76,9 @@ func (p *Provider) planExternals(ctx context.Context, runnerImage string) (strin
 // the container NAME — the in-volume flock, not the name, is the seeding mutex.
 //
 // Pin-then-validate (ADR-003 W2 structural redesign): the seed helper's
-// ContainerCreate PINS the externals volume; if a concurrent GC evicted it in the
+// ContainerCreate PINS the externals volume; if an operator-run manual
+// `docker volume prune` (or some other external actor — the provider's own GC
+// never removes a cache volume itself, only logs it as stale) removed it in the
 // ensure→seed window, real Moby AUTO-CREATES it UNLABELED and the seeder would
 // otherwise copy ~380MB into a volume the runner should not mount. An afterCreate
 // hook re-inspects the pinned volume and, only if a SUCCESSFUL inspect PROVES it is
@@ -110,7 +112,7 @@ func (p *Provider) seedExternals(ctx context.Context, runnerImage, volumeName st
 			// retry reconciles around the slot.
 			slog.WarnContext(vctx, "externals seed target is not our validated cache; leaving it in place as cruft and aborting this seed so GARM retries and reconciles around the slot",
 				"resource", "cache-volume", "volume", volumeName, "error", verr)
-			return fmt.Errorf("externals seed target %q is not our seeded cache (a GC/create race auto-created it): %w", volumeName, verr)
+			return fmt.Errorf("externals seed target %q is not our seeded cache (a manual-purge/create race auto-created it): %w", volumeName, verr)
 		}
 		return nil
 	}

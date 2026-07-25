@@ -390,12 +390,15 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 
 	// 5b. Revalidate the cache volumes the runner now references (ADR-003 W2
 	// structural redesign). The externals volume was ensured+seeded, and the
-	// toolcache/pnpm/diag volumes ensured, BEFORE this ContainerCreate. A
-	// concurrent, opportunistic age-based GC (a peer CreateInstance/ListInstances)
-	// could have evicted a still-current cache in that ensure→mount gap — before
-	// this container pins it in use — and real Moby then AUTO-CREATES the missing
-	// named volume UNLABELED during ContainerCreate, so the runner would mount an
-	// EMPTY read-only externals tree (or an empty cache). Confirm every referenced
+	// toolcache/pnpm/diag volumes ensured, BEFORE this ContainerCreate. The
+	// provider's own opportunistic GC never removes a cache volume itself — it
+	// only DETECTS a stale/superseded one and LOGS the operator's manual purge
+	// command (ADR-003's cache-GC-safety amendment); but an operator-run manual
+	// `docker volume prune` (or some other external actor) could still remove a
+	// still-current cache in that ensure→mount gap — before this container pins
+	// it in use — and real Moby then AUTO-CREATES the missing named volume
+	// UNLABELED during ContainerCreate, so the runner would mount an EMPTY
+	// read-only externals tree (or an empty cache). Confirm every referenced
 	// cache volume still carries our full identity; if any does not, remove the
 	// just-created (not-yet-started) runner and FAIL the allocation CLOSED —
 	// WITHOUT deleting the mismatched volume (it is left as cruft, never
@@ -466,8 +469,10 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 // validated against the expected identity via spec.ValidateAdoptedCacheVolume —
 // the full cache-kind/repo/digest/salt tuple, NOT merely cache=true — so a
 // wrong-digest externals volume or a foreign same-name squatter is caught as well
-// as an UNLABELED auto-created replacement (a concurrent GC evicted the original
-// in the ensure→mount window and Moby recreated it empty).
+// as an UNLABELED auto-created replacement (an operator-run manual
+// `docker volume prune`, or some other external actor, removed the original in
+// the ensure→mount window and Moby recreated it empty — the provider's own GC
+// never removes a cache volume itself, only logs it as stale for the operator).
 //
 // It fails CLOSED — a non-nil error — whenever ANY referenced cache cannot be
 // confirmed (an identity mismatch OR an inspect failure: context cancellation, a
@@ -499,7 +504,7 @@ func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePla
 		}
 	}
 	if len(bad) > 0 {
-		return fmt.Errorf("cache volume(s) could not be confirmed as our seeded cache during create (a GC/create race or a transient inspect failure); refusing to run the runner against an unverified cache: %s", strings.Join(bad, ", "))
+		return fmt.Errorf("cache volume(s) could not be confirmed as our seeded cache during create (a manual-purge/create race or a transient inspect failure); refusing to run the runner against an unverified cache: %s", strings.Join(bad, ", "))
 	}
 	return nil
 }

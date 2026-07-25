@@ -61,7 +61,8 @@ type cachePlan struct {
 	// H3b). revalidateReferencedCaches re-inspects each AFTER ContainerCreate and
 	// validates the LIVE volume's labels still match this expected identity via
 	// spec.ValidateAdoptedCacheVolume — not merely cache=true — so an UNLABELED
-	// auto-created replacement (a GC/create race), a foreign same-name squatter, or
+	// auto-created replacement (a manual-purge/create race — the provider's own
+	// GC never removes a cache volume itself), a foreign same-name squatter, or
 	// a wrong-digest externals volume is caught and the allocation fails CLOSED.
 	// Carrying the want labels here (rather than re-deriving them at revalidation)
 	// keeps the expected identity single-sourced from the ensure call.

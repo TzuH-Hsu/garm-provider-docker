@@ -118,8 +118,11 @@ func cacheVolsByKind(t *testing.T, fake *docker.FakeClient, kind spec.CacheKind)
 const cacheRepoURL = "https://github.com/example-org/example-repo"
 
 // TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate is the
-// ensure→mount-window guard under the structural redesign: a concurrent age-based
-// GC evicts the (already ensured+seeded) externals cache in the gap before the
+// ensure→mount-window guard under the structural redesign: an operator-run
+// manual `docker volume prune` (or some other external actor — never the
+// provider's own GC, which is log-only and never removes a cache volume
+// itself, ADR-003's cache-GC-safety amendment) removes the (already
+// ensured+seeded) externals cache in the gap before the
 // runner container pins it in use; real Moby then AUTO-CREATES the missing named
 // volume UNLABELED when the runner references it (modeled by the fake). The
 // provider revalidates the referenced caches after ContainerCreate, detects the
