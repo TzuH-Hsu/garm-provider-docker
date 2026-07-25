@@ -16,3 +16,68 @@ coverage.*
 *.test
 *.out
 .DS_Store
+
+# --- Credential deny patterns ---------------------------------------------
+#
+# The Dockerfile's `COPY . .` copies the WORKING TREE, not what git tracks.
+# An operator building this image from their own checkout may have untracked
+# local secrets sitting beside the module — a .env, a private key, a client
+# certificate, a kubeconfig — and every one of them would otherwise land in
+# the builder stage's layer and in the local BuildKit cache (which
+# `docker buildx build --cache-to` exports wholesale). The final distroless
+# stage copies only the compiled binary, so nothing reaches the published
+# image, but the builder layer and the build cache are real exposure.
+#
+# These are a fail-safe, not a licence to keep secrets in the repo directory.
+#
+# NOTE ON MATCHING: .dockerignore patterns are matched against the path
+# relative to the context root and are NOT recursive unless the pattern says
+# so — `*.pem` excludes `./key.pem` but not `./certs/key.pem`. Hence the
+# explicit `**/` variants below for extensions that can only ever be
+# credential material. Patterns that could plausibly collide with Go source
+# (`credentials*`, `secrets*` — cf. the tracked internal/metadata/
+# credentials.go) are deliberately left ROOT-ONLY. Do not blindly add `**/`
+# to those; it would exclude source files and break the build.
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.crt
+**/*.crt
+*.cer
+**/*.cer
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.jks
+*.keystore
+*.kdbx
+*.gpg
+*.asc
+id_rsa*
+**/id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+**/id_ed25519*
+*.ppk
+known_hosts
+.ssh/
+.netrc
+.npmrc
+.pypirc
+.aws/
+.gcloud/
+.kube/
+.docker/
+secrets*
+credentials*
+service-account*.json
+*.tfvars
+*.tfstate
+*.tfstate.*
