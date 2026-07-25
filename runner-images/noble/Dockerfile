@@ -2,12 +2,16 @@
 #
 # garm-provider-docker runner image (Ubuntu Noble base) - ADR-002.
 #
-# Digest pin below is the linux/amd64 platform manifest resolved from the
-# myoung34/github-runner:ubuntu-noble manifest list via:
+# Digest pin below is the MANIFEST-LIST (index) digest for
+# myoung34/github-runner:ubuntu-noble, not a single-platform manifest,
+# resolved via:
 #   docker buildx imagetools inspect myoung34/github-runner:ubuntu-noble
-# M0 targets linux/amd64 only (plan.md M0 scope); re-pin to a multi-arch
-# manifest-list digest (or a per-platform build matrix) at M4 release.
-FROM myoung34/github-runner:ubuntu-noble@sha256:24c831c159720f05607ef45e8ca1cd8d59b87d36664275bddc9e38c2e2be9ba5
+# M0 pinned the linux/amd64-only platform manifest (plan.md M0 scope); M4-W1
+# re-pins to this manifest-list digest — confirmed upstream publishes both
+# linux/amd64 and linux/arm64 manifests under it — so buildx's
+# .github/workflows/images.yml multi-platform build resolves the correct
+# per-platform image automatically instead of needing a build matrix here.
+FROM myoung34/github-runner:ubuntu-noble@sha256:2299e3ced2c54ff07d3ca48db09f1e8e5b28d02bafe8007b10ba0b8e060204bf
 
 LABEL org.opencontainers.image.source="https://github.com/TzuH-Hsu/garm-provider-docker" \
       org.opencontainers.image.description="GARM external Docker provider runner image (Ubuntu Noble base, ADR-002 JIT-aware entrypoint)" \
