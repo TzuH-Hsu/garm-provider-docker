@@ -188,7 +188,7 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
         run: |
-          version="v0.0.0-dryrun+${GITHUB_SHA::12}"
+          version="v0.0.0-dryrun-${GITHUB_SHA::12}"
           {
             echo "version=${version}"
             echo "tags=${IMAGE}:${version}"
