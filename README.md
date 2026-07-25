@@ -255,10 +255,19 @@ skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
   plus a hard-reserved name set (`RUNNER_*`, `DOCKER_*`, `GARM_*`,
   `RUN_AS_ROOT`, `PATH`, `LD_*`, …) rejected even if an operator allowlists
   it by mistake.
-- **Cleanup is label-scoped, always.** Every managed resource carries
+- **Cleanup is label-scoped, always.** Every **job-scoped** resource — the
+  per-job network, the runner container, the workspace volume, and in DinD
+  modes the sidecar plus its socket and `dind-state` volumes — carries
   `garm.docker/managed=true` plus controller-id/pool-id/instance-name
-  labels; every cleanup path, including the manual `RemoveAllInstances`
-  rescue operation, filters on those labels and never runs an unscoped
+  labels. Shared resources are deliberately *not* instance-scoped: cache
+  volumes carry `garm.docker/cache=true` plus controller-id (and their
+  cache-kind/repo identity) but no pool-id or instance-name, precisely so
+  they survive teardown and are reusable across jobs, and cache-helper
+  containers carry `role=cache-helper` with no instance-name so the
+  teardown/sweep predicate structurally excludes them and `ListInstances`
+  never reports them (ADR-003/ADR-004). Every cleanup path, including the
+  manual `RemoveAllInstances` rescue operation, filters on the labels
+  appropriate to what it is collecting and never runs an unscoped
   `docker system prune` or equivalent.
 - **`privileged-sidecar` is honest about its limits.** It protects other
   jobs' data and contains accidents, but a malicious job's code inside a
