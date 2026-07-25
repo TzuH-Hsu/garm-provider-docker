@@ -1,25 +1,30 @@
 package config
 
-import "testing"
+import (
+	"testing"
 
-// TestExamplesLoadAndValidate is the anti-drift pin for the two
-// user-facing example configs under examples/ (docs/plan.md M4 item 4;
+	"github.com/BurntSushi/toml"
+)
+
+// examplePaths are the two user-facing example configs under examples/,
 // referenced from the root README's Quick start section and
-// docs/config-reference.md). It loads each one through the REAL Load
+// docs/config-reference.md.
+var examplePaths = []struct {
+	name string
+	path string
+}{
+	{name: "config.minimal.toml", path: "../../examples/config.minimal.toml"},
+	{name: "config.full.toml", path: "../../examples/config.full.toml"},
+}
+
+// TestExamplesLoadAndValidate is the anti-drift pin for the two example
+// configs (docs/plan.md M4 item 4). It loads each one through the REAL Load
 // entry point - the same one main.go calls - so if either example ever
 // drifts out of sync with internal/config (a renamed key, a changed
 // default, a newly-required field), this test fails rather than the
 // example silently going stale.
 func TestExamplesLoadAndValidate(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-	}{
-		{name: "config.minimal.toml", path: "../../examples/config.minimal.toml"},
-		{name: "config.full.toml", path: "../../examples/config.full.toml"},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range examplePaths {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg, err := Load(tt.path)
 			if err != nil {
@@ -27,6 +32,38 @@ func TestExamplesLoadAndValidate(t *testing.T) {
 			}
 			if cfg.RunnerImage == "" {
 				t.Errorf("Load(%q): RunnerImage is empty after a successful load", tt.path)
+			}
+		})
+	}
+}
+
+// TestExamplesHaveNoUnknownKeys is the half of the anti-drift claim that
+// Load alone cannot make. Load DELIBERATELY tolerates unknown TOML keys
+// (forward/backward compatibility - see Config's doc comment), so a
+// misspelled key in an example - `dind_mod`, `runner_iamge`, a table
+// renamed in code but not in the example - is silently ignored and the
+// example still "loads and validates" while documenting a key that does
+// nothing. That made the anti-drift guarantee vacuous for precisely the
+// most likely kind of drift.
+//
+// This test decodes each example with toml.MetaData and asserts
+// Undecoded() is empty: every key in the file must map onto a real field
+// of Config. The strictness lives HERE, in the test, and deliberately NOT
+// in the production loader - an operator's real config must keep
+// tolerating unknown keys, but a file this repo ships as documentation
+// must not contain a single key the code does not understand.
+func TestExamplesHaveNoUnknownKeys(t *testing.T) {
+	for _, tt := range examplePaths {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg Config
+			md, err := toml.DecodeFile(tt.path, &cfg)
+			if err != nil {
+				t.Fatalf("DecodeFile(%q) returned unexpected error: %v", tt.path, err)
+			}
+			if undecoded := md.Undecoded(); len(undecoded) > 0 {
+				t.Errorf("%s contains %d key(s) that no Config field maps to: %v\n"+
+					"Either the example has a typo/stale key, or a field was renamed in internal/config "+
+					"without updating the example.", tt.path, len(undecoded), undecoded)
 			}
 		})
 	}
