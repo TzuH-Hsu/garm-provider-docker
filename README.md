@@ -21,7 +21,10 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   and torn down together. See [ADR-001](docs/adr/ADR-001-dind-strategy.md)
   and [ADR-004](docs/adr/ADR-004-teardown-and-orphan-cleanup.md).
 - **Three `dind_mode` options**, capped by an operator `allowed_dind_modes`
-  ceiling that a pool's `extra_specs` can never escalate past:
+  ceiling that a pool's `extra_specs` can never escalate past. The ceiling
+  itself **defaults to `["none"]`** — fail-closed: DinD is unavailable until
+  an operator both widens the ceiling and sets a digest-pinned `dind_image`,
+  so no pool can obtain a privileged sidecar by omission.
   - `none` (default) — no DinD sidecar at all; a `docker` call inside the
     job fails fast.
   - `privileged-sidecar` — the only DinD mechanism that works on every

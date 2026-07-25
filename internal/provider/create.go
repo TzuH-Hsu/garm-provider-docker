@@ -122,6 +122,24 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// would escalate past the operator's ceiling never leaves a partial allocation.
 	dindMode := resolved.DindMode
 
+	// A DinD mode with no dind_image configured cannot possibly succeed, so
+	// reject it HERE — still before the first Docker call — rather than
+	// letting the create proceed to the sweep, the claim network, the
+	// volumes and the credential fetch only to fail at the sidecar pull.
+	//
+	// config.Load's validateDindMode already requires dind_image whenever the
+	// CONFIG's own dind_mode is non-none, but that check cannot see a pool's
+	// extra_specs: an operator whose config is dind_mode="none" (so no
+	// dind_image is required of them) but whose allowed_dind_modes has been
+	// widened can still receive a pool that selects privileged-sidecar. That
+	// combination passes the ceiling and only then discovers there is no
+	// image to run. This is the pre-Docker gate for exactly that case.
+	if dindMode != config.DindModeNone && p.cfg.DindImage == "" {
+		return params.ProviderInstance{}, fmt.Errorf(
+			"instance %q requests dind_mode %q but no dind_image is configured: set dind_image in the provider config, or narrow allowed_dind_modes so this pool cannot select a DinD mode",
+			instanceName, dindMode)
+	}
+
 	// Opportunistic pre-create orphan sweep (ADR-004, F9): CreateInstance is one
 	// of the two host-wide sweep hooks (the other being ListInstances), so it
 	// runs the FULL controller-scoped sweep — not just this instance-name — to

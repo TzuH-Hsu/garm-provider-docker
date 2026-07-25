@@ -38,10 +38,18 @@ dind_mode = "none"
 
 # The operator CEILING on dind_mode (ADR-001 F7): the set of modes ANY
 # pool's extra_specs.dind_mode may ever select, regardless of what the pool
-# requests. Default: all three modes. On a shared or sensitive host, narrow
-# this (e.g. ["none"]) to forbid privileged workloads outright - a pool's
-# extra_specs can never escalate past this list.
-allowed_dind_modes = ["none", "privileged-sidecar", "sysbox-runc"]
+# requests. Default: ["none"] - FAIL-CLOSED. DinD is unavailable on this
+# host until you widen this list yourself; a pool's extra_specs can never
+# escalate past it.
+#
+# To enable DinD, widen the ceiling AND set dind_image above, e.g.:
+#   allowed_dind_modes = ["none", "privileged-sidecar"]
+# Read ADR-001's "Residual risk" section first: privileged-sidecar runs the
+# sidecar with Privileged=true, from which a malicious job's own code can
+# reach the host. Note that dind_mode itself must be a member of this list,
+# so widening the ceiling is also what makes a non-"none" dind_mode above
+# loadable at all.
+allowed_dind_modes = ["none"]
 
 # The DinD sidecar's own image reference, digest-pinned like runner_image.
 # No default. REQUIRED only when the effective dind_mode != "none"; even

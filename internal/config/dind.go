@@ -22,11 +22,24 @@ const (
 // the DinD sidecar when the operator does not override it (ADR-001).
 const defaultStorageDriver = "overlay2"
 
-// allDindModes is every valid dind_mode/allowed_dind_modes entry, and the
-// default value of AllowedDindModes when the config file omits that key
-// (ADR-001: "an operator who never touches the config should get the
-// previously-documented default behavior" — i.e. every mode allowed).
+// allDindModes is every VALID dind_mode/allowed_dind_modes entry. It is the
+// vocabulary of the two fields, not the default of either.
 var allDindModes = []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc}
+
+// defaultAllowedDindModes is the operator ceiling applied when the config
+// file omits allowed_dind_modes: ["none"], i.e. fail-closed — no DinD mode
+// can be selected at all until the operator explicitly widens the ceiling.
+//
+// This deliberately does NOT match allDindModes. The earlier all-three
+// default was inconsistent with the fail-closed posture of every other
+// default in this provider (dind_mode itself defaults to "none", and
+// [extra_specs].allowed_env defaults to empty): it meant a minimal config —
+// one with no dind_image at all — still permitted a pool's extra_specs to
+// select privileged-sidecar, standing up a Privileged=true daemon the
+// operator never opted into, and failing only once Docker work had already
+// begun. A ceiling whose whole purpose is "the operator gets the final word"
+// (ADR-001 F7) must not grant the most dangerous mode by omission.
+var defaultAllowedDindModes = []string{DindModeNone}
 
 // validateDindMode checks DindMode, AllowedDindModes, and (when DindMode
 // requires a sidecar) DindImage together, since ADR-001's operator ceiling
@@ -81,10 +94,11 @@ func (c Config) validateDindMode() error {
 // config-wide default/fallback.
 //
 // An empty AllowedDindModes FAILS CLOSED (denies every mode) rather than being
-// treated as "unrestricted" (F10). A loaded config always carries the
-// all-three default (Load populates it when the file omits allowed_dind_modes,
-// and Load's Validate rejects an explicitly empty list because DindMode could
-// not be a member of it), so an empty slice here can only reach this method
+// treated as "unrestricted" (F10). A loaded config always carries a non-empty
+// ceiling (Load populates defaultAllowedDindModes when the file omits
+// allowed_dind_modes, and Load's Validate rejects an explicitly empty list
+// because DindMode could not be a member of it), so an empty slice here can
+// only reach this method
 // from a hand-built Config that bypassed Load — exactly the "bypassing caller"
 // case a fail-open ceiling would silently let permit every mode. Provider
 // construction independently rejects an empty/malformed ceiling
@@ -96,7 +110,7 @@ func (c Config) EffectiveDindMode(poolMode string) (string, error) {
 		mode = poolMode
 	}
 	if len(c.AllowedDindModes) == 0 {
-		return "", fmt.Errorf("dind_mode %q is denied: allowed_dind_modes is empty (an empty ceiling denies every mode; a loaded config always has the all-three default)", mode)
+		return "", fmt.Errorf("dind_mode %q is denied: allowed_dind_modes is empty (an empty ceiling denies every mode; a loaded config always has at least the %v default)", mode, defaultAllowedDindModes)
 	}
 	if !slices.Contains(c.AllowedDindModes, mode) {
 		return "", fmt.Errorf("dind_mode %q is not within allowed_dind_modes %v", mode, c.AllowedDindModes)

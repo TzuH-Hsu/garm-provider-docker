@@ -63,11 +63,14 @@ type Config struct {
 	// AllowedDindModes is the operator ceiling on DindMode (ADR-001's F7,
 	// "the operator gets the final word"): the set of modes ANY pool's
 	// extra_specs may ever select on this host, regardless of what a pool
-	// or DindMode itself requests. Defaults to all three modes when the
-	// config file omits this key, matching ADR-001's documented default
-	// ("an operator who never touches the config should get the
-	// previously-documented default behavior"). DindMode must always be a
-	// member of this list — see Validate.
+	// or DindMode itself requests.
+	//
+	// Defaults to ["none"] — FAIL-CLOSED — when the config file omits this
+	// key (see defaultAllowedDindModes in dind.go for the full rationale):
+	// an operator must explicitly widen the ceiling before any DinD mode,
+	// privileged or otherwise, can be selected on this host. DindMode must
+	// always be a member of this list — see Validate — so widening the
+	// ceiling is also what makes a non-none dind_mode loadable at all.
 	AllowedDindModes []string `toml:"allowed_dind_modes"`
 
 	// DindImage is the DinD sidecar's image reference (ADR-001/ADR-002),
@@ -132,7 +135,7 @@ func Load(path string) (Config, error) {
 	cfg := Config{
 		DockerHost:       defaultDockerHost,
 		DindMode:         DindModeNone,
-		AllowedDindModes: append([]string(nil), allDindModes...),
+		AllowedDindModes: append([]string(nil), defaultAllowedDindModes...),
 		StorageDriver:    defaultStorageDriver,
 		Network: Network{
 			EnableJobNetwork: true,

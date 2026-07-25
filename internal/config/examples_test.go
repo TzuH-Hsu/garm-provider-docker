@@ -86,7 +86,7 @@ func TestExampleFullMatchesDocumentedDefaults(t *testing.T) {
 	if cfg.DindMode != DindModeNone {
 		t.Errorf("DindMode = %q, want default %q", cfg.DindMode, DindModeNone)
 	}
-	wantAllowedDindModes := []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc}
+	wantAllowedDindModes := []string{DindModeNone}
 	if len(cfg.AllowedDindModes) != len(wantAllowedDindModes) {
 		t.Fatalf("AllowedDindModes = %v, want %v", cfg.AllowedDindModes, wantAllowedDindModes)
 	}

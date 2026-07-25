@@ -165,6 +165,10 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		`docker_host = "unix:///var/run/docker.sock"`,
 		`runner_image = "` + runnerTag + `"`,
 		`allow_unpinned_runner_image = true`,
+		// The ceiling defaults to ["none"] (fail-closed, ADR-001 2026-07-26
+		// Amendment), so a DinD mode must be widened in explicitly or the
+		// config would not load at all.
+		`allowed_dind_modes = ["none", "privileged-sidecar"]`,
 		`dind_mode = "privileged-sidecar"`,
 		`dind_image = "` + dindImageDigest + `"`,
 		`storage_driver = "overlay2"`,

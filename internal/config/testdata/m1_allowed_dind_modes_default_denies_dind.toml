@@ -1,0 +1,6 @@
+# A config that opts into a DinD mode WITHOUT widening the ceiling. Under the
+# fail-closed default (allowed_dind_modes = ["none"]) this must be rejected at
+# load time, even though every other field here is individually valid.
+runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+dind_mode = "privileged-sidecar"
+dind_image = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"

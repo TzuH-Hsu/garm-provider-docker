@@ -109,7 +109,7 @@ These are the project's headline acceptance criteria, mapped to the milestone th
 - Whether an optional diagnostic-log shipping path (syslog/Loki) is worth adding.
 - Whether toolcache generation should track image-generation bumps only, or also runner minor-version bumps.
 - Ownership of the DinD readiness probe: entrypoint-only, or also provider-side.
-- The default value of `allowed_dind_modes` (ADR-001/ADR-005) — all three modes today, versus a more conservative out-of-the-box ceiling given the documented residual host-compromise risk of `privileged-sidecar`.
+- ~~The default value of `allowed_dind_modes` (ADR-001/ADR-005) — all three modes today, versus a more conservative out-of-the-box ceiling given the documented residual host-compromise risk of `privileged-sidecar`.~~ **Resolved (M4-W1): defaults to `["none"]`, fail-closed** — see ADR-001's "fail-closed `allowed_dind_modes` default" Amendment.
 - Robustness of the entity-scope (repo vs. org vs. enterprise) detection heuristic across forges beyond GitHub (ADR-003) — currently inferred from `repo_url` path depth only.
 - Final tuning of the concurrency-safe orphan-sweep grace window introduced to close the concurrent-`CreateInstance` race (ADR-004), and whether it should be a value independent from the existing exited-container grace period.
 

@@ -26,7 +26,7 @@
     "allowed_dind_modes": {
       "type": "array",
       "items": { "type": "string", "enum": ["none", "privileged-sidecar", "sysbox-runc"] },
-      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to all three. Set to [\"none\"] to forbid privileged workloads on this host outright. dind_mode must be a member."
+      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to [\"none\"] — FAIL-CLOSED: DinD is unavailable until the operator widens this list explicitly, so a pool can never obtain a privileged sidecar by omission. dind_mode must be a member, so widening this list is also what makes a non-\"none\" dind_mode loadable."
     },
     "dind_image": {
       "type": "string",

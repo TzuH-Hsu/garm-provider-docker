@@ -15,6 +15,11 @@ func TestLoadM1(t *testing.T) {
 		{name: "unknown dind_mode is rejected", path: "testdata/m1_dind_mode_invalid.toml", wantErr: true},
 		{name: "dind_mode outside allowed_dind_modes is rejected", path: "testdata/m1_dind_mode_not_allowed.toml", wantErr: true},
 		{name: "unknown entry in allowed_dind_modes is rejected", path: "testdata/m1_allowed_dind_modes_invalid.toml", wantErr: true},
+		// The fail-closed ceiling default in action: an otherwise entirely
+		// valid DinD config that never widens allowed_dind_modes is rejected
+		// at LOAD time, so the operator finds out from a startup error
+		// instead of from a create that fails halfway through.
+		{name: "dind_mode is denied by the default ceiling when not widened", path: "testdata/m1_allowed_dind_modes_default_denies_dind.toml", wantErr: true},
 		{name: "dind_image required when dind_mode != none", path: "testdata/m1_dind_image_missing.toml", wantErr: true},
 		{name: "tag-only dind_image rejected by default", path: "testdata/m1_dind_image_unpinned.toml", wantErr: true},
 		{name: "tag-only dind_image accepted with its own escape hatch", path: "testdata/m1_dind_image_unpinned_allowed.toml"},
@@ -42,10 +47,12 @@ func TestLoadM1(t *testing.T) {
 
 // TestLoadM1Defaults confirms an M0-shaped config (no M1 keys at all, e.g.
 // testdata/valid.toml) still loads with ADR-001's documented M1 defaults
-// applied: dind_mode=none, every mode allowed, storage_driver=overlay2,
-// enable_job_network=true, and internal=false (the 2026-07-21 owner ruling,
-// ADR-001 Amendment — job networks default to open egress; per-allocation
-// network separation, not this flag, provides job-to-job isolation).
+// applied: dind_mode=none, the FAIL-CLOSED ["none"] ceiling (an operator who
+// never touches the config gets no DinD mode available at all — see
+// defaultAllowedDindModes), storage_driver=overlay2, enable_job_network=true,
+// and internal=false (the 2026-07-21 owner ruling, ADR-001 Amendment — job
+// networks default to open egress; per-allocation network separation, not
+// this flag, provides job-to-job isolation).
 func TestLoadM1Defaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
@@ -54,7 +61,7 @@ func TestLoadM1Defaults(t *testing.T) {
 	if cfg.DindMode != DindModeNone {
 		t.Errorf("DindMode = %q, want %q", cfg.DindMode, DindModeNone)
 	}
-	wantModes := []string{DindModeNone, DindModePrivilegedSidecar, DindModeSysboxRunc}
+	wantModes := []string{DindModeNone}
 	if len(cfg.AllowedDindModes) != len(wantModes) {
 		t.Fatalf("AllowedDindModes = %v, want %v", cfg.AllowedDindModes, wantModes)
 	}

@@ -42,6 +42,66 @@ func newDindTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	return p, fake
 }
 
+// TestCreateInstanceRejectsDindModeWithoutDindImage covers the pre-Docker
+// dind_image gate. config.Load already requires dind_image whenever the
+// CONFIG's own dind_mode is non-none, but that check cannot see a pool's
+// extra_specs: an operator running dind_mode="none" (so Load never demanded a
+// dind_image of them) who has widened allowed_dind_modes can still be handed a
+// pool that selects privileged-sidecar. That combination clears the ceiling
+// and would otherwise run the sweep, the claim network, the volumes and the
+// credential fetch before failing at the sidecar pull.
+//
+// The assertions are all "nothing happened yet": no container, no image pull,
+// no credential exec — i.e. the rejection really is ahead of every Docker op.
+func TestCreateInstanceRejectsDindModeWithoutDindImage(t *testing.T) {
+	fake := docker.NewFakeClient()
+	cfg := config.Config{
+		DockerHost:  "unix:///var/run/docker.sock",
+		RunnerImage: "ghcr.io/example/runner@sha256:deadbeef",
+		// The operator's own default is none — so config validation never
+		// required a dind_image — but the ceiling has been widened.
+		DindMode:         config.DindModeNone,
+		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar},
+		DindImage:        "",
+		StorageDriver:    "overlay2",
+		Network:          config.Network{EnableJobNetwork: true},
+	}
+	p, err := New(fake, cfg, "controller-abc")
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+
+	// The pool escalates within the (widened) ceiling to a DinD mode.
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = []byte(`{"dind_mode": "privileged-sidecar"}`)
+
+	_, err = p.CreateInstance(context.Background(), b)
+	if err == nil {
+		t.Fatal("expected a missing-dind_image error, got nil")
+	}
+	if !strings.Contains(err.Error(), "dind_image") {
+		t.Errorf("error %q does not mention dind_image", err)
+	}
+
+	if n := listAll(t, p); n != 0 {
+		t.Errorf("rejection left %d containers behind, want 0", n)
+	}
+	if len(fake.PulledImages) != 0 {
+		t.Errorf("rejection must not pull an image, got %v", fake.PulledImages)
+	}
+	if len(fake.Execs) != 0 {
+		t.Errorf("rejection must not deliver credentials, got %d execs", len(fake.Execs))
+	}
+	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
+	if len(nets) != 0 {
+		t.Errorf("rejection created %d networks, want 0 (it must precede the claim marker)", len(nets))
+	}
+	vols, _ := fake.VolumeList(context.Background(), volume.ListOptions{})
+	if len(vols.Volumes) != 0 {
+		t.Errorf("rejection created %d volumes, want 0", len(vols.Volumes))
+	}
+}
+
 func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
