@@ -11,7 +11,7 @@
     "required": ["dind_mode"]
   },
   "then": {
-    "description": "dind_image is required, and must be non-empty, exactly when dind_mode is present and is not \"none\" — mirroring internal/config's validateDindMode. Two further loader rules are NOT expressible in draft-07 and are enforced in Go only: (1) runner_image, dind_image, and each flavor's runner_image must be pinned by a sha256 digest (name@sha256:<64-hex>) unless the corresponding allow_unpinned_*_image flag is set; (2) a pool's extra_specs may select a DinD mode within a widened ceiling even when the config's own dind_mode is \"none\" — in that case CreateInstance rejects the allocation before any Docker operation if dind_image is empty, a runtime condition no schema over this file alone can express. (A third rule this schema used to defer to Go-only enforcement — dind_mode must be a member of allowed_dind_modes — IS now expressed below, per non-\"none\" mode, via the allOf conditionals and draft-07's \"contains\" keyword.)",
+    "description": "dind_image is required, and must be non-empty, exactly when dind_mode is present and is not \"none\" — mirroring internal/config's validateDindMode. Two further loader rules are NOT expressible in draft-07 and are enforced in Go only: (1) runner_image, dind_image, and each flavor's runner_image must be pinned by a sha256 digest (name@sha256:<64-hex>) unless the corresponding allow_unpinned_*_image flag is set; (2) a pool's extra_specs may select a DinD mode within a widened ceiling even when the config's own dind_mode is \"none\" — in that case CreateInstance rejects the allocation before any Docker operation if dind_image is empty, a runtime condition no schema over this file alone can express. (A third rule this schema used to defer to Go-only enforcement — dind_mode must be a member of allowed_dind_modes, for EVERY dind_mode value including the absent/\"none\" default, not only the two non-\"none\" modes — IS now expressed below via the allOf conditionals, minItems on allowed_dind_modes, and draft-07's \"contains\"/\"dependencies\" keywords.)",
     "required": ["dind_image"],
     "properties": { "dind_image": { "type": "string", "minLength": 1 } }
   },
@@ -47,6 +47,24 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "anyOf": [
+          { "not": { "required": ["dind_mode"] } },
+          { "properties": { "dind_mode": { "const": "none" } }, "required": ["dind_mode"] }
+        ]
+      },
+      "then": {
+        "description": "When dind_mode is absent or explicitly \"none\", the loader's membership check (validateDindMode: dind_mode must be a member of allowed_dind_modes, unconditionally — not only for the two non-\"none\" modes above) still applies. An explicitly-present allowed_dind_modes must therefore contain \"none\" too, or Load rejects the config exactly as it does for privileged-sidecar/sysbox-runc above. An OMITTED allowed_dind_modes is left alone here (the \"dependencies\" keyword only bites when the key is present): Load defaults it to [\"none\"], which trivially satisfies the loader's own check, so no schema constraint is needed for the omitted case.",
+        "dependencies": {
+          "allowed_dind_modes": {
+            "properties": {
+              "allowed_dind_modes": { "contains": { "const": "none" } }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {
@@ -70,8 +88,9 @@
     },
     "allowed_dind_modes": {
       "type": "array",
+      "minItems": 1,
       "items": { "type": "string", "enum": ["none", "privileged-sidecar", "sysbox-runc"] },
-      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to [\"none\"] — FAIL-CLOSED: DinD is unavailable until the operator widens this list explicitly, so a pool can never obtain a privileged sidecar by omission. dind_mode must be a member, so widening this list is also what makes a non-\"none\" dind_mode loadable."
+      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to [\"none\"] — FAIL-CLOSED: DinD is unavailable until the operator widens this list explicitly, so a pool can never obtain a privileged sidecar by omission. dind_mode must be a member (of EVERY mode, including \"none\" — see the allOf conditionals below), so widening this list is also what makes a non-\"none\" dind_mode loadable. An empty array is rejected by minItems here: the loader never accepts an empty ceiling regardless of dind_mode (Config.validateDindMode/EffectiveDindMode both fail closed on an empty AllowedDindModes)."
     },
     "dind_image": {
       "type": "string",

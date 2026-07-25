@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/xeipuuv/gojsonschema"
@@ -64,11 +66,18 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 
 	const runnerRef = "ghcr.io/example/runner@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	const dindRef = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
+	const runnerTOML = `runner_image = "` + runnerRef + `"` + "\n"
 
 	tests := []struct {
 		name     string
 		instance string
-		wantOK   bool
+		// toml, when non-empty, is a TOML-equivalent of instance: it is also run
+		// through the real Load(), and the resulting success/failure is asserted
+		// to AGREE with wantOK — so this table isn't just testing the schema in
+		// isolation, it is a truth table both the schema and the loader must
+		// satisfy identically (the whole point of a self-describing schema).
+		toml   string
+		wantOK bool
 	}{
 		{
 			name:     "empty object rejected (runner_image is required)",
@@ -81,13 +90,18 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			wantOK:   false,
 		},
 		{
+			// omitted dind_mode + omitted allowed_dind_modes: both default
+			// ("none" / ["none"]), and "none" is trivially a member of its own
+			// default ceiling.
 			name:     "runner_image alone is a complete minimal config",
 			instance: `{"runner_image": "` + runnerRef + `"}`,
+			toml:     runnerTOML,
 			wantOK:   true,
 		},
 		{
 			name:     "explicit dind_mode none needs no dind_image",
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none"}`,
+			toml:     runnerTOML + `dind_mode = "none"` + "\n",
 			wantOK:   true,
 		},
 		{
@@ -139,6 +153,47 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "bogus"}`,
 			wantOK:   false,
 		},
+		// H2/M4-W1: the loader's membership check (dind_mode must be a member of
+		// allowed_dind_modes) is UNCONDITIONAL — it applies just as much to the
+		// "none"/omitted default as to privileged-sidecar/sysbox-runc above. The
+		// schema used to omit this for the "none" case (no allOf conditional
+		// covered it), a false PASS the loader itself rejects. These cases pin
+		// the full truth table down, with a real Load() cross-check where
+		// practical.
+		{
+			name:     "none mode with an EMPTY allowed_dind_modes ceiling rejected (empty ceiling denies every mode)",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none", "allowed_dind_modes": []}`,
+			toml:     runnerTOML + "dind_mode = \"none\"\nallowed_dind_modes = []\n",
+			wantOK:   false,
+		},
+		{
+			name:     "none mode with a ceiling that EXCLUDES none rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none", "allowed_dind_modes": ["privileged-sidecar"]}`,
+			toml:     runnerTOML + "dind_mode = \"none\"\nallowed_dind_modes = [\"privileged-sidecar\"]\n",
+			wantOK:   false,
+		},
+		{
+			name:     "omitted dind_mode (defaults to none) with a ceiling that EXCLUDES none rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "allowed_dind_modes": ["privileged-sidecar"]}`,
+			toml:     runnerTOML + "allowed_dind_modes = [\"privileged-sidecar\"]\n",
+			wantOK:   false,
+		},
+		{
+			name:     "none mode with a ceiling that CONTAINS none accepted",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none", "allowed_dind_modes": ["none"]}`,
+			toml:     runnerTOML + "dind_mode = \"none\"\nallowed_dind_modes = [\"none\"]\n",
+			wantOK:   true,
+		},
+		{
+			// dind_mode omitted (defaults to "none") but the ceiling is
+			// explicitly widened to include privileged-sidecar too: "none" is
+			// still a member, so this is a PASS despite the wider ceiling —
+			// widening the ceiling only ever adds permission, never removes it.
+			name:     "omitted dind_mode with a ceiling containing none plus another mode accepted",
+			instance: `{"runner_image": "` + runnerRef + `", "allowed_dind_modes": ["none", "privileged-sidecar"]}`,
+			toml:     runnerTOML + "allowed_dind_modes = [\"none\", \"privileged-sidecar\"]\n",
+			wantOK:   true,
+		},
 		{
 			// additionalProperties stays true at the top level on purpose:
 			// the loader tolerates unknown TOML keys for forward/backward
@@ -158,6 +213,24 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			if got := result.Valid(); got != tt.wantOK {
 				t.Errorf("schema.Validate(%s) valid = %v, want %v (errors: %v)",
 					tt.instance, got, tt.wantOK, result.Errors())
+			}
+
+			if tt.toml == "" {
+				return
+			}
+			// Cross-check: the same instance, as TOML, run through the REAL
+			// loader. The schema and the loader must agree — that is the whole
+			// point of a self-describing schema (see the package doc comment on
+			// JSONSchema()).
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tt.toml), 0o600); err != nil {
+				t.Fatalf("writing temp config %q: %v", path, err)
+			}
+			_, loadErr := Load(path)
+			if gotLoadOK := loadErr == nil; gotLoadOK != tt.wantOK {
+				t.Errorf("Load(%s) ok = %v, want %v (err: %v) — schema and loader DISAGREE",
+					tt.toml, gotLoadOK, tt.wantOK, loadErr)
 			}
 		})
 	}
