@@ -1,10 +1,14 @@
 # garm-provider-docker - full example config.
 #
-# Every configurable key, commented. Where internal/config defines a
-# default, the value below IS that default (so this file doubles as a
-# reference for "what do I get if I never touch a key"); where a field has
-# no default (runner_image, dind_image, [flavors.*]), the value below is an
-# illustrative placeholder - replace it with your own before using this
+# Every configurable key, commented. Unless a key's own comment says
+# otherwise, the value below IS internal/config's real default (so this
+# file doubles as a reference for "what do I get if I never touch a key").
+# A few sections deliberately show a non-default, illustrative value
+# instead - [resources]'s runner_memory/dind_memory (default: empty,
+# meaning unlimited) and [extra_specs].allowed_env (default: empty) are the
+# two - and each such section's comment says so explicitly. Fields with no
+# default at all (runner_image, dind_image, [flavors.*]) are always
+# illustrative placeholders - replace them with your own before using this
 # file for real. See docs/config-reference.md for the full reference and
 # the two published JSON Schemas (internal/config/schema.json,
 # internal/extraspecs/schema.json) for the machine-readable contracts this
