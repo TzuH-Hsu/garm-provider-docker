@@ -65,7 +65,11 @@ Always set by the provider:
 | `GITHUB_URL` | Base GitHub host (e.g. `https://github.com`) - informational/connectivity-check in JIT mode, the host component of the constructed registration URL in non-JIT mode. |
 | `DISABLE_RUNNER_UPDATE` | Always `true`. |
 | `DOCKER_HOST` | DinD modes only - triggers the Docker readiness wait (step 2 below). Unset in `none` mode. |
-| `GARM_DIAG_DIR` | M2-W2 only - set when a persistent diagnostic-logs volume is mounted, so the entrypoint owns that dir (`mkdir -p` + `chown` to `runner`) before dropping privileges. Unset when the cache is disabled or the pool is cache-ineligible. |
+| `DOCKER_SOCK_GID` | DinD modes only, alongside `DOCKER_HOST` - the supplementary GID the entrypoint adds the `runner` user to before dropping privileges, so an unprivileged `docker` call can reach the DinD sidecar's socket (fixed value `2000`; see `internal/spec/dind.go`'s `DindSocketGID`). Unset in `none` mode. |
+| `RUNNER_TOOL_CACHE` | Set whenever the persistent-cache feature is enabled (`[cache].enabled`, default `true`), even for a cache-ineligible allocation - the entrypoint creates and chowns this directory before dropping privileges (`prepare_cache_dirs`) so `pnpm`/tool-setup actions can write into it as the unprivileged runner. |
+| `npm_config_store_dir` | Set only when a persistent pnpm-store volume is actually mounted; same ownership prep as `RUNNER_TOOL_CACHE` (`prepare_cache_dirs`). Unset when the cache is disabled or the allocation is cache-ineligible, leaving pnpm on its own default store. |
+| `GARM_DIAG_DIR` | Set when a persistent diagnostic-logs volume is mounted, so the entrypoint owns that dir (`mkdir -p` + `chown` to `runner`, `prepare_diag`) before dropping privileges. Unset when the cache is disabled or the pool is cache-ineligible. |
+| `GARM_EXTERNALS_SEEDED_MARKER` | Set only when a shared, image-digest-keyed externals cache volume is mounted (ADR-003). Path to the seed-completion marker the entrypoint blocks on (`wait_for_externals_seeded`, step 5 below) before execing the runner, so a job can never start against a half-seeded externals tree. Unset when the externals cache is not in play. |
 
 JIT mode only (`JIT_CONFIG_ENABLED=true`) — deliberately nothing else:
 GARM bakes the runner's name, labels, group, and ephemeral flag into the
@@ -92,7 +96,8 @@ overridable for local testing):
 |---|---|---|
 | `GARM_CRED_WAIT_SECONDS` | `120` | Timeout for step 1 (waiting for the `.delivered` marker). |
 | `WAIT_FOR_DOCKER_SECONDS` | `120` | Timeout for step 2 (Docker daemon readiness poll), DinD modes only. |
-| `RUN_AS_ROOT` | unset (drops privileges via `gosu`) | Set to `true` to run the runner (and `config.sh`, with `RUNNER_ALLOW_RUNASROOT=1`) as root instead of dropping to the `runner` user. When unset and `gosu` is unavailable, the entrypoint fails closed rather than running as root. |
+| `GARM_EXTERNALS_WAIT_SECONDS` | `600` | Timeout for step 5 (waiting for `GARM_EXTERNALS_SEEDED_MARKER` to appear), externals-cache allocations only. Generous headroom over a cold-volume seed (bounded provider-side at 10 minutes); on the common warm path the marker is already present and this returns immediately. |
+| `RUN_AS_ROOT` | unset (drops privileges via `gosu`) | Set to `true` to run the runner (and `config.sh`, with `RUNNER_ALLOW_RUNASROOT=1`) as root instead of dropping to the `runner` user. **Fails closed, not silently**: when unset and `gosu` is unavailable, the entrypoint refuses to start rather than running as root. This is a deliberate, explicit opt-out of non-root isolation - `extra_specs.extra_env` can never set it (`RUN_AS_ROOT` is hard-reserved, ADR-005), so it is reachable only by an operator who controls the container's own environment directly. |
 
 Deliberately absent, under any circumstance: the instance/bearer token,
 the metadata URL, the callback URL. There is no field or code path here
@@ -100,21 +105,32 @@ that could emit any of them.
 
 ## Entrypoint contract
 
-1. **Delivery-marker wait** — wait for the single atomic marker
-   `/run/garm/.delivered` (the provider writes it as the last entry of the
-   credential tar, so it appears only once every file is fully delivered),
-   bounded by `GARM_CRED_WAIT_SECONDS`.
+1. **Delivery-marker wait, concurrent with Docker readiness** — wait for the
+   single atomic marker `/run/garm/.delivered` (the provider writes it as
+   the last entry of the credential tar, so it appears only once every file
+   is fully delivered), bounded by `GARM_CRED_WAIT_SECONDS`. Backgrounded
+   alongside step 2 below; if either fails, the other is killed rather than
+   left to run out its own timeout.
 2. **Docker readiness** (DinD modes only) — if `DOCKER_HOST` is set, poll
    `docker info` until ready, bounded by `WAIT_FOR_DOCKER_SECONDS`,
    independently of and concurrently with step 1. Skipped entirely when
    `DOCKER_HOST` is unset.
-3. **Install & exec** —
+3. **DinD socket group membership, cache/diag directory ownership** — still
+   as root, before dropping privileges: in DinD modes, add the `runner` user
+   to the supplementary group owning the DinD socket (`DOCKER_SOCK_GID`) so
+   an unprivileged `docker` call can reach it; then `mkdir`/`chown` any
+   mounted persistent-cache directories (`RUNNER_TOOL_CACHE`,
+   `npm_config_store_dir`) and the diagnostic-logs directory
+   (`GARM_DIAG_DIR`) to the `runner` user — a fresh named volume mounts
+   root-owned, so without this the unprivileged runner cannot write into it.
+   Each step is a no-op when its corresponding env var is unset.
+4. **Install credentials** —
    - **JIT**: **pre-link** `/actions-runner/.runner`,
      `.credentials`, `.credentials_rsaparams` at the tmpfs files under
      `/run/garm` (credentials stay on tmpfs, never copied onto the
-     writable layer), then `exec ./run.sh` directly (no `config.sh`, no
-     `--jitconfig`). Pre-linking is safe here because all three JIT files are
-     delivered up front, so the symlinks are never dangling.
+     writable layer) — no `config.sh`, no `--jitconfig`. Pre-linking is safe
+     here because all three JIT files are delivered up front, so the
+     symlinks are never dangling.
    - **Non-JIT**: run `./config.sh --unattended --ephemeral --disableupdate
      --url … --token … --name …` (as the runner user via `gosu`, so the base
      image's own root guard is satisfied), letting it write
@@ -129,11 +145,19 @@ that could emit any of them.
      BY `config.sh` during registration) — crashes it (`FileNotFoundException`,
      exit 134) before registration runs (confirmed on a live daemon). A
      scrub-on-failure trap removes any credential-pattern files from the
-     writable layer if `config.sh` fails, then `exec ./run.sh`.
-   - Both paths drop root via `gosu runner` unless `RUN_AS_ROOT=true`, and
-     **fail closed**: if `gosu` is missing and `RUN_AS_ROOT` is not set,
-     the entrypoint exits with an error rather than silently running as
-     root.
+     writable layer if `config.sh` fails.
+5. **Externals-seed wait** (only when `GARM_EXTERNALS_SEEDED_MARKER` is set)
+   — block until that marker exists in the read-only externals mount,
+   bounded by `GARM_EXTERNALS_WAIT_SECONDS`. The provider seeds the shared,
+   image-digest-keyed externals volume under an in-volume flock and writes
+   the marker last, so its presence proves the tree is fully populated; this
+   consumer-side wait is the backstop that makes a half-seeded start
+   impossible regardless of provider-side timing (ADR-003). Skipped entirely
+   when the marker env var is unset (no externals cache mounted).
+6. **Exec** — drop root via `gosu runner` unless `RUN_AS_ROOT=true`, then
+   `exec ./run.sh` in the foreground so it receives signals directly.
+   **Fails closed**: if `gosu` is missing and `RUN_AS_ROOT` is not set, the
+   entrypoint exits with an error rather than silently running as root.
 
 The script never echoes credential file contents.
 
@@ -163,12 +187,19 @@ docker build -t garm-runner-noble:dev runner-images/noble
 
 The base image is pinned by digest, not by mutable tag, so a rebuild only
 happens when this repository explicitly bumps the pin (or the
-`GH_RUNNER_VERSION` the base image itself is built with). The digest
-above is the **linux/amd64 platform manifest** resolved from the
-`ubuntu-noble` tag's manifest list — correct for M0's linux/amd64-only
-scope (`docs/plan.md` M0). At M4 (multi-arch release), re-resolve to
-either a manifest-list digest or move to a per-platform build matrix so
-`linux/arm64` is covered too. Re-resolve the current digest with:
+`GH_RUNNER_VERSION` the base image itself is built with). The digest in the
+`Dockerfile` is the **manifest-list (index) digest** for
+`myoung34/github-runner:ubuntu-noble` — not a single-platform manifest —
+confirmed to cover both `linux/amd64` and `linux/arm64` under that one
+digest. This lets `.github/workflows/images.yml`'s multi-platform
+`docker/build-push-action` (`platforms: linux/amd64,linux/arm64`) resolve
+the correct per-platform image automatically via buildx, with no separate
+build matrix needed in this Dockerfile. (M0 originally pinned the
+single-platform `linux/amd64` manifest, matching that milestone's
+`linux/amd64`-only scope; M4 re-pinned to the manifest-list digest for the
+multi-arch release — see the `Dockerfile`'s own comment for the history.)
+
+Re-resolve the current digest with:
 
 ```sh
 docker buildx imagetools inspect myoung34/github-runner:ubuntu-noble
