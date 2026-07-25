@@ -29,8 +29,11 @@ func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.P
 
 	// Opportunistic, best-effort cache GC (ADR-003 W2): ListInstances is the
 	// second piggyback hook (the other being CreateInstance) where superseded/
-	// aged cache volumes are evicted, diag logs pruned, and leaked helpers
-	// reaped. Best-effort — a GC failure must not fail the list GARM asked for.
+	// aged cache volumes are DETECTED and LOGGED for operator visibility (never
+	// auto-removed — ADR-003 NEW-H1: cache-volume GC is non-destructive/log-only,
+	// reclaimed only via an explicit operator `docker volume prune`), diag logs
+	// pruned, and leaked helpers reaped. Best-effort — a GC failure must not fail
+	// the list GARM asked for.
 	p.runCacheGC(ctx)
 
 	f := filters.NewArgs(

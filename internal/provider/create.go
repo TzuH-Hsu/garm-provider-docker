@@ -47,12 +47,15 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 // WP4's sysbox-runc — the two share this entire flow, differing only in the
 // sidecar's Privileged/Runtime pair, ADR-001), with an isolated DinD sidecar —
 // and delivers the runner's credentials without ever exposing them to the
-// container's environment or to host disk (ADR-002). Two checks run before
-// ANY Docker operation and fail closed on their own: platform support, and
-// (WP4) resolving dind_mode within the operator's allowed_dind_modes ceiling
-// (ADR-001 F7) — a misconfiguration here is rejected before a network or
-// volume ever exists for the attempt. After those, the sequence is the
-// ADR-001/ADR-004 allocation flow:
+// container's environment or to host disk (ADR-002). Three checks run before
+// ANY Docker operation and fail closed on their own: platform support;
+// extra_specs schema-validation and resolution against this operator's config
+// (ADR-005), which is also where (WP4) dind_mode is resolved within the
+// operator's allowed_dind_modes ceiling (ADR-001 F7); and, when the resolved
+// dind_mode is non-"none", that a dind_image is actually configured — a
+// misconfiguration on any of the three is rejected before a network or volume
+// ever exists for the attempt. After those, the sequence is the ADR-001/
+// ADR-004 allocation flow:
 //
 //  1. run the host-wide, controller-scoped orphan sweep (F9): collect every
 //     abandoned allocation past its grace window (a crashed prior allocation of
@@ -157,8 +160,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 
 	// Opportunistic, best-effort cache GC (ADR-003 W2): CreateInstance is one of
 	// the two piggyback hooks (the other being ListInstances) where superseded/
-	// aged cache volumes are evicted, diagnostic logs pruned to their retention
-	// window, and leaked helper containers reaped — there is no background daemon
+	// aged cache volumes are DETECTED and LOGGED for operator visibility (never
+	// auto-removed — ADR-003 NEW-H1: cache-volume GC is non-destructive/log-only,
+	// reclaimed only via an explicit operator `docker volume prune`), diagnostic
+	// logs pruned to their retention window (the one remaining destructive cache
+	// action — it deletes FILES inside the diag volume, not the volume itself),
+	// and leaked helper containers reaped — there is no background daemon
 	// (ADR-004). It never hard-fails the create: every step logs and continues.
 	p.runCacheGC(ctx)
 

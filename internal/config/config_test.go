@@ -291,13 +291,15 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
-// validBaseConfig returns a Config that passes every M0+M1 Validate check
-// (dind_mode/allowed_dind_modes/storage_driver default to the same values
-// Load() applies), so a test focused on one field (e.g. RunnerImage here,
-// or a single M1 field in config_m1_test.go) does not have to separately
-// satisfy every other field's validation just to reach the check it cares
-// about. Tests that hand-build a Config directly (bypassing Load(), which
-// applies these same defaults from a bare TOML file) must start from this
+// validBaseConfig returns a Config that passes every M0+M1 Validate check.
+// dind_mode and storage_driver match the same defaults Load() applies, but
+// allowed_dind_modes is DELIBERATELY WIDENED to all three modes here rather
+// than matching Load()'s real fail-closed ["none"] default (M4-W1), so a test
+// focused on one field (e.g. RunnerImage here, or a single M1 field in
+// config_m1_test.go) can freely combine any dind_mode without also having to
+// override the ceiling just to reach the check it actually cares about. Tests
+// that hand-build a Config directly (bypassing Load(), which applies the real
+// ["none"] ceiling default from a bare TOML file) must start from this
 // baseline rather than a bare Config{} literal, or they fail on fields
 // unrelated to what they're testing.
 func validBaseConfig(runnerImage string, allowUnpinnedRunnerImage bool) Config {

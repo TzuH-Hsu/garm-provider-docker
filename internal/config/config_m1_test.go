@@ -349,8 +349,9 @@ func TestConfigEffectiveDindMode(t *testing.T) {
 		{
 			// F10: an empty AllowedDindModes must FAIL CLOSED (deny every mode),
 			// never be treated as fail-open "unrestricted". A loaded config
-			// always carries the all-three default, so an empty slice only ever
-			// reaches here from a hand-built Config that bypassed Load.
+			// always carries at least the fail-closed ["none"] default (M4-W1),
+			// so an empty slice only ever reaches here from a hand-built Config
+			// that bypassed Load.
 			name:             "an empty AllowedDindModes fails closed (denies every mode)",
 			dindMode:         DindModePrivilegedSidecar,
 			allowedDindModes: nil,
