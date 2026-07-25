@@ -71,8 +71,8 @@ the same tag:
 1. **Release binaries** — static `linux/amd64` and `linux/arm64` binaries
    (`CGO_ENABLED=0`, no libc dependency) with a `SHA256SUMS` checksum file,
    attached to a draft GitHub Release.
-2. **Container images** — `ghcr.io/tzuh-hsu/garm-provider-docker` (the
-   provider binary, packaged for convenience — see below) and
+2. **Container images** — `ghcr.io/tzuh-hsu/garm-provider-docker` (a
+   distribution vehicle for the binary — see below) and
    `ghcr.io/tzuh-hsu/garm-runner-noble` (the runner image), both multi-arch
    (`linux/amd64` + `linux/arm64`) with SBOM and provenance attestations.
 
@@ -85,12 +85,48 @@ cd garm-provider-docker
 go build -o garm-provider-docker .
 ```
 
-Running the provider itself as a container is a packaging convenience, not
-a requirement: GARM invokes it as a plain CLI executable either way (see
-`main.go`). If you do run it from `ghcr.io/tzuh-hsu/garm-provider-docker`,
-mount the host Docker socket into **that** container — never into a runner
-or DinD-sidecar container, which must stay isolated from the host daemon in
-every mode (see Security model below).
+### The provider image is a delivery mechanism, not a runtime
+
+**The provider cannot be run as a container.** GARM does not start a
+container for an external provider — it `exec`s the configured
+`provider_executable` **filesystem path** directly, passing the request
+through environment variables and stdin (`garm-provider-common` v0.1.9:
+`exec.CommandContext(ctx, providerBin)`). An OCI image reference is not a
+path to an executable, so it cannot be a `provider_executable`, and there
+is no hook that would make GARM run `docker run …` on your behalf. Even
+setting that aside, the image's distroless `nonroot` process (uid 65532)
+could not open a `root:docker` host socket.
+
+What the image *is* good for is getting the binary onto a host, or into
+your own GARM image, without a Go toolchain:
+
+```sh
+# Extract the static binary to the path GARM will exec.
+cid="$(docker create ghcr.io/tzuh-hsu/garm-provider-docker:<tag>)"
+docker cp "${cid}:/garm-provider-docker" /opt/garm/providers.d/garm-provider-docker
+docker rm "${cid}"
+chmod +x /opt/garm/providers.d/garm-provider-docker
+```
+
+If you build your own GARM image, copy the binary in at build time instead:
+
+```dockerfile
+COPY --from=ghcr.io/tzuh-hsu/garm-provider-docker:<tag> \
+     /garm-provider-docker /opt/garm/providers.d/garm-provider-docker
+```
+
+Either way, the binary GARM execs runs in GARM's own process context and
+needs access to the host Docker socket from there — for a containerized
+GARM, that means the socket is mounted into the **GARM** container, which
+is a property of your GARM deployment, not of this provider. Never mount
+it into a runner or DinD-sidecar container, which must stay isolated from
+the host daemon in every mode (see Security model below).
+
+A small `docker run` exec-wrapper that would let the image act as a
+`provider_executable` is a plausible future addition, but none is shipped
+today, and none should be used until it has been tested end to end against
+a real GARM — the credential and stdin/stdout contract is exactly the part
+a naive wrapper gets wrong.
 
 ## Register with GARM
 

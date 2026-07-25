@@ -2,21 +2,37 @@
 #
 # garm-provider-docker provider binary image (M4-W1, plan.md M4 item 1).
 #
-# This is a packaging convenience, not a requirement: GARM invokes this
-# provider as a plain CLI executable (see main.go's doc comment — it reads
-# GARM_COMMAND and the execution environment, then exits), so nothing about
-# the provider's own logic requires a container. Shipping one anyway gives
-# operators a pinned, reproducible artifact if they'd rather run it that way
-# than install a bare binary.
+# THIS IMAGE IS A DELIVERY MECHANISM FOR THE BINARY, NOT A RUNTIME. It is
+# not, and cannot be, a way to "run the provider as a container":
+#
+#   GARM does not start a container for an external provider. It execs the
+#   configured `provider_executable` FILESYSTEM PATH directly, handing the
+#   request over in environment variables and on stdin
+#   (garm-provider-common v0.1.9: `exec.CommandContext(ctx, providerBin)`).
+#   An OCI image reference is not a path to an executable, so it can never
+#   be a provider_executable, and there is no hook by which GARM would run
+#   `docker run` on an operator's behalf. Separately, the distroless
+#   nonroot process below (uid 65532) could not open a root:docker host
+#   socket even if something did start it.
+#
+# The image exists so operators can obtain a pinned, reproducible,
+# attested build of the binary without a Go toolchain — either extracted
+# with `docker create` + `docker cp` onto the path GARM will exec, or
+# pulled into their own GARM image with
+# `COPY --from=ghcr.io/tzuh-hsu/garm-provider-docker:<tag>`. See the root
+# README's "The provider image is a delivery mechanism, not a runtime"
+# section for both recipes. A tested `docker run` exec-wrapper could make
+# the image usable as a provider_executable in future; none is shipped
+# here, deliberately.
 #
 # Trust-topology note (see runner-images/noble/README.md for the full
 # version): the PROVIDER is the trusted party that legitimately needs host
 # Docker access to create/destroy the containers, networks, and volumes a
-# job needs. If you run the provider from THIS image, mount the host socket
-# into THIS container. Never mount it into a runner or DinD-sidecar
-# container — those must stay isolated from the host daemon in every mode
-# (ADR-001); this image ships no `docker` CLI and has no way to reach a
-# socket on its own.
+# job needs — it holds that access in GARM's own process context, wherever
+# GARM runs. The host socket must NEVER be mounted into a runner or
+# DinD-sidecar container: those stay isolated from the host daemon in every
+# mode (ADR-001). This image ships no `docker` CLI and has no way to reach
+# a socket on its own.
 
 # --platform=$BUILDPLATFORM pins the BUILDER stage to the host's own
 # platform, never a target platform. Pure-Go cross-compilation only needs
@@ -63,7 +79,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
 
 LABEL org.opencontainers.image.source="https://github.com/TzuH-Hsu/garm-provider-docker" \
-      org.opencontainers.image.description="GARM external Docker provider binary (packaging image, M4-W1)" \
+      org.opencontainers.image.description="GARM external Docker provider binary. Delivery mechanism only: extract the binary (docker cp, or COPY --from) onto the path GARM execs as provider_executable. GARM does not run providers as containers." \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=builder /out/garm-provider-docker /garm-provider-docker
