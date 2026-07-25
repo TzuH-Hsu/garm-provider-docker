@@ -38,9 +38,28 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
     Synology DSM or Unraid today.
 - **Persistent, repo-scoped caches.** Toolcache and pnpm-store volumes
   survive across jobs against the same repository, keyed by a normalized
-  repo URL plus generation/pnpm-major salts, with an opportunistic
-  age-based GC. Org/enterprise-shared caches are an explicit opt-in
-  (`allow_org_shared`), off by default. See
+  repo URL plus generation/pnpm-major salts. Cache volumes are **never
+  deleted automatically**: the opportunistic GC pass is *log-only* — it
+  detects stale and superseded caches and logs them for operator
+  visibility, and reclaiming them is a deliberate operator command. This
+  is by design (ADR-003): Docker has no atomic label-qualified volume
+  delete, so an inspect-then-delete-by-name is inherently racy, and the
+  provider will not delete a volume it cannot prove is its own. Reclaim
+  them at a quiescent moment with the controller-scoped purge:
+
+  ```sh
+  docker volume prune -a \
+    --filter label=garm.docker/cache=true \
+    --filter label=garm.docker/controller-id=<your-controller-id>
+  ```
+
+  (`docker volume prune` skips in-use volumes, so a warm cache held by a
+  live job is never reclaimed.) The one destructive cache action the
+  provider does perform is pruning *files* inside the diagnostic-log
+  volume to `diagnostic_log_retention_days`, gated on full-identity
+  validation. Org/enterprise-shared caches are an explicit opt-in
+  (`allow_org_shared`), off by default. NAS operators with limited storage
+  should plan for this manual step. See
   [ADR-003](docs/adr/ADR-003-cache-keying-and-lifecycle.md).
 - **Fail-closed `extra_specs`.** The GARM-admin trust tier (pool
   `extra_specs`) is bounded by a published, `additionalProperties: false`
