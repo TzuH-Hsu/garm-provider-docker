@@ -1,0 +1,143 @@
+# garm-provider-docker - full example config.
+#
+# Every configurable key, commented. Where internal/config defines a
+# default, the value below IS that default (so this file doubles as a
+# reference for "what do I get if I never touch a key"); where a field has
+# no default (runner_image, dind_image, [flavors.*]), the value below is an
+# illustrative placeholder - replace it with your own before using this
+# file for real. See docs/config-reference.md for the full reference and
+# the two published JSON Schemas (internal/config/schema.json,
+# internal/extraspecs/schema.json) for the machine-readable contracts this
+# file and pool extra_specs are validated against.
+#
+# This file is loaded by internal/config/examples_test.go on every change,
+# so it is guaranteed to always parse and validate against the real loader
+# (an anti-drift pin: if a field here stops matching the code, that test
+# fails).
+
+# Address of the Docker daemon this provider manages allocations on.
+# Default: unix:///var/run/docker.sock
+docker_host = "unix:///var/run/docker.sock"
+
+# REQUIRED, no default: the runner image used for CreateInstance. Must be
+# pinned by a sha256 digest (name@sha256:<64-hex>) unless
+# allow_unpinned_runner_image is set below. A named flavor (see
+# [flavors.*] below) is the ONLY channel that can vary this per pool - no
+# extra_specs field ever accepts a raw image reference (ADR-002/ADR-005).
+runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+# Dev-only escape hatch: allow a tag-only (non-digest-pinned) runner_image.
+# Default: false. Never set this true in a real deployment.
+allow_unpinned_runner_image = false
+
+# Default DinD sidecar strategy for pools that do not select one via
+# extra_specs.dind_mode (ADR-001). One of "none", "privileged-sidecar",
+# "sysbox-runc". Default: "none" - no DinD sidecar is created, and any
+# `docker` call inside a job fails fast, until an operator opts in.
+dind_mode = "none"
+
+# The operator CEILING on dind_mode (ADR-001 F7): the set of modes ANY
+# pool's extra_specs.dind_mode may ever select, regardless of what the pool
+# requests. Default: all three modes. On a shared or sensitive host, narrow
+# this (e.g. ["none"]) to forbid privileged workloads outright - a pool's
+# extra_specs can never escalate past this list.
+allowed_dind_modes = ["none", "privileged-sidecar", "sysbox-runc"]
+
+# The DinD sidecar's own image reference, digest-pinned like runner_image.
+# No default. REQUIRED only when the effective dind_mode != "none"; even
+# under "none" (as here), a value you DO set is still validated, so a typo
+# is caught at load time rather than only after you later enable DinD.
+dind_image = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
+
+# Dev-only escape hatch for dind_image, independent of
+# allow_unpinned_runner_image (see internal/config/config.go's doc comment
+# for why these are two separate flags). Default: false.
+allow_unpinned_dind_image = false
+
+# Explicit --storage-driver dockerd flag for the DinD sidecar (ADR-001):
+# NAS host filesystems make in-container autodetection unreliable, so this
+# is always explicit. One of "overlay2" or "vfs". Default: "overlay2"
+# ("vfs" is the slower, more compatible fallback - see the NAS notes in the
+# root README).
+storage_driver = "overlay2"
+
+[resources]
+  # Container memory limits. No cpu or pids limits, by design (ADR-005).
+  # Both fields default to EMPTY (unlimited) when omitted; the values below
+  # are illustrative, not defaults - an operator who wants no hard cap
+  # should simply omit both keys.
+  runner_memory = "8GiB"
+  dind_memory = "4GiB"
+
+[network]
+  # Reserved: the per-job network is always created regardless of this
+  # flag's value (see internal/config/network.go). Default: true.
+  enable_job_network = true
+
+  # Docker's `internal` flag on every per-job network. Default: false
+  # (2026-07-21 owner ruling, ADR-001 Amendment) - the runner needs egress
+  # to reach GitHub and a DinD sidecar needs it for registry pulls; per-job
+  # isolation comes from each allocation's own separate network, not this
+  # flag. Set true only for a fully airgapped job. Whatever you choose here,
+  # the host Docker daemon itself must never be configured to listen on TCP
+  # (see ADR-001's Amendment and the root README's Security model section).
+  internal = false
+
+[cache]
+  # Toggles the whole persistent-cache feature (toolcache + pnpm store).
+  # Default: true.
+  enabled = true
+
+  # Toolcache generation salt: bump it to invalidate every repo's toolcache
+  # by moving to a fresh volume name. Default: "1".
+  generation = "1"
+
+  # pnpm store salt: bump it on a pnpm major-version change (the store's
+  # on-disk layout is tied to the major). Default: "9".
+  pnpm_major = "9"
+
+  # Where the toolcache volume mounts inside the runner (RUNNER_TOOL_CACHE).
+  # Default: "/opt/hostedtoolcache".
+  toolcache_path = "/opt/hostedtoolcache"
+
+  # Where the pnpm store volume mounts inside the runner
+  # (npm_config_store_dir). Default: "/opt/pnpm-store".
+  pnpm_store_path = "/opt/pnpm-store"
+
+  # Opt-in for org/enterprise-keyed shared caches (ADR-003). Default:
+  # false - an org/enterprise-scoped pool gets NO persistent cache until
+  # this is explicitly set true, because repo_url is shared across every
+  # member repository under that scope.
+  allow_org_shared = false
+
+  # Age-since-creation window (days) for the opportunistic cache-volume GC.
+  # Default: 30.
+  stale_cache_eviction_days = 30
+
+  # Retention window (days) for the provider-side diagnostic-logs prune.
+  # Default: 7.
+  diagnostic_log_retention_days = 7
+
+[extra_specs]
+  # Operator allowlist of environment-variable NAMES a pool's
+  # extra_specs.extra_env may set on the runner container (ADR-005 H2).
+  # Default: EMPTY (fail-closed - a pool can inject NO extra env at all
+  # until you opt names in here). Hard-reserved names (RUNNER_*, DOCKER_*,
+  # GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) are rejected even if listed here -
+  # see docs/config-reference.md for the full reserved set.
+  allowed_env = ["MY_CI_FLAG", "TZ"]
+
+# Named [flavors.<name>] entries: per-pool overrides for
+# runner_memory/dind_memory/runner_image, selected via extra_specs.flavor.
+# No default - flavors are entirely optional. A flavor is the ONLY channel
+# that varies the runner image per pool (ADR-002/ADR-005); every field
+# within a flavor is itself optional and falls through to the top-level
+# value when unset.
+[flavors.default]
+  runner_memory = "8GiB"
+  dind_memory = "4GiB"
+
+[flavors.small]
+  runner_memory = "2GiB"
+  dind_memory = "1GiB"
+  runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble-small@sha256:cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"

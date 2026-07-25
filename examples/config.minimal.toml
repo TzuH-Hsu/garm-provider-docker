@@ -1,0 +1,22 @@
+# garm-provider-docker - minimal example config.
+#
+# This is the smallest file that produces a valid, working configuration:
+# every key besides runner_image is optional and falls back to its
+# documented default (see docs/config-reference.md and internal/config).
+#
+# Result: "none" dind_mode (no DinD sidecar, no privileged container),
+# docker_host = unix:///var/run/docker.sock, storage_driver = "overlay2",
+# persistent toolcache/pnpm caches enabled at their ADR-003 defaults, and
+# [network].internal = false (job containers keep normal internet egress).
+#
+# This file is loaded by internal/config/examples_test.go on every change,
+# so it is guaranteed to always parse and validate against the real loader.
+
+# Required: the runner image this provider creates job containers from.
+# Must be pinned by a sha256 digest (name@sha256:<64-hex>) unless
+# allow_unpinned_runner_image is set (dev-only escape hatch - never set it
+# in a real deployment). Replace the placeholder digest below with the one
+# you resolve for ghcr.io/tzuh-hsu/garm-runner-noble (see
+# runner-images/noble/README.md's "Digest-pin policy" section) or your own
+# derivative image.
+runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
