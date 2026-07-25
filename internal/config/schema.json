@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/TzuH-Hsu/garm-provider-docker/schemas/config.json",
   "title": "garm-provider-docker provider config",
-  "description": "The operator-set provider configuration for garm-provider-docker (ADR-005), written as TOML. This schema describes the same structure in JSON form for self-documentation (the v0.1.1 GetConfigJSONSchema command); the on-disk file is TOML and unknown keys are tolerated by the loader. This is the most-trusted trust tier (ADR-001): it strictly outranks pool extra_specs, which can never override docker_host, the privileged flag (derived from dind_mode only), a raw image reference, or a managed label.",
+  "description": "The operator-set provider configuration for garm-provider-docker (ADR-005), written as TOML. This schema describes the same structure in JSON form for self-documentation (the v0.1.1 GetConfigJSONSchema command). This is the most-trusted trust tier (ADR-001): it strictly outranks pool extra_specs, which can never override docker_host, the privileged flag (derived from dind_mode only), a raw image reference, or a managed label. INTENTIONAL SCHEMA/LOADER DELTA: this schema is deliberately STRICTER than the runtime loader. Every nested object below sets \"additionalProperties\": false, so an unknown key inside [resources], [network], [flavors.<name>], [cache], or [extra_specs] fails schema validation (a lint/self-describe-time signal an operator's editor or CI can catch). The actual TOML loader (toml.DecodeFile, BurntSushi/toml's default lenient decode) IGNORES unknown keys at every level, top-level and nested alike, for forward compatibility — a config with a stray or newer-than-this-binary key still loads and runs. The two shipped example configs are additionally verified (internal/config/examples_test.go, via toml.MetaData.Undecoded()) to contain no unknown keys at all, so they never drift out of sync with either the schema or the loader's real struct fields.",
   "type": "object",
   "additionalProperties": true,
   "required": ["runner_image"],
@@ -11,10 +11,44 @@
     "required": ["dind_mode"]
   },
   "then": {
-    "description": "dind_image is required, and must be non-empty, exactly when dind_mode is present and is not \"none\" — mirroring internal/config's validateDindMode. Three further loader rules are NOT expressible in draft-07 and are enforced in Go only: (1) dind_mode must be a member of allowed_dind_modes, which itself defaults to [\"none\"], so a non-\"none\" dind_mode ALSO requires allowed_dind_modes to be widened explicitly or the config is rejected at load; (2) runner_image, dind_image, and each flavor's runner_image must be pinned by a sha256 digest (name@sha256:<64-hex>) unless the corresponding allow_unpinned_*_image flag is set; (3) a pool's extra_specs may select a DinD mode within a widened ceiling even when the config's own dind_mode is \"none\" — in that case CreateInstance rejects the allocation before any Docker operation if dind_image is empty, a runtime condition no schema over this file alone can express.",
+    "description": "dind_image is required, and must be non-empty, exactly when dind_mode is present and is not \"none\" — mirroring internal/config's validateDindMode. Two further loader rules are NOT expressible in draft-07 and are enforced in Go only: (1) runner_image, dind_image, and each flavor's runner_image must be pinned by a sha256 digest (name@sha256:<64-hex>) unless the corresponding allow_unpinned_*_image flag is set; (2) a pool's extra_specs may select a DinD mode within a widened ceiling even when the config's own dind_mode is \"none\" — in that case CreateInstance rejects the allocation before any Docker operation if dind_image is empty, a runtime condition no schema over this file alone can express. (A third rule this schema used to defer to Go-only enforcement — dind_mode must be a member of allowed_dind_modes — IS now expressed below, per non-\"none\" mode, via the allOf conditionals and draft-07's \"contains\" keyword.)",
     "required": ["dind_image"],
     "properties": { "dind_image": { "type": "string", "minLength": 1 } }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "dind_mode": { "const": "privileged-sidecar" } },
+        "required": ["dind_mode"]
+      },
+      "then": {
+        "description": "dind_mode=\"privileged-sidecar\" requires allowed_dind_modes to be present and to contain \"privileged-sidecar\" — mirroring the loader's fail-closed ceiling (allowed_dind_modes defaults to [\"none\"], the M4-W1 fail-closed amendment to ADR-001/ADR-005): a non-\"none\" dind_mode with an omitted, empty, or non-widened ceiling is REJECTED both here and by Config.EffectiveDindMode/validateDindMode at load/resolve time.",
+        "required": ["allowed_dind_modes"],
+        "properties": {
+          "allowed_dind_modes": {
+            "type": "array",
+            "contains": { "const": "privileged-sidecar" }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "dind_mode": { "const": "sysbox-runc" } },
+        "required": ["dind_mode"]
+      },
+      "then": {
+        "description": "dind_mode=\"sysbox-runc\" requires allowed_dind_modes to be present and to contain \"sysbox-runc\" — same fail-closed-ceiling rationale as the privileged-sidecar conditional above.",
+        "required": ["allowed_dind_modes"],
+        "properties": {
+          "allowed_dind_modes": {
+            "type": "array",
+            "contains": { "const": "sysbox-runc" }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "docker_host": {
       "type": "string",

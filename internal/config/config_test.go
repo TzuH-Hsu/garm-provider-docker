@@ -101,14 +101,38 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			wantOK:   false,
 		},
 		{
-			name:     "privileged-sidecar with a dind_image accepted",
+			// R4(b): a non-"none" dind_mode with an OMITTED allowed_dind_modes
+			// must now FAIL schema validation, matching the loader's fail-closed
+			// ceiling (allowed_dind_modes defaults to ["none"], M4-W1) — this is
+			// the case that used to pass the schema while the loader rejected it.
+			name:     "privileged-sidecar with dind_image but no allowed_dind_modes ceiling rejected",
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": "` + dindRef + `"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "privileged-sidecar with dind_image and a ceiling that EXCLUDES it rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": "` + dindRef + `", "allowed_dind_modes": ["none"]}`,
+			wantOK:   false,
+		},
+		{
+			name:     "privileged-sidecar with dind_image and a ceiling that CONTAINS it accepted",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": "` + dindRef + `", "allowed_dind_modes": ["privileged-sidecar"]}`,
 			wantOK:   true,
 		},
 		{
 			name:     "sysbox-runc without dind_image rejected",
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "sysbox-runc"}`,
 			wantOK:   false,
+		},
+		{
+			name:     "sysbox-runc with dind_image but no allowed_dind_modes ceiling rejected",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "sysbox-runc", "dind_image": "` + dindRef + `"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "sysbox-runc with dind_image and a ceiling that CONTAINS it accepted",
+			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "sysbox-runc", "dind_image": "` + dindRef + `", "allowed_dind_modes": ["sysbox-runc"]}`,
+			wantOK:   true,
 		},
 		{
 			name:     "unknown dind_mode rejected by the enum",
