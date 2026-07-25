@@ -41,10 +41,6 @@
       "enum": ["overlay2", "vfs"],
       "description": "Explicit --storage-driver for the DinD sidecar's dockerd (ADR-001). Defaults to overlay2; vfs is the slower, more compatible fallback. A pool may override within this enum via extra_specs.storage_driver."
     },
-    "enable_runner_callbacks": {
-      "type": "boolean",
-      "description": "Whether the runner may reach GARM's callback endpoint (ADR-002 F10). Defaults to false."
-    },
     "resources": {
       "type": "object",
       "additionalProperties": false,

@@ -23,7 +23,9 @@ dind_image = "docker:dind@sha256:REPLACE_WITH_DIGEST"
 dind_mode = "privileged-sidecar"  # none | privileged-sidecar | sysbox-runc — an example operator-chosen value; when OMITTED the default is "none" (ADR-001 F11 Amendment: DinD is off unless the operator opts in)
 allowed_dind_modes = ["none", "privileged-sidecar", "sysbox-runc"]  # ceiling on what extra_specs may select (ADR-001)
 storage_driver = "overlay2"      # or "vfs"
-enable_runner_callbacks = false
+# enable_runner_callbacks: NOT a real field — the opt-in that ADR-002 designs
+# for was never implemented through M3 and is deferred (post-M4 follow-up);
+# it is intentionally absent from this example and from the config JSON Schema.
 
 [resources]
 runner_memory = "8GiB"
