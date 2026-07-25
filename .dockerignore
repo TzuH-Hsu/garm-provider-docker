@@ -1,0 +1,18 @@
+# Build-context filter for the root Dockerfile (M4-W1 provider image).
+# Keeps .git, docs, and non-Go tooling out of the `COPY . .` layer so the
+# image build doesn't needlessly pull in or cache-bust on unrelated changes.
+
+.git
+.github
+.claude
+docs
+runner-images
+scripts
+*.md
+*.local.md
+dist/
+bin/
+coverage.*
+*.test
+*.out
+.DS_Store
