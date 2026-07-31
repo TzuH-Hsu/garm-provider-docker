@@ -27,6 +27,20 @@ concurrency:
 jobs:
   build:
     name: build, vet, fmt, unit tests, shellcheck
+    # Stays on ubuntu-latest, not ubuntu-slim: this job's `go test ./...
+    # -race` step is the cost driver, and the race detector's CPU/memory
+    # overhead makes its wall-clock time on slim's single vCPU (vs.
+    # ubuntu-latest's standard multi-core allotment) impossible to bound
+    # without an empirical run against the hard 15-minute job cap — not a
+    # risk worth taking for a required gate. Splitting the cheap lint-only
+    # steps (gofmt, shellcheck) into a second, slim-hosted job was
+    # considered and rejected: those steps are a few seconds of work, but a
+    # second job pays its own checkout+setup-go overhead and GitHub Actions
+    # bills in whole-minute increments — a split only saves money if
+    # trimming those seconds happens to cross a minute-boundary on THIS
+    # job, which is not guaranteed, while the new job's minimum 1-minute
+    # billing floor ($0.002) is guaranteed. Net effect is a likely wash or
+    # loss, not a saving, so the job stays intact.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -104,6 +118,12 @@ jobs:
   dockerverify:
     name: dockerverify (live-daemon integration suite; manual only)
     if: github.event_name == 'workflow_dispatch'
+    # Stays on ubuntu-latest: this job execs the real provider binary
+    # against a real Docker daemon (see the file-level comment above).
+    # ubuntu-slim runs the job itself inside a container with no Docker
+    # daemon available — GitHub has declined to add Docker-in-Docker
+    # support there (actions/runner-images#13541) — so slim cannot satisfy
+    # this job's hard requirement regardless of cost.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -55,6 +55,10 @@ jobs:
   publish:
     name: publish (${{ matrix.name }})
     if: github.event_name == 'push' && github.ref_type == 'tag'
+    # Stays on ubuntu-latest: multi-platform buildx/QEMU builds need a real
+    # Docker daemon, which ubuntu-slim's container-only runtime cannot
+    # provide (see ci.yml's dockerverify job comment for the same
+    # constraint, and actions/runner-images#13541).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -150,6 +154,8 @@ jobs:
   dry-run:
     name: dry-run (${{ matrix.name }})
     if: github.event_name != 'push' || github.ref_type != 'tag'
+    # Stays on ubuntu-latest: same buildx/QEMU Docker requirement as the
+    # publish job above; ubuntu-slim cannot run a Docker daemon.
     runs-on: ubuntu-latest
     permissions:
       contents: read
