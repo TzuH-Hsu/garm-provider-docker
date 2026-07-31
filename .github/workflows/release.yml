@@ -53,8 +53,12 @@ jobs:
     # #13541). No -race, no test suite runs here (that's ci.yml's job), and
     # this repo is small (~26k LOC, 10 packages, 74 total modules), so a
     # cold build+link comfortably clears slim's hard 15-minute cap with
-    # room to spare.
+    # room to spare. timeout-minutes below is set to 10, not the 20 used
+    # for heavier ubuntu-latest builds elsewhere in this repo, because any
+    # value here still has to fit under slim's own 15-minute platform
+    # ceiling.
     runs-on: ubuntu-slim
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
@@ -80,6 +84,9 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.goversion.outputs.version }}
+          # setup-go v7 already caches by default when go.sum is present;
+          # declared explicitly so the behavior is self-documenting.
+          cache: true
 
       # A pushed vX.Y.Z tag IS the version. Every other trigger — including
       # a workflow_dispatch aimed at a tag ref, which sets ref_type=tag
@@ -149,6 +156,7 @@ jobs:
     # dependency, so nothing here needs ubuntu-latest. $0.002/min vs.
     # $0.008/min for a job that is seconds of work either way.
     runs-on: ubuntu-slim
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -202,6 +210,7 @@ jobs:
     # writes a step summary — no Docker, no gh CLI, no compile step. Same
     # rationale as the publish job above.
     runs-on: ubuntu-slim
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
