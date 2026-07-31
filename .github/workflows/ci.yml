@@ -57,9 +57,8 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.goversion.outputs.version }}
-          # setup-go v7 already caches the module/build cache by default
-          # whenever go.sum is present (it is, here) — declared explicitly
-          # so the behavior is self-documenting rather than implicit.
+          # caching is explicit here for clarity; the default cache key
+          # hashes go.mod (set cache-dependency-path to go.sum to key on it)
           cache: true
 
       - name: go build ./...
@@ -146,8 +145,8 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.goversion.outputs.version }}
-          # setup-go v7 already caches by default when go.sum is present;
-          # declared explicitly so the behavior is self-documenting.
+          # caching is explicit here for clarity; the default cache key
+          # hashes go.mod (set cache-dependency-path to go.sum to key on it)
           cache: true
 
       - name: Verify Docker is reachable
