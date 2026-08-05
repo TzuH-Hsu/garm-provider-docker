@@ -81,24 +81,26 @@ jobs:
       # go-version-file is setup-go's own mechanism for that (same technique
       # as ci.yml).
       #
-      # This is strictly safer than parsing go.mod ourselves: a grep that
-      # matched nothing would hand setup-go an EMPTY go-version, which the
-      # action only logs via core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.') — NOT
-      # setFailed — silently falling back to the runner image's own Go.
-      # Since the ubuntu-24.04 image ships a different Go than 1.25.0, that
-      # would be a green build against the wrong toolchain. Verified in
-      # setup-go's src/main.ts at the pinned SHA
-      # b7ad1dad31e06c5925ef5d2fc7ad053ef454303e.
+      # This narrows the old grep's failure mode rather than eliminating it:
+      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
+      # missing the `go`/`toolchain` directive entirely still falls through
+      # to the same preinstalled-Go fallback the old `grep '^go '` produced
+      # on a no-match — core.info('[warning]go-version input was not
+      # specified. The action will try to use pre-installed version.'), NOT
+      # setFailed. So go-version-file is not a universal, "strictly safer"
+      # replacement for that grep; go.mod having no `go` line at all still
+      # falls back to whatever Go the runner image ships. What it does
+      # concretely fix:
       #
-      # It also honours a toolchain directive if go.mod ever gains one (`go
-      # get -u` can add one), which a `grep '^go '` would silently ignore.
-      #
-      # And it parses go.mod inside the action itself, with no shell and no
-      # $GITHUB_OUTPUT round-trip — matching this repo's documented rule (see
-      # this file's and images.yml's file headers) that repo content, which
-      # is attacker-controlled on a fork PR, must never round-trip through a
-      # shell.
+      #   - the failed-grep-produces-empty-string case specifically (a
+      #     malformed but PRESENT `go` line the grep pattern missed)
+      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
+      #     get -u` can add one), which `grep '^go '` would silently ignore
+      #   - it parses go.mod inside the action itself, with no shell and no
+      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
+      #     (see this file's and images.yml's file headers) that repo
+      #     content, which is attacker-controlled on a fork PR, must never
+      #     round-trip through a shell
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
