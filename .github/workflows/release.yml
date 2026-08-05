@@ -154,15 +154,23 @@ jobs:
 
       # overwrite: true. At the pinned SHA 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       # (v7.0.1), overwrite defaults to 'false' and the action FAILS if an
-      # artifact of this name already exists; it does NOT fail when the
-      # artifact is simply absent, so this is safe on a normal first run.
+      # artifact of this name already exists — confirmed from the action's
+      # own source at that SHA. It does NOT fail when the artifact is
+      # simply absent, so `overwrite: true` is safe and purely defensive on
+      # a normal first run: it changes nothing when there is nothing to
+      # overwrite.
       #
-      # Artifacts are scoped to the RUN, not the run attempt — the REST
-      # artifact record carries workflow_run.id only, with no run_attempt
-      # field — and GITHUB_RUN_ID is unchanged by a re-run. So without this,
-      # "Re-run all jobs" on a release makes this step try to re-upload a
-      # name that already exists from attempt 1, and the release build dies.
-      # ("Re-run failed jobs" is unaffected; it skips this build job.)
+      # Why it is defensive rather than provably necessary: artifacts are
+      # scoped to the RUN, not the run attempt — the REST artifact record
+      # carries workflow_run.id only, with no run_attempt field — and
+      # GITHUB_RUN_ID is unchanged by a re-run. From that we INFER, but have
+      # not empirically reproduced here, that "Re-run all jobs" on a
+      # release would make this step try to re-upload a name that already
+      # exists from attempt 1 and fail without `overwrite: true`. ("Re-run
+      # failed jobs" is unaffected either way; it skips this build job.)
+      # Even if that inference turns out wrong, `overwrite: true` costs
+      # nothing on the common path, so it stays set as a no-downside
+      # precaution.
       #
       # Deleting the stale artifact first also keeps the downstream
       # publish/dry-run download unambiguous: both use merge-multiple: true
@@ -193,8 +201,12 @@ jobs:
     # (GitHub CLI 2.85.0) is confirmed present on ubuntu-slim per
     # actions/runner-images' ubuntu-slim-Readme.md, and actions/
     # download-artifact is a Node.js-based action with no Docker
-    # dependency, so nothing here needs ubuntu-latest. $0.002/min vs.
-    # $0.008/min for a job that is seconds of work either way.
+    # dependency, so nothing here needs ubuntu-latest. slim is chosen here
+    # for sufficiency, not cost: this repo is public, so GitHub-hosted
+    # runner minutes are $0 on either runs-on choice — GitHub Actions is
+    # free for standard GitHub-hosted runners on public repos. A $/min
+    # argument for this choice only applies if this pattern is reused in a
+    # private repo, where minutes are billed.
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:

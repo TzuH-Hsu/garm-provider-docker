@@ -8,19 +8,28 @@
 # comment). shellcheck runs against the repo's shell scripts last.
 #
 # Whether `build` is actually enforced as a required gate lives in a
-# repository RULESET, not in this file: as of this writing there is no
-# branch protection and no ruleset configured (GET
-# /branches/main/protection → 404 "Branch not protected"; GET /rulesets →
-# []), so nothing here currently blocks a push or PR. A ruleset making
-# this job's check run required is being added separately by the owner.
+# repository RULESET, not in this file. Ruleset id 20447102
+# ("main-branch-protection", target `~DEFAULT_BRANCH`) is active and
+# requires: no branch deletion, no non-fast-forward pushes, and a pull
+# request (0 approving reviews required) whose status checks include one
+# named "build, vet, fmt, unit tests, shellcheck" passing. Verify the live
+# rule with `gh api repos/TzuH-Hsu/garm-provider-docker/rulesets/20447102`.
 #
-# That makes the coupling below load-bearing once the ruleset exists: a
-# required check is matched by the check-run NAME, which is this job's
-# `name:` field — the string "build, vet, fmt, unit tests, shellcheck"
-# below. That string becomes a load-bearing external identifier the
-# moment the ruleset references it; renaming it here silently detaches
-# the ruleset's required check from this job, with no error anywhere. Do
-# not change that `name:` value without also updating the ruleset.
+# That makes the coupling below load-bearing: a required check is matched
+# by the check-run NAME, which is this job's `name:` field — the string
+# "build, vet, fmt, unit tests, shellcheck" below. That string is a
+# load-bearing external identifier the ruleset references; renaming it
+# here silently detaches the ruleset's required check from this job, with
+# no error anywhere. Do not change that `name:` value without also
+# updating the ruleset.
+#
+# Honest caveat: the ruleset's `bypass_actors` grants the repository ADMIN
+# role `bypass_mode: always`, so an admin push can skip every rule above,
+# required check included, with no override prompt. For the solo
+# maintainer — who holds that role — this ruleset functions as a
+# guard-rail against accidental force-pushes, branch deletion, and
+# unreviewed merges from anyone else, not as a hard technical gate the
+# maintainer themself is unable to bypass.
 #
 # The `dockerverify` job is OPTIONAL and manual-only (workflow_dispatch) —
 # see its own comment below for why it is not part of the required gate.
@@ -40,10 +49,17 @@ on:
 # outcome), that build record IS the artifact for a main push, not a
 # byproduct. On a public repo with GitHub-hosted runners the minutes
 # "saved" by cancelling cost $0, so there is nothing on the other side of
-# that trade. Same-group pushes to `main` now serialize instead of
-# cancelling, which at ~47s per run is not a constraint. PRs are
-# unaffected either way: `github.ref` for a PR is `refs/pull/<N>/merge`,
-# so each PR already has its own concurrency group.
+# that trade. Same-group pushes to `main` now queue rather than cancelling
+# the RUNNING run — but GitHub's concurrency model holds at most one
+# running plus one PENDING run per group, and a new push while one is
+# already pending cancels that earlier pending run to take its place. So
+# this is not a guarantee that every push to `main` gets a completed run:
+# two pushes in a row both get to run, but a burst of three or more in
+# quick succession can still leave an intermediate commit's run cancelled
+# before it starts. At ~47s per run that is a narrow edge case, not a
+# constraint worth engineering around. PRs are unaffected either way:
+# `github.ref` for a PR is `refs/pull/<N>/merge`, so each PR already has
+# its own concurrency group.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -87,24 +103,26 @@ jobs:
       # must never drift from it by hardcoding a version here. go-version-file
       # is setup-go's own mechanism for that.
       #
-      # This is strictly safer than parsing go.mod ourselves: a grep that
-      # matched nothing would hand setup-go an EMPTY go-version, which the
-      # action only logs via core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.') — NOT
-      # setFailed — silently falling back to the runner image's own Go.
-      # Since the ubuntu-24.04 image ships a different Go than 1.25.0, that
-      # would be a green build against the wrong toolchain. Verified in
-      # setup-go's src/main.ts at the pinned SHA
-      # b7ad1dad31e06c5925ef5d2fc7ad053ef454303e.
+      # This narrows the old grep's failure mode rather than eliminating it:
+      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
+      # missing the `go`/`toolchain` directive entirely still falls through
+      # to the same preinstalled-Go fallback the old `grep '^go '` produced
+      # on a no-match — core.info('[warning]go-version input was not
+      # specified. The action will try to use pre-installed version.'), NOT
+      # setFailed. So go-version-file is not a universal, "strictly safer"
+      # replacement for that grep; go.mod having no `go` line at all still
+      # falls back to whatever Go the runner image ships. What it does
+      # concretely fix:
       #
-      # It also honours a toolchain directive if go.mod ever gains one (`go
-      # get -u` can add one), which a `grep '^go '` would silently ignore.
-      #
-      # And it parses go.mod inside the action itself, with no shell and no
-      # $GITHUB_OUTPUT round-trip — matching this repo's documented rule (see
-      # the release.yml/images.yml file headers) that repo content, which is
-      # attacker-controlled on a fork PR, must never round-trip through a
-      # shell.
+      #   - the failed-grep-produces-empty-string case specifically (a
+      #     malformed but PRESENT `go` line the grep pattern missed)
+      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
+      #     get -u` can add one), which `grep '^go '` would silently ignore
+      #   - it parses go.mod inside the action itself, with no shell and no
+      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
+      #     (see the release.yml/images.yml file headers) that repo content,
+      #     which is attacker-controlled on a fork PR, must never round-trip
+      #     through a shell
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -199,24 +217,26 @@ jobs:
       # suite must never drift from it by hardcoding a version here.
       # go-version-file is setup-go's own mechanism for that.
       #
-      # This is strictly safer than parsing go.mod ourselves: a grep that
-      # matched nothing would hand setup-go an EMPTY go-version, which the
-      # action only logs via core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.') — NOT
-      # setFailed — silently falling back to the runner image's own Go.
-      # Since the ubuntu-24.04 image ships a different Go than 1.25.0, that
-      # would be a green build against the wrong toolchain. Verified in
-      # setup-go's src/main.ts at the pinned SHA
-      # b7ad1dad31e06c5925ef5d2fc7ad053ef454303e.
+      # This narrows the old grep's failure mode rather than eliminating it:
+      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
+      # missing the `go`/`toolchain` directive entirely still falls through
+      # to the same preinstalled-Go fallback the old `grep '^go '` produced
+      # on a no-match — core.info('[warning]go-version input was not
+      # specified. The action will try to use pre-installed version.'), NOT
+      # setFailed. So go-version-file is not a universal, "strictly safer"
+      # replacement for that grep; go.mod having no `go` line at all still
+      # falls back to whatever Go the runner image ships. What it does
+      # concretely fix:
       #
-      # It also honours a toolchain directive if go.mod ever gains one (`go
-      # get -u` can add one), which a `grep '^go '` would silently ignore.
-      #
-      # And it parses go.mod inside the action itself, with no shell and no
-      # $GITHUB_OUTPUT round-trip — matching this repo's documented rule (see
-      # the release.yml/images.yml file headers) that repo content, which is
-      # attacker-controlled on a fork PR, must never round-trip through a
-      # shell.
+      #   - the failed-grep-produces-empty-string case specifically (a
+      #     malformed but PRESENT `go` line the grep pattern missed)
+      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
+      #     get -u` can add one), which `grep '^go '` would silently ignore
+      #   - it parses go.mod inside the action itself, with no shell and no
+      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
+      #     (see the release.yml/images.yml file headers) that repo content,
+      #     which is attacker-controlled on a fork PR, must never round-trip
+      #     through a shell
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

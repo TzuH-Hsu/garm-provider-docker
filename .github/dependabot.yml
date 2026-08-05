@@ -9,17 +9,33 @@
 # file would stop the monthly version-update PRs below; it would not touch
 # security updates at all.
 #
-# Three keys in the blocks below DO leak into the security-update path, so
-# each is called out at its use site rather than assumed obvious:
+# Several keys in the blocks below DO leak into the security-update path
+# (per GitHub's own docs), so each is called out at its use site rather
+# than assumed obvious:
 #   - `ignore:` (used once, on gomod's `golang` module in the `docker`
 #     block, and scoped with `update-types:` so it only suppresses VERSION
 #     bumps — a bare `dependency-name:` with no `update-types:` would have
 #     also suppressed the security PR for that dependency; see
 #     https://github.com/dependabot/dependabot-core/issues/4027).
-#   - `target-branch:` — deliberately absent everywhere in this file.
-#     Pointing it at a non-default branch silently disables security
-#     updates for that ecosystem, which is a strictly worse outcome than
-#     not configuring the ecosystem at all.
+#   - `target-branch:` — deliberately absent everywhere in this file. This
+#     header previously claimed that pointing it at a non-default branch
+#     "silently disables security updates" for that ecosystem; GitHub's
+#     docs do not say that, and that was wrong. What they actually say is
+#     that specific per-ecosystem options stop applying to security PRs
+#     once `target-branch` targets a non-default branch — verbatim: "All
+#     pull requests for security updates are created with the chosen
+#     assignees, unless `target-branch` defines updates to a non-default
+#     branch," and "All commit messages follow the defined pattern, unless
+#     `target-branch` defines updates to a non-default branch." Security
+#     updates themselves keep running regardless. Keeping `target-branch`
+#     absent here is still correct — this repo has no reason to target a
+#     non-default branch — the reason is just "keep `assignees` /
+#     `commit-message` applying to security PRs too," not "or security
+#     updates stop."
+#   - `commit-message:` — set on both ecosystem blocks below. Per the same
+#     docs quoted above, its prefix also shapes security-update commit
+#     messages, not just version-update ones, so `ci(deps)` / `build(deps)`
+#     are not version-update-only cosmetics.
 #   - `groups:` — both groups below are pinned to
 #     `applies-to: version-updates` so a group can never batch a security
 #     fix behind an unrelated version bump and delay it.
@@ -82,13 +98,16 @@ updates:
         # otherwise-safe minor/patch bumps hostage.
         #
         # Spelling note: `minor` / `patch` (bare, no `version-update:`
-        # prefix) is the correct spelling INSIDE a group's
+        # prefix) is the documented spelling INSIDE a group's
         # `update-types:`. The `version-update:semver-minor` /
-        # `version-update:semver-patch` spelling belongs to `ignore:`
-        # blocks only — used inside a group it is not rejected, just
-        # silently ineffective, and the group would fall back to grouping
-        # everything including majors. See the `docker` block below for
+        # `version-update:semver-patch` spelling is documented for
+        # `ignore:` blocks instead — see the `docker` block below for
         # where that spelling IS the correct one, in an `ignore:` entry.
+        # What happens if the two spellings are swapped inside a group is
+        # not documented behavior, so this comment does not claim to know
+        # it; the bare spelling is used here because it is the documented
+        # one for this context, not because the alternative has been
+        # observed to fail in a specific way.
         update-types:
           - minor
           - patch
@@ -140,6 +159,20 @@ updates:
         # resolvable semver (see that group's own comment); this
         # ecosystem's bumps mostly don't, so the filter would do the
         # opposite of what it does above.
+        #
+        # Scope of the batching above: "directories:" lists two Dockerfiles
+        # and this one `groups:` block covers both, but that does NOT mean
+        # updates from both directories land in a single PR. Grouping is
+        # per directory unless `group-by: dependency-name` is also set, and
+        # even then it only merges updates that share the exact SAME
+        # dependency name across directories. The root Dockerfile and
+        # runner-images/noble/Dockerfile pin different images, so today
+        # this configuration produces one PR per directory when both have
+        # pending updates — "batching" here means "the updates within one
+        # directory ride together," not "both Dockerfiles ride together."
+        # `group-by: dependency-name` is deliberately not added: it would
+        # not change behavior for two directories with no shared dependency
+        # names, and nobody has asked for cross-directory batching.
     ignore:
       # Dockerfile:49 pins `golang:1.25.0` as this image's build toolchain.
       # go.mod's `go 1.25.0` line is this repo's single source of truth for
@@ -155,12 +188,23 @@ updates:
       # repo's release images get compiled by a toolchain CI has never run
       # a single test against.
       #
-      # All three semver update-types are ignored, but that still leaves
-      # DIGEST refreshes of `golang:1.25.0` itself flowing through —
-      # rebuilding the same tag with base-OS CVE fixes baked in is not a
-      # semver update, so it is not covered by this ignore rule at all.
-      # Security rebuilds of the pinned version: yes. Drift to a version
-      # CI has never validated: no.
+      # All three semver update-types are ignored. What this `ignore` rule
+      # does NOT do is filter digest-only changes: a rebuild of the same
+      # `golang:1.25.0` tag with base-OS CVE fixes baked in has no semver
+      # update-type to match against, so `ignore` semantics alone mean this
+      # rule is simply silent on that case — it neither suppresses it nor
+      # promises to let it through.
+      #
+      # Whether Dependabot actually EMITS a digest-only PR for that case is
+      # a separate, moving question this file does not promise an answer
+      # to: dependabot-core has shipped digest-suppression logic (e.g.
+      # "Respect cooldown for Docker digest updates and suppress
+      # multi-arch no-ops"), and which suppression behavior is active on
+      # GitHub.com at any given time is not something checked into this
+      # repo can verify. If a digest-refresh PR for `golang:1.25.0` shows
+      # up, take it — it is still gated by this repo's normal review. If
+      # it never shows up, the outcome is simply staying pinned at the
+      # current digest, which is the safe direction to fail in either way.
       #
       # Rejected alternative: leave it unignored as a standing "new Go is
       # out" reminder PR. Rejected because that PR is wrong as merged —
