@@ -18,11 +18,32 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancel a superseded run on the same ref so a rapid string of pushes to one
-# PR doesn't queue up redundant CI minutes.
+# Cancellation is PR-only. On a PR a superseded run is dead weight — the
+# new push already supersedes it — but on `main` cancelling a run leaves a
+# merged commit with no green check and no record it ever built. Since
+# nothing outside this workflow consumes CI's result (release.yml and
+# images.yml trigger independently on pushed tags, not on ci.yml's
+# outcome), that build record IS the artifact for a main push, not a
+# byproduct. On a public repo with GitHub-hosted runners the minutes
+# "saved" by cancelling cost $0, so there is nothing on the other side of
+# that trade. Same-group pushes to `main` now serialize instead of
+# cancelling, which at ~47s per run is not a constraint. PRs are
+# unaffected either way: `github.ref` for a PR is `refs/pull/<N>/merge`,
+# so each PR already has its own concurrency group.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# release.yml:42-43 and images.yml:50-51 already pin this explicitly;
+# ci.yml silently inherited the repository's default instead. That default
+# lives in an unversioned Settings toggle invisible to code review, and
+# this is the one workflow that executes repository code (`go test
+# ./...`), so pin it here too. Neither job needs more than read: `build`
+# reads/compiles/tests/lints the checked-out code, and `dockerverify` talks
+# to the runner's local Docker socket, not the GitHub API. Declaring this
+# can only narrow the token's scope, never widen it.
+permissions:
+  contents: read
 
 jobs:
   build:
