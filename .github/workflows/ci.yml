@@ -1,12 +1,26 @@
 # M3-W2: the first CI workflow for this repository. Kept minimal and
 # comment-heavy on purpose — see plan.md §3 M3, item 2.
 #
-# The `build` job is the required gate for every push/PR: go build, go vet,
-# gofmt, and `go test ./... -race` (unit tests only — the internal/verify
-# package's live-daemon scenarios are gated behind the `dockerverify` build
-# tag, so a plain `go test ./...` never compiles or runs them; see that
-# package's own doc comment). shellcheck runs against the repo's shell
-# scripts last.
+# The `build` job runs go build, go vet, gofmt, and `go test ./... -race`
+# (unit tests only — the internal/verify package's live-daemon scenarios
+# are gated behind the `dockerverify` build tag, so a plain `go test
+# ./...` never compiles or runs them; see that package's own doc
+# comment). shellcheck runs against the repo's shell scripts last.
+#
+# Whether `build` is actually enforced as a required gate lives in a
+# repository RULESET, not in this file: as of this writing there is no
+# branch protection and no ruleset configured (GET
+# /branches/main/protection → 404 "Branch not protected"; GET /rulesets →
+# []), so nothing here currently blocks a push or PR. A ruleset making
+# this job's check run required is being added separately by the owner.
+#
+# That makes the coupling below load-bearing once the ruleset exists: a
+# required check is matched by the check-run NAME, which is this job's
+# `name:` field — the string "build, vet, fmt, unit tests, shellcheck"
+# below. That string becomes a load-bearing external identifier the
+# moment the ruleset references it; renaming it here silently detaches
+# the ruleset's required check from this job, with no error anywhere. Do
+# not change that `name:` value without also updating the ruleset.
 #
 # The `dockerverify` job is OPTIONAL and manual-only (workflow_dispatch) —
 # see its own comment below for why it is not part of the required gate.
@@ -55,13 +69,14 @@ jobs:
     # without an empirical run against the hard 15-minute job cap — not a
     # risk worth taking for a required gate. Splitting the cheap lint-only
     # steps (gofmt, shellcheck) into a second, slim-hosted job was
-    # considered and rejected: those steps are a few seconds of work, but a
-    # second job pays its own checkout+setup-go overhead and GitHub Actions
-    # bills in whole-minute increments — a split only saves money if
-    # trimming those seconds happens to cross a minute-boundary on THIS
-    # job, which is not guaranteed, while the new job's minimum 1-minute
-    # billing floor ($0.002) is guaranteed. Net effect is a likely wash or
-    # loss, not a saving, so the job stays intact.
+    # considered and rejected on WALL-CLOCK grounds, not cost: those steps
+    # are ~3s of measured work, but a second job pays its own
+    # checkout+setup-go overhead (~14s measured) just to relocate them —
+    # net slower, not a saving, regardless of price. (This repo is public,
+    # so GitHub-hosted runner minutes are $0 here either way — GitHub
+    # Actions is free for standard GitHub-hosted runners on public repos.
+    # A $/min argument for this split only applies if this pattern is
+    # reused in a private repo, where minutes are billed.)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -136,7 +151,13 @@ jobs:
   #      and the crash-orphan-sweep scenario waits past the orphan sweep's
   #      ~2-minute exited-runner grace window — see
   #      internal/verify/verify_m3_scenarios_test.go). That is appropriate for
-  #      a manual/nightly run, not for gating every push/PR.
+  #      a manual run, not for gating every push/PR. (There is no cron
+  #      schedule anywhere in this repo — nothing runs nightly. Scheduling
+  #      this suite was considered and deliberately not done: as reason 3
+  #      below explains, it has not yet been validated against the
+  #      GitHub-hosted amd64 environment, so putting it on a schedule
+  #      today would just produce recurring red runs with no one watching
+  #      them.)
   #   2. This suite drives the REAL provider binary against a REAL Docker
   #      daemon. GitHub's hosted ubuntu-latest runners ship Docker Engine
   #      pre-installed and already running, so no separate docker:dind
