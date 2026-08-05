@@ -149,6 +149,26 @@ jobs:
             -o "${out}" .
           chmod +x "${out}"
 
+      # overwrite: true. At the pinned SHA 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      # (v7.0.1), overwrite defaults to 'false' and the action FAILS if an
+      # artifact of this name already exists; it does NOT fail when the
+      # artifact is simply absent, so this is safe on a normal first run.
+      #
+      # Artifacts are scoped to the RUN, not the run attempt — the REST
+      # artifact record carries workflow_run.id only, with no run_attempt
+      # field — and GITHUB_RUN_ID is unchanged by a re-run. So without this,
+      # "Re-run all jobs" on a release makes this step try to re-upload a
+      # name that already exists from attempt 1, and the release build dies.
+      # ("Re-run failed jobs" is unaffected; it skips this build job.)
+      #
+      # Deleting the stale artifact first also keeps the downstream
+      # publish/dry-run download unambiguous: both use merge-multiple: true
+      # with no name filter, so two attempts' artifacts — which carry
+      # identical filenames — would otherwise be merged and SHA256SUMS
+      # computed over a nondeterministic result. A run_attempt name suffix
+      # was considered and rejected for exactly this reason: it would let
+      # both attempts' artifacts coexist and get merged instead of the
+      # later attempt cleanly replacing the earlier one.
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -156,6 +176,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
   # Real release: a pushed vX.Y.Z tag, and nothing else. This is the ONLY
   # job in this workflow with `contents: write`, and the only one that
