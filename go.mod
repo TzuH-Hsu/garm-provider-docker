@@ -6,6 +6,14 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/cloudbase/garm-provider-common v0.1.9
 	github.com/distribution/reference v0.6.0
+	// Pinned to v27.5.1+incompatible: this module path never adopted a
+	// /vN import path, so the Go module proxy caps github.com/docker/docker
+	// at v28.5.2+incompatible — no v29 is reachable under this import
+	// path. Upstream split the client into the separately-versioned
+	// github.com/moby/moby/client instead. Bumping this is a deliberate,
+	// reviewed change, not a routine dependency refresh — Dependabot gomod
+	// VERSION updates are intentionally not enabled for this reason (see
+	// .github/dependabot.yml), while gomod SECURITY updates remain active.
 	github.com/docker/docker v27.5.1+incompatible
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
