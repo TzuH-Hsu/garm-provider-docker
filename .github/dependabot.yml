@@ -34,24 +34,25 @@
 #
 # There is deliberately NO `gomod` block here — do not "restore" one
 # thinking it was left out by mistake. `go.mod` pins
-# `github.com/docker/docker` at `v27.5.1+incompatible`. That module path
+# `github.com/docker/docker` at `v28.5.2+incompatible`. That module path
 # never adopted a `/vN` suffix, so proxy.golang.org caps what it will ever
-# resolve there at `v28.5.2+incompatible` — there is no v29 reachable
-# under this import path, so there is exactly ONE version bump ever
-# available on it. A spike confirmed that bump is a go.mod/go.sum-only
-# diff that builds, vets, and passes the full test suite with zero source
-# changes — so this is not about the PR being unmergeable. It is about
-# cadence: that one bump is a deliberate, reviewed change, gated on a
-# manual `dockerverify` run against a real Docker daemon (see ci.yml's
-# dockerverify job) before it ships, not a routine monthly refresh worth
-# handing to a recurring Dependabot PR. gomod SECURITY updates are
-# governed by the repo-level setting above and are NOT affected by the
-# absence of this block — they keep running. An `ignore` rule for
-# `docker/docker` was considered instead of omitting the block entirely,
-# and rejected: `ignore` cannot distinguish "silence the pointless version
-# bump" from "silence the security fix," so it would also gag the one PR
-# this repo actually wants on the day a fix for that module finally
-# ships.
+# resolve there at `v28.5.2+incompatible` — this pin is already the
+# TERMINAL version reachable on this import path; there is no v29 and no
+# further version bump for Dependabot to ever propose here (the one bump
+# this path ever had, v27.5.1 to v28.5.2, has already landed — see the
+# `build(deps)` commit that bumped go.mod). Moving past v28.5.2 is not a
+# version bump at all: it is a migration to the separately-versioned
+# github.com/moby/moby/v2 import path, tracked as its own deliberate piece
+# of work in issue #1, not something a routine monthly Dependabot PR on
+# this block could ever produce. gomod SECURITY updates are governed by
+# the repo-level setting above and are NOT affected by the absence of this
+# block — they keep running regardless of this pin being terminal. An
+# `ignore` rule for `docker/docker` was considered instead of omitting the
+# block entirely and rejected on the same grounds as before: `ignore`
+# cannot distinguish "silence a pointless version bump" from "silence a
+# security fix" — moot for version bumps now that there are none left to
+# silence on this path, but the same reasoning will apply again once a
+# gomod block is added for the eventual moby/moby/v2 migration.
 version: 2
 updates:
   # 3 workflows (ci.yml, images.yml, release.yml), 18 `uses:` lines, 8
