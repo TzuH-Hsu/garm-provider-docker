@@ -76,7 +76,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # attacker could pivot to even with code execution inside the binary
 # itself. The "nonroot" variant (uid/gid 65532), not the bare "static" tag,
 # so the process never runs as UID 0.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 LABEL org.opencontainers.image.source="https://github.com/TzuH-Hsu/garm-provider-docker" \
       org.opencontainers.image.description="GARM external Docker provider binary. Delivery mechanism only: extract the binary (docker cp, or COPY --from) onto the path GARM execs as provider_executable. GARM does not run providers as containers." \
