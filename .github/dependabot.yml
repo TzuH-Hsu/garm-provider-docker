@@ -12,10 +12,12 @@
 # Several keys in the blocks below DO leak into the security-update path
 # (per GitHub's own docs), so each is called out at its use site rather
 # than assumed obvious:
-#   - `ignore:` (used once, on gomod's `golang` module in the `docker`
-#     block, and scoped with `update-types:` so it only suppresses VERSION
-#     bumps — a bare `dependency-name:` with no `update-types:` would have
-#     also suppressed the security PR for that dependency; see
+#   - `ignore:` (used once, on the `golang` base-image dependency in the
+#     `docker` block below — that is a Docker image tag named `golang`,
+#     not a Go module; do not confuse it with the separate `gomod` block
+#     also below). It is scoped with `update-types:` so it only suppresses
+#     VERSION bumps — a bare `dependency-name:` with no `update-types:`
+#     would have also suppressed the security PR for that dependency; see
 #     https://github.com/dependabot/dependabot-core/issues/4027).
 #   - `target-branch:` — deliberately absent everywhere in this file. This
 #     header previously claimed that pointing it at a non-default branch
@@ -32,10 +34,10 @@
 #     non-default branch — the reason is just "keep `assignees` /
 #     `commit-message` applying to security PRs too," not "or security
 #     updates stop."
-#   - `commit-message:` — set on both ecosystem blocks below. Per the same
-#     docs quoted above, its prefix also shapes security-update commit
-#     messages, not just version-update ones, so `ci(deps)` / `build(deps)`
-#     are not version-update-only cosmetics.
+#   - `commit-message:` — set on all three ecosystem blocks below. Per the
+#     same docs quoted above, its prefix also shapes security-update
+#     commit messages, not just version-update ones, so `ci(deps)` /
+#     `build(deps)` are not version-update-only cosmetics.
 #   - `groups:` — both groups below are pinned to
 #     `applies-to: version-updates` so a group can never batch a security
 #     fix behind an unrelated version bump and delay it.
@@ -48,27 +50,70 @@
 # because it lets three months of drift accumulate into one diff that is
 # no longer reviewable in one sitting.
 #
-# There is deliberately NO `gomod` block here — do not "restore" one
-# thinking it was left out by mistake. `go.mod` pins
-# `github.com/docker/docker` at `v28.5.2+incompatible`. That module path
-# never adopted a `/vN` suffix, so proxy.golang.org caps what it will ever
-# resolve there at `v28.5.2+incompatible` — this pin is already the
-# TERMINAL version reachable on this import path; there is no v29 and no
-# further version bump for Dependabot to ever propose here (the one bump
-# this path ever had, v27.5.1 to v28.5.2, has already landed — see the
-# `build(deps)` commit that bumped go.mod). Moving past v28.5.2 is not a
-# version bump at all: it is a migration to the separately-versioned
+# There IS a `gomod` block below (added 2026-09-21) — but not because
+# `go.mod` has gomod version updates coming; it does not (see the
+# terminal-pin paragraph below). It exists for a narrower, already-
+# observed reason: on 2026-09-21, Dependabot's own gomod SECURITY PR #2
+# (bumping go.opentelemetry.io/otel/exporters/otlp/otlptrace/
+# otlptracehttp past GHSA-8wmf-6v46-5gfg, alert #7) could not be rebased,
+# because at the time PR #2 was opened this file had no `gomod` entry for
+# Dependabot to re-derive the PR from. Commenting `@dependabot rebase` on
+# PR #2 got back, verbatim:
+#
+#   "The dependabot.yml entry that created this PR has been deleted so
+#   this PR can't be rebased. Please close the PR so Dependabot can
+#   create a new one with the current dependabot.yml."
+#
+# PR #2 could not be rebased, so the same bump was applied by hand
+# instead (see the `build(deps)` commit bumping `otlptracehttp` to
+# v1.45.0). PR #2 itself is still OPEN as of this writing; if Dependabot
+# has not closed it as superseded by the time this lands, close it by
+# hand as a duplicate. The `gomod`
+# block below exists SOLELY so the next gomod security PR has a config
+# entry to be recreated from and to attach `@dependabot rebase` /
+# `@dependabot recreate` to — it is not there to invite gomod
+# version-update PRs. `open-pull-requests-limit: 0` on the block is what
+# keeps those version-update PRs at zero: per GitHub's Dependabot options
+# reference, that setting lets you "temporarily disable version updates
+# for a package manager by setting this option to zero," while — same
+# page — "Security update pull requests are not subject to this limit and
+# do not count toward it. There is no limit on the number of open pull
+# requests for security updates." So the block mutes exactly the
+# version-update noise this ecosystem has zero of anyway (below), and
+# leaves gomod security PRs, and their rebase/recreate commands, fully
+# working.
+#
+# `go.mod` pins `github.com/docker/docker` at `v28.5.2+incompatible`.
+# That module path never adopted a `/vN` suffix, so proxy.golang.org caps
+# what it will ever resolve there at `v28.5.2+incompatible` — this pin is
+# already the TERMINAL version reachable on this import path. The one
+# version bump this path ever had, v27.5.1 to v28.5.2, LANDED on
+# 2026-09-21 via PR #5, gated on a live run of this repo's `dockerverify`
+# suite against a real daemon (Docker Engine 29.8.0, all 18 scenarios
+# passing in 398.180s — see PR #5's description) rather than the fake
+# client alone. There is now no v29 and no further version bump for
+# Dependabot to ever propose on this import path again — a gomod
+# version-update PR for `github.com/docker/docker` specifically can never
+# appear again, which is one more reason the limit-0 block above costs
+# this repo nothing: even without that cap, this particular dependency
+# would already be silent. Moving past v28.5.2 is not a version bump at
+# all: it is a migration to the separately-versioned
 # github.com/moby/moby/v2 import path, tracked as its own deliberate piece
 # of work in issue #1, not something a routine monthly Dependabot PR on
-# this block could ever produce. gomod SECURITY updates are governed by
-# the repo-level setting above and are NOT affected by the absence of this
-# block — they keep running regardless of this pin being terminal. An
-# `ignore` rule for `docker/docker` was considered instead of omitting the
-# block entirely and rejected on the same grounds as before: `ignore`
-# cannot distinguish "silence a pointless version bump" from "silence a
-# security fix" — moot for version bumps now that there are none left to
-# silence on this path, but the same reasoning will apply again once a
-# gomod block is added for the eventual moby/moby/v2 migration.
+# this block could ever produce — and not something
+# `open-pull-requests-limit: 0` would block either, since that migration
+# is a manual dependency-name change a maintainer makes, not a
+# Dependabot-generated version-update PR.
+#
+# No `ignore:` rule is added for `docker/docker` on the `gomod` block
+# below. The reasoning is the same one this file already uses for
+# `ignore:` elsewhere (see the `docker` ecosystem block's `golang` entry
+# lower down): `ignore` cannot distinguish "silence a pointless version
+# bump" from "silence a security fix," so it is the wrong tool even for a
+# dependency this terminally pinned. `open-pull-requests-limit: 0` mutes
+# ALL version updates for the whole `gomod` ecosystem without that
+# ambiguity, so a per-dependency `ignore:` would be strictly narrower for
+# no benefit here.
 version: 2
 updates:
   # 3 workflows (ci.yml, images.yml, release.yml), 18 `uses:` lines, 8
@@ -243,6 +288,45 @@ updates:
     # a `registries:` entry with a read-only Docker Hub token — not a
     # preemptive addition now.
 
+  # This block exists ONLY so a gomod SECURITY pull request always has a
+  # `dependabot.yml` entry to be recreated from and to attach
+  # `@dependabot rebase` / `@dependabot recreate` to — see the file header
+  # for the 2026-09-21 PR #2 incident that motivated adding it. It is NOT
+  # here to produce gomod version-update PRs: `github.com/docker/docker`
+  # is this module's only version-pinned dependency of any consequence on
+  # this front and it is already at its terminal reachable version on
+  # this import path (see header), so there is nothing for a monthly
+  # gomod version-update check to find today. If that changes — most
+  # plausibly once the moby/moby/v2 migration in issue #1 lands and the
+  # new import path starts producing its own real version updates — raise
+  # `open-pull-requests-limit` off of `0` at that point. Leaving it at `0`
+  # after that would silently recreate the exact "PR nobody can rebase"
+  # failure mode this block was added to fix, just for a different
+  # dependency.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: monthly
+    # Mutes ALL version-update PRs for this ecosystem — see the file
+    # header and the "Options considered and rejected" footer entry for
+    # `open-pull-requests-limit` for the GitHub docs quote confirming this
+    # does not touch security updates, which keep running and keep being
+    # reachable by `@dependabot rebase` / `@dependabot recreate`
+    # regardless of this setting.
+    open-pull-requests-limit: 0
+    # No `ignore:` entry for `github.com/docker/docker`: see the file
+    # header — `ignore` cannot distinguish a version bump from a security
+    # fix, and `open-pull-requests-limit: 0` above already mutes every
+    # version update in this ecosystem without that ambiguity.
+    #
+    # No `groups:` block: grouping only matters when more than one PR
+    # could be open at once to batch together, and
+    # `open-pull-requests-limit: 0` guarantees zero version-update PRs are
+    # ever open here to batch. Add one only alongside raising the limit
+    # off `0` (see above).
+    commit-message:
+      prefix: "build(deps)"
+
 # ---------------------------------------------------------------------------
 # Options considered and rejected for this file. Recorded here so they are
 # not re-litigated the next time someone reads this file wondering why it
@@ -282,14 +366,22 @@ updates:
 #   picking it up; the built-in 3-day default cooldown (applied even with
 #   `cooldown:` unset) stays as-is on top of that.
 #
-# - `open-pull-requests-limit` — the default of 5 is slack this repo does
-#   not need at roughly 2-3 version-update PRs/month across both
-#   ecosystems combined; lowering it would strand updates silently past the
-#   cap with no visible signal. Worth recording: `0` is the correct way to
-#   mute an ecosystem's version updates entirely while leaving its security
-#   updates untouched, and is preferable to deleting that ecosystem's whole
-#   block if that's ever needed, because it preserves all the reasoning
-#   above in place.
+# - `open-pull-requests-limit` — for the `github-actions` and `docker`
+#   blocks, the default of 5 remains slack this repo does not need at
+#   roughly 2-3 version-update PRs/month across those two ecosystems
+#   combined; lowering it there would strand updates silently past the cap
+#   with no visible signal, so both are left at the default. For the
+#   `gomod` block this option is NOT rejected: it is set to `0`, which
+#   GitHub's Dependabot options reference confirms is the documented way
+#   to "temporarily disable version updates for a package manager by
+#   setting this option to zero," while, per the same page, "Security
+#   update pull requests are not subject to this limit and do not count
+#   toward it." Setting `0` is also preferable to deleting an ecosystem's
+#   whole block if muting it is ever needed for `github-actions` or
+#   `docker` too, because it preserves all the reasoning in this file in
+#   place instead of losing it. See the `gomod` block above (and the file
+#   header) for why that block exists and is muted this way rather than
+#   deleted outright.
 #
 # - `rebase-strategy: disabled` — the real lever to reach for if CI churn
 #   from rebasing open Dependabot PRs ever becomes a problem, but ci.yml's
