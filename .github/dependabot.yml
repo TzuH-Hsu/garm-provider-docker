@@ -116,7 +116,7 @@
 # no benefit here.
 version: 2
 updates:
-  # 3 workflows (ci.yml, images.yml, release.yml), 22 `uses:` lines, 8
+  # 3 workflows (ci.yml, images.yml, release.yml), 24 `uses:` lines, 8
   # distinct actions, every one of them SHA-pinned with a trailing
   # `# vX.Y.Z` comment. Dependabot updates the SHA AND rewrites that
   # trailing comment to match (GitHub changelog, 2022-10-31, "Dependabot

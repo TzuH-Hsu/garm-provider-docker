@@ -1,62 +1,115 @@
 # M4-W1: builds and publishes this repo's two container images to GHCR.
 #
-# Three jobs, split along one line: which of them can reach GHCR at all.
+# Four jobs, split by trigger and by which of them can reach GHCR at all:
 #
+#   On a pushed `v*` tag:
 #   publish-build — matrix, one leg per image. Builds multi-arch and pushes
 #     BY DIGEST ONLY: the image manifest lands in GHCR but no tag is moved,
 #     so nothing a `docker pull <image>:<tag>` resolves changes yet. Each
 #     leg hands its digest to publish-tag as a run artifact.
 #   publish-tag — no matrix, `needs: publish-build`, so it only starts once
 #     EVERY build leg has succeeded. Checks that both digests are present,
-#     then points `<image>:<tag>` and `<image>:latest` at them for both
-#     images. One failed build therefore publishes nothing under a tag,
-#     instead of advancing one image of the pair and not the other (#8).
-#   dry-run — `workflow_dispatch` only. Runs the exact same multi-arch
-#     build with `push: false`, holds NO `packages` scope at all, and has
-#     no registry-login step to skip in the first place.
+#     then points `<image>:<tag>` at them for both images. One failed build
+#     therefore publishes nothing under a tag, instead of advancing one
+#     image of the pair and not the other (#8). It never touches `:latest`.
 #
-# publish-build and publish-tag are both gated on
-# `github.event_name == 'push' && github.ref_type == 'tag'`, and they are
-# the only two jobs carrying `packages: write`.
+#   On a GitHub release becoming a full (non-pre-release) release:
+#   promote-latest — moves `<image>:latest` to `<image>:<tag>` for both
+#     images. It runs on `release: released`, which fires when a full
+#     release is published (including publishing release.yml's draft as
+#     one) or when a published pre-release is changed to a full release.
+#     A tag push alone therefore never moves `:latest` (#7): release.yml
+#     turns the same tag into a DRAFT release, and `:latest` follows only
+#     once a maintainer has reviewed it and made it a full release.
 #
-# The gate is deliberate and load-bearing: `workflow_dispatch` accepts a
-# `--ref` of any kind, INCLUDING a tag (`gh workflow run --ref v1.2.3`), in
-# which case `github.ref_type` is `tag` even though nothing was pushed. A
-# job that keyed its login/push decision on `ref_type` alone would
-# therefore publish semver+latest from a manual invocation — breaking the
-# dry-run promise. Requiring `event_name == 'push'` as well, and scoping
+#   On workflow_dispatch:
+#   dry-run — runs the exact same multi-arch build with `push: false`,
+#     holds NO `packages` scope at all, and has no registry-login step to
+#     skip in the first place.
+#
+# publish-build, publish-tag and promote-latest are the only jobs carrying
+# `packages: write`. The first two are gated on
+# `github.event_name == 'push' && github.ref_type == 'tag'`, promote-latest
+# on `github.event_name == 'release'`, and dry-run on
+# `github.event_name == 'workflow_dispatch'` — every job names the one
+# event it runs for, so no trigger can fall through into another's job.
+#
+# Why promote-latest can rely on `release: released` firing at all:
+# release.yml creates the draft with GITHUB_TOKEN, and per GitHub's docs
+# ("Triggering a workflow from a workflow"), "events triggered by the
+# `GITHUB_TOKEN` will not create a new workflow run" (the documented
+# exceptions are workflow_dispatch, repository_dispatch, and some
+# pull_request activity types). That rules out release.yml itself kicking
+# off promote-latest. Publishing the draft, or changing a pre-release to
+# a full release, is a maintainer's own action in the UI or API, not a
+# GITHUB_TOKEN event, so it does start this workflow.
+#
+# Why `released` and not `published`: GitHub's webhook reference defines
+# `published` as "A release, pre-release, or draft of a release was
+# published." and `released` as "A release was published, or a
+# pre-release was changed to a release." The `release` event docs add
+# that to run "when stable *and* pre-releases publish, subscribe to
+# `published` instead of `released` and `prereleased`" — `released` is
+# the stable-only activity. So `released` alone covers both routes to a
+# full release (a draft published as one, a pre-release promoted to one),
+# fires once per promotion, and does not fire when a pre-release is
+# published. promote-latest's `if:` still checks the payload's
+# `prerelease` flag as defence in depth, so a pre-release cannot move
+# `:latest` even if that reading of the docs ever stops holding.
+#
+# The push gate is deliberate and load-bearing: `workflow_dispatch`
+# accepts a `--ref` of any kind, INCLUDING a tag (`gh workflow run --ref
+# v1.2.3`), in which case `github.ref_type` is `tag` even though nothing
+# was pushed. A job that keyed its login/push decision on `ref_type` alone
+# would therefore publish from a manual invocation — breaking the dry-run
+# promise. Requiring `event_name == 'push'` as well, and scoping
 # `packages: write` to the publish jobs only, means there is no path by
 # which a manual run can authenticate to or write to the registry: even if
 # the `push` input were somehow forced true, the dispatch job's token has
-# no packages scope to push with.
+# no packages scope to push with. For the same reason there is no
+# dispatch path to promote-latest: moving `:latest` by hand means making
+# the tag's GitHub release a full release, not running this workflow.
 #
 # No `pull_request` trigger: this workflow only ever runs against a ref that
-# has already been reviewed and merged (a pushed tag) or an explicit manual
-# invocation.
+# has already been reviewed and merged (a pushed tag), a release a
+# maintainer made a full release, or an explicit manual invocation.
 #
 # Script-injection hygiene (same rationale as release.yml): git tag names
 # are not restricted to a safe shell-metacharacter-free set, so
-# $GITHUB_REF_NAME (GitHub's own built-in env var) is read as a quoted shell
-# variable inside `run:` steps below, never spliced via `${{ }}` into script
-# text. Values that end up in `with:` inputs to the pinned Docker actions
-# (build-args) are not run through a shell at all, and Docker's own
-# tag-name validation rejects anything a malicious ref could smuggle in
-# there regardless.
+# $GITHUB_REF_NAME (GitHub's own built-in env var) and the release
+# payload's tag_name are read as quoted shell variables inside `run:` steps
+# below (the latter via `env:`), never spliced via `${{ }}` into script
+# text, and each is checked against Docker's tag grammar before use.
+# Values that end up in `with:` inputs to the pinned Docker actions
+# (build-args) are not run through a shell at all.
 name: Container Images
 
 on:
   push:
     tags:
       - 'v*'
+  release:
+    types: [released]
   workflow_dispatch:
 
+# For a `release` event, `github.ref` is the release's tag ref
+# (`refs/tags/<tag_name>`, per the events-that-trigger-workflows docs) —
+# the same ref the tag-push run for that tag had. Both runs therefore land
+# in the same concurrency group, and with cancel-in-progress: false the
+# promote run waits for a still-running publish run of the same tag rather
+# than overlapping it. That is intended: publishing the draft early must
+# not let promote-latest look for `:<tag>` before publish-tag has written
+# it. Caveat: GitHub keeps at most one pending run per group by default,
+# so a THIRD run for the same ref arriving while one is pending — e.g. a
+# dry-run dispatched at that tag — cancels the pending one. The cancelled
+# run shows up as such in the Actions tab and can be re-run from there.
 concurrency:
   group: images-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 # Workflow-level default is read-only. `packages: write` is granted ONLY to
-# the publish-build and publish-tag jobs below; the dry-run job explicitly
-# holds none.
+# the publish-build, publish-tag and promote-latest jobs below; the dry-run
+# job explicitly holds none.
 permissions:
   contents: read
 
@@ -274,11 +327,80 @@ jobs:
 
           for image in "${images[@]}"; do
             digest="$(cat "${dir}/${image##*/}")"
-            echo "Tagging ${image}@${digest} as :${version} and :latest"
+            echo "Tagging ${image}@${digest} as :${version}"
             docker buildx imagetools create \
               -t "${image}:${version}" \
-              -t "${image}:latest" \
               "${image}@${digest}"
+          done
+
+  # Moves `:latest` for both images to the release's `:<tag>` when that
+  # GitHub release becomes a full release: its draft is published as a
+  # non-pre-release, or an already-published pre-release is changed to a
+  # full release. Both routes fire `release: released` (see the file
+  # header for why that activity, why it fires here at all, and why the
+  # `prerelease` check in `if:` is kept anyway). Publishing a pre-release
+  # does not move `:latest`; promoting that pre-release later does.
+  # Nothing is built or checked out: both `:<tag>` images must already
+  # exist from the tag-push run, and this job refuses to move either
+  # `:latest` unless BOTH do, so the pair can never end up split across
+  # releases.
+  promote-latest:
+    name: promote-latest
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    # setup-buildx-action's builder needs a Docker daemon, which
+    # ubuntu-slim cannot provide (see publish-build).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout, so no `contents` scope is needed; `packages: write` is
+    # the only thing this job does with its token.
+    permissions:
+      packages: write
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      # Before any registry contact: the tag must look like a release
+      # version and be a valid Docker tag. Same grammar publish-build
+      # enforces on the tag-push side.
+      - name: Validate release tag
+        run: |
+          if ! [[ "${TAG}" =~ ^v[0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo "::error::release tag '${TAG}' is not a valid vX.Y.Z image tag"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Two passes, as in publish-tag: every `:<tag>` is confirmed to exist
+      # before any `:latest` is written. A single image-index source is
+      # re-pushed byte for byte, so `:latest` ends up at exactly the
+      # digest `:<tag>` points to.
+      - name: Promote both images to latest
+        run: |
+          images=(
+            ghcr.io/tzuh-hsu/garm-runner-noble
+            ghcr.io/tzuh-hsu/garm-provider-docker
+          )
+
+          for image in "${images[@]}"; do
+            if ! docker buildx imagetools inspect "${image}:${TAG}" > /dev/null; then
+              echo "::error::${image}:${TAG} not found or not readable; refusing to move :latest on either image"
+              exit 1
+            fi
+          done
+
+          for image in "${images[@]}"; do
+            echo "Moving ${image}:latest to ${image}:${TAG}"
+            docker buildx imagetools create \
+              -t "${image}:latest" \
+              "${image}:${TAG}"
           done
 
   # Dry run: `workflow_dispatch`, including a dispatch aimed at a tag ref.
@@ -359,6 +481,8 @@ jobs:
             echo
             echo "- Synthetic version: \`${VERSION}\`"
             echo "- Tag that WOULD have been built: \`${TAGS}\`"
-            echo "- A real release pushes both images by digest, then tags"
-            echo "  \`<image>:<tag>\` plus \`<image>:latest\` only after both built."
+            echo "- A pushed \`v*\` tag pushes both images by digest, then tags"
+            echo "  \`<image>:<tag>\` only after both built. \`<image>:latest\` moves"
+            echo "  only when the GitHub release for that tag becomes a full"
+            echo "  (non-pre-release) release."
           } >> "$GITHUB_STEP_SUMMARY"
