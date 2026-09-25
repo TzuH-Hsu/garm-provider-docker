@@ -50,8 +50,9 @@ func TestVerifyM2W1CacheHit(t *testing.T) {
 	t.Logf("[setup] controller=%s repoKey=%s\n  toolVol=%s\n  pnpmVol=%s", controllerID, repoKey, toolVol, pnpmVol)
 
 	// --- foreign snapshot: containers AND volumes must be untouched -----------
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
 	// --- build sleep runner image + the REAL provider binary -----------------
@@ -93,8 +94,8 @@ allow_org_shared = false
 		for _, v := range []string{toolVol, pnpmVol, orgToolVol} {
 			_, _ = dockerTry("volume", "rm", "-f", v)
 		}
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		volsAfter := volumeSet(t)
 		for name := range volsBefore {
 			if !volsAfter[name] {

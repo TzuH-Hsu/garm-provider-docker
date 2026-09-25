@@ -116,8 +116,9 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	controllerID := randControllerID(t)
 
 	// --- foreign snapshot (must be identical after) --------------------------
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	// Snapshot by NAME, not id: Docker Desktop rotates the DEFAULT bridge
 	// network's internal id when its network stack reinitializes (e.g. after the
 	// last user network is removed), independent of this provider — the set of
@@ -172,8 +173,8 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	// too, which kills its nested workload), then the foreign + snapshot checks.
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		assertSnapshotIdentical(t, "containers", beforeC, "ps", "-a", "--format", "{{.Names}}")
 		assertSnapshotIdentical(t, "networks", beforeN, "network", "ls", "--format", "{{.Name}}")
 		assertSnapshotIdentical(t, "volumes", beforeV, "volume", "ls", "--format", "{{.Name}}")

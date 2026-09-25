@@ -18,7 +18,8 @@
 //     go test -tags dockerverify -v -run TestVerifyM2CacheSafety ./internal/verify/
 //
 // Everything is scoped to a unique controller-id and torn down by label; it never
-// touches hbot-lab-mongodb/hummingbot or any foreign resource.
+// touches this suite's self-owned foreign-canary containers (see
+// ensureForeignCanaries in verify_test.go) or any other foreign resource.
 package verify
 
 import (
@@ -32,8 +33,9 @@ import (
 
 func TestVerifyM2CacheSafety(t *testing.T) {
 	root := repoRoot(t)
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 
 	imageTag := "garm-m2safety-sleep:latest"
 	buildSleepImage(t, imageTag)
@@ -243,6 +245,6 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 }

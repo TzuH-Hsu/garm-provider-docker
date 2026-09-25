@@ -233,12 +233,13 @@ func runProviderIO(t *testing.T, bin, configFile, controllerID, command, instanc
 func TestVerifyM1WP2Allocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 
 	// --- foreign-resource snapshot (must be untouched throughout) ------------
 	foreignBefore := dockerOut(t, "ps", "-a", "--format", "{{.Names}}")
 	t.Logf("[snapshot] containers before:\n%s", foreignBefore)
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 
 	// --- build the sleep runner image ----------------------------------------
 	imageTag := "garm-wp2-verify-sleep:latest"
@@ -281,8 +282,8 @@ enabled = false
 	// a leftover assertion. Never touches foreign resources.
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	// =========================================================================
@@ -457,6 +458,119 @@ func assertForeignPresent(t *testing.T, name string) {
 	if _, err := dockerTry("inspect", name); err != nil {
 		t.Errorf("[foreign] protected container %q is missing/modified: %v", name, err)
 	}
+}
+
+// foreignCanaryImage is the image ensureForeignCanaries runs its canaries
+// from. alpine:3.20 is already a hard dependency of this suite
+// (buildSleepImage's Dockerfile is `FROM alpine:3.20`), so this introduces no
+// new external image for the harness to pull.
+const foreignCanaryImage = "alpine:3.20"
+
+// foreignCanaryPrefix names every canary ensureForeignCanaries ever creates.
+// The helper itself never deletes anything by name or by this prefix (see
+// below) — it exists purely so a leftover canary from an aborted run can
+// still be FOUND for manual removal: `docker ps -a --filter
+// name=garm-verify-foreign-canary-`.
+const foreignCanaryPrefix = "garm-verify-foreign-canary-"
+
+// ensureForeignCanaries creates two long-lived containers that this suite
+// itself owns, standing in for the "foreign" (pre-existing, unrelated)
+// resources every test in this package must prove it never touches.
+//
+// Previously the suite depended on pre-existing, host-specific containers,
+// which made every test fail on any host that lacked them — a contributor's
+// machine, a fresh Docker Desktop install, or CI's manual dockerverify job
+// (.github/workflows/ci.yml). Owning the canaries makes the suite
+// self-contained instead.
+//
+// The canaries carry NO garm.docker/* labels of any kind, so no filter this
+// provider or cleanupController (below) uses — every one keyed on some
+// garm.docker/* label, see internal/spec/labels.go — can ever match them.
+//
+// Names are unique PER CALL (garm-verify-foreign-canary-<8 hex>-a/-b, the hex
+// from crypto/rand, one value shared by the pair), not fixed: this suite
+// makes no promise that only one dockerverify invocation runs against a host
+// at a time, and a fixed name cannot distinguish "the canary this call
+// created" from a foreign container squatting the same name, or a concurrent
+// run's own canary.
+//
+// t.Cleanup removes each canary strictly by the container ID captured from
+// `docker run`'s own output — never by name — so this helper only ever
+// deletes a container it has proven, by ID, to have created itself. Cleanup
+// is registered BEFORE any container is created, over a slice that
+// accumulates an ID as each create succeeds, so a failure partway through the
+// pair still reaps whatever was already created rather than leaking it; a
+// removal failure is logged (t.Logf) rather than silently dropped or failing
+// the test. A canary abandoned by a run killed before its own t.Cleanup could
+// fire is therefore not auto-reclaimed, but stays discoverable by its
+// garm-verify-foreign-canary- name prefix for manual removal (`docker ps -a
+// --filter name=garm-verify-foreign-canary-` then `docker rm -f`).
+//
+// Cleanup ordering: t.Cleanup only runs after the test function itself (and
+// every `defer` it registered) has returned — a guarantee of the testing
+// package, not something coordinated here — so every teardown `defer` in
+// this package's tests that asserts the canaries are still present always
+// runs before this removal.
+func ensureForeignCanaries(t *testing.T) []string {
+	t.Helper()
+	var suffixBytes [4]byte
+	if _, err := rand.Read(suffixBytes[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	suffix := hex.EncodeToString(suffixBytes[:])
+	names := []string{
+		foreignCanaryPrefix + suffix + "-a",
+		foreignCanaryPrefix + suffix + "-b",
+	}
+
+	var ids []string
+	t.Cleanup(func() {
+		for _, id := range ids {
+			if out, err := dockerTry("rm", "-f", id); err != nil {
+				t.Logf("[foreign-canary] failed to remove canary (id=%s): %v\n%s\nremove it manually: docker rm -f %s", id, err, out, id)
+			}
+		}
+	})
+
+	for _, name := range names {
+		id, err := runForeignCanary(name)
+		if err != nil {
+			t.Fatalf("create foreign canary %q: %v", name, err)
+		}
+		ids = append(ids, id)
+	}
+	return names
+}
+
+// runForeignCanary runs `docker run -d --name name <foreignCanaryImage> sleep
+// infinity` and returns the container ID docker printed on success.
+//
+// It deliberately does NOT use dockerTry, which merges stdout and stderr into
+// one buffer: `docker run` writes an "Unable to find image ... Pulling from
+// ..." progress trace to STDERR whenever the image is not already cached — a
+// fresh Docker Desktop, a CI runner, exactly the hosts self-owned canaries
+// are meant to work on, and several callers of ensureForeignCanaries run
+// before buildSleepImage has pulled anything — while the container ID is the
+// ONLY thing `docker run` ever prints to STDOUT. Merging the two would
+// corrupt the captured "ID" with that pull trace and fail the hex-ID check
+// below on exactly the hosts this change targets, so stdout and stderr are
+// captured into separate buffers here and only stdout is parsed as the ID.
+func runForeignCanary(name string) (string, error) {
+	cmd := exec.Command("docker", "run", "-d", "--name", name, foreignCanaryImage, "sleep", "infinity")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%w\n%s", err, stderr.String())
+	}
+	id := strings.TrimSpace(string(out))
+	if len(id) != 64 {
+		return "", fmt.Errorf("docker run -d printed %q on stdout, want a 64-character hex container ID (stderr: %s)", id, strings.TrimSpace(stderr.String()))
+	}
+	if _, err := hex.DecodeString(id); err != nil {
+		return "", fmt.Errorf("docker run -d printed %q, which is not valid hex: %w", id, err)
+	}
+	return id, nil
 }
 
 func assertGone(t *testing.T, kind string, args ...string) {

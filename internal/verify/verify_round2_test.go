@@ -27,8 +27,9 @@
 //
 // Isolation: a unique controller-id + unique repo_url; cleanup is label-scoped
 // plus explicit removal of this run's cache volumes, asserted by a before/after
-// volume snapshot. It NEVER touches hbot-lab-mongodb/hummingbot or any foreign
-// resource.
+// volume snapshot. It NEVER touches this suite's self-owned foreign-canary
+// containers (see ensureForeignCanaries in verify_test.go) or any other
+// foreign resource.
 //
 // Run with: go test -tags dockerverify -v -run TestVerifyRound2 ./internal/verify/
 package verify
@@ -50,8 +51,9 @@ func TestVerifyRound2SeedBeforeStartIdempotentDiagNoWedge(t *testing.T) {
 	repoURL := "https://github.com/garm-r2-verify/repo-" + token
 	repoKey := spec.RepoKey(repoURL)
 
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
 	nobleTag := "garm-r2-noble:" + token
@@ -97,8 +99,8 @@ stale_cache_eviction_days = 30
 			_, _ = dockerTry("volume", "rm", "-f", v)
 		}
 		_, _ = dockerTry("rmi", "-f", image, nobleTag)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		volsAfter := volumeSet(t)
 		for name := range volsBefore {
 			if !volsAfter[name] {
