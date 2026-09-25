@@ -81,8 +81,7 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
 
 ## Install
 
-No version has been tagged yet, so no release binaries or container images
-have been published. Once a `vX.Y.Z` tag is pushed,
+For each pushed `vX.Y.Z` tag,
 [`.github/workflows/release.yml`](.github/workflows/release.yml) and
 [`.github/workflows/images.yml`](.github/workflows/images.yml) publish, from
 the same tag:
@@ -99,8 +98,10 @@ the same tag:
    published as a non-pre-release, or a published pre-release later changed
    to a full release.
 
-Until then, build from source (see `go.mod`'s `go` directive for the
-required Go version):
+`v0.1.0` has been tagged and its container images are on GHCR as
+`:v0.1.0`, but its GitHub Release is still a draft, so no release binaries
+are publicly downloadable yet. Until a release is published, build from
+source (see `go.mod`'s `go` directive for the required Go version):
 
 ```sh
 git clone https://github.com/TzuH-Hsu/garm-provider-docker
@@ -309,9 +310,10 @@ skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 
 ## Status
 
-M0 through M4 are implemented and tested on this branch, but no version has
-been tagged and no binaries, container images, or upstream pull request
-have been published yet. See [`docs/plan.md`](docs/plan.md) for the
+M0 through M4 are implemented and tested on this branch. `v0.1.0` has been
+tagged and its container images are on GHCR, but its GitHub Release (with
+the release binaries) is still a draft, and no upstream pull request has
+been published yet. See [`docs/plan.md`](docs/plan.md) for the
 milestone breakdown and [`docs/adr/`](docs/adr/) for the design decisions
 behind each one.
 
