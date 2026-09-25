@@ -80,8 +80,9 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 	pnpmVol := spec.PnpmVolumeName(repoKey, "9")
 
 	// --- foreign snapshot (must be identical after) --------------------------
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	beforeC := snapshotIDs(t, "ps", "-a", "--format", "{{.Names}}")
 	beforeV := snapshotIDs(t, "volume", "ls", "--format", "{{.Name}}")
 
@@ -119,8 +120,8 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		cleanupController(t, controllerID)
 		_, _ = dockerTry("volume", "rm", "-f", pnpmVol, spec.ToolcacheVolumeName(repoKey, "1"), spec.DiagVolumeName(repoKey))
 		_, _ = dockerTry("rmi", "-f", runnerTag)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		assertSnapshotIdentical(t, "containers", beforeC, "ps", "-a", "--format", "{{.Names}}")
 		// Cache volumes we created are removed above; assert no FOREIGN volume vanished.
 		afterV := map[string]bool{}

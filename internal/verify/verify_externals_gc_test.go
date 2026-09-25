@@ -41,8 +41,9 @@ func TestVerifyM2W2ExternalsGCDiag(t *testing.T) {
 	repoKey := spec.RepoKey(repoURL)
 
 	// --- foreign snapshot ----------------------------------------------------
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
 	// --- build the noble runner image (with externals + pnpm), then two
@@ -102,8 +103,8 @@ stale_cache_eviction_days = 30
 		for _, img := range []string{imageA, imageB, nobleTag} {
 			_, _ = dockerTry("rmi", "-f", img)
 		}
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		volsAfter := volumeSet(t)
 		for name := range volsBefore {
 			if !volsAfter[name] {

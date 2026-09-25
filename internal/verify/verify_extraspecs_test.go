@@ -105,8 +105,9 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 	controllerID := randControllerID(t)
 
 	// --- foreign snapshot (identical after) ----------------------------------
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 	beforeC := snapshotIDs(t, "ps", "-a", "--format", "{{.Names}}")
 	beforeN := snapshotIDs(t, "network", "ls", "--format", "{{.Name}}")
 	beforeV := snapshotIDs(t, "volume", "ls", "--format", "{{.Name}}")
@@ -114,8 +115,8 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 		assertSnapshotIdentical(t, "containers", beforeC, "ps", "-a", "--format", "{{.Names}}")
 		assertSnapshotIdentical(t, "networks", beforeN, "network", "ls", "--format", "{{.Name}}")
 		assertSnapshotIdentical(t, "volumes", beforeV, "volume", "ls", "--format", "{{.Name}}")

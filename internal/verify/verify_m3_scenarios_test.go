@@ -47,7 +47,8 @@
 //     rather than silently skipped).
 //   - foreign-resource non-interference
 //     -> PRE-EXISTING (partial): every test in this package snapshots/asserts
-//     hbot-lab-mongodb/hummingbot presence and, in several tests, a foreign
+//     the suite's own self-owned foreign-canary containers' presence (see
+//     ensureForeignCanaries in verify_test.go) and, in several tests, a foreign
 //     VOLUME. NEW, comprehensive: TestVerifyM3ForeignResourceNonInterference
 //     (this file) additionally seeds a foreign CONTAINER, VOLUME, and NETWORK
 //     with zero garm.docker labels, drives DeleteInstance + the opportunistic
@@ -205,6 +206,7 @@ func runDeleteKillOnTeardownBarrier(t *testing.T, bin, configFile, controllerID,
 // branch TestVerifyM1WP2Allocation's (e) already covers.
 func TestVerifyM3ImagePullFailureLeavesNoOrphans(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	srv := newMetadataServer(t)
@@ -219,8 +221,8 @@ func TestVerifyM3ImagePullFailureLeavesNoOrphans(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	b := bootstrapFor("m3-pullfail-01", srv.URL, caBundle)
@@ -297,6 +299,7 @@ func newHangingCredentialsServer(t *testing.T) (*httptest.Server, func() bool) {
 // exit 30 (nothing left to delete), never an error, with zero orphans.
 func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-timeout-sleep:latest"
@@ -309,8 +312,8 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	b := bootstrapFor("m3-timeout-01", srv.URL, caBundle)
@@ -387,6 +390,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 // converges to zero leftover resources.
 func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-cancel-trapterm:latest"
@@ -399,8 +403,8 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	b := bootstrapFor("m3-cancel-01", srv.URL, caBundle)
@@ -473,6 +477,7 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 // crash-abandoned allocation.
 func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-crash-sleep:latest"
@@ -485,8 +490,8 @@ func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	b := bootstrapFor("m3-crash-01", srv.URL, caBundle)
@@ -547,6 +552,7 @@ func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 // disturbing the original allocation's container identity or running state.
 func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-restart-sleep:latest"
@@ -559,8 +565,8 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	b := bootstrapFor("m3-restart-01", srv.URL, caBundle)
@@ -657,6 +663,7 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 // test run."
 func TestVerifyM3ForeignResourceNonInterference(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-foreign-sleep:latest"
@@ -691,8 +698,8 @@ func TestVerifyM3ForeignResourceNonInterference(t *testing.T) {
 		_, _ = dockerTry("volume", "rm", "-f", foreignVolume)
 		_, _ = dockerTry("network", "rm", foreignNetwork)
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	assertForeignUnchanged := func(step string) {

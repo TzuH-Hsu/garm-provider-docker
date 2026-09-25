@@ -58,6 +58,7 @@ allowed_env = ["MY_BENIGN_VAR", "DISABLE_RUNNER_UPDATE"]
 
 func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 	controllerID := randControllerID(t)
+	canaries := ensureForeignCanaries(t)
 	bin := buildM3ProviderBinary(t)
 
 	imageTag := "garm-m3-hardening-sleep:latest"
@@ -70,8 +71,8 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		assertForeignPresent(t, "hbot-lab-mongodb")
-		assertForeignPresent(t, "hummingbot")
+		assertForeignPresent(t, canaries[0])
+		assertForeignPresent(t, canaries[1])
 	}()
 
 	// =========================================================================

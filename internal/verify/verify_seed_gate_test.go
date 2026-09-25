@@ -68,8 +68,9 @@ func buildSeedGateImage(t *testing.T, root, tag string) {
 
 func TestVerifyM2SeedGate(t *testing.T) {
 	root := repoRoot(t)
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	canaries := ensureForeignCanaries(t)
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 
 	tag := "garm-seedgate:" + randHex(t)
 	buildSeedGateImage(t, root, tag)
@@ -125,6 +126,6 @@ func TestVerifyM2SeedGate(t *testing.T) {
 		t.Logf("[seed-gate] env unset → no-op")
 	})
 
-	assertForeignPresent(t, "hbot-lab-mongodb")
-	assertForeignPresent(t, "hummingbot")
+	assertForeignPresent(t, canaries[0])
+	assertForeignPresent(t, canaries[1])
 }
