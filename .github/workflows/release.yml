@@ -227,8 +227,18 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
-      # This job's `if:` guarantees $GITHUB_REF_NAME is the pushed tag, so
-      # no branching is left to do.
+      # This job's `if:` guarantees $GITHUB_REF_NAME is the pushed tag. The
+      # only branching left is SemVer pre-release detection: a tag carrying
+      # a hyphen (e.g. `v0.2.0-rc.1`) is created with `--prerelease` as
+      # well as `--draft`. Such a tag still publishes `:<tag>` images via
+      # images.yml, but publishing its draft as a pre-release does NOT
+      # move `:latest`: images.yml's promote-latest job runs on
+      # `release: released`, which fires only for full releases, and also
+      # skips anything still flagged as a pre-release. Changing that
+      # pre-release into a full release later DOES move `:latest`. That
+      # makes an `-rc` tag a safe end-to-end rehearsal of the whole publish
+      # path (binaries, draft release, both images) that leaves `:latest`
+      # alone for as long as it stays a pre-release.
       #
       # `gh release create` (the GitHub CLI, preinstalled on every
       # GitHub-hosted runner) is used directly instead of a third-party
@@ -244,11 +254,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.ref_name }}
         run: |
+          prerelease=()
+          case "${VERSION}" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
           gh release create "${VERSION}" \
             dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${VERSION}" \
             --draft \
+            "${prerelease[@]}" \
             --generate-notes
 
   # Dry run: every trigger that is NOT a pushed tag — in practice
