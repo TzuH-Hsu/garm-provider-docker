@@ -93,7 +93,11 @@ the same tag:
 2. **Container images** — `ghcr.io/tzuh-hsu/garm-provider-docker` (a
    distribution vehicle for the binary — see below) and
    `ghcr.io/tzuh-hsu/garm-runner-noble` (the runner image), both multi-arch
-   (`linux/amd64` + `linux/arm64`) with SBOM and provenance attestations.
+   (`linux/amd64` + `linux/arm64`) with SBOM and provenance attestations,
+   tagged `:<tag>`. The tag push does not move `:latest`: that happens only
+   when the tag's GitHub Release becomes a full release — its draft
+   published as a non-pre-release, or a published pre-release later changed
+   to a full release.
 
 Until then, build from source (see `go.mod`'s `go` directive for the
 required Go version):
