@@ -98,10 +98,13 @@ the same tag:
    published as a non-pre-release, or a published pre-release later changed
    to a full release.
 
-`v0.1.0` has been tagged and its container images are on GHCR as
-`:v0.1.0`, but its GitHub Release is still a draft, so no release binaries
-are publicly downloadable yet. Until a release is published, build from
-source (see `go.mod`'s `go` directive for the required Go version):
+`v0.2.0` is the latest published release: its release binaries and
+`SHA256SUMS` checksum file are downloadable from the
+[v0.2.0 release page](https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.0),
+and its container images are on GHCR as both `:v0.2.0` and `:latest`.
+(`v0.1.0`'s tag and `:v0.1.0` images still exist, but its GitHub Release
+draft has since been removed.) You can also build from source instead
+(see `go.mod`'s `go` directive for the required Go version):
 
 ```sh
 git clone https://github.com/TzuH-Hsu/garm-provider-docker
@@ -310,12 +313,13 @@ skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 
 ## Status
 
-M0 through M4 are implemented and tested on this branch. `v0.1.0` has been
-tagged and its container images are on GHCR, but its GitHub Release (with
-the release binaries) is still a draft, and no upstream pull request has
-been published yet. See [`docs/plan.md`](docs/plan.md) for the
-milestone breakdown and [`docs/adr/`](docs/adr/) for the design decisions
-behind each one.
+M0 through M4 are implemented and tested on this branch. `v0.2.0` is the
+latest published release, with release binaries and container images
+(`:v0.2.0` and `:latest`) on GHCR; `v0.1.0`'s tag and `:v0.1.0` images
+still exist, though its GitHub Release draft has since been removed. No
+upstream pull request has been published yet. See
+[`docs/plan.md`](docs/plan.md) for the milestone breakdown and
+[`docs/adr/`](docs/adr/) for the design decisions behind each one.
 
 ## License
 
