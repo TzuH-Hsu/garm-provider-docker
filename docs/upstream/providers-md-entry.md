@@ -75,8 +75,8 @@ GARM" section for a worked example including `interface_version`).
 
 **Why two tables:** `doc/providers.md` is a dedicated provider-list page
 split out of `README.md` in an April-2026 docs restructure; the two have
-been kept in sync ever since. The prepared patch updates both in the same
-commit so they stay that way.
+been kept in sync ever since. The submission adds the row to both in the
+same commit so they stay that way.
 
 ## (b) PR title + body
 
@@ -146,8 +146,8 @@ checklist's end-to-end-testing item.
   "Thanks!" comment. Some of the maintainer's own commits do carry
   `Signed-off-by` (his personal habit), and one prior external contributor
   ([PR #428](https://github.com/cloudbase/garm/pull/428), Akamai/Linode)
-  added it voluntarily — but it is optional, not enforced. Per the task's
-  instructions, no `Signed-off-by` trailer was added to the prepared patch.
+  added it voluntarily — but it is optional, not enforced, so the
+  submission commit does not need a `Signed-off-by` trailer.
 - **Commit-message style:** a short imperative headline, no
   conventional-commit prefix, for the large majority of provider-list
   commits — e.g. "Add CloudStack provider", "Add GCP to the list of
@@ -215,11 +215,21 @@ checklist's end-to-end-testing item.
    git clone https://github.com/<your-username>/garm.git
    cd garm
 
-   # 3. Create the branch off an up-to-date main and apply the prepared
-   #    patch (re-run steps 1-2 above first; if the table has moved on,
-   #    re-apply the row by hand instead of the patch)
+   # 3. Create the branch off an up-to-date main and insert the two rows
+   #    from (a), each directly after the CloudStack row of its table.
+   #    If upstream has added or reordered providers since this kit was
+   #    written, re-check the alphabetical slot from (a) first.
    git checkout -b add-garm-provider-docker origin/main
-   git am /path/to/upstream-providers.patch
+   awk '{print} /^\| \*\*CloudStack\*\* \|/ {print "| **Docker** | [TzuH-Hsu/garm-provider-docker](https://github.com/TzuH-Hsu/garm-provider-docker) | Single-host, NAS-oriented, optional per-job DinD |"}' \
+     doc/providers.md > doc/providers.md.new && mv doc/providers.md.new doc/providers.md
+   awk '{print} /^\| CloudStack \|/ {print "| Docker | [TzuH-Hsu/garm-provider-docker](https://github.com/TzuH-Hsu/garm-provider-docker) |"}' \
+     README.md > README.md.new && mv README.md.new README.md
+
+   #    Check: exactly one Docker row per file, one line added per file
+   grep -c 'garm-provider-docker' doc/providers.md README.md   # expect 1 and 1
+   git diff --stat                                           # expect 2 files, 2 insertions
+
+   git commit -am "Add garm-provider-docker to the list of supported providers"
 
    # 4. Push to your fork
    git push -u origin add-garm-provider-docker
