@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 #
-# scripts/demo-m0.sh - M0 end-to-end demo harness for garm-provider-docker.
+# scripts/demo-m0.sh - end-to-end real-job gate for garm-provider-docker.
 #
-# Drives docs/plan.md's M0 item 9: point the built provider at a real GARM
-# instance and a throwaway test repository running a trivial echo workflow,
-# and walk the full lifecycle - CreateInstance -> JIT registration -> job
-# runs -> DeleteInstance -> runner confirmed gone from GitHub - while
-# checking the M0 go/no-go gate (docs/plan.md §3 M0) and the two ADR-002
-# M0-demo verification items (exec-tar-into-tmpfs credential delivery,
+# Points the provider at a real GARM instance and a throwaway test
+# repository running a trivial echo workflow, and walks the full
+# lifecycle - CreateInstance -> JIT registration -> job runs ->
+# DeleteInstance -> runner confirmed gone from GitHub - while checking the
+# headline safety property (docs/plan.md §4: no host Docker socket, no
+# GARM credentials, no GitHub App key visible on the runner) and the two
+# ADR-002 verification items (exec-tar-into-tmpfs credential delivery,
 # actions/runner symlink-compat) along the way.
+#
+# This originated as the M0 go/no-go gate (docs/plan.md §3 M0: pool mode,
+# dind_mode=none, linux/amd64 only). M1-M4 have since shipped the full
+# per-job topology (job network, named workspace volume, DinD modes,
+# persistent caches, extra_specs, v0.1.1 self-description) and a v0.2.0
+# release. This script now validates that release end to end; it keeps
+# dind_mode=none as its own default (the smallest, most portable slice -
+# DinD modes are a deliberate operator opt-in and out of scope for this
+# gate, see docs/demo-m0.md), but everything else it exercises is the
+# CURRENT provider, not the M0 slice.
 #
 # See docs/demo-m0.md for the full runbook: prerequisites, what each check
 # proves, and a troubleshooting table. This script only prints instructions
@@ -16,8 +27,24 @@
 # GitHub repository for you - those steps are always a manual, confirmed
 # action, by design.
 #
+# Two modes (see PROVIDER_SOURCE below):
+#   release    (default) Downloads the published vX.Y.Z release binary for
+#               this host's OS/arch, verifies it against the release's
+#               SHA256SUMS, and pins runner_image to the published
+#               ghcr.io/tzuh-hsu/garm-runner-noble image BY DIGEST
+#               (resolved at run time via `docker buildx imagetools
+#               inspect`) - so this run validates exactly what a real
+#               operator installs, with digest-pin enforcement left ON
+#               (no allow_unpinned_runner_image).
+#   source     Builds the provider binary and the runner image from this
+#               checkout (the original M0-era behavior): a local `go
+#               build`, a local `docker build runner-images/noble`, and
+#               allow_unpinned_runner_image=true (required for a mutable
+#               local tag). For development against uncommitted changes.
+#
 # Assumptions:
-#   - You are on a Linux Docker host (or macOS + Docker Desktop).
+#   - You are on a Linux Docker host (or macOS + Docker Desktop),
+#     linux/amd64 or linux/arm64.
 #   - A GARM server is ALREADY RUNNING and reachable, with garm-cli
 #     installed and authenticated against it (docs/demo-m0.md).
 #   - You have already registered a throwaway GitHub repository with GARM
@@ -29,11 +56,13 @@
 # argv or committed to an env var this script echoes.
 #
 # Usage:
-#   scripts/demo-m0.sh [-y|--yes] [COMMAND]
+#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [COMMAND]
 #
 # COMMAND (default: all):
-#   preflight   Step 0: environment checks; build provider binary + runner
-#               image; generate a demo provider config.toml
+#   preflight   Step 0: environment checks; obtain the provider binary +
+#               runner image (release: download+verify / resolve digest;
+#               source: build both locally); generate a demo provider
+#               config.toml; smoke-test the binary against it
 #   config      Step 1: print the config.toml [[provider]] snippet to
 #               register with GARM, and pause for confirmation
 #   pool        Step 2: print the garm-cli pool add command for your test
@@ -41,14 +70,21 @@
 #   watch       Step 3: watch docker ps / garm-cli runner list; print the
 #               sample workflow yaml to trigger
 #   verify      Step 4 (a-d): PASS/FAIL checks against the live runner
-#               container
+#               container, job network, and workspace volume
 #   postjob     Step 4 (e): PASS/FAIL checks after the job has finished
 #   cleanup     Print manual cleanup commands
 #   all         Run every step above, in order
 #
 # Flags:
-#   -y, --yes   Auto-confirm every pause (non-interactive)
-#   -h, --help  Show usage
+#   -y, --yes       Auto-confirm every pause (non-interactive)
+#   --from-source   Build the provider binary and runner image from this
+#                   checkout instead of using a published release
+#                   (equivalent to PROVIDER_SOURCE=source)
+#   --version vX.Y.Z
+#                   Release to validate in the default "release" mode
+#                   (equivalent to PROVIDER_VERSION=vX.Y.Z). Ignored with
+#                   --from-source. Default: v0.2.0
+#   -h, --help      Show usage
 #
 # Environment variables (all optional unless noted - see docs/demo-m0.md):
 #   GARM_URL              Base URL of the running GARM server. Informational
@@ -58,22 +94,33 @@
 #   REPO                  GARM repo identifier (UUID from `garm-cli repo
 #                          list`, or "owner/name") of the THROWAWAY test
 #                          repository. Required for pool/watch/all.
+#   PROVIDER_SOURCE       "release" (default) or "source" - see the two
+#                          modes above. --from-source sets this to "source".
+#   PROVIDER_VERSION      The vX.Y.Z release to download and validate in
+#                          "release" mode (also selects the
+#                          ghcr.io/tzuh-hsu/garm-runner-noble tag whose
+#                          digest gets resolved). Ignored in "source" mode.
+#                          Default: v0.2.0
 #   PROVIDER_NAME         Name this provider is registered under in GARM's
 #                          config.toml [[provider]] section.
 #                          Default: docker_demo
-#   PROVIDER_BIN_DIR      Directory the provider binary is built into.
-#                          Default: <repo>/bin
+#   PROVIDER_BIN_DIR      Directory the provider binary is downloaded/built
+#                          into. Default: <repo>/bin
 #   PROVIDER_CONFIG_DIR   Directory the generated demo provider config.toml
 #                          is written into. Default: ${TMPDIR:-/tmp}/garm-provider-docker-demo
-#   RUNNER_IMAGE_TAG      Local tag for the runner image build.
-#                          Default: garm-runner-noble:demo
+#   RUNNER_IMAGE_TAG      Local tag for the runner image build. "source"
+#                          mode only. Default: garm-runner-noble:demo
+#   OS_ARCH               Runner OS architecture: "amd64" or "arm64".
+#                          Auto-detected from `uname -m` when unset; also
+#                          selects which release binary asset is
+#                          downloaded in "release" mode.
 #   POOL_TAGS             Comma-separated tags applied to the pool; matched
 #                          by the sample workflow's runs-on.
 #                          Default: docker,garm-demo
 #   POOL_IMAGE, POOL_FLAVOR
 #                          Values for garm-cli pool add's required --image/
 #                          --flavor flags. Informational only for this
-#                          provider in M0 (see Step 2's own note).
+#                          provider (see Step 2's own note).
 #   WATCH_INTERVAL_SECONDS, WATCH_MAX_ITERATIONS
 #                          Step 3 poll cadence and bounded loop length
 #                          (0 = run until Ctrl+C). Defaults: 5, 120.
@@ -88,6 +135,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GARM_URL="${GARM_URL:-http://localhost:8080}"
 REPO="${REPO:-}"
 
+PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
+PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.0}"
+
 PROVIDER_NAME="${PROVIDER_NAME:-docker_demo}"
 
 PROVIDER_BIN_DIR="${PROVIDER_BIN_DIR:-${REPO_ROOT}/bin}"
@@ -98,26 +148,35 @@ PROVIDER_BIN="${PROVIDER_BIN_DIR}/garm-provider-docker"
 PROVIDER_CONFIG_DIR="${PROVIDER_CONFIG_DIR:-${TMPDIR:-/tmp}/garm-provider-docker-demo}"
 PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_DIR}/config.toml"
 
-# Deliberately NOT digest-pinned: allow_unpinned_runner_image=true is
-# required in the generated provider config for a local dev tag like this
-# one (ADR-002/ADR-005 F10; internal/config/config.go's validateRunnerImage).
+# "source" mode only: a mutable local dev tag, which is why "source" mode
+# needs allow_unpinned_runner_image=true in the generated config (ADR-002/
+# ADR-005 F10; internal/config/config.go's validateDigestPinnedImage).
+# "release" mode never uses this - it pins runner_image by digest instead.
 RUNNER_IMAGE_TAG="${RUNNER_IMAGE_TAG:-garm-runner-noble:demo}"
+
+# The published runner image "release" mode resolves a digest for.
+RUNNER_IMAGE_REPO="ghcr.io/tzuh-hsu/garm-runner-noble"
+
+# The GitHub release this repo's own release.yml publishes assets to.
+RELEASE_REPO_SLUG="TzuH-Hsu/garm-provider-docker"
+RELEASE_BASE_URL="https://github.com/${RELEASE_REPO_SLUG}/releases/download"
 
 POOL_TAGS="${POOL_TAGS:-docker,garm-demo}"
 
 # --image/--flavor are REQUIRED by `garm-cli pool add` but are provider-
-# specific and, for THIS provider in M0, purely informational:
-# CreateInstance always uses the config's runner_image and ignores
+# specific and, for THIS provider, purely informational: CreateInstance
+# always uses the config's (or flavor's) runner_image and ignores
 # bootstrap.Image entirely (internal/provider/create.go's ensureImage).
 POOL_IMAGE="${POOL_IMAGE:-unused-by-this-provider}"
 POOL_FLAVOR="${POOL_FLAVOR:-default}"
 
-# Fixed by design, not env-overridable: the M0 go/no-go gate only needs one
-# runner to ever exist at a time, and M0 supports linux/amd64 only
-# (internal/provider/create.go's validatePlatform).
+# Fixed by design, not env-overridable: this gate only needs one runner to
+# ever exist at a time. OS_TYPE is fixed to linux - the only OS this
+# provider supports (internal/provider/create.go's validatePlatform). Both
+# linux/amd64 and linux/arm64 are supported as of M1; OS_ARCH below is
+# auto-detected (or operator-overridden), not hardcoded to amd64.
 readonly MIN_IDLE_RUNNERS=0
 readonly MAX_RUNNERS=1
-readonly OS_ARCH=amd64
 readonly OS_TYPE=linux
 
 WATCH_INTERVAL_SECONDS="${WATCH_INTERVAL_SECONDS:-5}"
@@ -173,10 +232,56 @@ require_repo() {
   [[ -n "${REPO}" ]] || die "REPO is not set. export REPO=<garm-repo-id-or-owner/name> (see 'garm-cli repo list') and re-run."
 }
 
+# detect_arch maps `uname -m` to the amd64/arm64 vocabulary this provider,
+# GARM's --os-arch flag, and this repo's release-asset naming all use.
+# OS_ARCH can still be set explicitly (env) to override the detected value.
+detect_arch() {
+  local machine
+  machine="$(uname -m)"
+  case "${machine}" in
+    x86_64|amd64)   printf 'amd64' ;;
+    aarch64|arm64)  printf 'arm64' ;;
+    *) die "unsupported host architecture '${machine}': this provider only supports linux/amd64 and linux/arm64 (internal/provider/create.go's supportedOSArches)" ;;
+  esac
+}
+OS_ARCH="${OS_ARCH:-$(detect_arch)}"
+
+# require_linux_host_for_release_mode fails closed, with a clear next step,
+# when PROVIDER_SOURCE=release is requested on a non-Linux host: this repo's
+# release.yml build matrix publishes linux/amd64 and linux/arm64 binaries
+# ONLY (no darwin build), because the provider binary is meant to run as a
+# HOST process wherever GARM itself runs (see the root README's "The
+# provider image is a delivery mechanism, not a runtime" section) - macOS +
+# Docker Desktop is a supported DOCKER HOST for the containers this provider
+# creates, but there is no macOS release asset for the provider binary
+# itself. Verified empirically: downloading and running the linux/arm64
+# release asset directly on a macOS host fails with "cannot execute binary
+# file" (wrong OS for the ELF), which is exactly what this check heads off
+# with an actionable message instead of an opaque exec error.
+require_linux_host_for_release_mode() {
+  local os
+  os="$(uname -s)"
+  if [[ "${os}" != "Linux" ]]; then
+    die "PROVIDER_SOURCE=release has no published binary for this host OS ('${os}') - only linux/amd64 and linux/arm64 are built and released. Use --from-source instead (it builds a native binary for THIS host with 'go build', which is how a non-Linux dev host is expected to run this gate), or run this gate from a Linux host/VM that can reach this Docker daemon."
+  fi
+}
+
+# compute_sha256 prints the lowercase hex sha256 of file "$1", preferring
+# sha256sum (Linux) and falling back to shasum -a 256 (macOS).
+compute_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -- "$1" | awk '{print $1}'
+  else
+    die "neither sha256sum nor shasum is on PATH; cannot verify the release download's checksum"
+  fi
+}
+
 # --- Step 0: preflight -------------------------------------------------------
 
 build_provider_binary() {
-  log "Building provider binary (go build -ldflags version stamp)..."
+  log "Building provider binary from source (go build -ldflags version stamp)..."
   mkdir -p "${PROVIDER_BIN_DIR}" || die "could not create ${PROVIDER_BIN_DIR}"
   local version
   version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
@@ -188,33 +293,138 @@ build_provider_binary() {
   log "Built ${PROVIDER_BIN} (version ${version})"
 }
 
+# download_provider_binary fetches the PROVIDER_VERSION release's binary
+# asset for this host's OS_ARCH plus its SHA256SUMS file, and verifies the
+# binary against the matching SHA256SUMS line before it is ever executed -
+# failing hard, not just warning, on any mismatch or missing entry. Asset
+# naming matches .github/workflows/release.yml's
+# "garm-provider-docker_<version>_<goos>_<goarch>" convention exactly.
+download_provider_binary() {
+  require_cmd curl
+  mkdir -p "${PROVIDER_BIN_DIR}" || die "could not create ${PROVIDER_BIN_DIR}"
+
+  local asset="garm-provider-docker_${PROVIDER_VERSION}_linux_${OS_ARCH}"
+  local asset_path="${PROVIDER_BIN_DIR}/${asset}"
+  local sums_path="${PROVIDER_BIN_DIR}/SHA256SUMS"
+
+  log "Downloading ${asset} (release ${PROVIDER_VERSION})..."
+  curl -fsSL -o "${asset_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/${asset}" \
+    || die "failed to download ${asset} from the ${PROVIDER_VERSION} release - check PROVIDER_VERSION and OS_ARCH, and that this host can reach github.com"
+  curl -fsSL -o "${sums_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/SHA256SUMS" \
+    || die "failed to download SHA256SUMS from the ${PROVIDER_VERSION} release"
+
+  local expected
+  expected="$(awk -v f="${asset}" '$2 == f { print $1; found=1 } END { exit !found }' "${sums_path}")" \
+    || die "SHA256SUMS from release ${PROVIDER_VERSION} has no entry for ${asset} - refusing to trust an unverifiable download"
+
+  local actual
+  actual="$(compute_sha256 "${asset_path}")"
+  if [[ "${expected}" != "${actual}" ]]; then
+    rm -f "${asset_path}"
+    die "checksum mismatch for ${asset}: SHA256SUMS says ${expected}, downloaded file hashes to ${actual} - refusing to use a corrupted or tampered binary"
+  fi
+  ok "SHA256SUMS verified for ${asset} (${expected})"
+
+  mv -f "${asset_path}" "${PROVIDER_BIN}"
+  chmod +x "${PROVIDER_BIN}"
+  log "Installed verified binary: ${PROVIDER_BIN}"
+}
+
 build_runner_image() {
   log "Building runner image ${RUNNER_IMAGE_TAG} from runner-images/noble ..."
   docker build -t "${RUNNER_IMAGE_TAG}" "${REPO_ROOT}/runner-images/noble" \
     || die "docker build of the runner image failed"
 }
 
+# resolve_runner_image_digest resolves ghcr.io/tzuh-hsu/garm-runner-noble's
+# PROVIDER_VERSION tag to its current manifest-list digest via `docker
+# buildx imagetools inspect` (no pull required) and prints the resulting
+# name@sha256:<digest> reference. This is the SAME digest for every
+# platform (it names the multi-arch index; the daemon selects
+# linux/amd64 vs linux/arm64 at pull time), so it is resolved once
+# regardless of OS_ARCH.
+resolve_runner_image_digest() {
+  require_cmd docker
+  local ref="${RUNNER_IMAGE_REPO}:${PROVIDER_VERSION}"
+  log "Resolving digest for ${ref} (docker buildx imagetools inspect)..." >&2
+  local digest
+  digest="$(docker buildx imagetools inspect "${ref}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
+    || die "failed to resolve a digest for ${ref} - is 'docker buildx' available, and can this host reach ghcr.io?"
+  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "unexpected digest format from 'docker buildx imagetools inspect ${ref}': '${digest}'"
+  log "Resolved ${ref} -> ${digest}" >&2
+  printf '%s@%s' "${RUNNER_IMAGE_REPO}" "${digest}"
+}
+
+# generate_provider_config writes the demo provider config.toml. In
+# "release" mode it pins runner_image by digest and leaves digest-pin
+# enforcement ON (no allow_unpinned_runner_image) - this is meant to be
+# exactly what a real operator's minimal config looks like (see
+# examples/config.minimal.toml). In "source" mode it points at the local
+# mutable dev tag, which requires the dev-only escape hatch.
 generate_provider_config() {
+  local runner_image="$1"
   mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
-  cat > "${PROVIDER_CONFIG_FILE}" <<EOF
-# Generated by scripts/demo-m0.sh - M0 demo ONLY, do not use in production.
+
+  if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
+    cat > "${PROVIDER_CONFIG_FILE}" <<EOF
+# Generated by scripts/demo-m0.sh (release mode, ${PROVIDER_VERSION}) -
+# gate config for garm-provider-docker. Every key besides runner_image
+# falls back to its documented default (docs/config-reference.md):
+# dind_mode = "none", docker_host = "unix:///var/run/docker.sock", and so
+# on - see examples/config.minimal.toml, which this mirrors.
+#
+# runner_image is pinned by digest, resolved from
+# ${RUNNER_IMAGE_REPO}:${PROVIDER_VERSION} at preflight
+# time - digest-pin enforcement stays ON (no allow_unpinned_runner_image).
+runner_image = "${runner_image}"
+EOF
+  else
+    cat > "${PROVIDER_CONFIG_FILE}" <<EOF
+# Generated by scripts/demo-m0.sh (--from-source mode) - dev/CI gate
+# config ONLY, do not use in production.
 #
 # allow_unpinned_runner_image=true is a dev-only escape hatch
 # (internal/config/config.go; ADR-002/ADR-005 F10): it lets runner_image be
 # a mutable local tag instead of a sha256-digest-pinned reference. Never set
 # this in a real deployment.
 docker_host = "unix:///var/run/docker.sock"
-runner_image = "${RUNNER_IMAGE_TAG}"
+runner_image = "${runner_image}"
 allow_unpinned_runner_image = true
 EOF
+  fi
   log "Wrote provider config: ${PROVIDER_CONFIG_FILE}"
 }
 
+# smoke_test_binary runs the obtained binary once with GARM_COMMAND=GetVersion
+# against the just-generated config, so a broken download (wrong arch, a
+# corrupted binary that passed the checksum check for the wrong reason -
+# it should not, but this is cheap insurance) or a config the CURRENT
+# loader rejects surfaces here, immediately, rather than opaquely inside
+# GARM's own provider-subprocess log later.
+smoke_test_binary() {
+  log "Smoke-testing the provider binary (GARM_COMMAND=GetVersion) against the generated config..."
+  # main.go writes its structured log lines to stderr and the GetVersion
+  # result (a bare version string) to stdout (see main.go's run()), so stdout
+  # alone is the clean "reported version" value; stderr is captured
+  # separately and surfaced only on failure, for a readable error.
+  local out err rc=0
+  out="$(GARM_COMMAND=GetVersion \
+      GARM_CONTROLLER_ID=demo-preflight \
+      GARM_PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_FILE}" \
+      "${PROVIDER_BIN}" 2>"${PROVIDER_CONFIG_DIR}/.smoke-test-stderr")" || rc=$?
+  err="$(cat "${PROVIDER_CONFIG_DIR}/.smoke-test-stderr" 2>/dev/null)"
+  rm -f "${PROVIDER_CONFIG_DIR}/.smoke-test-stderr"
+  if [[ "${rc}" -ne 0 ]]; then
+    die "the provider binary failed GetVersion against the generated config (exit ${rc}): ${err}"
+  fi
+  ok "provider binary runs and loads the generated config (reported version: ${out})"
+}
+
 step_preflight() {
-  log "=== Step 0: preflight ==="
+  log "=== Step 0: preflight (mode: ${PROVIDER_SOURCE}, arch: ${OS_ARCH}) ==="
 
   require_cmd docker
-  require_cmd go
 
   if docker info >/dev/null 2>&1; then
     ok "docker is reachable"
@@ -244,14 +454,32 @@ step_preflight() {
     warn "curl not found; skipping the GARM_URL reachability probe"
   fi
 
-  build_provider_binary
-  build_runner_image
-  generate_provider_config
+  local runner_image
+  case "${PROVIDER_SOURCE}" in
+    release)
+      require_linux_host_for_release_mode
+      download_provider_binary
+      runner_image="$(resolve_runner_image_digest)"
+      ;;
+    source)
+      require_cmd go
+      build_provider_binary
+      build_runner_image
+      runner_image="${RUNNER_IMAGE_TAG}"
+      ;;
+    *)
+      die "PROVIDER_SOURCE must be 'release' or 'source', got '${PROVIDER_SOURCE}'"
+      ;;
+  esac
+
+  generate_provider_config "${runner_image}"
+  smoke_test_binary
 
   log "Preflight complete."
+  log "  Mode            : ${PROVIDER_SOURCE}"
   log "  Provider binary : ${PROVIDER_BIN}"
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
-  log "  Runner image    : ${RUNNER_IMAGE_TAG}"
+  log "  Runner image    : ${runner_image}"
 }
 
 # --- Step 1: register the provider with GARM --------------------------------
@@ -265,18 +493,19 @@ step_config() {
 [[provider]]
   name = "${PROVIDER_NAME}"
   provider_type = "external"
-  description = "garm-provider-docker M0 demo"
+  description = "garm-provider-docker real-job gate (${PROVIDER_SOURCE} ${PROVIDER_VERSION})"
   disable_jit_config = false
   [provider.external]
     provider_executable = "${PROVIDER_BIN}"
     config_file = "${PROVIDER_CONFIG_FILE}"
-    interface_version = "v0.1.0"
+    interface_version = "v0.1.1"
 
 EOF
-  log "interface_version is shown explicitly for clarity; an empty/omitted"
-  log "interface_version defaults to v0.1.0 in GARM as well (docs/research.md"
-  log "§1.H), which is the only interface surface this M0 provider implements"
-  log "(internal/provider/provider.go)."
+  log "interface_version = v0.1.1 turns on this provider's self-description"
+  log "methods (GetConfigJSONSchema/GetExtraSpecsJSONSchema/ValidatePoolInfo,"
+  log "ADR-005) in addition to the eight lifecycle methods this gate"
+  log "exercises; omitting it (or v0.1.0) still works for everything this"
+  log "gate itself checks (internal/provider/provider.go)."
   log "Verify registration with: garm-cli provider list"
 
   confirm "Once the [[provider]] section above is added and GARM has been restarted/reloaded, confirm with 'garm-cli provider list' that '${PROVIDER_NAME}' appears."
@@ -306,9 +535,10 @@ garm-cli pool add \\
 
 EOF
   log "--image/--flavor are required by garm-cli but are informational only"
-  log "for this provider in M0 (see the note above POOL_IMAGE/POOL_FLAVOR in"
-  log "this script)."
-  log "min-idle-runners=0 / max-runners=1 by design: this demo only ever"
+  log "for this provider (see the note above POOL_IMAGE/POOL_FLAVOR in this"
+  log "script); --os-arch ${OS_ARCH} was auto-detected from this host (override"
+  log "with OS_ARCH=amd64|arm64)."
+  log "min-idle-runners=0 / max-runners=1 by design: this gate only ever"
   log "needs one runner to exist at a time."
   log "List pools with: garm-cli pool list --repo ${REPO}"
 
@@ -405,6 +635,53 @@ verify_labels() {
   fi
 }
 
+# verify_topology checks the two OTHER per-allocation resources every
+# CreateInstance provisions alongside the runner container as of M1
+# (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's F4/
+# nonce-scoped teardown all hinges on it existing and being labeled) and the
+# named, labeled workspace volume (replacing M0's anonymous one). Both are
+# looked up by label rather than by name, since the workspace volume's name
+# embeds a create-nonce this script does not otherwise learn
+# (internal/spec/names.go's WorkspaceVolumeName).
+verify_topology() {
+  local cid="$1"
+  local instance
+  instance="$(label_value "${cid}" garm.docker/instance-name)"
+  log "-- (a, continued) job network + workspace volume --"
+  if [[ -z "${instance}" ]]; then
+    bad "cannot check the job network/workspace volume - garm.docker/instance-name was missing on the runner container"
+    return
+  fi
+
+  local net_id
+  net_id="$(docker network ls \
+    --filter "label=garm.docker/managed=true" \
+    --filter "label=garm.docker/resource=job-network" \
+    --filter "label=garm.docker/instance-name=${instance}" \
+    --format '{{.ID}}' | head -n1)"
+  if [[ -n "${net_id}" ]]; then
+    ok "per-job network exists and carries garm.docker/resource=job-network (ADR-001/ADR-004 claim marker)"
+  else
+    bad "no labeled per-job network found for instance ${instance}"
+  fi
+
+  local vol_name
+  vol_name="$(docker volume ls \
+    --filter "label=garm.docker/managed=true" \
+    --filter "label=garm.docker/resource=workspace" \
+    --filter "label=garm.docker/instance-name=${instance}" \
+    --format '{{.Name}}' | head -n1)"
+  if [[ -n "${vol_name}" ]]; then
+    ok "named workspace volume exists and carries garm.docker/resource=workspace (${vol_name})"
+  else
+    bad "no labeled workspace volume found for instance ${instance}"
+  fi
+
+  local cache_vols
+  cache_vols="$(docker volume ls --filter 'label=garm.docker/cache=true' --format '{{.Name}}' | wc -l | tr -d ' ')"
+  log "  (informational, not PASS/FAIL: ${cache_vols} garm.docker/cache=true volume(s) present - toolcache/pnpm/externals/diag persist across jobs by design, ADR-003)"
+}
+
 verify_no_credentials_in_inspect() {
   local cid="$1"
   log "-- (b) docker inspect: no credentials, no host docker.sock --"
@@ -467,7 +744,7 @@ verify_symlink_compat() {
   ls_out="$(docker exec "${cid}" ls -la /actions-runner/.runner 2>&1)"
   printf '    %s\n' "${ls_out}"
   if printf '%s' "${ls_out}" | grep -q -- '-> /run/garm/runner'; then
-    ok "/actions-runner/.runner is a symlink -> /run/garm/runner (ADR-002 M0-demo verification item)"
+    ok "/actions-runner/.runner is a symlink -> /run/garm/runner (ADR-002 verification item)"
   else
     bad "/actions-runner/.runner is NOT a symlink to /run/garm/runner - see ADR-002's documented fallback (docs/adr/ADR-002-runner-image-and-jit-delivery.md)"
   fi
@@ -498,6 +775,7 @@ step_verify() {
   log "Checking container: ${cid} (${cname})"
 
   verify_labels "${cid}"
+  verify_topology "${cid}"
   verify_no_credentials_in_inspect "${cid}"
   verify_tmpfs_delivery "${cid}"
   verify_symlink_compat "${cid}"
@@ -536,20 +814,27 @@ step_postjob() {
     ok "no managed runner container remains"
   fi
 
-  local leftover_c leftover_v
+  local leftover_c leftover_n leftover_v
   leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}')"
+  leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
   leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
-  if [[ -z "${leftover_c}" && -z "${leftover_v}" ]]; then
-    ok "no leftover garm.docker/managed=true containers or volumes"
+  if [[ -z "${leftover_c}" && -z "${leftover_n}" && -z "${leftover_v}" ]]; then
+    ok "no leftover garm.docker/managed=true containers, networks, or volumes"
   else
     bad "leftover managed resources found"
     [[ -n "${leftover_c}" ]] && printf '    containers: %s\n' "${leftover_c}"
+    [[ -n "${leftover_n}" ]] && printf '    networks: %s\n' "${leftover_n}"
     [[ -n "${leftover_v}" ]] && printf '    volumes: %s\n' "${leftover_v}"
   fi
-  log "Note: M0's per-job workspace volume is anonymous (carries no"
-  log "garm.docker/* label - internal/spec/mounts.go's WorkspaceMount); it is"
-  log "removed automatically with its container (RemoveVolumes=true), not"
-  log "swept independently, so it never shows up in the volume check above."
+  log "Note: the per-job network and the named workspace volume both carry"
+  log "garm.docker/managed=true (ADR-001/ADR-004), so DeleteInstance's"
+  log "teardown removes both explicitly - they are NOT anonymous/implicit"
+  log "resources, and a leftover one IS a real failure the check above"
+  log "would catch. This differs from the persistent, repo-scoped cache"
+  log "volumes (toolcache/pnpm/externals/diag, ADR-003), which carry"
+  log "garm.docker/cache=true instead and are DELIBERATELY never swept by"
+  log "any teardown path - they are meant to survive across jobs. See the"
+  log "root README's Cache section for how to reclaim them manually."
 
   return "${VERIFY_FAILED}"
 }
@@ -558,6 +843,12 @@ step_postjob() {
 
 step_cleanup() {
   log "=== Cleanup ==="
+  local image_cleanup_line
+  if [[ "${PROVIDER_SOURCE}" == "source" ]]; then
+    image_cleanup_line="  docker image rm ${RUNNER_IMAGE_TAG}"
+  else
+    image_cleanup_line="  # (release mode pulled ${RUNNER_IMAGE_REPO}@sha256:... by digest; 'docker image ls' / 'docker image rm' it by digest if you want the disk space back)"
+  fi
   cat <<EOF
 
 Manual cleanup once you're done with the demo:
@@ -571,15 +862,23 @@ Manual cleanup once you're done with the demo:
   # 2. Confirm no leftover managed Docker resources for this controller
   #    (should already be empty if Step 4(e) passed)
   docker ps -a --filter 'label=garm.docker/managed=true'
+  docker network ls --filter 'label=garm.docker/managed=true'
   docker volume ls --filter 'label=garm.docker/managed=true'
 
-  # 3. Remove the demo-local build artifacts this script created
-  docker image rm ${RUNNER_IMAGE_TAG}
+  # 3. Remove the demo-local build/download artifacts this script created
+${image_cleanup_line}
   rm -rf ${PROVIDER_CONFIG_DIR}
   rm -rf ${PROVIDER_BIN_DIR}
 
   # 4. Remove the [[provider]] section for '${PROVIDER_NAME}' from GARM's
   #    own config.toml and restart/reload GARM.
+
+  # Persistent caches (toolcache/pnpm/externals/diag, ADR-003) are NOT
+  # touched by any of the above - they are deliberately never auto-deleted.
+  # Reclaim them explicitly, once no job is using them, with:
+  #   docker volume prune -a \\
+  #     --filter label=garm.docker/cache=true \\
+  #     --filter label=garm.docker/controller-id=<your-controller-id>
 
 EOF
 }
@@ -588,21 +887,26 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: scripts/demo-m0.sh [-y|--yes] [COMMAND]
+Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [COMMAND]
 
 COMMAND (default: all):
-  preflight   Step 0: environment checks, build provider binary + runner image, generate demo config
+  preflight   Step 0: environment checks; obtain the provider binary + runner image, generate demo config, smoke-test it
   config      Step 1: print the config.toml [[provider]] snippet to register with GARM
   pool        Step 2: print the garm-cli pool add command for your test repo
   watch       Step 3: watch docker ps / garm-cli runner list; print the sample workflow yaml
-  verify      Step 4(a-d): PASS/FAIL checks against the live runner container
+  verify      Step 4(a-d): PASS/FAIL checks against the live runner container, job network, and workspace volume
   postjob     Step 4(e): PASS/FAIL checks after the job has finished
   cleanup     Print manual cleanup commands
   all         Run preflight, config, pool, watch, verify, postjob, cleanup in order
 
 Flags:
-  -y, --yes   Skip confirmation pauses (auto-confirm)
-  -h, --help  Show this help
+  -y, --yes           Skip confirmation pauses (auto-confirm)
+  --from-source       Build the provider binary + runner image from this checkout
+                       instead of downloading/pinning a published release
+                       (equivalent to PROVIDER_SOURCE=source)
+  --version vX.Y.Z    Release to validate in the default "release" mode
+                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.0
+  -h, --help          Show this help
 
 See docs/demo-m0.md for prerequisites, environment variables, what each
 check proves, and a troubleshooting table. No secret is ever read,
@@ -615,6 +919,12 @@ COMMAND="all"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1; shift ;;
+    --from-source) PROVIDER_SOURCE="source"; shift ;;
+    --version)
+      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.0"
+      PROVIDER_VERSION="$2"
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     preflight|config|pool|watch|verify|postjob|cleanup|all) COMMAND="$1"; shift ;;
     *) usage >&2; die "unknown argument: $1" ;;
