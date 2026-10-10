@@ -181,3 +181,46 @@ func TestFakeContainerLogsFollowOfStoppedContainerEnds(t *testing.T) {
 		t.Fatalf("follow of an exited container = %q, %v; want %q and EOF", out.String(), err, "bye\n")
 	}
 }
+
+// TestFakeContainerLogsNoneDriverIsNotImplemented models what a real daemon
+// returns for a container using the "none" log driver: HTTP 501, surfaced by
+// the SDK as errdefs.NotImplemented, and no stream.
+func TestFakeContainerLogsNoneDriverIsNotImplemented(t *testing.T) {
+	f := NewFakeClient()
+	f.DefaultLogDriver = "none"
+	id := startFakeContainer(t, f, "runner", false)
+
+	rc, err := f.ContainerLogs(context.Background(), id, container.LogsOptions{ShowStdout: true, Follow: true})
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("ContainerLogs returned a stream for a container using the none log driver")
+	}
+	if !errdefs.IsNotImplemented(err) || !strings.Contains(err.Error(), "does not support reading") {
+		t.Fatalf("ContainerLogs error = %v, want NotImplemented \"configured logging driver does not support reading\"", err)
+	}
+}
+
+func TestFakeContainerTop(t *testing.T) {
+	f := NewFakeClient()
+	id := startFakeContainer(t, f, "runner", false)
+	f.SetProcesses(id, "/bin/bash /actions-runner/run.sh", "/actions-runner/bin/Runner.Listener run")
+
+	top, err := f.ContainerTop(context.Background(), id, nil)
+	if err != nil {
+		t.Fatalf("ContainerTop: %v", err)
+	}
+	if len(top.Titles) == 0 || top.Titles[len(top.Titles)-1] != "CMD" || len(top.Processes) != 2 {
+		t.Fatalf("ContainerTop = %+v, want two rows under titles ending in CMD", top)
+	}
+	if got := top.Processes[1][len(top.Titles)-1]; got != "/actions-runner/bin/Runner.Listener run" {
+		t.Errorf("CMD column = %q", got)
+	}
+
+	f.SetState(id, "exited", false)
+	if _, err := f.ContainerTop(context.Background(), id, nil); !errdefs.IsConflict(err) {
+		t.Errorf("ContainerTop of a stopped container error = %v, want Conflict", err)
+	}
+	if _, err := f.ContainerTop(context.Background(), "missing", nil); !errdefs.IsNotFound(err) {
+		t.Errorf("ContainerTop of a missing container error = %v, want NotFound", err)
+	}
+}

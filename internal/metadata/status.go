@@ -42,7 +42,10 @@ const maxStatusResponseBytes = 64 << 10
 // any value that differs from the one already on the row ("agent ID
 // mismatch"); a scale-set runner's row already carries the agent ID GARM got
 // when it generated the JIT config, and the provider has no authoritative
-// source for it. Omitting the field leaves the row's agent ID untouched.
+// source for it. Omitting the field leaves the row's agent ID untouched. That
+// is only correct when GARM already stored the agent ID, i.e. for JIT runners
+// (scale sets, and pools with JIT); the provider therefore reports status for
+// JIT runners only (internal/provider/status_report.go).
 type statusUpdate struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`

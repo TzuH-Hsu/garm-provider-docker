@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
+	"github.com/docker/docker/api/types/container"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
@@ -360,5 +362,140 @@ func TestCreateInstanceStatusFailureLogsNoToken(t *testing.T) {
 	}
 	if strings.Contains(out, testInstanceToken) {
 		t.Fatalf("REDACTION FAILURE: logs contain the instance token:\n%s", out)
+	}
+}
+
+// fastListenerFallback shortens the process-list fallback's timing.
+func fastListenerFallback(t *testing.T) {
+	t.Helper()
+	prevPoll, prevSettle := listenerPollInterval, listenerSettle
+	listenerPollInterval, listenerSettle = 20*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { listenerPollInterval, listenerSettle = prevPoll, prevSettle })
+}
+
+// TestCreateInstanceStatusNonJITSkipsReporting: a non-JIT runner registers
+// inside the container, so GARM has no agent ID for it and its own bootstrap
+// would send one with idle; an ID-less report would leave the row without one.
+// Nothing is reported for non-JIT runners.
+func TestCreateInstanceStatusNonJITSkipsReporting(t *testing.T) {
+	meta := newRegistrationTokenServer(t)
+	defer meta.Close()
+	cb, rec := newStatusCallbackServer(t, nil)
+	p, _ := newTestProvider(t)
+
+	b := statusBootstrap(meta.URL, cb.URL)
+	b.JitConfigEnabled = false
+	start := time.Now()
+	if _, err := p.CreateInstance(context.Background(), b); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if got := rec.seen(); len(got) != 0 {
+		t.Fatalf("non-JIT runner had %v reported, want nothing", got)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("CreateInstance took %v for a non-JIT runner; it must not wait", d)
+	}
+}
+
+// TestCreateInstanceStatusLogsUnreadableFallsBackToListenerProcess: with the
+// "none" log driver the daemon cannot return the runner's logs, so readiness
+// falls back to the Runner.Listener process staying up for the settle time.
+func TestCreateInstanceStatusLogsUnreadableFallsBackToListenerProcess(t *testing.T) {
+	fastListenerFallback(t)
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	p, fake := newTestProvider(t)
+	fake.DefaultLogDriver = "none"
+	b := statusBootstrap(meta.URL, "")
+	runner := spec.RunnerContainerName(b.Name)
+	cb, rec := newStatusCallbackServer(t, func(status string) int {
+		if status == "installing" {
+			fake.SetProcesses(runner, "/bin/bash /actions-runner/run.sh", "/actions-runner/bin/Runner.Listener run")
+		}
+		return 0
+	})
+	b.CallbackURL = cb.URL + "/api/v1/callbacks"
+	logs := captureLogs(t)
+
+	if _, err := p.CreateInstance(context.Background(), b); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if got := rec.seen(); strings.Join(got, ",") != "installing,idle" {
+		t.Fatalf("reported statuses = %v, want [installing idle]", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "cannot read the runner's logs") || !strings.Contains(out, "json-file") {
+		t.Errorf("expected a warning recommending a readable log driver, logs:\n%s", out)
+	}
+}
+
+// TestCreateInstanceStatusLogsUnreadableListenerNeverAppears: the fallback
+// keeps the overall bound, and without a listener the runner stays installing.
+func TestCreateInstanceStatusLogsUnreadableListenerNeverAppears(t *testing.T) {
+	fastListenerFallback(t)
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	p, fake := newTestProvider(t)
+	fake.DefaultLogDriver = "none"
+	p.cfg.StatusReport.TimeoutSeconds = intPtr(1)
+	b := statusBootstrap(meta.URL, "")
+	cb, rec := newStatusCallbackServer(t, func(status string) int {
+		if status == "installing" {
+			fake.SetProcesses(spec.RunnerContainerName(b.Name), "/bin/bash /entrypoint.sh", "sleep 5")
+		}
+		return 0
+	})
+	b.CallbackURL = cb.URL + "/api/v1/callbacks"
+
+	start := time.Now()
+	if _, err := p.CreateInstance(context.Background(), b); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if got := rec.seen(); strings.Join(got, ",") != "installing" {
+		t.Fatalf("reported statuses = %v, want only [installing]", got)
+	}
+	if d := time.Since(start); d < time.Second || d > 10*time.Second {
+		t.Errorf("CreateInstance took %v, want about the 1s status_report timeout", d)
+	}
+}
+
+// TestWaitListenerProcessRequiresSettle: a listener that appears and then
+// disappears (a crash loop) does not count; the container stopping ends the wait.
+func TestWaitListenerProcessRequiresSettle(t *testing.T) {
+	fastListenerFallback(t)
+	p, fake := newTestProvider(t)
+	created, err := fake.ContainerCreate(context.Background(), &container.Config{Image: "img"}, nil, nil, nil, "flappy")
+	if err != nil {
+		t.Fatalf("ContainerCreate: %v", err)
+	}
+	if err := fake.ContainerStart(context.Background(), created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart: %v", err)
+	}
+	go func() {
+		for i := 0; i < 4; i++ { // up for less than the settle time, then gone
+			fake.SetProcesses(created.ID, "/actions-runner/bin/Runner.Listener run")
+			time.Sleep(listenerSettle / 4)
+			fake.SetProcesses(created.ID)
+			time.Sleep(listenerSettle / 4)
+		}
+		fake.SetState(created.ID, "exited", false)
+	}()
+
+	ok, err := p.waitListenerProcess(context.Background(), created.ID)
+	if ok || !errors.Is(err, errRunnerStopped) {
+		t.Fatalf("waitListenerProcess = %v, %v; want false, errRunnerStopped", ok, err)
+	}
+}
+
+func TestHasProcess(t *testing.T) {
+	top := container.TopResponse{
+		Titles:    []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"},
+		Processes: [][]string{{"runner", "7", "1", "0", "00:00", "?", "00:00:00", "/actions-runner/bin/Runner.Listener run"}},
+	}
+	if !hasProcess(top, runnerListenerProcess) {
+		t.Error("hasProcess missed Runner.Listener in the CMD column")
+	}
+	if hasProcess(container.TopResponse{Titles: []string{"PID"}, Processes: [][]string{{"Runner.Listener"}}}, runnerListenerProcess) {
+		t.Error("hasProcess matched outside a CMD/COMMAND column")
 	}
 }

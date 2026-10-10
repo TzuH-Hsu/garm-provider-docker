@@ -112,6 +112,14 @@ type Client interface {
 	// "Listening for Jobs" before reporting the runner idle to GARM.
 	ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
 
+	// ContainerTop lists the processes running in a container (`docker top`):
+	// Titles names the columns (the command line is "CMD" with the default ps
+	// arguments) and each Processes row holds one process. The daemon answers
+	// 409 Conflict for a container that is not running. CreateInstance uses it
+	// only as a readiness fallback when the runner's logs cannot be read (log
+	// driver "none"), looking for the actions/runner Runner.Listener process.
+	ContainerTop(ctx context.Context, containerID string, arguments []string) (container.TopResponse, error)
+
 	// NetworkCreate creates a labeled bridge network — the per-job network
 	// ADR-001 requires in every mode, and ADR-004's claim marker (the first
 	// resource created for an allocation). It returns a Conflict error

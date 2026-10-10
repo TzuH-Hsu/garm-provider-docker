@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
@@ -83,6 +85,13 @@ func (f *FakeClient) ContainerLogs(ctx context.Context, containerID string, opti
 	if c == nil {
 		return nil, notFoundf("No such container: %s", containerID)
 	}
+	if c.logDriver == "none" {
+		// Observed on a real daemon (Docker Engine 29.8.2): GET
+		// /containers/{id}/logs answers HTTP 501 {"message":"configured
+		// logging driver does not support reading"}, which the SDK surfaces
+		// as an errdefs.NotImplemented error. No stream is returned.
+		return nil, errdefs.NotImplemented(errors.New("configured logging driver does not support reading"))
+	}
 	if c.logNotify == nil {
 		c.logNotify = make(chan struct{})
 	}
@@ -149,4 +158,40 @@ func writeLogEntry(e fakeLogEntry, options container.LogsOptions, stdout, stderr
 	}
 	_, err := w.Write([]byte(line))
 	return err
+}
+
+// topTitles are the column titles the daemon returns for `docker top` with the
+// default ps arguments (observed on Docker Engine 29.8.2).
+var topTitles = []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"}
+
+// SetProcesses sets the command lines ContainerTop reports for containerID
+// (by ID or name), replacing any earlier set. Unknown containers are ignored.
+func (f *FakeClient) SetProcesses(containerID string, cmdlines ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.find(containerID); c != nil {
+		c.processes = append([]string(nil), cmdlines...)
+	}
+}
+
+// ContainerTop models `docker top` with the default ps arguments: a missing
+// container is NotFound, a container that is not running is a Conflict (the
+// daemon's 409 "container ... is not running"), and a running one lists one
+// row per SetProcesses command line under topTitles.
+func (f *FakeClient) ContainerTop(_ context.Context, containerID string, _ []string) (container.TopResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c := f.find(containerID)
+	if c == nil {
+		return container.TopResponse{}, notFoundf("No such container: %s", containerID)
+	}
+	if c.state != "running" {
+		return container.TopResponse{}, conflictf("container %s is not running", c.id)
+	}
+	resp := container.TopResponse{Titles: append([]string(nil), topTitles...)}
+	for i, cmd := range c.processes {
+		resp.Processes = append(resp.Processes, []string{"1001", strconv.Itoa(100 + i), "1", "0", "00:00", "?", "00:00:00", cmd})
+	}
+	return resp, nil
 }

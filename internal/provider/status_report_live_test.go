@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
@@ -41,6 +42,13 @@ func newLiveProvider(t *testing.T) *Provider {
 // shell script, and removes it when the test ends.
 func runLiveContainer(t *testing.T, p *Provider, script string) string {
 	t.Helper()
+	return runLiveContainerWithLogDriver(t, p, script, "")
+}
+
+// runLiveContainerWithLogDriver is runLiveContainer with an explicit log
+// driver ("" keeps the daemon default).
+func runLiveContainerWithLogDriver(t *testing.T, p *Provider, script, logDriver string) string {
+	t.Helper()
 	ctx := context.Background()
 	if err := p.ensureImage(ctx, liveImage); err != nil {
 		t.Fatalf("ensureImage: %v", err)
@@ -52,7 +60,7 @@ func runLiveContainer(t *testing.T, p *Provider, script string) string {
 		Image: liveImage,
 		Cmd:   []string{"sh", "-c", script},
 		Tty:   false,
-	}, nil, nil, nil, name)
+	}, &container.HostConfig{LogConfig: container.LogConfig{Type: logDriver}}, nil, nil, name)
 	if err != nil {
 		t.Fatalf("ContainerCreate: %v", err)
 	}
@@ -136,5 +144,65 @@ func TestLiveWaitRunnerListeningTimesOut(t *testing.T) {
 	}
 	if d := time.Since(start); d > 10*time.Second {
 		t.Errorf("a 2s wait took %v", d)
+	}
+}
+
+// TestLiveContainerLogsNoneDriverIsNotImplemented records what the real daemon
+// returns for the "none" log driver, which docker.FakeClient models: no stream,
+// an errdefs.NotImplemented error "configured logging driver does not support
+// reading" (HTTP 501).
+func TestLiveContainerLogsNoneDriverIsNotImplemented(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainerWithLogDriver(t, p, `echo hidden; sleep 30`, "none")
+
+	rc, err := p.cli.ContainerLogs(context.Background(), id, container.LogsOptions{ShowStdout: true, Follow: true})
+	if rc != nil {
+		_ = rc.Close()
+	}
+	t.Logf("ContainerLogs with log driver none: %v", err)
+	if err == nil || !errdefs.IsNotImplemented(err) {
+		t.Fatalf("ContainerLogs error = %v, want errdefs.NotImplemented", err)
+	}
+}
+
+// TestLiveContainerTopOfStoppedContainerIsConflict pins the 409 the fallback
+// treats as "the runner stopped".
+func TestLiveContainerTopOfStoppedContainerIsConflict(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainer(t, p, `exit 0`)
+	time.Sleep(time.Second)
+	_, err := p.cli.ContainerTop(context.Background(), id, nil)
+	t.Logf("ContainerTop of a stopped container: %v", err)
+	if !errdefs.IsConflict(err) {
+		t.Fatalf("ContainerTop error = %v, want errdefs.Conflict", err)
+	}
+}
+
+// TestLiveWaitRunnerListeningFallsBackWhenLogsUnreadable drives the production
+// detector against a "none"-driver container whose process list gains a
+// Runner.Listener command line after a second.
+func TestLiveWaitRunnerListeningFallsBackWhenLogsUnreadable(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainerWithLogDriver(t, p, `sleep 1; n=Runner; sh -c "sleep 60; : /actions-runner/bin/$n.Listener run"`, "none")
+
+	start := time.Now()
+	ok, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
+	if !ok {
+		t.Fatalf("waitRunnerListening = false (%v), want true via the process fallback", err)
+	}
+	// The listener command line only exists from t≈1s (the outer shell's own
+	// argv spells it "$n.Listener"), so a match needs 1s plus the settle time.
+	if d := time.Since(start); d < listenerSettle+500*time.Millisecond {
+		t.Errorf("matched after %v, before the listener had been up for the %v settle time", d, listenerSettle)
+	}
+}
+
+func TestLiveWaitRunnerListeningFallbackTimesOutWithoutListener(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainerWithLogDriver(t, p, `sleep 60`, "none")
+
+	ok, err := p.waitRunnerListening(context.Background(), id, 3*time.Second)
+	if ok || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitRunnerListening = %v, %v; want false, deadline exceeded", ok, err)
 	}
 }
