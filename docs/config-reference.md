@@ -20,6 +20,15 @@ escalate beyond it.
 
 ## Emitting the schemas from the binary (v0.1.1)
 
+These commands are v0.1.1-only, but GARM v0.2.1 never invokes them; they are
+for operators and tooling. They work regardless of the `interface_version`
+GARM is configured with, because you set `GARM_INTERFACE_VERSION=v0.1.1` on
+the command line yourself. On GARM <= v0.2.1 register the provider with
+`interface_version = "v0.1.0"` (GARM v0.2.1's v0.1.1 `ListInstances` wrapper
+misreports every successful list as an error; fixed upstream by
+[cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878), unreleased
+as of 2026-10-11 — see the README's "Register with GARM" section).
+
 ```sh
 # The extra_specs JSON Schema (draft-07)
 GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=GetExtraSpecsJSONSchema \

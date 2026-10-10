@@ -80,14 +80,12 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   `GetConfigJSONSchema`, `GetExtraSpecsJSONSchema`, `ValidatePoolInfo`);
   omitting it (or setting `v0.1.0`) gets the original eight lifecycle
   methods only.
-- **Pools and scale sets.** Both work with GARM v0.2.x. Under `v0.1.1`,
-  GARM sends scale-set delete/get/start/stop calls without a pool ID; the
-  provider accepts that (see
-  [research.md §1.D](docs/research.md)). On GARM **v0.2.1 and earlier**,
-  prefer `interface_version = "v0.1.0"`: GARM's own v0.1.1 `ListInstances`
-  wrapper misreports every successful list as an error
-  (`returned error: %!s(<nil>)`), which breaks GARM's runner reconciliation
-  until a GARM release ships the upstream fix.
+- **Pools and scale sets.** Both work with GARM v0.2.x under either
+  interface version. Under `v0.1.1`, GARM sends scale-set
+  delete/get/start/stop calls without a pool ID; the provider accepts that
+  (see [research.md §1.D](docs/research.md)). On GARM **v0.2.1 and
+  earlier**, register the provider with `interface_version = "v0.1.0"`
+  (see [Register with GARM](#register-with-garm) for why).
 
 ## Install
 
@@ -179,8 +177,23 @@ Add a `[[provider]]` section to GARM's own `config.toml` (commonly
   [provider.external]
     provider_executable = "/opt/garm/providers.d/garm-provider-docker"
     config_file = "/etc/garm/garm-provider-docker.toml"
-    interface_version = "v0.1.1"  # or "v0.1.0" / omit for the 8-method-only surface (recommended on GARM <= v0.2.1, see Features)
+    interface_version = "v0.1.0"  # recommended on GARM <= v0.2.1; see below
 ```
+
+**Which `interface_version`?** On GARM **v0.2.1 and earlier**, use
+`v0.1.0`. GARM v0.2.1's own v0.1.1 wrapper inverts the error check in
+`ListInstances` (`if err == nil` in `runner/providers/v0.1.1/external.go`),
+so every *successful* list is reported as
+`provider binary ... returned error: %!s(<nil>)` and GARM's runner
+reconciliation for pools and scale sets keeps failing. This is an upstream
+GARM bug, fixed by [cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878)
+(commit `488cf98b`, merged 2026-09-11) but not in any release as of
+2026-10-11. Nothing is lost by choosing `v0.1.0`: GARM v0.2.1 never calls
+the v0.1.1-only self-description commands (`GetSupportedInterfaceVersions`,
+`GetConfigJSONSchema`, `GetExtraSpecsJSONSchema`, `ValidatePoolInfo`) —
+you can still run them by hand with `GARM_INTERFACE_VERSION=v0.1.1` (see
+[`docs/config-reference.md`](docs/config-reference.md)). Switch to
+`v0.1.1` once a GARM release includes #878; this provider supports both.
 
 Restart/reload GARM, confirm with `garm-cli provider list`, then create a
 pool against it:
