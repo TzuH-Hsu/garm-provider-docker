@@ -277,3 +277,35 @@ func TestLiveDetachedWatcherReportsIdle(t *testing.T) {
 		t.Errorf("idle after %v, before the runner printed the listening line", d)
 	}
 }
+
+// TestLiveStoppedContainerLogsReplayThenEOF pins what docker.FakeClient
+// models and why readiness is confirmed against the container state: a
+// container that printed the listening line and exited still returns that
+// buffered line from a follow request, then EOF — so the marker alone would
+// report a dead runner idle.
+func TestLiveStoppedContainerLogsReplayThenEOF(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainer(t, p, `echo "2026-10-10 17:45:14Z: Listening for Jobs"; exit 0`)
+	time.Sleep(2 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rc, err := p.cli.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, Follow: true})
+	if err != nil {
+		t.Fatalf("ContainerLogs: %v", err)
+	}
+	var stdout bytes.Buffer
+	_, err = stdcopy.StdCopy(&stdout, io.Discard, rc)
+	_ = rc.Close()
+	if err != nil || ctx.Err() != nil {
+		t.Fatalf("follow of a stopped container did not end with EOF: %v (ctx %v)", err, ctx.Err())
+	}
+	if !strings.Contains(stdout.String(), "Listening for Jobs") {
+		t.Fatalf("stopped container's logs = %q, want the buffered listening line", stdout.String())
+	}
+
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 10*time.Second)
+	if ok || !errors.Is(err, errRunnerStopped) {
+		t.Fatalf("waitRunnerListening = %v, %v; want false, errRunnerStopped for an exited runner", ok, err)
+	}
+}
