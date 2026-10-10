@@ -379,3 +379,96 @@ func TestInterfaceV010IsDelegated(t *testing.T) {
 		t.Fatal("GetEnvironment (unsupported version) = nil, want error")
 	}
 }
+
+// unsetEnv removes key for the duration of the test (t.Setenv registers the
+// restore; the variable is then genuinely absent, as when GARM never sets it).
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unsetting %s: %v", key, err)
+	}
+}
+
+// setV010Env reproduces what GARM v0.2.1's v0.1.0 wrapper
+// (runner/providers/v0.1.0/external.go) sends: GARM_INTERFACE_VERSION=v0.1.0
+// (L54), GARM_COMMAND, GARM_CONTROLLER_ID, GARM_PROVIDER_CONFIG_FILE, and
+// never GARM_POOL_EXTRASPECS. GARM_POOL_ID is sent only for CreateInstance
+// (L78) and ListInstances (L205); Delete/Get/Start/Stop carry
+// GARM_INSTANCE_ID and no pool ID at all (L127-135, L155-163).
+func setV010Env(t *testing.T, command execcommon.ExecutionCommand, poolID, instanceID string) {
+	t.Helper()
+	setBaseEnv(t, command)
+	t.Setenv("GARM_INTERFACE_VERSION", execcommon.Version010)
+	unsetEnv(t, "GARM_POOL_EXTRASPECS")
+	unsetEnv(t, "GARM_POOL_ID")
+	unsetEnv(t, "GARM_INSTANCE_ID")
+	if poolID != "" {
+		t.Setenv("GARM_POOL_ID", poolID)
+	}
+	if instanceID != "" {
+		t.Setenv("GARM_INSTANCE_ID", instanceID)
+	}
+}
+
+// TestGarmV021ScaleSetLifecycleReplayV010 is the interface v0.1.0 twin of
+// TestGarmV021ScaleSetLifecycleReplay — the recommended interface on GARM
+// <= v0.2.1. The stdin payload still carries the injected
+// runner_install_template (it is added before the interface wrapper runs);
+// Get/Delete arrive with no GARM_POOL_ID variable at all.
+func TestGarmV021ScaleSetLifecycleReplayV010(t *testing.T) {
+	p := newFakeProvider(t)
+	md := newMetadataServer(t)
+	b := scaleSetBootstrap(md.URL)
+
+	setV010Env(t, execcommon.CreateInstanceCommand, b.PoolID, "")
+	payload, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal bootstrap: %v", err)
+	}
+	withStdin(t, payload)
+	out, err := runCommand(t, p)
+	if err != nil {
+		t.Fatalf("CreateInstance (v0.1.0 scale-set payload) = %v, want success", err)
+	}
+	var created params.ProviderInstance
+	if err := json.Unmarshal([]byte(out), &created); err != nil || created.Name != testInstanceName {
+		t.Fatalf("CreateInstance output %q (decode err %v), want instance %q", out, err, testInstanceName)
+	}
+
+	assertListedV010(t, p, 1)
+
+	setV010Env(t, execcommon.GetInstanceCommand, "", testInstanceName)
+	out, err = runCommand(t, p)
+	if err != nil {
+		t.Fatalf("GetInstance (v0.1.0, no GARM_POOL_ID) = %v, want success", err)
+	}
+	var got params.ProviderInstance
+	if err := json.Unmarshal([]byte(out), &got); err != nil || got.Name != testInstanceName {
+		t.Fatalf("GetInstance output %q (decode err %v), want instance %q", out, err, testInstanceName)
+	}
+
+	setV010Env(t, execcommon.DeleteInstanceCommand, "", testInstanceName)
+	if _, err := runCommand(t, p); err != nil {
+		t.Fatalf("DeleteInstance (v0.1.0, no GARM_POOL_ID) = %v, want success", err)
+	}
+
+	assertListedV010(t, p, 0)
+}
+
+// assertListedV010 runs a GARM v0.2.1 v0.1.0 scale-set ListInstances.
+func assertListedV010(t *testing.T, p *provider.Provider, want int) {
+	t.Helper()
+	setV010Env(t, execcommon.ListInstancesCommand, testPseudoPoolID, "")
+	out, err := runCommand(t, p)
+	if err != nil {
+		t.Fatalf("ListInstances (v0.1.0, pseudo pool ID) = %v, want success", err)
+	}
+	var list []params.ProviderInstance
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		t.Fatalf("decoding ListInstances output %q: %v", out, err)
+	}
+	if len(list) != want {
+		t.Fatalf("ListInstances returned %d instances, want %d: %s", len(list), want, out)
+	}
+}
