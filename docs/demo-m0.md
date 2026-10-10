@@ -272,6 +272,20 @@ the DinD variant, or run a single step directly
 (`scripts/demo-m0.sh verify`, etc.) — see `scripts/demo-m0.sh --help` for
 the full command list and every environment variable it accepts.
 
+**Modes are remembered between steps.** `preflight` (and `all`) record the
+effective `PROVIDER_SOURCE`, `PROVIDER_VERSION`, `GARM_TARGET`,
+`GATE_VARIANT` and `PROVIDER_INTERFACE_VERSION` in
+`$PROVIDER_CONFIG_DIR/gate-modes` (mode 0600, plain `KEY=value` lines that
+are parsed, never sourced). A later single step run without a flag for a
+mode uses the saved value and logs `using saved <mode>=<value>`, so
+`scripts/demo-m0.sh --dind preflight` followed by a plain `pool`, `watch`,
+`verify` or `postjob` stays in the DinD variant. An explicit flag or
+environment value that conflicts with the saved one is an error rather than
+a silent switch: to change modes, re-run `preflight` with the new flags (it
+overwrites the file) or remove `gate-modes`. The file must be a regular file
+you own; a symlink or foreign owner is rejected, a loose mode is reset to
+0600, and unknown keys or invalid values abort. `--help` never reads it.
+
 No step ever reads, generates, or prints a secret: no GitHub PAT/App key, no
 GARM API token, no runner bearer token. `garm-cli`'s own stored profile is
 what authenticates against GARM; this script only shells out to it.
