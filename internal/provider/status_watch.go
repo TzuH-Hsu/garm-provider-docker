@@ -197,6 +197,14 @@ func runStatusWatch(ctx context.Context, p *Provider, req statusWatchRequest) {
 		return
 	}
 
+	if err := postStatus(ctx, reporter, metadata.RunnerStatusInstalling, statusMessageInstalling); err != nil {
+		// A runner GARM still has at "pending" cannot legally move to "idle",
+		// so there is nothing to gain from waiting for it.
+		slog.WarnContext(ctx, "status watcher: failed to report runner status installing; not waiting for the runner",
+			"instance", req.Instance, "error", req.redact(err.Error()))
+		return
+	}
+
 	ok, viaProcess, waitErr := p.waitRunnerListening(ctx, req.ContainerID, time.Until(req.Deadline))
 	status, message := metadata.RunnerStatusIdle, statusMessageIdle
 	switch {
