@@ -26,6 +26,9 @@ storage_driver = "overlay2"      # or "vfs"
 # enable_runner_callbacks: NOT a real field — the opt-in that ADR-002 designs
 # for was never implemented through M3 and is deferred (post-M4 follow-up);
 # it is intentionally absent from this example and from the config JSON Schema.
+# Runner status is reported to GARM's callback by the PROVIDER process, not the
+# container ([status_report] below, ADR-002 2026-10-11 Amendment); that needs
+# no enable_runner_callbacks opt-in because the token never enters the container.
 
 [resources]
 runner_memory = "8GiB"
@@ -49,6 +52,11 @@ internal = false  # default (2026-07-21 owner ruling, ADR-001 Amendment): the ru
 # each allocation's own separate network, not this flag. Set true only for a fully airgapped
 # job (reserved building block for a future proxy-sidecar egress-allowlist opt-in — ADR-001).
 # Also see ADR-001: the host Docker daemon must not be configured to listen on TCP.
+
+[status_report]
+timeout_seconds = 90  # default (2026-10-11, ADR-002 Amendment): bound on the wait for the runner
+# to log "Listening for Jobs" before the provider reports it idle to GARM's callback; 0 disables
+# status reporting; range 0-600. Config-only, never an extra_specs channel.
 
 # Note: the reserved-name denylist for extra_specs env (RUNNER_*, DOCKER_*, JIT_CONFIG_ENABLED,
 # GITHUB_URL, ACTIONS_RUNNER_INPUT_*, ...) is fixed by the provider itself and is not an

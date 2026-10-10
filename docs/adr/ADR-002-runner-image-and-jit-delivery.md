@@ -27,6 +27,42 @@ Status: Accepted (2026-07-19)
 > The design goal (credential invisibility to `docker inspect`, no credentials
 > on host disk) is unchanged; only the mechanism that achieves it is corrected.
 
+> **Amendment (2026-10-11): provider-side runner status reporting.** The
+> statement below that callbacks are "a latency optimization ..., not a
+> correctness requirement" does not hold for GARM v0.2.1 scale sets. GARM
+> creates every runner with runner status `pending`, and only an instance
+> callback moves it on. The scale-set job-started handler
+> (`workers/scaleset/scaleset_helper.go`) then sets `active` through a
+> *checked* update, and `params.RunnerStatusTransitions` allows `active` only
+> from `idle` or `offline`. A runner still at `pending` therefore fails that
+> update, the listener does not acknowledge the message and keeps refetching
+> it, and the scale set stalls until GARM's consolidation removes the runner.
+> Pools are not affected (their status updates are forced). Upstream relaxed
+> the transition table in `cloudbase/garm#817` (commit `1a9aeff2`), which is
+> not in any release as of 2026-10-11.
+>
+> The provider now reports status itself, from the provider process, using
+> the instance token it already holds for the credential fetch:
+> `POST {callback-url}/status` with `{"status": "installing", ...}` once the
+> credentials are delivered and the runner is verified running, then
+> `{"status": "idle", ...}` once the runner's own stdout shows
+> `Listening for Jobs` (read through the Docker logs API, bounded by
+> `[status_report].timeout_seconds`, default 90 s, `0` disables). `idle` is
+> never reported before the runner is listening: GARM's bootstrap-timeout
+> reaper only collects `pending`/`installing` runners, so a runner reported
+> `idle` early that then failed to come up would never be reaped. On timeout
+> the runner stays `installing`. Both reports are best-effort and never fail
+> `CreateInstance`. `agent_id` is omitted (GARM rejects a mismatch with the
+> value already on a scale-set row). The callback URL gets the metadata URL's
+> transport rules (https, or http to loopback only; no userinfo; CA bundle)
+> and no redirect is followed.
+>
+> The credential-invisibility design goal is unchanged: the runner container
+> still never calls GARM and never sees the instance token or the callback
+> URL; `docker inspect` output is the same as before. The
+> `enable_runner_callbacks` opt-in discussed below (which would have put the
+> token in the container) remains unbuilt and is not needed for this.
+
 ## Context
 
 GARM (see ADR-001 for the provider/GARM split of responsibilities) generates just-in-time (JIT) runner configuration for scale-set pools and expects the provider to get that configuration onto the instance it creates. The provider receives a bootstrap payload on stdin that includes an instance token; it must turn that into a running, registered GitHub Actions runner without ever letting GARM's credentials — the instance token, the metadata/callback URLs backing it, or (further upstream) the GitHub App key — reach the container's environment or filesystem. This is one of the project's explicit security red lines and the primary acceptance criterion for the M0 milestone (see plan.md): `docker inspect` of a running runner must show no host Docker socket, no GARM credentials, and no GitHub App key, in either its environment or its mounts.
@@ -65,9 +101,9 @@ In Docker-in-Docker (DinD) modes, the entrypoint's delivery-marker wait and Dock
 
 JIT config validity (~60 minutes per credential-file set) is ample headroom, since the provider fetches the credential files up front — bounded by an aggregate ≤60s deadline — and delivers them immediately after starting the container, rather than on any delayed schedule.
 
-**Runner callbacks default to off** (`enable_runner_callbacks = false` in config, ADR-005). Enabling this flag is an explicit, informed operator **opt-out** of the credential-invisibility guarantee that is this ADR's central design goal — not a minor trade-off to wave through. Turning it on puts the instance token into the runner container's environment, which means: (1) the token is visible in plaintext to anyone with `docker inspect` access on the host, and (2) it is reachable by the untrusted workflow job code running inside the runner, which could read its own environment and call the metadata service with that token on the job's own behalf. With callbacks off (the default), GARM still reconciles runner state by polling GitHub's own runner list plus this provider's stdout status responses — callbacks are a latency optimization for faster `agent_id` correlation, not a correctness requirement. plan.md's M3 milestone includes a test that enumerates exactly what becomes newly visible when callbacks are turned on, so this exposure is bounded and deliberate rather than assumed.
+**Runner callbacks default to off** (`enable_runner_callbacks = false` in config, ADR-005). Enabling this flag is an explicit, informed operator **opt-out** of the credential-invisibility guarantee that is this ADR's central design goal — not a minor trade-off to wave through. Turning it on puts the instance token into the runner container's environment, which means: (1) the token is visible in plaintext to anyone with `docker inspect` access on the host, and (2) it is reachable by the untrusted workflow job code running inside the runner, which could read its own environment and call the metadata service with that token on the job's own behalf. With callbacks off (the default), GARM still reconciles runner state by polling GitHub's own runner list plus this provider's stdout status responses — callbacks are a latency optimization for faster `agent_id` correlation, not a correctness requirement. (Superseded for GARM v0.2.1 scale sets — see the 2026-10-11 Amendment: runner *status* must reach GARM's callback, and the provider now reports it itself, without the container ever holding the token.) plan.md's M3 milestone includes a test that enumerates exactly what becomes newly visible when callbacks are turned on, so this exposure is bounded and deliberate rather than assumed.
 
-> **Status (M3-W2, unimplemented — post-M4 follow-up):** the `enable_runner_callbacks` opt-in described above was never built. There is no such field in provider config or in the self-describing config JSON Schema (`internal/config/schema.json`); setting it in TOML today does nothing, since it is silently ignored as an unknown key. GARM currently always learns runner completion via polling — the "callbacks off (the default)" behavior above is the only behavior that exists (see `internal/verify/verify_m3_scenarios_test.go`). The design rationale above (opt-out framing, the exact exposure it would create) stands unchanged for whenever the opt-in is actually implemented; that implementation work is deferred, not scheduled for any milestone through M4.
+> **Status (M3-W2, unimplemented — post-M4 follow-up):** the `enable_runner_callbacks` opt-in described above was never built. There is no such field in provider config or in the self-describing config JSON Schema (`internal/config/schema.json`); setting it in TOML today does nothing, since it is silently ignored as an unknown key. GARM currently always learns runner completion via polling — the "callbacks off (the default)" behavior above is the only in-container behavior that exists (see `internal/verify/verify_m3_scenarios_test.go`); runner status is reported by the provider process, not the container (2026-10-11 Amendment). The design rationale above (opt-out framing, the exact exposure it would create) stands unchanged for whenever the opt-in is actually implemented; that implementation work is deferred, not scheduled for any milestone through M4.
 
 **Non-JIT fallback**: needed when a pool explicitly sets `disable_jit_config`. In that case the provider fetches a registration token from `/runner-registration-token` instead of the three JIT credential files, delivers it into the container's tmpfs via the identical fetch → create → start → exec-deliver sequence described above (now carrying one token file plus the `.delivered` marker instead of three credential files), and the entrypoint runs `config.sh --ephemeral --disableupdate --token "$(cat …)"` followed by `run.sh`. Two mode-specific details matter here: (1) the base `myoung34/github-runner` image's `config.sh` refuses to run as root without `RUNNER_ALLOW_RUNASROOT=1`, so the entrypoint runs `config.sh` as the runner user via `gosu` by default (it exports `RUNNER_ALLOW_RUNASROOT=1` and runs as root only when the operator explicitly sets `RUN_AS_ROOT=true`); and (2) the entrypoint lets `config.sh` write `.runner`/`.credentials`/`.credentials_rsaparams` into the install dir normally and, **only after `config.sh` SUCCEEDS**, moves those files onto the tmpfs and replaces them with symlinks (a post-config move), leaving the non-JIT credentials tmpfs-resident at steady state, exactly like the JIT path. It deliberately does **not** pre-link the symlinks before `config.sh`: the real .NET runner's `Runner.Listener configure` reads `.credentials` in its startup `HostContext` constructor, and a pre-created dangling symlink — whose tmpfs target is not delivered in non-JIT mode (`.credentials` is created BY `config.sh` during registration) — makes that read fail (`FileNotFoundException`, exit 134) BEFORE registration runs (confirmed on a live daemon against the real runner image). JIT keeps its pre-link because all its files ARE delivered up front, so its symlinks are never dangling. A scrub-on-failure trap around the `config.sh` phase removes any credential-pattern files from the writable layer (and tmpfs) if registration fails, so no failure path leaves credentials on the writable layer. `--disableupdate` is appended unconditionally because the image is digest-managed (ADR-005). In practice, GARM scale sets force `jit_config_enabled = true` upstream, so JIT is the primary and expected path; the non-JIT fallback exists for completeness and for non-scale-set pools, and deliberately shares the same provider-side-fetch, never-a-host-temp-file, credentials-only-on-tmpfs mechanism for a uniform threat model across both paths.
 

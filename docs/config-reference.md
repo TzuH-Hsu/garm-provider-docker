@@ -183,3 +183,45 @@ set no extra env at all); add the names you trust a pool admin to set:
 # rejected even if listed here.
 allowed_env = ["MY_CI_FLAG", "TZ"]
 ```
+
+### `[status_report]` (runner status reported to GARM)
+
+After the runner container is started, its credentials are delivered, and it
+is verified running, the provider reports the runner's status to GARM's
+instance callback (`POST {callback-url}/status`, authenticated with the
+instance token it already holds for the credential fetch):
+
+1. `installing` right away;
+2. `idle` once the runner's own stdout shows `Listening for Jobs` (read
+   through the Docker logs API), waiting at most `timeout_seconds`.
+
+If the runner is not listening in time, it is left `installing`, so GARM's
+`runner_bootstrap_timeout` still reaps it if it never comes up. `idle` is never
+reported early for that reason. Both reports are best-effort: a callback error
+is logged (with the token redacted) and `CreateInstance` still succeeds. If the
+`installing` report fails, the wait and the `idle` report are skipped.
+
+This is required for **GARM v0.2.1 scale sets**: their job-started handler moves
+a runner to `active` with a checked status transition that only `idle` (or
+`offline`) may take, so a runner left at GARM's initial `pending` stalls the
+scale-set listener until GARM removes the runner. Upstream relaxed this in
+[cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817) (commit
+`1a9aeff2`), which is not in any release as of 2026-10-11. Pools work either
+way and also get accurate status.
+
+```toml
+[status_report]
+# Bound on the wait for "Listening for Jobs". Default 90; range 0-600.
+# 0 disables status reporting entirely (no callback is made).
+timeout_seconds = 90
+```
+
+| Key | Type | Default | Bound |
+|---|---|---|---|
+| `timeout_seconds` | integer | `90` | `0`–`600`; `0` disables |
+
+The callback URL gets the same transport rules as the metadata URL (https, or
+plain http only to a loopback host; no userinfo; `ca-cert-bundle` honored), and
+no redirect is followed. The runner container is unchanged: it never sees the
+instance token or the callback URL, and `docker inspect` shows neither. This
+key is config-only; `extra_specs` cannot change it.

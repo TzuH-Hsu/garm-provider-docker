@@ -136,7 +136,7 @@ Validation (`garm/runner/providers/common/common.go` `ValidateResult`): `provide
 
 ### 1.F Status/timeouts and GARM's reaper
 
-An instance MAY POST `/api/v1/callbacks/status` (`InstanceUpdateMessage{status, message, agent_id}`) and `/callbacks/system-info` with the instance JWT — this is called by the instance itself, not the provider; the provider's own stdout status is the only provider-side channel.
+An instance MAY POST `/api/v1/callbacks/status` (`InstanceUpdateMessage{status, message, agent_id}`) and `/callbacks/system-info` with the instance JWT — this is called by the instance itself, not the provider; the provider's own stdout status is the only provider-side channel. (2026-10-11: on GARM v0.2.1 scale sets a runner must reach `idle` through this callback before it can be marked `active`; this provider therefore makes the `/status` call itself from the provider process with the token it already holds — see ADR-002's 2026-10-11 Amendment.)
 
 garm reaps every 5 min: instances older than `runner_bootstrap_timeout` (default 20 min) that aren't live on GitHub → `DeleteRunner` → provider `DeleteInstance`. **The provider needs no reaper of its own**; `DeleteInstance` must simply be idempotent (exit `30`/`0` on not-found).
 
