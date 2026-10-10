@@ -1356,6 +1356,22 @@ verify_no_extra_privileges() {
   fi
 }
 
+# cache_disabled_in_config succeeds when the provider config file sets
+# `enabled = false` inside its [cache] table. [cache].enabled defaults to true
+# (internal/config/cache.go defaultCache, wired in config.go), and when the
+# cache is enabled CreateInstance provisions and mounts the shared externals
+# volume for EVERY allocation regardless of entity scope
+# (internal/provider/create.go, the "4b. Externals cache" block gated only on
+# p.cfg.Cache.Enabled). The generated gate config never touches [cache].
+cache_disabled_in_config() {
+  [[ -f "${PROVIDER_CONFIG_FILE}" ]] || return 1
+  awk '
+    /^[[:space:]]*\[/ { in_cache = ($0 ~ /^[[:space:]]*\[cache\][[:space:]]*(#.*)?$/) }
+    in_cache && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false([[:space:]]*(#.*)?)?$/ { found = 1 }
+    END { exit !found }
+  ' "${PROVIDER_CONFIG_FILE}"
+}
+
 # verify_topology checks the two OTHER per-allocation resources every
 # CreateInstance provisions alongside the runner container as of M1
 # (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's F4/
@@ -1425,7 +1441,13 @@ verify_topology() {
   case "${ext_rw}" in
     false) ok "shared externals volume is mounted read-only at ${RUNNER_EXTERNALS_DIR}" ;;
     true)  bad "shared externals volume at ${RUNNER_EXTERNALS_DIR} is mounted READ-WRITE (it is shared across repositories and must be read-only)" ;;
-    *)     log "  (informational, not PASS/FAIL: no volume mounted at ${RUNNER_EXTERNALS_DIR} - cache disabled?)" ;;
+    *)
+      if cache_disabled_in_config; then
+        log "  (informational, not PASS/FAIL: no volume mounted at ${RUNNER_EXTERNALS_DIR} - [cache] enabled = false in ${PROVIDER_CONFIG_FILE})"
+      else
+        bad "no volume mounted at ${RUNNER_EXTERNALS_DIR}, but the cache is enabled (the default) and externals are mounted for every allocation when it is"
+      fi
+      ;;
   esac
 
   verify_no_extra_privileges "${cid}" "runner container"
