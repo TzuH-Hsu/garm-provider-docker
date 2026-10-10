@@ -44,7 +44,6 @@ is specific to this provider and this demo.
 - [Troubleshooting](#troubleshooting)
 - [Recording a result](#recording-a-result)
 - [Results](#results)
-- [Operator settings the gate needed](#operator-settings-the-gate-needed)
 - [Known open issue](#known-open-issue)
 - [Still unverified](#still-unverified)
 <!-- /TOC -->
@@ -103,6 +102,20 @@ is specific to this provider and this demo.
      locally (`docker build runner-images/noble`).
 5. This repository checked out locally, with `scripts/demo-m0.sh`
    executable (`chmod +x scripts/demo-m0.sh` if needed).
+6. **Provider paths readable by GARM's service user.** GARM executes the
+   provider binary and reads its config as its own service user, so both
+   must live in a directory that user can read: not under a home
+   directory (typically not traversable by a service user) and not under
+   `/tmp` (usually cleared on reboot). The script's defaults
+   (`PROVIDER_BIN_DIR` under the checkout, `PROVIDER_CONFIG_DIR` under
+   `/tmp`) are kept for backward compatibility and the preflight warns,
+   without failing, when either resolves under `/tmp` or `$HOME`. Example:
+
+   ```sh
+   sudo install -d -m 0755 -o "$USER" /opt/garm-gate
+   export PROVIDER_BIN_DIR=/opt/garm-gate/bin PROVIDER_CONFIG_DIR=/opt/garm-gate/config
+   export GARM_URL=http://127.0.0.1:<port>   # must match the API's bind address
+   ```
 
 ## Release mode vs. source mode
 
@@ -468,28 +481,47 @@ that GARM injects, and `DeleteInstance`/`GetInstance` failed with
 `ListInstances` bug was also hit. The first two are fixed in the
 scale-set compatibility fix.
 
-**`none` variant.** Step 4(a-d) all PASS. The GitHub job succeeded. After
-the job, the runner container, the per-job network and the workspace
-volume were removed; the persistent cache volumes remain by design.
+The runs below are listed in the order they happened; each lists the
+checks it covered. Checks added to the script later were re-run live
+afterwards, as recorded.
 
-**`--dind` variant.** Step 4 verification all PASS, including: sidecar
-`Privileged=true`, no host bind mounts, runner `DOCKER_HOST` pointing at
-the shared socket volume, the runner reaching the sidecar's daemon, the
-`socket` and `dind-state` volumes, and memory limits of 6GiB (runner) /
-4GiB (sidecar). The job ran `docker run hello-world` and `docker build`
-successfully. After the job, the runner, sidecar, network, and the
-workspace, socket and `dind-state` volumes were removed.
+**Initial runs** (before the wiring checks existed):
+
+- `none` variant: Step 4(a-d) all PASS. The GitHub job succeeded. After the
+  job, the runner container, the per-job network and the workspace volume
+  were removed; the persistent cache volumes remain by design.
+- `--dind` variant: Step 4 verification all PASS, including: sidecar
+  `Privileged=true`, no host bind mounts, runner `DOCKER_HOST` pointing at
+  the shared socket volume, the runner reaching the sidecar's daemon, the
+  `socket` and `dind-state` volumes existing, and memory limits of 6GiB
+  (runner) / 4GiB (sidecar). The job ran `docker run hello-world` and
+  `docker build` successfully. After the job, the runner, sidecar,
+  network, and the workspace, socket and `dind-state` volumes were removed.
+
+**After the topology-wiring checks were added:**
+
+- `none` variant: verify all PASS, including "runner container is attached
+  to the labeled per-job network", "runner container is not attached to
+  the default 'bridge' network", and "runner container mounts the labeled
+  workspace volume at /actions-runner/_work".
+- `--dind` variant: verify all PASS, including "sidecar is attached to the
+  same labeled per-job network", "runner mounts the labeled socket volume
+  at /run", and "sidecar mounts the labeled socket volume at /run".
+
+**After the dind-state check and the architecture guard:** "sidecar mounts
+the labeled dind-state volume at /var/lib/docker" PASS. The `OS_ARCH`
+mismatch guard exits with the cross-architecture error.
+
+**After the sidecar-workspace check:** "sidecar mounts the labeled
+workspace volume at /actions-runner/_work" PASS, and the workflow step
+"shared workspace is visible to the sidecar daemon" succeeded (it printed
+"sidecar saw: ok"). All job steps succeeded: `docker run hello-world`,
+`docker build`, and the shared-workspace step.
 
 Verified as a consequence: tmpfs credential delivery against a real
 daemon, a symlinked `.runner` being accepted by `actions/runner` in JIT
 mode, the scale-set path against a live GARM, and the `--dind` variant
 against a real daemon.
-
-## Operator settings the gate needed
-
-- Put the provider binary and its config in a directory readable by
-  GARM's service user. Not under a home directory, and not `/tmp`.
-- `GARM_URL` must match the API's bind address.
 
 ## Known open issue
 
