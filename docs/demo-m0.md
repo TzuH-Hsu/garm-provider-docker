@@ -453,8 +453,8 @@ volume were removed; the persistent cache volumes remain by design.
 **`--dind` variant.** Step 4 verification all PASS, including: sidecar
 `Privileged=true`, no host bind mounts, runner `DOCKER_HOST` pointing at
 the shared socket volume, the runner reaching the sidecar's daemon, the
-`socket` and `dind-state` volumes, and memory limits of 6GiB (sidecar) /
-4GiB (runner). The job ran `docker run hello-world` and `docker build`
+`socket` and `dind-state` volumes, and memory limits of 6GiB (runner) /
+4GiB (sidecar). The job ran `docker run hello-world` and `docker build`
 successfully. After the job, the runner, sidecar, network, and the
 workspace, socket and `dind-state` volumes were removed.
 
