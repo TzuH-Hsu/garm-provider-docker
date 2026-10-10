@@ -31,6 +31,11 @@ type Provider struct {
 	// orphan sweep (ADR-001/ADR-004). It is derived from the same cli and
 	// controllerID, so it shares the Provider's stateless label-driven view.
 	topo *topology.Manager
+
+	// spawnStatusWatcher starts idle detection for a runner once CreateInstance
+	// has reported it installing (status_watch.go). It defaults to a detached
+	// watcher process; WithInProcessStatusWatcher replaces it.
+	spawnStatusWatcher statusWatcherFunc
 }
 
 // New constructs a Provider from its injected dependencies: the Docker
@@ -43,16 +48,21 @@ type Provider struct {
 // rejected here rather than silently permitting every mode. main.go's real
 // path already runs config.Load's full Validate; this is the defensive
 // construction-time guard for any other caller.
-func New(cli docker.Client, cfg config.Config, controllerID string) (*Provider, error) {
+func New(cli docker.Client, cfg config.Config, controllerID string, opts ...Option) (*Provider, error) {
 	if err := cfg.ValidateAllowedDindModes(); err != nil {
 		return nil, fmt.Errorf("invalid provider config: %w", err)
 	}
-	return &Provider{
-		cli:          cli,
-		cfg:          cfg,
-		controllerID: controllerID,
-		topo:         topology.New(cli, controllerID),
-	}, nil
+	p := &Provider{
+		cli:                cli,
+		cfg:                cfg,
+		controllerID:       controllerID,
+		topo:               topology.New(cli, controllerID),
+		spawnStatusWatcher: startDetachedWatcher,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p, nil
 }
 
 // Compile-time assertion that *Provider satisfies the FULL v0.1.1

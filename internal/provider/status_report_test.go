@@ -30,6 +30,16 @@ type statusCallbacks struct {
 	paths    []string
 }
 
+func (s *statusCallbacks) lastMessage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bodies) == 0 {
+		return ""
+	}
+	msg, _ := s.bodies[len(s.bodies)-1]["message"].(string)
+	return msg
+}
+
 func (s *statusCallbacks) seen() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,8 +196,12 @@ func TestCreateInstanceStatusDeadlineStaysInstalling(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	if got := rec.seen(); strings.Join(got, ",") != "installing" {
-		t.Fatalf("reported statuses = %v, want only [installing]", got)
+	// The watcher leaves the runner installing and records why.
+	if got := rec.seen(); strings.Join(got, ",") != "installing,installing" {
+		t.Fatalf("reported statuses = %v, want [installing installing]", got)
+	}
+	if msg := rec.lastMessage(); msg != statusMessageNotListening {
+		t.Errorf("last status message = %q, want %q", msg, statusMessageNotListening)
 	}
 	if elapsed < time.Second || elapsed > 10*time.Second {
 		t.Errorf("CreateInstance took %v, want about the 1s status_report timeout", elapsed)
@@ -214,8 +228,12 @@ func TestCreateInstanceStatusIgnoresListeningLineOnStderr(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), b); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
-	if got := rec.seen(); strings.Join(got, ",") != "installing" {
-		t.Fatalf("reported statuses = %v, want only [installing]", got)
+	// The watcher leaves the runner installing and records why.
+	if got := rec.seen(); strings.Join(got, ",") != "installing,installing" {
+		t.Fatalf("reported statuses = %v, want [installing installing]", got)
+	}
+	if msg := rec.lastMessage(); msg != statusMessageNotListening {
+		t.Errorf("last status message = %q, want %q", msg, statusMessageNotListening)
 	}
 }
 
@@ -250,8 +268,12 @@ func TestCreateInstanceStatusRunnerExitsBeforeListening(t *testing.T) {
 	if d := time.Since(start); d > 10*time.Second {
 		t.Errorf("CreateInstance waited %v for a runner that had already exited", d)
 	}
-	if got := rec.seen(); strings.Join(got, ",") != "installing" {
-		t.Fatalf("reported statuses = %v, want only [installing]", got)
+	// The watcher leaves the runner installing and records why.
+	if got := rec.seen(); strings.Join(got, ",") != "installing,installing" {
+		t.Fatalf("reported statuses = %v, want [installing installing]", got)
+	}
+	if msg := rec.lastMessage(); msg != statusMessageRunnerStopped {
+		t.Errorf("last status message = %q, want %q", msg, statusMessageRunnerStopped)
 	}
 }
 
@@ -423,6 +445,9 @@ func TestCreateInstanceStatusLogsUnreadableFallsBackToListenerProcess(t *testing
 	if got := rec.seen(); strings.Join(got, ",") != "installing,idle" {
 		t.Fatalf("reported statuses = %v, want [installing idle]", got)
 	}
+	if msg := rec.lastMessage(); msg != statusMessageIdleViaProcess {
+		t.Errorf("idle message = %q, want the process-fallback message", msg)
+	}
 	out := logs.String()
 	if !strings.Contains(out, "cannot read the runner's logs") || !strings.Contains(out, "json-file") {
 		t.Errorf("expected a warning recommending a readable log driver, logs:\n%s", out)
@@ -451,8 +476,12 @@ func TestCreateInstanceStatusLogsUnreadableListenerNeverAppears(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), b); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
-	if got := rec.seen(); strings.Join(got, ",") != "installing" {
-		t.Fatalf("reported statuses = %v, want only [installing]", got)
+	// The watcher leaves the runner installing and records why.
+	if got := rec.seen(); strings.Join(got, ",") != "installing,installing" {
+		t.Fatalf("reported statuses = %v, want [installing installing]", got)
+	}
+	if msg := rec.lastMessage(); msg != statusMessageNotListening {
+		t.Errorf("last status message = %q, want %q", msg, statusMessageNotListening)
 	}
 	if d := time.Since(start); d < time.Second || d > 10*time.Second {
 		t.Errorf("CreateInstance took %v, want about the 1s status_report timeout", d)

@@ -22,6 +22,13 @@ import (
 )
 
 func main() {
+	// The detached runner status watcher (internal/provider/status_watch.go)
+	// is this same binary re-executed with a hidden argument; it reads its
+	// request from stdin and never touches GARM's execution environment.
+	if len(os.Args) == 2 && os.Args[1] == provider.StatusWatcherArg {
+		slog.SetDefault(logging.New())
+		os.Exit(provider.RunStatusWatcher(os.Stdin))
+	}
 	os.Exit(run())
 }
 
