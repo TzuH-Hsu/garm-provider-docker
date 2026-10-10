@@ -841,6 +841,12 @@ EOF
           cd "$RUNNER_TEMP/dind-gate"
           printf 'FROM alpine:3.20\nRUN echo built-inside-dind\n' > Dockerfile
           docker build -t dind-gate:test .
+      - name: shared workspace is visible to the sidecar daemon
+        run: |
+          echo ok > "$GITHUB_WORKSPACE/gate-shared.txt"
+          out="$(docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt)"
+          echo "sidecar saw: ${out}"
+          test "${out}" = ok
       - name: hold the runner briefly for scripts/demo-m0.sh verify
         run: sleep 60
 EOF
@@ -1124,6 +1130,14 @@ verify_dind_topology() {
       bad "no labeled ${res} volume for instance ${instance}"
     fi
   done
+
+  local ws_vol
+  ws_vol="$(instance_volume_name "${instance}" workspace)"
+  if [[ -n "${ws_vol}" ]] && container_has_volume_mount "${did}" "${ws_vol}" "${RUNNER_WORKDIR}"; then
+    ok "sidecar mounts the labeled workspace volume ${ws_vol} at ${RUNNER_WORKDIR}"
+  else
+    bad "sidecar does not mount the labeled workspace volume '${ws_vol}' at ${RUNNER_WORKDIR} (a nested 'docker run -v \"\$PWD\":/work' would bind an empty path)"
+  fi
 
   local state_vol
   state_vol="$(instance_volume_name "${instance}" dind-state)"
