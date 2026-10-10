@@ -291,11 +291,14 @@ tags_to_yaml_array() {
   local -a parts
   IFS=',' read -ra parts <<< "${csv}"
   for tag in "${parts[@]}"; do
+    # Quoted: tags/names are allowlisted to [A-Za-z0-9._-], so a plain double
+    # quote is a complete YAML string escape, and it keeps tokens such as
+    # true / null / 123 from being parsed as non-strings by GitHub Actions.
     if [[ "${first}" -eq 1 ]]; then
-      out+="${tag}"
+      out+="\"${tag}\""
       first=0
     else
-      out+=", ${tag}"
+      out+=", \"${tag}\""
     fi
   done
   out+="]"
@@ -370,14 +373,17 @@ check_private_dir() {
     || die "$2 ($1) must be a real directory owned by you ($(id -un)) and not writable by group or others. Remove it or fix it (chmod go-w), or set $2 to a directory you own."
 }
 
-# ensure_private_dir creates directory "$1" ("$2" names it) with mode "$3"
-# when missing, then enforces check_private_dir.
+# ensure_private_dir creates directory "$1" ("$2" names it) when missing,
+# enforces check_private_dir, and then normalizes it to mode "$3" whether it
+# was just created or reused: a directory left at 0700 by an earlier run would
+# otherwise pass the ownership/no-group-write check yet stay unreadable to a
+# GARM service running under another account.
 ensure_private_dir() {
   if [[ ! -e "$1" && ! -L "$1" ]]; then
     mkdir -p "$1" || die "could not create $1"
-    chmod "$3" "$1" || die "could not set mode $3 on $1"
   fi
   check_private_dir "$1" "$2"
+  chmod "$3" "$1" || die "could not set mode $3 on $1 ($2); fix it manually (chmod $3 $1)"
 }
 
 # validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT /
@@ -968,7 +974,9 @@ sample_workflow_yaml() {
   local runs_on
   if [[ "${GARM_TARGET}" == "scaleset" ]]; then
     resolve_scaleset_name
-    runs_on="${SCALESET_NAME}"
+    # Quoted YAML string (name is allowlisted to [A-Za-z0-9._-]): a name such
+    # as true / null / 123 must stay a string for runs-on.
+    runs_on="\"${SCALESET_NAME}\""
   else
     runs_on="$(tags_to_yaml_array "${POOL_TAGS}")" || exit 1
   fi
