@@ -42,6 +42,24 @@
 #               allow_unpinned_runner_image=true (required for a mutable
 #               local tag). For development against uncommitted changes.
 #
+# Two dispatch targets (see GARM_TARGET below):
+#   scaleset   (default) Creates a GARM SCALE SET: GARM long-polls GitHub's
+#               message queue for jobs, so NO inbound webhook is needed and
+#               the GARM host can sit behind a NAT. The workflow targets the
+#               scale set by NAME in `runs-on`. Provider JIT delivery is
+#               forced on for scale sets (docs/research.md §1.D).
+#   pool       Creates a webhook-driven pool (the original flow). Needs
+#               GitHub to be able to reach GARM's webhook endpoint.
+#
+# Two topology variants (see GATE_VARIANT below):
+#   none       (default) dind_mode=none: the smallest, most portable slice.
+#   dind       Optional: allowed_dind_modes=["none","privileged-sidecar"], a
+#               "dind" flavor (runner 6GiB / dind 4GiB), extra_specs that
+#               select privileged-sidecar, and a test workflow that runs
+#               `docker run` and `docker build` inside the job. NOTE:
+#               privileged-sidecar runs a Privileged=true daemon on this
+#               host (ADR-001 "Residual risk") - use a disposable VM.
+#
 # Assumptions:
 #   - You are on a Linux Docker host (or macOS + Docker Desktop),
 #     linux/amd64 or linux/arm64.
@@ -56,7 +74,7 @@
 # argv or committed to an env var this script echoes.
 #
 # Usage:
-#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [COMMAND]
+#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind] [COMMAND]
 #
 # COMMAND (default: all):
 #   preflight   Step 0: environment checks; obtain the provider binary +
@@ -65,8 +83,9 @@
 #               config.toml; smoke-test the binary against it
 #   config      Step 1: print the config.toml [[provider]] snippet to
 #               register with GARM, and pause for confirmation
-#   pool        Step 2: print the garm-cli pool add command for your test
-#               repo, and pause for confirmation
+#   pool        Step 2: print the garm-cli scaleset add (or, with --pool,
+#               pool add) command for your test repo, and pause for
+#               confirmation
 #   watch       Step 3: watch docker ps / garm-cli runner list; print the
 #               sample workflow yaml to trigger
 #   verify      Step 4 (a-d): PASS/FAIL checks against the live runner
@@ -84,6 +103,10 @@
 #                   Release to validate in the default "release" mode
 #                   (equivalent to PROVIDER_VERSION=vX.Y.Z). Ignored with
 #                   --from-source. Default: v0.2.0
+#   --pool          Dispatch via a webhook-driven pool instead of a scale set
+#                   (equivalent to GARM_TARGET=pool)
+#   --dind          Run the DinD variant (privileged-sidecar) instead of
+#                   dind_mode=none (equivalent to GATE_VARIANT=dind)
 #   -h, --help      Show usage
 #
 # Environment variables (all optional unless noted - see docs/demo-m0.md):
@@ -101,6 +124,19 @@
 #                          ghcr.io/tzuh-hsu/garm-runner-noble tag whose
 #                          digest gets resolved). Ignored in "source" mode.
 #                          Default: v0.2.0
+#   GARM_TARGET           "scaleset" (default) or "pool" - see above.
+#   GATE_VARIANT          "none" (default) or "dind" - see above.
+#   SCALESET_NAME         Scale set name (= the workflow's runs-on value).
+#                          Default: garm-docker-gate-<6 random hex>, generated
+#                          once and remembered in the config dir so every
+#                          step agrees on it. Scale set labels/names cannot
+#                          be changed after creation.
+#   SCALESET_ID           GARM's scale set ID, for `scaleset runner list` and
+#                          cleanup. Looked up by name from `garm-cli scaleset
+#                          list` when unset.
+#   DIND_IMAGE_SOURCE     Mutable reference whose digest is resolved and
+#                          pinned as dind_image in the dind variant.
+#                          Default: docker:dind
 #   PROVIDER_NAME         Name this provider is registered under in GARM's
 #                          config.toml [[provider]] section.
 #                          Default: docker_demo
@@ -162,6 +198,25 @@ RELEASE_REPO_SLUG="TzuH-Hsu/garm-provider-docker"
 RELEASE_BASE_URL="https://github.com/${RELEASE_REPO_SLUG}/releases/download"
 
 POOL_TAGS="${POOL_TAGS:-docker,garm-demo}"
+
+# Dispatch target and topology variant (see the header comment).
+GARM_TARGET="${GARM_TARGET:-scaleset}"
+GATE_VARIANT="${GATE_VARIANT:-none}"
+SCALESET_NAME="${SCALESET_NAME:-}"
+SCALESET_ID="${SCALESET_ID:-}"
+
+# DinD variant only. dind_image must be digest-pinned like runner_image
+# (internal/config/dind.go's validateDindMode), so a mutable reference is
+# resolved to name@sha256:<digest> at preflight. The "dind" flavor carries the
+# memory sizing; the extra_specs below select it plus privileged-sidecar
+# (field names per internal/extraspecs/schema.json; privileged-sidecar must be
+# within the config's allowed_dind_modes ceiling, which the generated config
+# widens to exactly ["none", "privileged-sidecar"]).
+DIND_IMAGE_SOURCE="${DIND_IMAGE_SOURCE:-docker:dind}"
+readonly DIND_FLAVOR_NAME=dind
+readonly DIND_RUNNER_MEMORY=6GiB
+readonly DIND_DIND_MEMORY=4GiB
+readonly DIND_EXTRA_SPECS='{"flavor":"dind","dind_mode":"privileged-sidecar"}'
 
 # --image/--flavor are REQUIRED by `garm-cli pool add` but are provider-
 # specific and, for THIS provider, purely informational: CreateInstance
@@ -230,6 +285,48 @@ tags_to_yaml_array() {
 
 require_repo() {
   [[ -n "${REPO}" ]] || die "REPO is not set. export REPO=<garm-repo-id-or-owner/name> (see 'garm-cli repo list') and re-run."
+}
+
+# validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT early.
+validate_modes() {
+  case "${GARM_TARGET}" in
+    scaleset|pool) ;;
+    *) die "GARM_TARGET must be 'scaleset' or 'pool', got '${GARM_TARGET}'" ;;
+  esac
+  case "${GATE_VARIANT}" in
+    none|dind) ;;
+    *) die "GATE_VARIANT must be 'none' or 'dind', got '${GATE_VARIANT}'" ;;
+  esac
+}
+
+# resolve_scaleset_name fixes SCALESET_NAME for this run: the operator's
+# value, else one remembered from an earlier step in the config dir, else a
+# fresh garm-docker-gate-<6 hex>. It is persisted so `pool`, `watch` and
+# `cleanup` run as separate invocations all agree (scale set names - and
+# labels - cannot be changed after creation, and the workflow's runs-on must
+# match exactly).
+resolve_scaleset_name() {
+  [[ -z "${SCALESET_NAME}" ]] || return 0
+  local f="${PROVIDER_CONFIG_DIR}/scaleset-name"
+  if [[ -s "${f}" ]]; then
+    SCALESET_NAME="$(cat "${f}")"
+    return 0
+  fi
+  mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
+  SCALESET_NAME="garm-docker-gate-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "${SCALESET_NAME}" > "${f}"
+}
+
+# lookup_scaleset_id fills SCALESET_ID (when unset) by finding this scale
+# set's row in `garm-cli scaleset list --repo` and extracting the UUID from
+# it. Best-effort: leaves SCALESET_ID empty when the scale set is not there
+# yet (callers handle that).
+lookup_scaleset_id() {
+  [[ -z "${SCALESET_ID}" ]] || return 0
+  SCALESET_ID="$(garm-cli scaleset list --repo "${REPO}" 2>/dev/null \
+    | grep -F -- "${SCALESET_NAME}" \
+    | grep -Eo '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}' \
+    | head -n1)" || true
 }
 
 # detect_arch maps `uname -m` to the amd64/arm64 vocabulary this provider,
@@ -356,6 +453,21 @@ resolve_runner_image_digest() {
   printf '%s@%s' "${RUNNER_IMAGE_REPO}" "${digest}"
 }
 
+# resolve_dind_image_digest resolves DIND_IMAGE_SOURCE (default docker:dind,
+# a mutable tag) to name:tag@sha256:<digest> so the generated config's
+# dind_image is digest-pinned exactly like runner_image.
+resolve_dind_image_digest() {
+  require_cmd docker
+  log "Resolving digest for ${DIND_IMAGE_SOURCE} (docker buildx imagetools inspect)..." >&2
+  local digest
+  digest="$(docker buildx imagetools inspect "${DIND_IMAGE_SOURCE}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
+    || die "failed to resolve a digest for ${DIND_IMAGE_SOURCE} - can this host reach its registry?"
+  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "unexpected digest format from 'docker buildx imagetools inspect ${DIND_IMAGE_SOURCE}': '${digest}'"
+  log "Resolved ${DIND_IMAGE_SOURCE} -> ${digest}" >&2
+  printf '%s@%s' "${DIND_IMAGE_SOURCE}" "${digest}"
+}
+
 # generate_provider_config writes the demo provider config.toml. In
 # "release" mode it pins runner_image by digest and leaves digest-pin
 # enforcement ON (no allow_unpinned_runner_image) - this is meant to be
@@ -363,7 +475,7 @@ resolve_runner_image_digest() {
 # examples/config.minimal.toml). In "source" mode it points at the local
 # mutable dev tag, which requires the dev-only escape hatch.
 generate_provider_config() {
-  local runner_image="$1"
+  local runner_image="$1" dind_image="${2:-}"
   mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
@@ -393,6 +505,26 @@ runner_image = "${runner_image}"
 allow_unpinned_runner_image = true
 EOF
   fi
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    [[ -n "${dind_image}" ]] || die "internal error: dind variant requires a resolved dind_image"
+    # Top-level keys must precede any table in TOML; the base config above
+    # has no tables, so appending keys and then the flavor table is valid.
+    cat >> "${PROVIDER_CONFIG_FILE}" <<EOF
+
+# DinD variant (--dind): widen the operator ceiling so a pool/scale set's
+# extra_specs MAY select privileged-sidecar (the default ceiling is
+# ["none"], fail-closed). dind_mode itself stays at its default "none";
+# only the scale set/pool below opts in, via extra_specs. dind_image is
+# digest-pinned. privileged-sidecar runs a Privileged=true daemon on this
+# host (ADR-001 "Residual risk") - disposable hosts only.
+allowed_dind_modes = ["none", "privileged-sidecar"]
+dind_image = "${dind_image}"
+
+[flavors.${DIND_FLAVOR_NAME}]
+  runner_memory = "${DIND_RUNNER_MEMORY}"
+  dind_memory = "${DIND_DIND_MEMORY}"
+EOF
+  fi
   log "Wrote provider config: ${PROVIDER_CONFIG_FILE}"
 }
 
@@ -419,10 +551,27 @@ smoke_test_binary() {
     die "the provider binary failed GetVersion against the generated config (exit ${rc}): ${err}"
   fi
   ok "provider binary runs and loads the generated config (reported version: ${out})"
+
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    # Same Parse+Resolve path CreateInstance runs (internal/provider/v011.go's
+    # ValidatePoolInfo): proves the exact extra_specs this gate will attach
+    # is accepted by the generated config (flavor exists, privileged-sidecar
+    # is within allowed_dind_modes) BEFORE any Docker work.
+    local vrc=0
+    err="$(GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=ValidatePoolInfo \
+        GARM_CONTROLLER_ID=demo-preflight \
+        GARM_PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_FILE}" \
+        GARM_POOL_EXTRASPECS="${DIND_EXTRA_SPECS}" \
+        "${PROVIDER_BIN}" 2>&1 </dev/null)" || vrc=$?
+    if [[ "${vrc}" -ne 0 ]]; then
+      die "the provider rejected the DinD extra_specs ${DIND_EXTRA_SPECS} (exit ${vrc}): ${err}"
+    fi
+    ok "provider accepts the DinD extra_specs ${DIND_EXTRA_SPECS} (ValidatePoolInfo)"
+  fi
 }
 
 step_preflight() {
-  log "=== Step 0: preflight (mode: ${PROVIDER_SOURCE}, arch: ${OS_ARCH}) ==="
+  log "=== Step 0: preflight (source: ${PROVIDER_SOURCE}, target: ${GARM_TARGET}, variant: ${GATE_VARIANT}, arch: ${OS_ARCH}) ==="
 
   require_cmd docker
 
@@ -472,7 +621,12 @@ step_preflight() {
       ;;
   esac
 
-  generate_provider_config "${runner_image}"
+  local dind_image=""
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    dind_image="$(resolve_dind_image_digest)"
+  fi
+
+  generate_provider_config "${runner_image}" "${dind_image}"
   smoke_test_binary
 
   log "Preflight complete."
@@ -480,6 +634,7 @@ step_preflight() {
   log "  Provider binary : ${PROVIDER_BIN}"
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
   log "  Runner image    : ${runner_image}"
+  [[ -z "${dind_image}" ]] || log "  DinD image      : ${dind_image}"
 }
 
 # --- Step 1: register the provider with GARM --------------------------------
@@ -506,6 +661,9 @@ EOF
   log "ADR-005) in addition to the eight lifecycle methods this gate"
   log "exercises; omitting it (or v0.1.0) still works for everything this"
   log "gate itself checks (internal/provider/provider.go)."
+  log "The provider runs on THIS host and fetches runner credentials from GARM's"
+  log "metadata URL: that URL must be reachable from this host (GitHub never needs"
+  log "to reach it in scale-set mode)."
   log "Verify registration with: garm-cli provider list"
 
   confirm "Once the [[provider]] section above is added and GARM has been restarted/reloaded, confirm with 'garm-cli provider list' that '${PROVIDER_NAME}' appears."
@@ -514,12 +672,48 @@ EOF
 # --- Step 2: create a pool --------------------------------------------------
 
 step_pool() {
-  log "=== Step 2: create a pool against your throwaway test repo ==="
   require_repo
   [[ -n "${POOL_TAGS}" ]] || die "POOL_TAGS must not be empty."
 
-  log "Run the following against your THROWAWAY test repository (never a production one):"
-  cat <<EOF
+  # DinD variant: attach the extra_specs (validated in preflight) as the LAST
+  # option, so the printed command stays one valid continued shell command.
+  local extra_tail=""
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    extra_tail=" \\"$'\n'"  --extra-specs '${DIND_EXTRA_SPECS}'"
+  fi
+
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    log "=== Step 2: create a scale set against your throwaway test repo ==="
+    resolve_scaleset_name
+    log "Run the following against your THROWAWAY test repository (never a production one):"
+    cat <<EOF
+
+garm-cli scaleset add \\
+  --repo ${REPO} \\
+  --provider-name ${PROVIDER_NAME} \\
+  --name ${SCALESET_NAME} \\
+  --image ${POOL_IMAGE} \\
+  --flavor ${POOL_FLAVOR} \\
+  --min-idle-runners ${MIN_IDLE_RUNNERS} \\
+  --max-runners ${MAX_RUNNERS} \\
+  --os-arch ${OS_ARCH} \\
+  --os-type ${OS_TYPE} \\
+  --enabled${extra_tail}
+
+EOF
+    log "The scale set NAME (${SCALESET_NAME}) is what the workflow's runs-on"
+    log "targets (Step 3); it is remembered in ${PROVIDER_CONFIG_DIR}/scaleset-name so"
+    log "later steps agree. Scale set names and labels cannot be changed after"
+    log "creation - delete and re-create to change them. No webhook is needed:"
+    log "GARM long-polls GitHub's message queue for jobs."
+    log "List scale sets with: garm-cli scaleset list --repo ${REPO}"
+    confirm "Once the scale set is created, confirm it with 'garm-cli scaleset list --repo ${REPO}'."
+  else
+    log "=== Step 2: create a pool against your throwaway test repo ==="
+    log "Pool mode needs GitHub to reach GARM's webhook endpoint (the repo must"
+    log "have a webhook installed, e.g. 'garm-cli repo add ... --install-webhook')."
+    log "Run the following against your THROWAWAY test repository (never a production one):"
+    cat <<EOF
 
 garm-cli pool add \\
   --repo ${REPO} \\
@@ -531,25 +725,34 @@ garm-cli pool add \\
   --max-runners ${MAX_RUNNERS} \\
   --os-arch ${OS_ARCH} \\
   --os-type ${OS_TYPE} \\
-  --tags ${POOL_TAGS}
+  --tags ${POOL_TAGS}${extra_tail}
 
 EOF
+    log "List pools with: garm-cli pool list --repo ${REPO}"
+    confirm "Once the pool is created, confirm it with 'garm-cli pool list --repo ${REPO}'."
+  fi
   log "--image/--flavor are required by garm-cli but are informational only"
   log "for this provider (see the note above POOL_IMAGE/POOL_FLAVOR in this"
   log "script); --os-arch ${OS_ARCH} was auto-detected from this host (override"
   log "with OS_ARCH=amd64|arm64)."
   log "min-idle-runners=0 / max-runners=1 by design: this gate only ever"
   log "needs one runner to exist at a time."
-  log "List pools with: garm-cli pool list --repo ${REPO}"
-
-  confirm "Once the pool is created, confirm it with 'garm-cli pool list --repo ${REPO}'."
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    log "extra_specs selects the '${DIND_FLAVOR_NAME}' flavor (runner ${DIND_RUNNER_MEMORY} / dind ${DIND_DIND_MEMORY})"
+    log "and privileged-sidecar; both are bounded by the generated config."
+  fi
 }
 
 # --- Step 3: watch --------------------------------------------------------
 
 sample_workflow_yaml() {
   local runs_on
-  runs_on="$(tags_to_yaml_array "${POOL_TAGS}")"
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    resolve_scaleset_name
+    runs_on="${SCALESET_NAME}"
+  else
+    runs_on="$(tags_to_yaml_array "${POOL_TAGS}")"
+  fi
   cat <<EOF
 name: garm-m0-demo
 on:
@@ -562,16 +765,54 @@ jobs:
         run: |
           echo hello
           env | sort | head
+EOF
+  if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    cat <<'EOF'
+      - name: docker run inside the job (DinD sidecar)
+        run: |
+          docker version
+          docker run --rm hello-world
+      - name: docker build inside the job (DinD sidecar)
+        run: |
+          mkdir -p "$RUNNER_TEMP/dind-gate"
+          cd "$RUNNER_TEMP/dind-gate"
+          printf 'FROM alpine:3.20\nRUN echo built-inside-dind\n' > Dockerfile
+          docker build -t dind-gate:test .
+      - name: hold the runner briefly for scripts/demo-m0.sh verify
+        run: sleep 60
+EOF
+  else
+    cat <<'EOF'
           # Keep the job alive briefly so 'scripts/demo-m0.sh verify' has a
           # window to inspect the live runner container before it exits -
           # this runner is single-job ephemeral by design (ADR-002).
           sleep 30
 EOF
+  fi
+}
+
+# watch_runner_list prints GARM's own view of this gate's runners: the scale
+# set's runners (`garm-cli scaleset runner list <id>`) in scale-set mode, the
+# repo's runners in pool mode.
+watch_runner_list() {
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    lookup_scaleset_id
+    if [[ -n "${SCALESET_ID}" ]]; then
+      garm-cli scaleset runner list "${SCALESET_ID}" || true
+    else
+      warn "scale set '${SCALESET_NAME}' not found yet in 'garm-cli scaleset list --repo ${REPO}' (set SCALESET_ID to skip the lookup)"
+    fi
+  else
+    garm-cli runner list --repo "${REPO}" || true
+  fi
 }
 
 step_watch() {
   log "=== Step 3: trigger the workflow and watch the runner come up ==="
   require_repo
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    resolve_scaleset_name
+  fi
 
   log "Copy the following into <your-test-repo>/.github/workflows/garm-m0-demo.yml,"
   log "commit/push it, then trigger it (Actions tab > Run workflow, or"
@@ -580,7 +821,7 @@ step_watch() {
   sample_workflow_yaml
   echo
 
-  log "Watching docker ps (managed containers) + garm-cli runner list, every ${WATCH_INTERVAL_SECONDS}s"
+  log "Watching docker ps (managed containers) + GARM's runner list, every ${WATCH_INTERVAL_SECONDS}s"
   log "(Ctrl+C to stop early and move on to Step 4; stops on its own after ${WATCH_MAX_ITERATIONS} iterations, 0 = unbounded)."
 
   trap 'log "stopping watch (Ctrl+C)"; trap - INT; return 0' INT
@@ -590,7 +831,7 @@ step_watch() {
     echo "--- $(date -u +%FT%TZ) ---"
     docker ps --filter 'label=garm.docker/managed=true' \
       --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Labels}}' || true
-    garm-cli runner list --repo "${REPO}" || true
+    watch_runner_list
     sleep "${WATCH_INTERVAL_SECONDS}"
     iterations=$(( iterations + 1 ))
   done
@@ -682,6 +923,116 @@ verify_topology() {
   log "  (informational, not PASS/FAIL: ${cache_vols} garm.docker/cache=true volume(s) present - toolcache/pnpm/externals/diag persist across jobs by design, ADR-003)"
 }
 
+# verify_no_host_mounts fails if container "$1" ("$2" names it in output) has
+# ANY bind mount or any docker.sock mount. This provider creates only named
+# volumes and a tmpfs - no code path emits a bind mount (git grep
+# 'TypeBind|Binds' internal/) - so "no bind mount at all" is the stronger,
+# still-true form of "no host docker.sock", and it applies to the DinD
+# sidecar too (it serves its own daemon over a named socket volume).
+verify_no_host_mounts() {
+  local cid="$1" what="$2" mount_types
+  mount_types="$(docker inspect -f '{{range .Mounts}}{{.Type}}{{"\n"}}{{end}}' "${cid}")"
+  if printf '%s\n' "${mount_types}" | grep -qx bind; then
+    bad "${what}: found a bind mount (this provider only creates named volumes and a tmpfs) - check for a docker.sock bind"
+  else
+    ok "${what}: no host bind mount, no host docker.sock"
+  fi
+}
+
+# verify_dind_topology checks the privileged-sidecar allocation (ADR-001):
+# the role=dind sidecar container and its labels, Privileged=true (the one
+# deliberate exception, documented residual risk), no bind mounts, the
+# runner's DOCKER_HOST, the labeled socket and dind-state volumes, and the
+# flavor's memory limits. For the none variant it instead asserts that NO
+# sidecar exists.
+verify_dind_topology() {
+  local cid="$1" instance did
+  instance="$(label_value "${cid}" garm.docker/instance-name)"
+  did="$(docker ps -a --filter 'label=garm.docker/managed=true' \
+    --filter 'label=garm.docker/role=dind' \
+    --filter "label=garm.docker/instance-name=${instance}" -q | head -n1)"
+
+  if [[ "${GATE_VARIANT}" != "dind" ]]; then
+    log "-- (b, continued) no DinD sidecar in dind_mode=none --"
+    if [[ -z "${did}" ]]; then
+      ok "no role=dind sidecar exists for instance ${instance}"
+    else
+      bad "unexpected DinD sidecar ${did} in the none variant"
+    fi
+    return
+  fi
+
+  log "-- (b, continued) DinD sidecar topology (privileged-sidecar) --"
+  if [[ -z "${did}" ]]; then
+    bad "no role=dind sidecar container found for instance ${instance}"
+    return
+  fi
+  ok "DinD sidecar container exists (${did})"
+  if [[ "$(label_value "${did}" garm.docker/managed)" == "true" ]]; then
+    ok "sidecar: garm.docker/managed=true"
+  else
+    bad "sidecar: garm.docker/managed is not 'true'"
+  fi
+  if [[ -n "$(label_value "${did}" garm.docker/controller-id)" ]]; then
+    ok "sidecar: garm.docker/controller-id is set"
+  else
+    bad "sidecar: garm.docker/controller-id is missing"
+  fi
+  if [[ "$(label_value "${did}" garm.docker/instance-name)" == "${instance}" ]]; then
+    ok "sidecar: garm.docker/instance-name matches the runner's"
+  else
+    bad "sidecar: garm.docker/instance-name does not match the runner's"
+  fi
+
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${did}")" == "true" ]]; then
+    ok "sidecar is running"
+  else
+    bad "sidecar is not running"
+  fi
+  if [[ "$(docker inspect -f '{{.HostConfig.Privileged}}' "${did}")" == "true" ]]; then
+    ok "sidecar is Privileged=true (expected for privileged-sidecar; ADR-001 residual risk)"
+  else
+    bad "sidecar is not Privileged=true - not the privileged-sidecar mode this variant requests"
+  fi
+  verify_no_host_mounts "${did}" "DinD sidecar"
+
+  if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cid}" | grep -qx 'DOCKER_HOST=unix:///run/docker.sock'; then
+    ok "runner DOCKER_HOST=unix:///run/docker.sock (the shared socket volume, not a host socket)"
+  else
+    bad "runner DOCKER_HOST is not unix:///run/docker.sock"
+  fi
+  if docker exec "${cid}" docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    ok "runner container reaches the sidecar's daemon via DOCKER_HOST"
+  else
+    bad "runner container cannot reach the sidecar's daemon ('docker exec ${cid} docker version' failed)"
+  fi
+
+  local res
+  for res in socket dind-state; do
+    if [[ -n "$(docker volume ls --filter 'label=garm.docker/managed=true' \
+        --filter "label=garm.docker/resource=${res}" \
+        --filter "label=garm.docker/instance-name=${instance}" -q | head -n1)" ]]; then
+      ok "labeled ${res} volume exists"
+    else
+      bad "no labeled ${res} volume for instance ${instance}"
+    fi
+  done
+
+  local runner_mem dind_mem
+  runner_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "${cid}")"
+  dind_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "${did}")"
+  if [[ "${runner_mem}" == "6442450944" ]]; then
+    ok "runner memory limit is ${DIND_RUNNER_MEMORY} (flavor ${DIND_FLAVOR_NAME})"
+  else
+    bad "runner memory limit is ${runner_mem}, expected 6442450944 (${DIND_RUNNER_MEMORY})"
+  fi
+  if [[ "${dind_mem}" == "4294967296" ]]; then
+    ok "sidecar memory limit is ${DIND_DIND_MEMORY} (flavor ${DIND_FLAVOR_NAME})"
+  else
+    bad "sidecar memory limit is ${dind_mem}, expected 4294967296 (${DIND_DIND_MEMORY})"
+  fi
+}
+
 verify_no_credentials_in_inspect() {
   local cid="$1"
   log "-- (b) docker inspect: no credentials, no host docker.sock --"
@@ -700,12 +1051,12 @@ verify_no_credentials_in_inspect() {
     ok "no BEARER_TOKEN/METADATA_URL/CALLBACK_URL-like variable name in Config.Env"
   fi
 
-  local mounts_json
-  mounts_json="$(docker inspect -f '{{json .Mounts}}' "${cid}")"
-  if printf '%s' "${mounts_json}" | grep -q '/var/run/docker.sock'; then
-    bad "found a /var/run/docker.sock mount on the runner container"
+  verify_no_host_mounts "${cid}" "runner container"
+
+  if [[ "$(docker inspect -f '{{.HostConfig.Privileged}}' "${cid}")" == "false" ]]; then
+    ok "runner container is not privileged"
   else
-    ok "no host docker.sock mount"
+    bad "runner container is Privileged=true (only the DinD sidecar may ever be)"
   fi
 }
 
@@ -777,6 +1128,7 @@ step_verify() {
   verify_labels "${cid}"
   verify_topology "${cid}"
   verify_no_credentials_in_inspect "${cid}"
+  verify_dind_topology "${cid}"
   verify_tmpfs_delivery "${cid}"
   verify_symlink_compat "${cid}"
 
@@ -849,15 +1201,26 @@ step_cleanup() {
   else
     image_cleanup_line="  # (release mode pulled ${RUNNER_IMAGE_REPO}@sha256:... by digest; 'docker image ls' / 'docker image rm' it by digest if you want the disk space back)"
   fi
+  local target_cleanup
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    local sid="${SCALESET_ID:-<SCALESET_ID>}"
+    target_cleanup="  # 1. Disable and delete the demo scale set (it must have no runners left)
+  garm-cli scaleset list --repo ${REPO:-<your-repo>}
+  garm-cli scaleset update ${sid} --enabled=false
+  garm-cli scaleset runner list ${sid}        # confirm no runners remain
+  garm-cli scaleset delete ${sid}"
+  else
+    target_cleanup="  # 1. Disable and delete the demo pool (garm-cli requires it to be empty first)
+  garm-cli pool list --repo ${REPO:-<your-repo>}
+  garm-cli pool update <POOL_ID> --enabled=false
+  garm-cli runner list <POOL_ID>              # confirm no runners remain
+  garm-cli pool delete <POOL_ID>"
+  fi
   cat <<EOF
 
 Manual cleanup once you're done with the demo:
 
-  # 1. Disable and delete the demo pool (garm-cli requires it to be empty first)
-  garm-cli pool list --repo ${REPO:-<your-repo>}
-  garm-cli pool update <POOL_ID> --enabled=false
-  garm-cli runner list <POOL_ID>              # confirm no runners remain
-  garm-cli pool delete <POOL_ID>
+${target_cleanup}
 
   # 2. Confirm no leftover managed Docker resources for this controller
   #    (should already be empty if Step 4(e) passed)
@@ -887,12 +1250,12 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [COMMAND]
+Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind] [COMMAND]
 
 COMMAND (default: all):
   preflight   Step 0: environment checks; obtain the provider binary + runner image, generate demo config, smoke-test it
   config      Step 1: print the config.toml [[provider]] snippet to register with GARM
-  pool        Step 2: print the garm-cli pool add command for your test repo
+  pool        Step 2: print the garm-cli scaleset add (or, with --pool, pool add) command for your test repo
   watch       Step 3: watch docker ps / garm-cli runner list; print the sample workflow yaml
   verify      Step 4(a-d): PASS/FAIL checks against the live runner container, job network, and workspace volume
   postjob     Step 4(e): PASS/FAIL checks after the job has finished
@@ -906,6 +1269,11 @@ Flags:
                        (equivalent to PROVIDER_SOURCE=source)
   --version vX.Y.Z    Release to validate in the default "release" mode
                        (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.0
+  --pool              Dispatch via a webhook-driven pool instead of the default
+                       scale set (equivalent to GARM_TARGET=pool). Needs GitHub
+                       to be able to reach GARM's webhook endpoint.
+  --dind              DinD variant: privileged-sidecar + docker run/build in the
+                       job, instead of dind_mode=none (GATE_VARIANT=dind)
   -h, --help          Show this help
 
 See docs/demo-m0.md for prerequisites, environment variables, what each
@@ -925,6 +1293,8 @@ while [[ $# -gt 0 ]]; do
       PROVIDER_VERSION="$2"
       shift 2
       ;;
+    --pool) GARM_TARGET="pool"; shift ;;
+    --dind) GATE_VARIANT="dind"; shift ;;
     -h|--help) usage; exit 0 ;;
     preflight|config|pool|watch|verify|postjob|cleanup|all) COMMAND="$1"; shift ;;
     *) usage >&2; die "unknown argument: $1" ;;
@@ -944,6 +1314,7 @@ run_all() {
 }
 
 main() {
+  validate_modes
   case "${COMMAND}" in
     preflight) step_preflight ;;
     config)    step_config ;;
