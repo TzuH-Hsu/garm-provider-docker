@@ -1007,10 +1007,15 @@ verify_labels() {
 }
 
 # Runner workdir and DinD socket dir; keep in sync with internal/spec
-# (RunnerWorkDir in mounts.go, DindSocketDir and DindStateDir in dind.go).
+# (RunnerWorkDir in mounts.go, DindSocketDir, DindStateDir and
+# DindSocketGID in dind.go, RunnerExternalsDir in externals.go, CredentialDir
+# in mounts.go).
 RUNNER_WORKDIR="/actions-runner/_work"
 DIND_SOCKET_DIR="/run"
 DIND_STATE_DIR="/var/lib/docker"
+RUNNER_EXTERNALS_DIR="/actions-runner/externals"
+RUNNER_CRED_DIR="/run/garm"
+DIND_SOCKET_GID="2000"
 
 # job_network_name prints the name of the labeled per-job network of instance "$1".
 job_network_name() {
@@ -1041,6 +1046,45 @@ container_networks() {
 container_has_volume_mount() {
   docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Destination}}{{println}}{{end}}' "$1" \
     | grep -qxF "volume|$2|$3"
+}
+
+# container_networks_are_exactly succeeds when container "$1" is attached to
+# exactly one network and it is named "$2" (the spec sets the per-job network
+# as the SOLE attachment via NetworkMode).
+container_networks_are_exactly() {
+  [[ "$(container_networks "$1" | sed '/^$/d')" == "$2" ]]
+}
+
+# container_mount_dests prints the sorted mount destinations of container "$1".
+container_mount_dests() {
+  docker inspect -f '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' "$1" | sed '/^$/d' | sort
+}
+
+# container_mount_rw prints "true"/"false" for the RW flag of the mount of
+# container "$1" at destination "$2", or nothing when there is no such mount.
+container_mount_rw() {
+  docker inspect -f '{{range .Mounts}}{{.Destination}}|{{.RW}}{{println}}{{end}}' "$1" \
+    | awk -F'|' -v d="$2" '$1 == d { print $2; exit }'
+}
+
+# verify_no_extra_privileges checks "$1" ("$2" names it) has none of the
+# privilege widenings the spec never sets on the runner: no added
+# capabilities, devices or security options, and no host PID/IPC/UTS/user
+# namespace.
+verify_no_extra_privileges() {
+  local cid="$1" what="$2" extras ns
+  extras="$(docker inspect -f '{{len .HostConfig.CapAdd}} {{len .HostConfig.Devices}} {{len .HostConfig.SecurityOpt}}' "${cid}")"
+  if [[ "${extras}" == "0 0 0" ]]; then
+    ok "${what}: no added capabilities, devices or security options"
+  else
+    bad "${what}: unexpected CapAdd/Devices/SecurityOpt counts '${extras}' (spec sets none)"
+  fi
+  ns="$(docker inspect -f '{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}|{{.HostConfig.UTSMode}}|{{.HostConfig.UsernsMode}}' "${cid}")"
+  if printf '%s\n' "${ns}" | grep -qw host; then
+    bad "${what}: shares a host namespace (${ns})"
+  else
+    ok "${what}: no host PID/IPC/UTS/user namespace"
+  fi
 }
 
 # verify_topology checks the two OTHER per-allocation resources every
@@ -1077,6 +1121,11 @@ verify_topology() {
     else
       ok "runner container is not attached to the default 'bridge' network"
     fi
+    if container_networks_are_exactly "${cid}" "${net_name}"; then
+      ok "runner container's only network is the per-job network"
+    else
+      bad "runner container is attached to more than the per-job network"
+    fi
   fi
 
   local vol_name
@@ -1091,6 +1140,26 @@ verify_topology() {
       bad "runner container does not mount the labeled workspace volume ${vol_name} at ${RUNNER_WORKDIR}"
     fi
   fi
+
+  local tmpfs_opts
+  tmpfs_opts="$(docker inspect -f '{{index .HostConfig.Tmpfs "'"${RUNNER_CRED_DIR}"'"}}' "${cid}" 2>/dev/null)"
+  if [[ -n "${tmpfs_opts}" ]] \
+      && [[ ",${tmpfs_opts}," == *,noexec,* && ",${tmpfs_opts}," == *,nosuid,* && ",${tmpfs_opts}," == *,nodev,* \
+            && ",${tmpfs_opts}," == *,mode=0700,* && ",${tmpfs_opts}," == *,uid=1001,* && ",${tmpfs_opts}," == *,gid=1001,* ]]; then
+    ok "credential tmpfs at ${RUNNER_CRED_DIR} is noexec,nosuid,nodev, mode 0700, owned by the runner uid/gid"
+  else
+    bad "credential tmpfs at ${RUNNER_CRED_DIR} has unexpected options: '${tmpfs_opts}'"
+  fi
+
+  local ext_rw
+  ext_rw="$(container_mount_rw "${cid}" "${RUNNER_EXTERNALS_DIR}")"
+  case "${ext_rw}" in
+    false) ok "shared externals volume is mounted read-only at ${RUNNER_EXTERNALS_DIR}" ;;
+    true)  bad "shared externals volume at ${RUNNER_EXTERNALS_DIR} is mounted READ-WRITE (it is shared across repositories and must be read-only)" ;;
+    *)     log "  (informational, not PASS/FAIL: no volume mounted at ${RUNNER_EXTERNALS_DIR} - cache disabled?)" ;;
+  esac
+
+  verify_no_extra_privileges "${cid}" "runner container"
 
   local cache_vols
   cache_vols="$(docker volume ls --filter 'label=garm.docker/cache=true' --format '{{.Name}}' | wc -l | tr -d ' ')"
@@ -1200,6 +1269,24 @@ verify_dind_topology() {
     bad "sidecar does not mount the labeled workspace volume '${ws_vol}' at ${RUNNER_WORKDIR} (a nested 'docker run -v \"\$PWD\":/work' would bind an empty path)"
   fi
 
+  if [[ "$(container_mount_dests "${did}" | tr '\n' ' ')" == "${RUNNER_WORKDIR} ${DIND_SOCKET_DIR} ${DIND_STATE_DIR} " ]]; then
+    ok "sidecar has exactly the socket, dind-state and workspace mounts (no cache volumes)"
+  else
+    bad "sidecar mount destinations are not exactly {${RUNNER_WORKDIR}, ${DIND_SOCKET_DIR}, ${DIND_STATE_DIR}}: $(container_mount_dests "${did}" | tr '\n' ' ')"
+  fi
+  if docker inspect -f '{{range .HostConfig.GroupAdd}}{{.}}{{println}}{{end}}' "${cid}" | grep -qx "${DIND_SOCKET_GID}"; then
+    ok "runner has supplementary group ${DIND_SOCKET_GID} (the dockerd socket group)"
+  else
+    bad "runner is missing supplementary group ${DIND_SOCKET_GID} (the unprivileged runner user could not use the socket)"
+  fi
+  local sns
+  sns="$(docker inspect -f '{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}|{{.HostConfig.UTSMode}}|{{.HostConfig.UsernsMode}}' "${did}")"
+  if printf '%s\n' "${sns}" | grep -qw host; then
+    bad "sidecar shares a host namespace (${sns})"
+  else
+    ok "sidecar: no host PID/IPC/UTS/user namespace (privileged, but not sharing host namespaces)"
+  fi
+
   local state_vol
   state_vol="$(instance_volume_name "${instance}" dind-state)"
   if [[ -n "${state_vol}" ]] && container_has_volume_mount "${did}" "${state_vol}" "${DIND_STATE_DIR}"; then
@@ -1214,6 +1301,11 @@ verify_dind_topology() {
     ok "sidecar is attached to the same labeled per-job network ${net_name}"
   else
     bad "sidecar is not attached to the labeled per-job network '${net_name}'"
+  fi
+  if [[ -n "${net_name}" ]] && container_networks_are_exactly "${did}" "${net_name}"; then
+    ok "sidecar's only network is the per-job network (not attached to the default 'bridge')"
+  else
+    bad "sidecar is attached to more than the per-job network (or to the default 'bridge'): $(container_networks "${did}" | tr '\n' ' ')"
   fi
   sock_vol="$(instance_volume_name "${instance}" socket)"
   if [[ -n "${sock_vol}" ]] && container_has_volume_mount "${cid}" "${sock_vol}" "${DIND_SOCKET_DIR}"; then
