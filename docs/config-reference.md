@@ -195,6 +195,23 @@ instance token it already holds for the credential fetch):
 2. `idle` once the runner's own stdout shows `Listening for Jobs` (read
    through the Docker logs API), waiting at most `timeout_seconds`.
 
+Only **JIT** runners are reported (scale sets always use JIT; pools do unless
+`disable_jit_config` is set). A non-JIT runner registers inside the container,
+so GARM has no agent ID for it until its own bootstrap reports one with `idle`;
+an ID-less report would leave GARM unable to remove the runner's GitHub
+registration on delete. Non-JIT pools do not need the reports: pools move
+runners to `active` with forced updates.
+
+**Log driver.** Detection reads the runner's stdout through the Docker logs
+API, which works with the daemon's default `json-file` and `local` drivers (and
+remote drivers with dual logging enabled). With the `none` driver the daemon
+refuses to return logs ("configured logging driver does not support reading"),
+so the provider falls back to waiting for the runner's `Runner.Listener`
+process (via `docker top`) to stay up for 5 seconds, within the same
+`timeout_seconds`, and logs a warning. The fallback is weaker evidence (the
+listener process starts slightly before it is connected to GitHub), so prefer a
+readable log driver. The provider never changes the container's log driver.
+
 If the runner is not listening in time, it is left `installing`, so GARM's
 `runner_bootstrap_timeout` still reaps it if it never comes up. `idle` is never
 reported early for that reason. Both reports are best-effort: a callback error

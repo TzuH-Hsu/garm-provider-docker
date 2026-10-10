@@ -57,6 +57,25 @@ Status: Accepted (2026-07-19)
 > transport rules (https, or http to loopback only; no userinfo; CA bundle)
 > and no redirect is followed.
 >
+> Status is reported for **JIT runners only**. GARM stores a JIT runner's
+> agent ID when it generates the JIT config (scale sets:
+> `workers/scaleset/scaleset.go`; pools: `runner/pool/pool.go`), so omitting
+> `agent_id` is safe. A non-JIT runner registers inside the container, GARM
+> has no agent ID for it, and its own bootstrap would send one with `idle`;
+> an ID-less `idle` would leave the row at agent ID 0, and GARM skips
+> removing the GitHub registration of such a runner on delete. Non-JIT only
+> occurs on pools, which move runners to `active` with forced updates
+> (`runner/pool/pool.go` `setInstanceRunnerStatus`), so they lose nothing.
+>
+> If the daemon cannot return the runner's logs (log driver `none`, which
+> answers HTTP 501 "configured logging driver does not support reading", or
+> a remote driver with dual logging disabled), readiness falls back to the
+> `Runner.Listener` process appearing in `docker top` and staying up for 5 s,
+> within the same timeout, and a warning recommends a readable log driver.
+> This is weaker evidence than the "Listening for Jobs" line (the listener
+> process starts before its session with GitHub is open). The provider does
+> not override the container's log driver.
+>
 > The credential-invisibility design goal is unchanged: the runner container
 > still never calls GARM and never sees the instance token or the callback
 > URL; `docker inspect` output is the same as before. The
