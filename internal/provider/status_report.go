@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -121,6 +122,7 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		InstanceToken: b.InstanceToken,
 		CACertBundle:  b.CACertBundle,
 		Deadline:      time.Now().Add(sr.Timeout()),
+		ProxyEnv:      currentProxyEnv(),
 	}
 	if err := p.spawnStatusWatcher(ctx, req); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: could not start the runner status watcher; the runner stays installing (continuing)",
@@ -182,6 +184,9 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 		slog.WarnContext(ctx, "cannot read the runner's logs; falling back to watching for the runner listener process, which is weaker evidence that the runner is online than its \"Listening for Jobs\" line. Use a log driver the daemon can read back (json-file or local, or enable dual logging) for exact detection",
 			"container_id", containerID, "error", err)
 		ok, err := p.waitListenerProcess(waitCtx, containerID)
+		if ok {
+			ok, err = p.confirmRunning(waitCtx, containerID)
+		}
 		return ok, true, err
 	}
 	defer rc.Close()
@@ -194,12 +199,35 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 	}()
 
 	if containsLine(pr, runnerListeningMarker) {
-		return true, false, nil
+		// A stopped container's logs still replay its buffered lines, so the
+		// marker alone does not prove the runner is still up.
+		ok, err := p.confirmRunning(waitCtx, containerID)
+		return ok, false, err
 	}
 	if waitCtx.Err() != nil {
 		return false, false, waitCtx.Err()
 	}
 	return false, false, errLogStreamEnded
+}
+
+// confirmRunning checks, after a readiness signal, that the runner container
+// is still running. A runner that printed "Listening for Jobs" (or whose
+// listener process was seen) and then exited must not be reported idle:
+// GARM's bootstrap reaper only collects pending/installing runners, so an
+// idle report would strand it.
+func (p *Provider) confirmRunning(ctx context.Context, containerID string) (bool, error) {
+	info, err := p.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, errRunnerStopped
+		}
+		return false, fmt.Errorf("inspecting the runner container: %w", err)
+	}
+	st := info.State
+	if st == nil || !st.Running || st.Restarting || st.Paused || st.Dead || st.OOMKilled {
+		return false, errRunnerStopped
+	}
+	return true, nil
 }
 
 // waitListenerProcess polls the container's process list until the

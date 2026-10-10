@@ -208,8 +208,9 @@ func TestRunStatusWatchStopsAtDeadline(t *testing.T) {
 }
 
 // fakeDockerAPI is a minimal Docker Engine API for the detached watcher: it
-// answers the SDK's version negotiation and serves one container's logs as a
-// real daemon does for a non-TTY container (stdcopy frames, stream kept open).
+// answers the SDK's version negotiation, reports one container as running, and
+// serves its logs as a real daemon does for a non-TTY container (stdcopy
+// frames, stream kept open).
 func fakeDockerAPI(t *testing.T, containerID, line string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +218,9 @@ func fakeDockerAPI(t *testing.T, containerID, line string) *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/_ping"):
 			w.Header().Set("Api-Version", "1.47")
 			_, _ = w.Write([]byte("OK"))
+		case strings.HasSuffix(r.URL.Path, "/containers/"+containerID+"/json"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"` + containerID + `","State":{"Status":"running","Running":true}}`))
 		case strings.HasSuffix(r.URL.Path, "/containers/"+containerID+"/logs"):
 			w.Header().Set("Content-Type", "application/vnd.docker.multiplexed-stream")
 			payload := []byte(line + "\n")
@@ -275,5 +279,157 @@ func TestDetachedWatcherReportsIdleAfterParentReturns(t *testing.T) {
 	defer rec.mu.Unlock()
 	if len(rec.auths) == 0 || rec.auths[len(rec.auths)-1] != testMetadataToken {
 		t.Errorf("idle report Authorization = %v, want the instance token from the stdin request", rec.auths)
+	}
+}
+
+// TestCreateInstanceRunnerExitsAfterListening: a runner that printed the
+// listening line and then exited is not reported idle — a stopped
+// container's logs still replay the line, so readiness is confirmed against
+// the container's state.
+func TestCreateInstanceRunnerExitsAfterListening(t *testing.T) {
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	p, fake := newTestProvider(t)
+	b := statusBootstrap(meta.URL, "")
+	runner := spec.RunnerContainerName(b.Name)
+	cb, rec := newStatusCallbackServer(t, func(status string) int {
+		if status == "installing" {
+			printRunnerOnline(fake, runner)
+			if info, err := fake.ContainerInspect(context.Background(), runner); err == nil {
+				fake.SetState(info.ID, "exited", false)
+			}
+		}
+		return 0
+	})
+	b.CallbackURL = cb.URL + "/api/v1/callbacks"
+
+	if _, err := p.CreateInstance(context.Background(), b); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if got := rec.seen(); strings.Join(got, ",") != "installing,installing" || rec.lastMessage() != statusMessageRunnerStopped {
+		t.Fatalf("reports = %v / %q, want [installing installing] with the stopped message", got, rec.lastMessage())
+	}
+}
+
+func TestConfirmRunning(t *testing.T) {
+	p, fake := newTestProvider(t)
+	for _, tt := range []struct {
+		name  string
+		state string
+		oom   bool
+		want  bool
+	}{
+		{"running", "running", false, true},
+		{"exited", "exited", false, false},
+		{"dead", "dead", false, false},
+		{"oom killed", "running", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			id := startFakeRunnerNamed(t, fake, "confirm-"+strings.ReplaceAll(tt.name, " ", "-"))
+			fake.SetState(id, tt.state, tt.oom)
+			ok, err := p.confirmRunning(context.Background(), id)
+			if ok != tt.want {
+				t.Fatalf("confirmRunning = %v (%v), want %v", ok, err, tt.want)
+			}
+			if !ok && !errors.Is(err, errRunnerStopped) {
+				t.Errorf("error = %v, want errRunnerStopped", err)
+			}
+		})
+	}
+	if ok, err := p.confirmRunning(context.Background(), "missing"); ok || !errors.Is(err, errRunnerStopped) {
+		t.Errorf("missing container: %v, %v; want false, errRunnerStopped", ok, err)
+	}
+}
+
+func startFakeRunnerNamed(t *testing.T, fake *docker.FakeClient, name string) string {
+	t.Helper()
+	created, err := fake.ContainerCreate(context.Background(), &container.Config{Image: "img"}, nil, nil, nil, name)
+	if err != nil {
+		t.Fatalf("ContainerCreate: %v", err)
+	}
+	if err := fake.ContainerStart(context.Background(), created.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("ContainerStart: %v", err)
+	}
+	return created.ID
+}
+
+// TestCreateInstanceCarriesProxyEnv: the provider's proxy settings travel to
+// the watcher inside the stdin request.
+func TestCreateInstanceCarriesProxyEnv(t *testing.T) {
+	for _, k := range proxyEnvVars {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	t.Setenv("HTTPS_PROXY", "http://proxyuser:proxy-secret@proxy.example.test:3128")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1,.internal")
+
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	cb, _ := newStatusCallbackServer(t, nil)
+	p, _ := newTestProvider(t)
+	var got statusWatchRequest
+	p.spawnStatusWatcher = func(_ context.Context, req statusWatchRequest) error {
+		got = req
+		return nil
+	}
+	if _, err := p.CreateInstance(context.Background(), statusBootstrap(meta.URL, cb.URL)); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	want := map[string]string{
+		"HTTPS_PROXY": "http://proxyuser:proxy-secret@proxy.example.test:3128",
+		"NO_PROXY":    "localhost,127.0.0.1,.internal",
+	}
+	if len(got.ProxyEnv) != len(want) || got.ProxyEnv["HTTPS_PROXY"] != want["HTTPS_PROXY"] || got.ProxyEnv["NO_PROXY"] != want["NO_PROXY"] {
+		t.Fatalf("request proxy env = %v, want %v", got.ProxyEnv, want)
+	}
+}
+
+func TestStatusWatchRequestRedactsProxyCredentials(t *testing.T) {
+	req := statusWatchRequest{
+		InstanceToken: testInstanceToken,
+		ProxyEnv:      map[string]string{"HTTPS_PROXY": "http://proxyuser:p%40ss-secret@proxy.example.test:3128"},
+	}
+	msg := req.redact(`Post "https://garm/status": proxyconnect tcp: http://proxyuser:p%40ss-secret@proxy.example.test:3128 refused; password p@ss-secret; token ` + testInstanceToken)
+	for _, secret := range []string{"p@ss-secret", "p%40ss-secret", testInstanceToken} {
+		if strings.Contains(msg, secret) {
+			t.Errorf("redacted message still contains %q: %s", secret, msg)
+		}
+	}
+}
+
+// TestDetachedWatcherUsesCarriedProxy runs the real detached watcher with an
+// empty exec environment and a proxy only in its stdin request: its idle
+// report to a non-loopback GARM must go through that proxy (a CONNECT with
+// the proxy credentials), exactly as the provider's own requests would.
+func TestDetachedWatcherUsesCarriedProxy(t *testing.T) {
+	const containerID = "watcher-proxy-container"
+	dockerAPI := fakeDockerAPI(t, containerID, "2026-10-10 17:45:14Z: Listening for Jobs")
+	connects := make(chan string, 8)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			connects <- r.Host + " " + r.Header.Get("Proxy-Authorization")
+		}
+		w.WriteHeader(http.StatusBadGateway) // refuse the tunnel; reaching us is the point
+	}))
+	defer proxy.Close()
+	proxyURL := "http://proxyuser:proxy-secret@" + strings.TrimPrefix(proxy.URL, "http://")
+
+	err := startDetachedWatcher(context.Background(), statusWatchRequest{
+		Instance: "proxy", ContainerID: containerID,
+		DockerHost:  "tcp://" + strings.TrimPrefix(dockerAPI.URL, "http://"), // loopback: never proxied
+		CallbackURL: "https://garm.example.test/api/v1/callbacks", InstanceToken: testInstanceToken,
+		Deadline: time.Now().Add(30 * time.Second),
+		ProxyEnv: map[string]string{"HTTPS_PROXY": proxyURL},
+	})
+	if err != nil {
+		t.Fatalf("startDetachedWatcher: %v", err)
+	}
+	select {
+	case got := <-connects:
+		if !strings.HasPrefix(got, "garm.example.test:443 Basic ") {
+			t.Fatalf("CONNECT = %q, want garm.example.test:443 with Basic proxy credentials", got)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the watcher's idle report never went through the carried proxy")
 	}
 }

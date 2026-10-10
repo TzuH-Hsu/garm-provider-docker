@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"time"
 
@@ -34,7 +35,7 @@ const statusWatchGrace = statusPostTimeout + 5*time.Second
 const (
 	statusMessageIdleViaProcess = "runner listener process is up; the runner's logs could not be read with the container's log driver (use json-file or local for exact detection)"
 	statusMessageNotListening   = "runner was not listening for jobs before the status-report timeout; left installing for GARM's bootstrap timeout"
-	statusMessageRunnerStopped  = "runner container stopped before it was listening for jobs"
+	statusMessageRunnerStopped  = "runner container stopped before it was ready for jobs"
 )
 
 // statusWatchRequest is everything the watcher needs. It travels from
@@ -48,6 +49,71 @@ type statusWatchRequest struct {
 	InstanceToken string    `json:"instance_token"`
 	CACertBundle  []byte    `json:"ca_cert_bundle,omitempty"`
 	Deadline      time.Time `json:"deadline"`
+
+	// ProxyEnv carries the provider process's proxy environment (the
+	// proxyEnvVars that are set). The watcher starts with an empty
+	// environment, but both its HTTP clients — the GARM callback and, for a
+	// tcp:// docker_host, the Docker API — resolve proxies from the
+	// environment exactly as the provider's do; without these the idle
+	// report could take a different network path than the installing one.
+	// Proxy URLs can embed credentials, so they travel here, not in the
+	// watcher's exec environment.
+	ProxyEnv map[string]string `json:"proxy_env,omitempty"`
+}
+
+// proxyEnvVars are the variables net/http's ProxyFromEnvironment reads (the
+// Docker SDK's TCP transport uses the same function). The Docker client takes
+// nothing else from the environment: it is built from docker_host alone.
+var proxyEnvVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"}
+
+// currentProxyEnv captures the set proxy variables of this process.
+func currentProxyEnv() map[string]string {
+	var env map[string]string
+	for _, k := range proxyEnvVars {
+		if v, ok := os.LookupEnv(k); ok {
+			if env == nil {
+				env = make(map[string]string, len(proxyEnvVars))
+			}
+			env[k] = v
+		}
+	}
+	return env
+}
+
+// applyProxyEnv installs the carried proxy variables into this (watcher)
+// process before any HTTP client is used — net/http reads them once. It sets
+// only the known proxy variables. Setting them in-process does not change the
+// environment the kernel exposes for the process, which is the empty one it
+// was started with.
+func applyProxyEnv(env map[string]string) error {
+	for _, k := range proxyEnvVars {
+		if v, ok := env[k]; ok {
+			if err := os.Setenv(k, v); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// redact scrubs the instance token and any credentials embedded in the proxy
+// URLs from s, for logging.
+func (r statusWatchRequest) redact(s string) string {
+	s = logging.Redact(s, r.InstanceToken)
+	for _, v := range r.ProxyEnv {
+		u, err := url.Parse(v)
+		if err != nil || u.User == nil {
+			continue
+		}
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			s = logging.Redact(s, pw)
+			s = logging.Redact(s, url.QueryEscape(pw))
+		}
+		if name := u.User.Username(); name != "" {
+			s = logging.Redact(s, u.User.String())
+		}
+	}
+	return s
 }
 
 // validate rejects a malformed request, or one whose deadline is already past
@@ -103,6 +169,9 @@ func RunStatusWatcher(in io.Reader) int {
 	if err := req.validate(time.Now()); err != nil {
 		return 2
 	}
+	if err := applyProxyEnv(req.ProxyEnv); err != nil {
+		return 2
+	}
 
 	hardStop := req.Deadline.Add(statusWatchGrace)
 	time.AfterFunc(time.Until(hardStop)+time.Second, func() { os.Exit(3) })
@@ -124,7 +193,7 @@ func runStatusWatch(ctx context.Context, p *Provider, req statusWatchRequest) {
 	reporter, err := metadata.NewStatusReporter(req.CallbackURL, req.InstanceToken, req.CACertBundle)
 	if err != nil {
 		slog.WarnContext(ctx, "status watcher: invalid callback URL",
-			"instance", req.Instance, "error", logging.Redact(err.Error(), req.InstanceToken))
+			"instance", req.Instance, "error", req.redact(err.Error()))
 		return
 	}
 
@@ -141,9 +210,9 @@ func runStatusWatch(ctx context.Context, p *Provider, req statusWatchRequest) {
 
 	if err := postStatus(ctx, reporter, status, message); err != nil {
 		slog.WarnContext(ctx, "status watcher: failed to report runner status",
-			"instance", req.Instance, "status", status, "error", err)
+			"instance", req.Instance, "status", status, "error", req.redact(err.Error()))
 		return
 	}
 	slog.InfoContext(ctx, "status watcher: reported runner status",
-		"instance", req.Instance, "status", status, "detail", message, "wait_error", fmt.Sprint(waitErr))
+		"instance", req.Instance, "status", status, "detail", message, "wait_error", req.redact(fmt.Sprint(waitErr)))
 }
