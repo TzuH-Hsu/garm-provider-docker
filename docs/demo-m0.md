@@ -467,8 +467,9 @@ The gate has been run end to end against a live GARM, for both variants.
 - GARM v0.2.1 (systemd service, API on loopback), scale-set dispatch (no
   webhook); provider `interface_version` v0.1.0.
 - Docker Engine 29.9.0 on Ubuntu 26.04, amd64.
-- Provider built from the scale-set compatibility fix branch (a
-  pre-release of v0.2.1).
+- A pre-release build of the provider (from the scale-set compatibility fix
+  line, which later runs also combined with a separate provider-side
+  runner-status reporting change); not a published release.
 - Runner image
   `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:299d1e366519860d98795a861566c1ddff990b9b7089ab7289f9609b426da64e`.
 - DinD image
@@ -481,42 +482,30 @@ that GARM injects, and `DeleteInstance`/`GetInstance` failed with
 `ListInstances` bug was also hit. The first two are fixed in the
 scale-set compatibility fix.
 
-The runs below are listed in the order they happened; each lists the
-checks it covered. Checks added to the script later were re-run live
-afterwards, as recorded.
+**Full rerun with the current script** (every check that exists in
+`scripts/demo-m0.sh` at the time of writing, run live against both
+variants):
 
-**Initial runs** (before the wiring checks existed):
+- `none` variant: `verify` all checks PASS (24 PASS lines), including exact
+  per-job network attachment, the credential tmpfs (noexec, nosuid, nodev,
+  size 16 MiB, mode 0700, runner uid/gid), the read-only externals volume,
+  no added capabilities, devices or security options, and no host
+  namespaces. The GitHub job succeeded. `postjob` PASS ("no leftover
+  job-scoped garm.docker/managed=true containers, networks, or volumes");
+  the persistent cache volumes are reported as informational.
+- `--dind` variant: `verify` all checks PASS (45 PASS lines), including the
+  sidecar's sole per-job network attachment, its exact mount set (socket,
+  dind-state, workspace), no host namespaces, the runner's supplementary
+  group for the socket, and memory limits of 6GiB (runner) / 4GiB
+  (sidecar). The GitHub job succeeded (`docker run hello-world`,
+  `docker build`, and the shared-workspace step). `postjob` PASS.
 
-- `none` variant: Step 4(a-d) all PASS. The GitHub job succeeded. After the
-  job, the runner container, the per-job network and the workspace volume
-  were removed; the persistent cache volumes remain by design.
-- `--dind` variant: Step 4 verification all PASS, including: sidecar
-  `Privileged=true`, no host bind mounts, runner `DOCKER_HOST` pointing at
-  the shared socket volume, the runner reaching the sidecar's daemon, the
-  `socket` and `dind-state` volumes existing, and memory limits of 6GiB
-  (runner) / 4GiB (sidecar). The job ran `docker run hello-world` and
-  `docker build` successfully. After the job, the runner, sidecar,
-  network, and the workspace, socket and `dind-state` volumes were removed.
-
-**After the topology-wiring checks were added:**
-
-- `none` variant: verify all PASS, including "runner container is attached
-  to the labeled per-job network", "runner container is not attached to
-  the default 'bridge' network", and "runner container mounts the labeled
-  workspace volume at /actions-runner/_work".
-- `--dind` variant: verify all PASS, including "sidecar is attached to the
-  same labeled per-job network", "runner mounts the labeled socket volume
-  at /run", and "sidecar mounts the labeled socket volume at /run".
-
-**After the dind-state check and the architecture guard:** "sidecar mounts
-the labeled dind-state volume at /var/lib/docker" PASS. The `OS_ARCH`
-mismatch guard exits with the cross-architecture error.
-
-**After the sidecar-workspace check:** "sidecar mounts the labeled
-workspace volume at /actions-runner/_work" PASS, and the workflow step
-"shared workspace is visible to the sidecar daemon" succeeded (it printed
-"sidecar saw: ok"). All job steps succeeded: `docker run hello-world`,
-`docker build`, and the shared-workspace step.
+**Earlier runs** (kept briefly; superseded by the rerun above): the same
+variants were run as checks were added, in this order: the initial
+verification (labels, topology, credentials, symlink, sidecar flags and
+memory), then the network and volume wiring checks, the dind-state mount
+and architecture guard, and finally the sidecar workspace mount with the
+shared-workspace workflow step. Each passed when first added.
 
 Verified as a consequence: tmpfs credential delivery against a real
 daemon, a symlinked `.runner` being accepted by `actions/runner` in JIT

@@ -425,7 +425,7 @@ resolve_scaleset_name() {
     [[ -s "${f}" ]] && saved="$(head -c 256 "${f}")"
     if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
       ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
-      printf '%s\n' "${SCALESET_NAME}" > "${f}"
+      printf '%s\n' "${SCALESET_NAME}" | write_file_atomic "${f}" 0600
       if [[ -n "${saved}" ]]; then
         log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
       fi
@@ -449,7 +449,7 @@ resolve_scaleset_name() {
   fi
   ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
   SCALESET_NAME="garm-docker-gate-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '%s\n' "${SCALESET_NAME}" > "${f}"
+  printf '%s\n' "${SCALESET_NAME}" | write_file_atomic "${f}" 0600
 }
 
 # lookup_scaleset_id fills SCALESET_ID (when unset) by finding this scale
@@ -535,6 +535,31 @@ compute_sha256() {
   fi
 }
 
+# write_file_atomic writes stdin to "$1" with mode "$2" via a temp file in the
+# same directory and rename(2). The rename replaces a pre-planted symlink at
+# the destination instead of following it, and gives the file the intended
+# owner (us) and mode even when an older file with a different mode existed
+# (umask and directory mode only affect NEW files).
+write_file_atomic() {
+  local dest="$1" mode="$2" tmp
+  [[ ! -d "${dest}" ]] || die "${dest} is a directory; remove it and re-run."
+  tmp="$(mktemp "${dest}.XXXXXX")" || die "could not create a temporary file next to ${dest}"
+  if ! cat > "${tmp}" || ! chmod "${mode}" "${tmp}" || ! mv -f "${tmp}" "${dest}"; then
+    rm -f "${tmp}"
+    die "could not write ${dest}"
+  fi
+}
+
+# install_provider_binary moves the verified or freshly built binary "$1" into
+# place as PROVIDER_BIN (mode 0755, replacing any symlink there) and confirms
+# the installed file is a regular file we own that others cannot write.
+install_provider_binary() {
+  chmod 0755 "$1" || die "could not chmod $1"
+  mv -f "$1" "${PROVIDER_BIN}" || die "could not install ${PROVIDER_BIN}"
+  path_is_private "${PROVIDER_BIN}" f \
+    || die "${PROVIDER_BIN} must be a regular file owned by you and not writable by group or others."
+}
+
 # --- Step 0: preflight -------------------------------------------------------
 
 build_provider_binary() {
@@ -542,11 +567,15 @@ build_provider_binary() {
   ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
   local version
   version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
+  local bin_tmp
+  bin_tmp="$(mktemp "${PROVIDER_BIN}.XXXXXX")" || die "could not create a temporary file next to ${PROVIDER_BIN}"
   if ! ( cd "${REPO_ROOT}" && go build \
       -ldflags "-X github.com/TzuH-Hsu/garm-provider-docker/internal/version.Version=${version}" \
-      -o "${PROVIDER_BIN}" . ); then
+      -o "${bin_tmp}" . ); then
+    rm -f "${bin_tmp}"
     die "go build failed"
   fi
+  install_provider_binary "${bin_tmp}"
   log "Built ${PROVIDER_BIN} (version ${version})"
 }
 
@@ -588,14 +617,15 @@ download_provider_binary() {
   warn_if_known_incompatible_version
 
   local asset="garm-provider-docker_${PROVIDER_VERSION}_linux_${OS_ARCH}"
-  local asset_path="${PROVIDER_BIN_DIR}/${asset}"
-  local sums_path="${PROVIDER_BIN_DIR}/SHA256SUMS"
+  local asset_path sums_path
+  asset_path="$(mktemp "${PROVIDER_BIN_DIR}/${asset}.XXXXXX")" || die "could not create a temporary file in ${PROVIDER_BIN_DIR}"
+  sums_path="$(mktemp "${PROVIDER_BIN_DIR}/SHA256SUMS.XXXXXX")" || die "could not create a temporary file in ${PROVIDER_BIN_DIR}"
 
   log "Downloading ${asset} (release ${PROVIDER_VERSION})..."
   curl -fsSL -o "${asset_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/${asset}" \
-    || die "failed to download ${asset} from the ${PROVIDER_VERSION} release - check PROVIDER_VERSION, and that this host can reach github.com"
+    || { rm -f "${asset_path}" "${sums_path}"; die "failed to download ${asset} from the ${PROVIDER_VERSION} release - check PROVIDER_VERSION, and that this host can reach github.com"; }
   curl -fsSL -o "${sums_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/SHA256SUMS" \
-    || die "failed to download SHA256SUMS from the ${PROVIDER_VERSION} release"
+    || { rm -f "${asset_path}" "${sums_path}"; die "failed to download SHA256SUMS from the ${PROVIDER_VERSION} release"; }
 
   local expected
   expected="$(awk -v f="${asset}" '$2 == f { print $1; found=1 } END { exit !found }' "${sums_path}")" \
@@ -604,13 +634,13 @@ download_provider_binary() {
   local actual
   actual="$(compute_sha256 "${asset_path}")" || exit 1
   if [[ "${expected}" != "${actual}" ]]; then
-    rm -f "${asset_path}"
+    rm -f "${asset_path}" "${sums_path}"
     die "checksum mismatch for ${asset}: SHA256SUMS says ${expected}, downloaded file hashes to ${actual} - refusing to use a corrupted or tampered binary"
   fi
   ok "SHA256SUMS verified for ${asset} (${expected})"
 
-  mv -f "${asset_path}" "${PROVIDER_BIN}"
-  chmod +x "${PROVIDER_BIN}"
+  rm -f "${sums_path}"
+  install_provider_binary "${asset_path}"
   log "Installed verified binary: ${PROVIDER_BIN}"
 }
 
@@ -676,9 +706,11 @@ resolve_dind_image_digest() {
 generate_provider_config() {
   local runner_image="$1" dind_image="${2:-}"
   ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
+  local cfg_tmp
+  cfg_tmp="$(mktemp "${PROVIDER_CONFIG_FILE}.XXXXXX")" || die "could not create a temporary file next to ${PROVIDER_CONFIG_FILE}"
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
-    cat > "${PROVIDER_CONFIG_FILE}" <<EOF
+    cat > "${cfg_tmp}" <<EOF
 # Generated by scripts/demo-m0.sh (release mode, ${PROVIDER_VERSION}) -
 # gate config for garm-provider-docker. Every key besides runner_image
 # falls back to its documented default (docs/config-reference.md):
@@ -691,7 +723,7 @@ generate_provider_config() {
 runner_image = "${runner_image}"
 EOF
   else
-    cat > "${PROVIDER_CONFIG_FILE}" <<EOF
+    cat > "${cfg_tmp}" <<EOF
 # Generated by scripts/demo-m0.sh (--from-source mode) - dev/CI gate
 # config ONLY, do not use in production.
 #
@@ -708,7 +740,7 @@ EOF
     [[ -n "${dind_image}" ]] || die "internal error: dind variant requires a resolved dind_image"
     # Top-level keys must precede any table in TOML; the base config above
     # has no tables, so appending keys and then the flavor table is valid.
-    cat >> "${PROVIDER_CONFIG_FILE}" <<EOF
+    cat >> "${cfg_tmp}" <<EOF
 
 # DinD variant (--dind): widen the operator ceiling so a pool/scale set's
 # extra_specs MAY select privileged-sidecar (the default ceiling is
@@ -723,6 +755,13 @@ dind_image = "${dind_image}"
   runner_memory = "${DIND_RUNNER_MEMORY}"
   dind_memory = "${DIND_DIND_MEMORY}"
 EOF
+  fi
+  # config.toml holds no secrets and must be readable by GARM's service
+  # account, so it is 0644 regardless of the mode of any earlier file.
+  [[ ! -d "${PROVIDER_CONFIG_FILE}" ]] || die "${PROVIDER_CONFIG_FILE} is a directory; remove it and re-run."
+  if ! chmod 0644 "${cfg_tmp}" || ! mv -f "${cfg_tmp}" "${PROVIDER_CONFIG_FILE}"; then
+    rm -f "${cfg_tmp}"
+    die "could not write ${PROVIDER_CONFIG_FILE}"
   fi
   log "Wrote provider config: ${PROVIDER_CONFIG_FILE}"
 }
