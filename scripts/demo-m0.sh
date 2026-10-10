@@ -363,6 +363,12 @@ path_is_private() {
   [[ -n "$(find "$1" -maxdepth 0 -type "$2" -user "$(id -u)" ! -perm -020 ! -perm -002 2>/dev/null)" ]]
 }
 
+# path_is_owned_regular succeeds when "$1" is a real (non-symlink) regular file
+# owned by the invoking user, whatever its mode.
+path_is_owned_regular() {
+  [[ -n "$(find "$1" -maxdepth 0 -type f -user "$(id -u)" 2>/dev/null)" ]]
+}
+
 # check_private_dir dies when directory "$1" ("$2" names it) exists but is not
 # a real directory owned by the invoking user and closed to group/others:
 # another local account could otherwise pre-create or tamper with it (the
@@ -421,14 +427,18 @@ resolve_scaleset_name() {
     # by this name on each run), so nothing else needs invalidating.
     [[ "${SCALESET_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
       || die "SCALESET_NAME '${SCALESET_NAME}' is invalid: use letters, digits, '.', '_' and '-', starting with a letter or digit"
+    # The old value is only read from a regular file we own (never through a
+    # symlink), and is only used for the "changed" log line.
     local saved=""
-    [[ -s "${f}" ]] && saved="$(head -c 256 "${f}")"
-    if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
-      ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
-      write_file_atomic "${f}" 0600 <<< "${SCALESET_NAME}"
-      if [[ -n "${saved}" ]]; then
-        log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
-      fi
+    if path_is_owned_regular "${f}"; then
+      saved="$(head -c 256 "${f}")"
+    fi
+    ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
+    # Always (re)write: cheap, and it also normalizes the mode of a file left
+    # group-writable by an older version of this script.
+    write_file_atomic "${f}" 0600 <<< "${SCALESET_NAME}"
+    if [[ -n "${saved}" && "${saved}" != "${SCALESET_NAME}" ]]; then
+      log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
     fi
     return 0
   fi
@@ -436,8 +446,17 @@ resolve_scaleset_name() {
     # The cached name feeds printed commands and the workflow, so it gets the
     # same allowlist as an explicit one, and the file must be ours and closed
     # to others (the config dir can live under /tmp).
-    path_is_private "${f}" f \
-      || die "${f} must be a regular file owned by you and not writable by group or others. Remove it and re-run."
+    # Wrong owner, a symlink or a non-regular file is fatal. A regular file we
+    # own that is merely group/other-writable (e.g. left by an older version
+    # of this script) is normalized to 0600: ownership is the trust boundary,
+    # and the content is allowlist-validated below either way, so a foreign
+    # edit can at worst yield a rejected or different valid name.
+    path_is_owned_regular "${f}" \
+      || die "${f} must be a regular file owned by you (not a symlink). Remove it and re-run."
+    if ! path_is_private "${f}" f; then
+      chmod 0600 "${f}" || die "could not set mode 0600 on ${f}; remove it and re-run."
+      warn "${f} was writable by group or others; reset its mode to 0600."
+    fi
     local cached
     cached="$(head -c 256 "${f}")"
     cached="${cached%%$'\n'*}"
