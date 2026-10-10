@@ -14,8 +14,10 @@
 # This originated as the M0 go/no-go gate (docs/plan.md §3 M0: pool mode,
 # dind_mode=none, linux/amd64 only). M1-M4 have since shipped the full
 # per-job topology (job network, named workspace volume, DinD modes,
-# persistent caches, extra_specs, v0.1.1 self-description) and a v0.2.0
-# release. This script now validates that release end to end; it keeps
+# persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
+# failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
+# a published release that passes this gate (v0.2.1 once published; until then
+# use --from-source). The script keeps
 # dind_mode=none as its own default (the smallest, most portable slice -
 # DinD modes are a deliberate operator opt-in and out of scope for this
 # gate, see docs/demo-m0.md), but everything else it exercises is the
@@ -153,9 +155,12 @@
 #   RUNNER_IMAGE_TAG      Local tag for the runner image build. "source"
 #                          mode only. Default: garm-runner-noble:demo
 #   OS_ARCH               Runner OS architecture: "amd64" or "arm64".
-#                          Auto-detected from `uname -m` when unset; also
-#                          selects which release binary asset is
-#                          downloaded in "release" mode.
+#                          Auto-detected from `uname -m` when unset. If set,
+#                          it must equal the host's architecture (the
+#                          provider does no cross-architecture runner
+#                          selection); the script exits otherwise. It
+#                          selects the release binary asset in "release"
+#                          mode.
 #   POOL_TAGS             Comma-separated tags applied to the pool; matched
 #                          by the sample workflow's runs-on.
 #                          Default: docker,garm-demo
@@ -236,7 +241,7 @@ POOL_FLAVOR="${POOL_FLAVOR:-default}"
 # ever exist at a time. OS_TYPE is fixed to linux - the only OS this
 # provider supports (internal/provider/create.go's validatePlatform). Both
 # linux/amd64 and linux/arm64 are supported as of M1; OS_ARCH below is
-# auto-detected (or operator-overridden), not hardcoded to amd64.
+# auto-detected from the host (and must match it), not hardcoded to amd64.
 readonly MIN_IDLE_RUNNERS=0
 readonly MAX_RUNNERS=1
 readonly OS_TYPE=linux
@@ -351,7 +356,10 @@ lookup_scaleset_id() {
 
 # detect_arch maps `uname -m` to the amd64/arm64 vocabulary this provider,
 # GARM's --os-arch flag, and this repo's release-asset naming all use.
-# OS_ARCH can still be set explicitly (env) to override the detected value.
+# OS_ARCH may be set explicitly, but only to the host's own architecture: the
+# provider creates containers with no platform override (internal/provider/
+# create.go passes a nil platform), so it never selects a cross-architecture
+# runner, and the release asset / source build must match the host to execute.
 detect_arch() {
   local machine
   machine="$(uname -m)"
@@ -361,7 +369,11 @@ detect_arch() {
     *) die "unsupported host architecture '${machine}': this provider only supports linux/amd64 and linux/arm64 (internal/provider/create.go's supportedOSArches)" ;;
   esac
 }
-OS_ARCH="${OS_ARCH:-$(detect_arch)}"
+HOST_ARCH="$(detect_arch)"
+OS_ARCH="${OS_ARCH:-${HOST_ARCH}}"
+if [[ "${OS_ARCH}" != "${HOST_ARCH}" ]]; then
+  die "cross-architecture runners are not supported; OS_ARCH must match the host (${HOST_ARCH}), got '${OS_ARCH}'"
+fi
 
 # require_linux_host_for_release_mode fails closed, with a clear next step,
 # when PROVIDER_SOURCE=release is requested on a non-Linux host: this repo's
@@ -453,7 +465,7 @@ download_provider_binary() {
 
   log "Downloading ${asset} (release ${PROVIDER_VERSION})..."
   curl -fsSL -o "${asset_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/${asset}" \
-    || die "failed to download ${asset} from the ${PROVIDER_VERSION} release - check PROVIDER_VERSION and OS_ARCH, and that this host can reach github.com"
+    || die "failed to download ${asset} from the ${PROVIDER_VERSION} release - check PROVIDER_VERSION, and that this host can reach github.com"
   curl -fsSL -o "${sums_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/SHA256SUMS" \
     || die "failed to download SHA256SUMS from the ${PROVIDER_VERSION} release"
 
@@ -784,8 +796,8 @@ EOF
   fi
   log "--image/--flavor are required by garm-cli but are informational only"
   log "for this provider (see the note above POOL_IMAGE/POOL_FLAVOR in this"
-  log "script); --os-arch ${OS_ARCH} was auto-detected from this host (override"
-  log "with OS_ARCH=amd64|arm64)."
+  log "script); --os-arch ${OS_ARCH} was auto-detected from this host (OS_ARCH, if"
+  log "set, must match it)."
   log "min-idle-runners=0 / max-runners=1 by design: this gate only ever"
   log "needs one runner to exist at a time."
   if [[ "${GATE_VARIANT}" == "dind" ]]; then
@@ -928,9 +940,10 @@ verify_labels() {
 }
 
 # Runner workdir and DinD socket dir; keep in sync with internal/spec
-# (RunnerWorkDir in mounts.go, DindSocketDir in dind.go).
+# (RunnerWorkDir in mounts.go, DindSocketDir and DindStateDir in dind.go).
 RUNNER_WORKDIR="/actions-runner/_work"
 DIND_SOCKET_DIR="/run"
+DIND_STATE_DIR="/var/lib/docker"
 
 # job_network_name prints the name of the labeled per-job network of instance "$1".
 job_network_name() {
@@ -1111,6 +1124,14 @@ verify_dind_topology() {
       bad "no labeled ${res} volume for instance ${instance}"
     fi
   done
+
+  local state_vol
+  state_vol="$(instance_volume_name "${instance}" dind-state)"
+  if [[ -n "${state_vol}" ]] && container_has_volume_mount "${did}" "${state_vol}" "${DIND_STATE_DIR}"; then
+    ok "sidecar mounts the labeled dind-state volume ${state_vol} at ${DIND_STATE_DIR}"
+  else
+    bad "sidecar does not mount the labeled dind-state volume '${state_vol}' at ${DIND_STATE_DIR}"
+  fi
 
   local net_name sock_vol
   net_name="$(job_network_name "${instance}")"

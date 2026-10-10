@@ -17,8 +17,10 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 (`docs/plan.md` §3 M0: pool mode, `dind_mode=none`, `linux/amd64` only);
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
-self-description) and a tagged `v0.2.0` release, so this runbook now
-validates that release end to end — it keeps `dind_mode=none` as its own
+self-description). `v0.2.0` is the recorded failing baseline: it does not
+work against GARM v0.2.x (see "Results"). The end-to-end claim is reserved
+for a published release that passes this gate (`v0.2.1` once published;
+until then use `--from-source`). The runbook keeps `dind_mode=none` as its own
 default (the smallest, most portable slice) and treats the DinD modes as
 out of scope for this particular gate (see "What this demo does not cover"
 below), but everything else it exercises is the CURRENT provider, not the
@@ -82,7 +84,9 @@ is specific to this provider and this demo.
    plugin) — the default **release** mode uses `docker buildx imagetools
    inspect` to resolve the runner image's digest, no local image build
    required. `linux/amd64` and `linux/arm64` hosts are both supported;
-   `OS_ARCH` is auto-detected from `uname -m`.
+   `OS_ARCH` is auto-detected from `uname -m`; if set explicitly it must
+   match the host (cross-architecture runners are not supported and the
+   script exits).
    - **Release mode needs a Linux host.** This repo's release workflow
      publishes `linux/amd64`/`linux/arm64` **provider binaries only** — the
      provider binary always runs as a host process wherever GARM itself
@@ -317,7 +321,7 @@ Prints the exact `garm-cli scaleset add` command (`garm-cli pool add` with
 workflow's `runs-on`), `--enabled`, `--min-idle-runners 0 --max-runners 1`
 (fixed by design — this demo only ever needs one runner to exist at a
 time), `--extra-specs` in the `--dind` variant, `--os-arch` set to this host's
-auto-detected architecture (`amd64` or `arm64` — override with `OS_ARCH`),
+auto-detected architecture (`amd64` or `arm64`; `OS_ARCH` may only restate it),
 and placeholder `--image`/`--flavor` values (required by `garm-cli`, but
 informational only for this provider: `CreateInstance` always uses the
 config's — or a selected flavor's — `runner_image` and ignores the
