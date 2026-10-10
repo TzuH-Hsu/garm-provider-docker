@@ -81,13 +81,16 @@ Status: Accepted (2026-07-19)
 > as of 2026-10-11) bounds it by `runner_bootstrap_timeout` and the optional
 > `[provider.external].exec_timeout_seconds`, killing the binary and marking
 > the create failed on expiry; a synchronous wait could therefore turn a
-> healthy create into a failed one. `CreateInstance` only sends `installing`
-> (bounded by a 20 s POST timeout) and then re-executes the provider binary as
-> a detached watcher (hidden first argument, `os.StartProcess` with `Setsid`,
-> stdout/stderr on `/dev/null` so GARM's pipes are not held open, an empty
-> environment, and the request — token, callback URL, container ID,
-> deadline — written to a private stdin pipe, never argv or environment). The
-> watcher does the log follow (or the `docker top` fallback), reports `idle`,
+> healthy create into a failed one, and so could a slow callback. `CreateInstance`
+> therefore makes no request to GARM at all: it re-executes the provider
+> binary as a detached watcher (hidden first argument, `os.StartProcess` with
+> `Setsid`, stdout/stderr on `/dev/null` so GARM's pipes are not held open, an
+> environment holding only `SSL_CERT_FILE`, `SSL_CERT_DIR` and `GODEBUG` when
+> set — no secrets, and needed at process start for root-CA loading and
+> runtime settings — and the request — token, callback URL, container ID,
+> deadline, proxy variables — written to a private stdin pipe, never argv or
+> environment) and returns after that handoff (at most 5 s). The watcher
+> reports `installing`, does the log follow (or the `docker top` fallback), reports `idle`,
 > or reports `installing` again with the reason when it gives up, and exits
 > no later than about 25 s past `timeout_seconds` regardless. The token's
 > lifetime in memory is extended accordingly; it is still never in the
