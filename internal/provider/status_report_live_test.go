@@ -309,3 +309,56 @@ func TestLiveStoppedContainerLogsReplayThenEOF(t *testing.T) {
 		t.Fatalf("waitRunnerListening = %v, %v; want false, errRunnerStopped for an exited runner", ok, err)
 	}
 }
+
+// TestLivePID1WithoutInitLeavesZombies grounds the reaper check on a real
+// daemon: in a container whose PID 1 is not an init (here `sleep`, which
+// never waits for children), an orphaned process stays a zombie after it
+// exits, and /proc/1/comm names that process; with --init, PID 1 is
+// docker-init and the orphan is reaped.
+func TestLivePID1WithoutInitLeavesZombies(t *testing.T) {
+	// The subshell starts a short sleep and exits, orphaning it to PID 1;
+	// PID 1 then execs a long sleep.
+	const script = `(sleep 0.2 &); exec sleep 30`
+	for _, tt := range []struct {
+		name       string
+		args       []string
+		wantComm   string
+		wantReaped bool
+		wantZombie bool
+	}{
+		{"without init", nil, "sleep", false, true},
+		{"with --init", []string{"--init"}, "docker-init", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"run", "-d"}, tt.args...)
+			args = append(args, liveImage, "sh", "-c", script)
+			out, err := exec.Command("docker", args...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("docker run: %v\n%s", err, out)
+			}
+			id := strings.TrimSpace(string(out))
+			t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
+			time.Sleep(1500 * time.Millisecond)
+
+			out, err = exec.Command("docker", "exec", id, "sh", "-c", `cat /proc/1/comm; ps -o stat | grep -c "^Z" || true`).CombinedOutput()
+			if err != nil {
+				t.Fatalf("docker exec: %v\n%s", err, out)
+			}
+			fields := strings.Fields(string(out))
+			if len(fields) != 2 {
+				t.Fatalf("unexpected output %q", out)
+			}
+			comm, zombies := fields[0], fields[1]
+			t.Logf("PID 1 = %s, zombies = %s", comm, zombies)
+			if comm != tt.wantComm {
+				t.Errorf("/proc/1/comm = %q, want %q", comm, tt.wantComm)
+			}
+			if got := reaperVerdict(comm+"\n", nil); got != tt.wantReaped {
+				t.Errorf("reaperVerdict(%q) = %v, want %v", comm, got, tt.wantReaped)
+			}
+			if (zombies != "0") != tt.wantZombie {
+				t.Errorf("zombie count = %s, want zombies=%v", zombies, tt.wantZombie)
+			}
+		})
+	}
+}

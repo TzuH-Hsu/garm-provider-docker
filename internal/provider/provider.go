@@ -33,8 +33,9 @@ type Provider struct {
 	topo *topology.Manager
 
 	// spawnStatusWatcher starts idle detection for a runner once CreateInstance
-	// has reported it installing (status_watch.go). It defaults to a detached
-	// watcher process; WithInProcessStatusWatcher replaces it.
+	// applies (status_watch.go). It defaults to startStatusWatcher (a detached
+	// watcher process, or in-process when orphans would not be reaped);
+	// WithInProcessStatusWatcher replaces it.
 	spawnStatusWatcher statusWatcherFunc
 }
 
@@ -53,12 +54,12 @@ func New(cli docker.Client, cfg config.Config, controllerID string, opts ...Opti
 		return nil, fmt.Errorf("invalid provider config: %w", err)
 	}
 	p := &Provider{
-		cli:                cli,
-		cfg:                cfg,
-		controllerID:       controllerID,
-		topo:               topology.New(cli, controllerID),
-		spawnStatusWatcher: startDetachedWatcher,
+		cli:          cli,
+		cfg:          cfg,
+		controllerID: controllerID,
+		topo:         topology.New(cli, controllerID),
 	}
+	p.spawnStatusWatcher = p.startStatusWatcher
 	for _, opt := range opts {
 		opt(p)
 	}

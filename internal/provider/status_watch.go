@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
@@ -139,16 +140,64 @@ type Option func(*Provider)
 // WithInProcessStatusWatcher runs idle detection inside CreateInstance itself,
 // synchronously, through the provider's own Docker client, instead of in a
 // detached process. It exists for tests and embedding, where re-executing the
-// binary is not possible; production uses the detached watcher.
+// binary is not possible; production uses startStatusWatcher.
 func WithInProcessStatusWatcher() Option {
-	return func(p *Provider) {
-		p.spawnStatusWatcher = func(ctx context.Context, req statusWatchRequest) error {
-			watchCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), req.Deadline.Add(statusWatchGrace))
-			defer cancel()
-			runStatusWatch(watchCtx, p, req)
-			return nil
-		}
+	return func(p *Provider) { p.spawnStatusWatcher = p.runInProcessWatcher }
+}
+
+// runInProcessWatcher runs the watcher synchronously in this process, bounded
+// by the request deadline plus statusWatchGrace.
+func (p *Provider) runInProcessWatcher(ctx context.Context, req statusWatchRequest) error {
+	watchCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), req.Deadline.Add(statusWatchGrace))
+	defer cancel()
+	runStatusWatch(watchCtx, p, req)
+	return nil
+}
+
+// Seams for tests: whether an orphaned watcher would be reaped, and how a
+// detached watcher is started.
+var (
+	orphanReaperCheck = orphansAreReaped
+	detachWatcher     = startDetachedWatcher
+)
+
+// startStatusWatcher is the production statusWatcherFunc. It detaches the
+// watcher when an orphaned process will be reaped, which is the normal case
+// (systemd, or a container started with an init such as docker run --init).
+// When the provider's PID namespace has a PID 1 that is not a known init —
+// typically GARM itself as PID 1 in a container started without --init —
+// a detached watcher would become a zombie once it exits, one per runner,
+// because nothing would wait for it. Then the watcher runs in-process
+// instead, inside CreateInstance and bounded by timeout_seconds; on GARM
+// versions that bound CreateInstance (exec_timeout_seconds) that wait counts
+// against the bound.
+func (p *Provider) startStatusWatcher(ctx context.Context, req statusWatchRequest) error {
+	if reaped, pid1 := orphanReaperCheck(); !reaped {
+		slog.WarnContext(ctx, "CreateInstance: PID 1 in this PID namespace is not an init process that reaps orphans, so a detached status watcher would be left as a zombie; waiting for the runner inside CreateInstance instead. Run GARM's container with an init process (docker run --init, or init: true in Compose) to avoid this",
+			"instance", req.Instance, "pid1", pid1)
+		return p.runInProcessWatcher(ctx, req)
 	}
+	return detachWatcher(ctx, req)
+}
+
+// knownReapers are PID 1 process names (as /proc/1/comm shows them, at most
+// 15 characters) that wait for orphaned processes they inherit.
+var knownReapers = map[string]bool{
+	"systemd": true, "init": true, "tini": true, "tini-static": true,
+	"docker-init": true, "dumb-init": true, "catatonit": true, "s6-svscan": true,
+	"runsvdir": true, "runit": true, "openrc-init": true, "supervisord": true,
+	"pause": true, "launchd": true,
+}
+
+// reaperVerdict decides from PID 1's name (and whether it could be read)
+// whether orphans are reaped. An unreadable /proc/1/comm (for example
+// hidepid on a host) is treated as a host whose init reaps: containers, where
+// the problem arises, can always read their own PID 1.
+func reaperVerdict(comm string, err error) bool {
+	if err != nil {
+		return true
+	}
+	return knownReapers[strings.TrimSpace(comm)]
 }
 
 // RunStatusWatcher is the detached watcher's entry point (main.go dispatches
