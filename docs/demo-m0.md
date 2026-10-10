@@ -286,6 +286,13 @@ overwrites the file) or remove `gate-modes`. The file must be a regular file
 you own; a symlink or foreign owner is rejected, a loose mode is reset to
 0600, and unknown keys or invalid values abort. `--help` never reads it.
 
+The scale set name is remembered the same way
+(`$PROVIDER_CONFIG_DIR/scaleset-name`). In scale-set mode, `preflight` (and
+`all`) fix it up front, generating one if none is saved, and any command
+given an explicit `SCALESET_NAME` validates and saves it, so a name supplied
+to `preflight` is the one `pool`, `watch` and the printed workflow use. Pool
+mode never creates the file.
+
 No step ever reads, generates, or prints a secret: no GitHub PAT/App key, no
 GARM API token, no runner bearer token. `garm-cli`'s own stored profile is
 what authenticates against GARM; this script only shells out to it.
