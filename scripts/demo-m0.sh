@@ -299,6 +299,80 @@ require_repo() {
   [[ -n "${REPO}" ]] || die "REPO is not set. export REPO=<garm-repo-id-or-owner/name> (see 'garm-cli repo list') and re-run."
 }
 
+# --- Input validation --------------------------------------------------------
+#
+# Every operator- or file-supplied value that reaches a printed copy-paste
+# command, a generated file (TOML/YAML) or a docker/garm-cli invocation is
+# checked against a strict allowlist here, so no value can carry shell
+# metacharacters, quotes, newlines or arithmetic. The allowlists contain no
+# quote, backslash, space, $, ;, &, |, <, >, backtick or newline, which also
+# makes the values safe inside the generated TOML strings and YAML scalars.
+# (Values derived from tool output - image digests - are format-checked where
+# they are produced.)
+
+readonly MAX_NAME_LEN=64
+
+# require_format NAME VALUE ERE MAXLEN DESCRIPTION: dies unless VALUE matches
+# ERE and is at most MAXLEN characters.
+require_format() {
+  local name="$1" value="$2" re="$3" max="$4" what="$5"
+  if (( ${#value} > max )) || ! [[ "${value}" =~ ${re} ]]; then
+    die "${name} is invalid (${what}; at most ${max} characters)"
+  fi
+}
+
+# validate_inputs checks every env-overridable value used in a sink.
+validate_inputs() {
+  local name_re='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+  local path_re='^/[A-Za-z0-9._/+@-]*$'
+  require_format PROVIDER_NAME "${PROVIDER_NAME}" '^[A-Za-z0-9][A-Za-z0-9_-]*$' "${MAX_NAME_LEN}" "letters, digits, '_' and '-'"
+  require_format PROVIDER_VERSION "${PROVIDER_VERSION}" "${name_re}" "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-'"
+  require_format PROVIDER_SOURCE "${PROVIDER_SOURCE}" '^(release|source)$' 16 "'release' or 'source'"
+  require_format POOL_TAGS "${POOL_TAGS}" '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$' 256 "comma-separated tags of letters, digits, '.', '_' and '-'"
+  require_format POOL_IMAGE "${POOL_IMAGE}" '^[A-Za-z0-9][A-Za-z0-9._:/@-]*$' 256 "letters, digits and '._:/@-'"
+  require_format POOL_FLAVOR "${POOL_FLAVOR}" '^[A-Za-z0-9][A-Za-z0-9._-]*$' "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-'"
+  require_format DIND_IMAGE_SOURCE "${DIND_IMAGE_SOURCE}" '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' 256 "an image reference of letters, digits and '._:/-'"
+  require_format RUNNER_IMAGE_TAG "${RUNNER_IMAGE_TAG}" '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' 256 "an image tag of letters, digits and '._:/-'"
+  require_format GARM_URL "${GARM_URL}" '^https?://[][A-Za-z0-9._:-]+(/[A-Za-z0-9._~/-]*)?$' 256 "an http(s) URL without credentials, query or special characters"
+  require_format WATCH_INTERVAL_SECONDS "${WATCH_INTERVAL_SECONDS}" '^[0-9]{1,6}$' 6 "a non-negative integer"
+  require_format WATCH_MAX_ITERATIONS "${WATCH_MAX_ITERATIONS}" '^[0-9]{1,6}$' 6 "a non-negative integer"
+  require_format POST_JOB_WAIT_SECONDS "${POST_JOB_WAIT_SECONDS}" '^[0-9]{1,6}$' 6 "a non-negative integer"
+  [[ -z "${REPO}" ]] || require_format REPO "${REPO}" '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$' 128 "a repo ID or owner/name of letters, digits, '.', '_', '-' and one '/'"
+  [[ -z "${SCALESET_NAME}" ]] || require_format SCALESET_NAME "${SCALESET_NAME}" "${name_re}" "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-', starting with a letter or digit"
+  [[ -z "${SCALESET_ID}" ]] || require_format SCALESET_ID "${SCALESET_ID}" '^[A-Za-z0-9][A-Za-z0-9-]*$' 64 "an ID of letters, digits and '-'"
+  require_format PROVIDER_BIN_DIR "${PROVIDER_BIN_DIR}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces; set PROVIDER_BIN_DIR explicitly if the checkout path contains other characters)"
+  require_format PROVIDER_CONFIG_DIR "${PROVIDER_CONFIG_DIR}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces; set PROVIDER_CONFIG_DIR explicitly)"
+  [[ "/${PROVIDER_BIN_DIR}/" != */../* && "/${PROVIDER_CONFIG_DIR}/" != */../* ]] \
+    || die "PROVIDER_BIN_DIR / PROVIDER_CONFIG_DIR must not contain '..' segments"
+}
+
+# path_is_private succeeds when "$1" is a real (non-symlink) object of find(1)
+# type "$2" (d or f) owned by the invoking user and writable by neither group
+# nor others. Portable across Linux and macOS find.
+path_is_private() {
+  [[ -n "$(find "$1" -maxdepth 0 -type "$2" -user "$(id -u)" ! -perm -020 ! -perm -002 2>/dev/null)" ]]
+}
+
+# check_private_dir dies when directory "$1" ("$2" names it) exists but is not
+# a real directory owned by the invoking user and closed to group/others:
+# another local account could otherwise pre-create or tamper with it (the
+# default config dir lives under /tmp).
+check_private_dir() {
+  [[ -e "$1" || -L "$1" ]] || return 0
+  path_is_private "$1" d \
+    || die "$2 ($1) must be a real directory owned by you ($(id -un)) and not writable by group or others. Remove it or fix it (chmod go-w), or set $2 to a directory you own."
+}
+
+# ensure_private_dir creates directory "$1" ("$2" names it) with mode "$3"
+# when missing, then enforces check_private_dir.
+ensure_private_dir() {
+  if [[ ! -e "$1" && ! -L "$1" ]]; then
+    mkdir -p "$1" || die "could not create $1"
+    chmod "$3" "$1" || die "could not set mode $3 on $1"
+  fi
+  check_private_dir "$1" "$2"
+}
+
 # validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT /
 # PROVIDER_INTERFACE_VERSION early.
 validate_modes() {
@@ -314,6 +388,9 @@ validate_modes() {
     none|dind) ;;
     *) die "GATE_VARIANT must be 'none' or 'dind', got '${GATE_VARIANT}'" ;;
   esac
+  validate_inputs
+  check_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR
+  check_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR
 }
 
 # resolve_scaleset_name fixes SCALESET_NAME for this run: the operator's
@@ -332,9 +409,9 @@ resolve_scaleset_name() {
     [[ "${SCALESET_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
       || die "SCALESET_NAME '${SCALESET_NAME}' is invalid: use letters, digits, '.', '_' and '-', starting with a letter or digit"
     local saved=""
-    [[ -s "${f}" ]] && saved="$(cat "${f}")"
+    [[ -s "${f}" ]] && saved="$(head -c 256 "${f}")"
     if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
-      mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
+      ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
       printf '%s\n' "${SCALESET_NAME}" > "${f}"
       if [[ -n "${saved}" ]]; then
         log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
@@ -343,10 +420,21 @@ resolve_scaleset_name() {
     return 0
   fi
   if [[ -s "${f}" ]]; then
-    SCALESET_NAME="$(cat "${f}")"
+    # The cached name feeds printed commands and the workflow, so it gets the
+    # same allowlist as an explicit one, and the file must be ours and closed
+    # to others (the config dir can live under /tmp).
+    path_is_private "${f}" f \
+      || die "${f} must be a regular file owned by you and not writable by group or others. Remove it and re-run."
+    local cached
+    cached="$(head -c 256 "${f}")"
+    cached="${cached%%$'\n'*}"
+    if (( ${#cached} > MAX_NAME_LEN )) || ! [[ "${cached}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      die "the saved scale set name in ${f} is invalid (letters, digits, '.', '_' and '-' only; at most ${MAX_NAME_LEN} characters). Remove the file and re-run."
+    fi
+    SCALESET_NAME="${cached}"
     return 0
   fi
-  mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
   SCALESET_NAME="garm-docker-gate-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
   printf '%s\n' "${SCALESET_NAME}" > "${f}"
 }
@@ -438,7 +526,7 @@ compute_sha256() {
 
 build_provider_binary() {
   log "Building provider binary from source (go build -ldflags version stamp)..."
-  mkdir -p "${PROVIDER_BIN_DIR}" || die "could not create ${PROVIDER_BIN_DIR}"
+  ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
   local version
   version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
   if ! ( cd "${REPO_ROOT}" && go build \
@@ -481,7 +569,7 @@ warn_if_known_incompatible_version() {
 # "garm-provider-docker_<version>_<goos>_<goarch>" convention exactly.
 download_provider_binary() {
   require_cmd curl
-  mkdir -p "${PROVIDER_BIN_DIR}" || die "could not create ${PROVIDER_BIN_DIR}"
+  ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
 
   check_release_published
   warn_if_known_incompatible_version
@@ -574,7 +662,7 @@ resolve_dind_image_digest() {
 # mutable dev tag, which requires the dev-only escape hatch.
 generate_provider_config() {
   local runner_image="$1" dind_image="${2:-}"
-  mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
     cat > "${PROVIDER_CONFIG_FILE}" <<EOF
@@ -1145,8 +1233,8 @@ verify_topology() {
   tmpfs_opts="$(docker inspect -f '{{index .HostConfig.Tmpfs "'"${RUNNER_CRED_DIR}"'"}}' "${cid}" 2>/dev/null)"
   if [[ -n "${tmpfs_opts}" ]] \
       && [[ ",${tmpfs_opts}," == *,noexec,* && ",${tmpfs_opts}," == *,nosuid,* && ",${tmpfs_opts}," == *,nodev,* \
-            && ",${tmpfs_opts}," == *,mode=0700,* && ",${tmpfs_opts}," == *,uid=1001,* && ",${tmpfs_opts}," == *,gid=1001,* ]]; then
-    ok "credential tmpfs at ${RUNNER_CRED_DIR} is noexec,nosuid,nodev, mode 0700, owned by the runner uid/gid"
+            && ",${tmpfs_opts}," == *,size=16777216,* && ",${tmpfs_opts}," == *,mode=0700,* && ",${tmpfs_opts}," == *,uid=1001,* && ",${tmpfs_opts}," == *,gid=1001,* ]]; then
+    ok "credential tmpfs at ${RUNNER_CRED_DIR} is noexec,nosuid,nodev, size=16777216 (16 MiB), mode 0700, owned by the runner uid/gid"
   else
     bad "credential tmpfs at ${RUNNER_CRED_DIR} has unexpected options: '${tmpfs_opts}'"
   fi
