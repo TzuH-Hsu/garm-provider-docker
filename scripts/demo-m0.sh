@@ -386,11 +386,21 @@ detect_arch() {
     *) die "unsupported host architecture '${machine}': this provider only supports linux/amd64 and linux/arm64 (internal/provider/create.go's supportedOSArches)" ;;
   esac
 }
-HOST_ARCH="$(detect_arch)"
-OS_ARCH="${OS_ARCH:-${HOST_ARCH}}"
-if [[ "${OS_ARCH}" != "${HOST_ARCH}" ]]; then
-  die "cross-architecture runners are not supported; OS_ARCH must match the host (${HOST_ARCH}), got '${OS_ARCH}'"
-fi
+HOST_ARCH=""
+OS_ARCH="${OS_ARCH:-}"
+
+# init_arch resolves HOST_ARCH and OS_ARCH. It runs from main, after argument
+# parsing and only for real commands, so --help never depends on arch
+# detection. detect_arch runs in a command-substitution subshell, where its
+# die only exits the subshell, so the status is checked explicitly here.
+init_arch() {
+  HOST_ARCH="$(detect_arch)" || exit 1
+  [[ -n "${HOST_ARCH}" ]] || die "could not determine the host architecture"
+  OS_ARCH="${OS_ARCH:-${HOST_ARCH}}"
+  if [[ "${OS_ARCH}" != "${HOST_ARCH}" ]]; then
+    die "cross-architecture runners are not supported; OS_ARCH must match the host (${HOST_ARCH}), got '${OS_ARCH}'"
+  fi
+}
 
 # require_linux_host_for_release_mode fails closed, with a clear next step,
 # when PROVIDER_SOURCE=release is requested on a non-Linux host: this repo's
@@ -491,7 +501,7 @@ download_provider_binary() {
     || die "SHA256SUMS from release ${PROVIDER_VERSION} has no entry for ${asset} - refusing to trust an unverifiable download"
 
   local actual
-  actual="$(compute_sha256 "${asset_path}")"
+  actual="$(compute_sha256 "${asset_path}")" || exit 1
   if [[ "${expected}" != "${actual}" ]]; then
     rm -f "${asset_path}"
     die "checksum mismatch for ${asset}: SHA256SUMS says ${expected}, downloaded file hashes to ${actual} - refusing to use a corrupted or tampered binary"
@@ -539,7 +549,7 @@ resolve_runner_image_digest() {
   local ref="${RUNNER_IMAGE_REPO}:${PROVIDER_VERSION}"
   log "Resolving digest for ${ref} (docker buildx imagetools inspect)..." >&2
   local digest
-  digest="$(imagetools_digest "${ref}")"
+  digest="$(imagetools_digest "${ref}")" || exit 1
   log "Resolved ${ref} -> ${digest}" >&2
   printf '%s@%s' "${RUNNER_IMAGE_REPO}" "${digest}"
 }
@@ -551,7 +561,7 @@ resolve_dind_image_digest() {
   require_cmd docker
   log "Resolving digest for ${DIND_IMAGE_SOURCE} (docker buildx imagetools inspect)..." >&2
   local digest
-  digest="$(imagetools_digest "${DIND_IMAGE_SOURCE}")"
+  digest="$(imagetools_digest "${DIND_IMAGE_SOURCE}")" || exit 1
   log "Resolved ${DIND_IMAGE_SOURCE} -> ${digest}" >&2
   printf '%s@%s' "${DIND_IMAGE_SOURCE}" "${digest}"
 }
@@ -718,7 +728,7 @@ step_preflight() {
     release)
       require_linux_host_for_release_mode
       download_provider_binary
-      runner_image="$(resolve_runner_image_digest)"
+      runner_image="$(resolve_runner_image_digest)" || exit 1
       ;;
     source)
       require_cmd go
@@ -733,7 +743,7 @@ step_preflight() {
 
   local dind_image=""
   if [[ "${GATE_VARIANT}" == "dind" ]]; then
-    dind_image="$(resolve_dind_image_digest)"
+    dind_image="$(resolve_dind_image_digest)" || exit 1
   fi
 
   generate_provider_config "${runner_image}" "${dind_image}"
@@ -865,7 +875,7 @@ sample_workflow_yaml() {
     resolve_scaleset_name
     runs_on="${SCALESET_NAME}"
   else
-    runs_on="$(tags_to_yaml_array "${POOL_TAGS}")"
+    runs_on="$(tags_to_yaml_array "${POOL_TAGS}")" || exit 1
   fi
   cat <<EOF
 name: garm-m0-demo
@@ -1522,6 +1532,7 @@ run_all() {
 }
 
 main() {
+  init_arch
   validate_modes
   case "${COMMAND}" in
     preflight) step_preflight ;;
