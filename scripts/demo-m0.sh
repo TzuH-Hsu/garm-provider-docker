@@ -140,6 +140,12 @@
 #   PROVIDER_NAME         Name this provider is registered under in GARM's
 #                          config.toml [[provider]] section.
 #                          Default: docker_demo
+#   PROVIDER_INTERFACE_VERSION
+#                         interface_version printed in Step 1's [[provider]]
+#                          snippet: "v0.1.0" (default) or "v0.1.1". Keep
+#                          v0.1.0 on GARM <= v0.2.1 (see step_config and
+#                          docs/demo-m0.md); switch to v0.1.1 once a GARM
+#                          release includes cloudbase/garm#878.
 #   PROVIDER_BIN_DIR      Directory the provider binary is downloaded/built
 #                          into. Default: <repo>/bin
 #   PROVIDER_CONFIG_DIR   Directory the generated demo provider config.toml
@@ -175,6 +181,7 @@ PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.0}"
 
 PROVIDER_NAME="${PROVIDER_NAME:-docker_demo}"
+PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-v0.1.0}"
 
 PROVIDER_BIN_DIR="${PROVIDER_BIN_DIR:-${REPO_ROOT}/bin}"
 PROVIDER_BIN="${PROVIDER_BIN_DIR}/garm-provider-docker"
@@ -287,8 +294,13 @@ require_repo() {
   [[ -n "${REPO}" ]] || die "REPO is not set. export REPO=<garm-repo-id-or-owner/name> (see 'garm-cli repo list') and re-run."
 }
 
-# validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT early.
+# validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT /
+# PROVIDER_INTERFACE_VERSION early.
 validate_modes() {
+  case "${PROVIDER_INTERFACE_VERSION}" in
+    v0.1.0|v0.1.1) ;;
+    *) die "PROVIDER_INTERFACE_VERSION must be 'v0.1.0' or 'v0.1.1', got '${PROVIDER_INTERFACE_VERSION}'" ;;
+  esac
   case "${GARM_TARGET}" in
     scaleset|pool) ;;
     *) die "GARM_TARGET must be 'scaleset' or 'pool', got '${GARM_TARGET}'" ;;
@@ -661,14 +673,18 @@ step_config() {
   [provider.external]
     provider_executable = "${PROVIDER_BIN}"
     config_file = "${PROVIDER_CONFIG_FILE}"
-    interface_version = "v0.1.1"
+    interface_version = "${PROVIDER_INTERFACE_VERSION}"
 
 EOF
-  log "interface_version = v0.1.1 turns on this provider's self-description"
-  log "methods (GetConfigJSONSchema/GetExtraSpecsJSONSchema/ValidatePoolInfo,"
-  log "ADR-005) in addition to the eight lifecycle methods this gate"
-  log "exercises; omitting it (or v0.1.0) still works for everything this"
-  log "gate itself checks (internal/provider/provider.go)."
+  log "interface_version defaults to v0.1.0 here (override with"
+  log "PROVIDER_INTERFACE_VERSION=v0.1.1). On GARM <= v0.2.1, GARM's own v0.1.1"
+  log "ListInstances wrapper inverts its error check (if err == nil in"
+  log "runner/providers/v0.1.1/external.go), so every successful list is"
+  log "reported as 'returned error: %!s(<nil>)' and GARM's runner"
+  log "reconciliation keeps failing. Fixed upstream by cloudbase/garm#878"
+  log "(commit 488cf98b), not in any GARM release as of 2026-10-11. GARM v0.2.1"
+  log "never calls the v0.1.1-only self-description methods, so v0.1.0 loses"
+  log "nothing; switch to v0.1.1 once a GARM release includes #878."
   log "The provider runs on THIS host and fetches runner credentials from GARM's"
   log "metadata URL: that URL must be reachable from this host (GitHub never needs"
   log "to reach it in scale-set mode)."

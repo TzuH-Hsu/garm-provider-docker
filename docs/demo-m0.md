@@ -271,13 +271,33 @@ Prints the exact `[[provider]]` section to add to GARM's own `config.toml`
 (commonly `/etc/garm/config.toml`, see `docs/research.md` §1.H and
 [Providers](https://github.com/cloudbase/garm/blob/main/doc/providers.md)):
 the provider executable's absolute path, the generated config file's
-absolute path, and `interface_version = "v0.1.1"` — this turns on the
-provider's v0.1.1 self-description methods (`GetConfigJSONSchema`,
-`GetExtraSpecsJSONSchema`, `ValidatePoolInfo`, `ADR-005`) in addition to the
-eight lifecycle methods this gate itself exercises; omitting it (or setting
-`v0.1.0`) still works for everything this gate checks
-(`internal/provider/provider.go`). Pauses for you to add it and restart/
-reload GARM, then confirm with `garm-cli provider list`.
+absolute path, and `interface_version = "v0.1.0"` by default
+(`PROVIDER_INTERFACE_VERSION=v0.1.1` overrides it). Pauses for you to add it
+and restart/reload GARM, then confirm with `garm-cli provider list`.
+
+**Why v0.1.0.** On GARM v0.2.1 and earlier, GARM's own v0.1.1
+`ListInstances` wrapper inverts its error check (`if err == nil` in
+`runner/providers/v0.1.1/external.go`), so every *successful* provider list
+is reported as `provider binary ... returned error: %!s(<nil>)`, and GARM's
+runner reconciliation for scale sets and pools keeps failing. This is an
+upstream GARM bug, fixed by
+[cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878) ("Improve
+metrics", commit `488cf98b`, merged 2026-09-11) but not in any GARM release
+as of 2026-10-11 (latest: v0.2.1). The v0.1.0 wrapper does not have the bug.
+Nothing is lost: GARM v0.2.1 never calls the v0.1.1-only self-description
+methods (`GetSupportedInterfaceVersions`, `GetConfigJSONSchema`,
+`GetExtraSpecsJSONSchema`, `ValidatePoolInfo`, ADR-005); you can still run
+them by hand with `GARM_INTERFACE_VERSION=v0.1.1`.
+
+**When to switch to v0.1.1.** Once you run a GARM release that includes
+#878, set `PROVIDER_INTERFACE_VERSION=v0.1.1`. The provider supports both
+versions.
+
+Related GARM v0.2.1 pitfall, unrelated to the interface version: a pool or
+scale set whose `extra_specs` is JSON `null` (rather than `{}` or unset)
+makes GARM panic while it injects `runner_install_template`
+([cloudbase/garm#787](https://github.com/cloudbase/garm/issues/787), fix
+slated for GARM 0.2.2). This gate never sends `null`.
 
 ### Step 2 — create a scale set (or pool)
 
