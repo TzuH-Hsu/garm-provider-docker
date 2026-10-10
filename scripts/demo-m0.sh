@@ -425,7 +425,7 @@ resolve_scaleset_name() {
     [[ -s "${f}" ]] && saved="$(head -c 256 "${f}")"
     if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
       ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
-      printf '%s\n' "${SCALESET_NAME}" | write_file_atomic "${f}" 0600
+      write_file_atomic "${f}" 0600 <<< "${SCALESET_NAME}"
       if [[ -n "${saved}" ]]; then
         log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
       fi
@@ -449,7 +449,7 @@ resolve_scaleset_name() {
   fi
   ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
   SCALESET_NAME="garm-docker-gate-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '%s\n' "${SCALESET_NAME}" | write_file_atomic "${f}" 0600
+  write_file_atomic "${f}" 0600 <<< "${SCALESET_NAME}"
 }
 
 # lookup_scaleset_id fills SCALESET_ID (when unset) by finding this scale
