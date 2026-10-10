@@ -1015,6 +1015,13 @@ step_preflight() {
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
   log "  Runner image    : ${runner_image}"
   [[ -z "${dind_image}" ]] || log "  DinD image      : ${dind_image}"
+
+  # Record the modes only now: they describe the artifacts preflight just
+  # produced (binary, runner/DinD image, config.toml), so a failed preflight
+  # must not leave modes saved that the installed config does not match.
+  # (die exits before reaching this line.) For `all`, later steps in this
+  # process already use the effective modes held in the variables.
+  save_modes
 }
 
 # --- Step 1: register the provider with GARM --------------------------------
@@ -1894,13 +1901,16 @@ main() {
   init_arch
   validate_modes
   case "${COMMAND}" in
-    preflight|all) save_modes ;;
+    preflight|all) ;; # these define the modes; step_preflight saves them on success
     *) load_saved_modes; validate_modes ;;
   esac
   # In scale-set mode the scale set name is fixed up front, by preflight/all
   # (generating and saving one if needed) or by any command given an explicit
-  # SCALESET_NAME, so every later step agrees from the start. Pool mode has no
-  # scale set name and never creates the file.
+  # SCALESET_NAME, so every later step agrees from the start. Unlike the
+  # modes, the name describes no generated artifact (it is only the label the
+  # workflow targets), so saving it before preflight's downloads and builds
+  # cannot leave anything inconsistent. Pool mode has no scale set name and
+  # never creates the file.
   if [[ "${GARM_TARGET}" == "scaleset" ]]; then
     case "${COMMAND}" in
       preflight|all) resolve_scaleset_name ;;
