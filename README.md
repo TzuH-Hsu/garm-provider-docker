@@ -205,6 +205,14 @@ you can still run them by hand with `GARM_INTERFACE_VERSION=v0.1.1` (see
 [`docs/config-reference.md`](docs/config-reference.md)). Switch to
 `v0.1.1` once a GARM release includes #878; this provider supports both.
 
+**Running GARM in a container?** Start it with an init process
+(`docker run --init`, or `init: true` in Docker Compose). The provider reports
+runner status from a short-lived background process that must be reaped by
+PID 1 when it exits; GARM's own image runs `/bin/garm` as PID 1, which does
+not reap it. Without an init the provider detects this and waits for the
+runner inside `CreateInstance` instead, which makes creates slower (see
+[`[status_report]`](docs/config-reference.md#status_report-runner-status-reported-to-garm)).
+
 Restart/reload GARM, confirm with `garm-cli provider list`, then create a
 pool against it:
 

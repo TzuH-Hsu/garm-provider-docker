@@ -260,6 +260,25 @@ service manager) is restarted while a watcher runs, the watcher may be stopped
 with it; the runner then stays `installing` and GARM's bootstrap timeout
 applies.
 
+**GARM in a container: run it with an init.** When the provider exits, the
+detached watcher is adopted by PID 1 of its PID namespace, which must wait for
+it when it finishes. systemd (GARM as a service) does. In a container, PID 1 is
+whatever the image starts — in GARM's own image that is `/bin/garm` (its
+`ENTRYPOINT`), and GARM's Docker quickstart starts it without an init — and
+GARM never waits for processes it did not start, so each finished watcher
+would stay a zombie (one per runner) until the container restarts. Start GARM's
+container with an init: `docker run --init`, or `init: true` for the service
+in Docker Compose.
+
+The provider checks this itself: it reads `/proc/1/comm` and detaches the
+watcher only when PID 1 is a known init (`systemd`, `docker-init`, `tini`,
+`dumb-init`, `catatonit`, `s6-svscan`, and similar). Otherwise it logs a
+warning and runs the watcher inside `CreateInstance` instead, so
+`CreateInstance` then takes up to `timeout_seconds` (plus the two reports)
+longer. GARM v0.2.1 does not bound `CreateInstance`; on GARM versions that do
+(`exec_timeout_seconds`, `runner_bootstrap_timeout`), keep `timeout_seconds`
+plus about a minute below that bound, or run GARM with an init.
+
 This is required for **GARM v0.2.1 scale sets**: their job-started handler moves
 a runner to `active` with a checked status transition that only `idle` (or
 `offline`) may take, so a runner left at GARM's initial `pending` stalls the
