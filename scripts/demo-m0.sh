@@ -189,6 +189,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GARM_URL="${GARM_URL:-http://localhost:8080}"
 REPO="${REPO:-}"
 
+# Which modes the operator chose explicitly (env here, flags in the argument
+# loop); the rest may be loaded from the modes saved by an earlier
+# preflight (see load_saved_modes).
+EXPL_PROVIDER_SOURCE="${PROVIDER_SOURCE:-}"
+EXPL_PROVIDER_VERSION="${PROVIDER_VERSION:-}"
+EXPL_PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-}"
+EXPL_GARM_TARGET="${GARM_TARGET:-}"
+EXPL_GATE_VARIANT="${GATE_VARIANT:-}"
+
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.1}"
 
@@ -410,6 +419,98 @@ validate_modes() {
   validate_inputs
   check_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR
   check_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR
+}
+
+# --- Saved modes -------------------------------------------------------------
+#
+# The selected modes are remembered in $PROVIDER_CONFIG_DIR/gate-modes so the
+# documented single-step flow (preflight, then pool, watch, verify, ...) in
+# separate invocations keeps using the same source, version, dispatch target,
+# variant and interface version. Format: KEY=value lines, parsed WITHOUT
+# sourcing or eval, keys and values strictly allowlisted.
+
+readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION"
+
+modes_file() { printf '%s/gate-modes' "${PROVIDER_CONFIG_DIR}"; }
+
+# mode_value_valid KEY VALUE succeeds when VALUE is allowed for KEY.
+mode_value_valid() {
+  case "$1" in
+    PROVIDER_SOURCE)            [[ "$2" =~ ^(release|source)$ ]] ;;
+    PROVIDER_VERSION)           (( ${#2} <= MAX_NAME_LEN )) && [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ;;
+    GARM_TARGET)                [[ "$2" =~ ^(scaleset|pool)$ ]] ;;
+    GATE_VARIANT)               [[ "$2" =~ ^(none|dind)$ ]] ;;
+    PROVIDER_INTERFACE_VERSION) [[ "$2" =~ ^v0\.1\.[01]$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+# explicit_mode_value prints the value the operator chose explicitly for KEY
+# (empty when none).
+explicit_mode_value() {
+  case "$1" in
+    PROVIDER_SOURCE)            printf '%s' "${EXPL_PROVIDER_SOURCE}" ;;
+    PROVIDER_VERSION)           printf '%s' "${EXPL_PROVIDER_VERSION}" ;;
+    GARM_TARGET)                printf '%s' "${EXPL_GARM_TARGET}" ;;
+    GATE_VARIANT)               printf '%s' "${EXPL_GATE_VARIANT}" ;;
+    PROVIDER_INTERFACE_VERSION) printf '%s' "${EXPL_PROVIDER_INTERFACE_VERSION}" ;;
+  esac
+}
+
+# save_modes records the effective modes (called by preflight and all).
+save_modes() {
+  local f key content=""
+  f="$(modes_file)"
+  for key in ${MODE_KEYS}; do
+    content+="${key}=${!key}"$'\n'
+  done
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
+  write_file_atomic "${f}" 0600 <<< "${content%$'\n'}"
+  log "recorded modes in ${f}"
+}
+
+# load_saved_modes applies the modes saved by an earlier preflight to every
+# mode the operator did not choose explicitly, and dies when an explicit
+# choice conflicts with the saved one (never silently switching modes).
+load_saved_modes() {
+  local f key line k v expl cur
+  f="$(modes_file)"
+  [[ -e "${f}" || -L "${f}" ]] || return 0
+  path_is_owned_regular "${f}" \
+    || die "${f} must be a regular file owned by you (not a symlink). Remove it and re-run."
+  if ! path_is_private "${f}" f; then
+    chmod 0600 "${f}" || die "could not set mode 0600 on ${f}; remove it and re-run."
+    warn "${f} was writable by group or others; reset its mode to 0600."
+  fi
+
+  local -a seen=()
+  local count=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    (( ++count <= 16 )) || die "${f} has too many lines. Remove it and re-run preflight."
+    [[ "${line}" == *=* ]] || die "${f} has a malformed line. Remove it and re-run preflight."
+    k="${line%%=*}"
+    v="${line#*=}"
+    [[ " ${MODE_KEYS} " == *" ${k} "* ]] || die "${f} has an unknown key. Remove it and re-run preflight."
+    [[ " ${seen[*]-} " != *" ${k} "* ]] || die "${f} repeats the key ${k}. Remove it and re-run preflight."
+    mode_value_valid "${k}" "${v}" || die "${f} has an invalid value for ${k}. Remove it and re-run preflight."
+    seen+=("${k}")
+    printf -v "SAVED_${k}" '%s' "${v}"
+  done < <(head -c 2048 "${f}")
+
+  for key in ${MODE_KEYS}; do
+    [[ " ${seen[*]-} " == *" ${key} "* ]] || continue
+    v="SAVED_${key}"; v="${!v}"
+    expl="$(explicit_mode_value "${key}")"
+    cur="${!key}"
+    if [[ -n "${expl}" ]]; then
+      [[ "${expl}" == "${v}" ]] \
+        || die "${key}=${expl} conflicts with the saved ${key}=${v} (${f}). Re-run preflight with the new modes, or remove the file."
+    elif [[ "${cur}" != "${v}" ]]; then
+      printf -v "${key}" '%s' "${v}"
+      log "using saved ${key}=${v} from ${f}"
+    fi
+  done
 }
 
 # resolve_scaleset_name fixes SCALESET_NAME for this run: the operator's
@@ -1747,6 +1848,10 @@ Flags:
                        job, instead of dind_mode=none (GATE_VARIANT=dind)
   -h, --help          Show this help
 
+The modes chosen for preflight (or all) are remembered, so later single steps
+(pool, watch, verify, ...) use them without repeating the flags; an explicit
+flag that conflicts with the remembered mode is an error (re-run preflight).
+
 See docs/demo-m0.md for prerequisites, environment variables, what each
 check proves, and a troubleshooting table. No secret is ever read,
 generated, or printed by this script.
@@ -1758,14 +1863,15 @@ COMMAND="all"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1; shift ;;
-    --from-source) PROVIDER_SOURCE="source"; shift ;;
+    --from-source) PROVIDER_SOURCE="source"; EXPL_PROVIDER_SOURCE="source"; shift ;;
     --version)
       [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.1"
       PROVIDER_VERSION="$2"
+      EXPL_PROVIDER_VERSION="$2"
       shift 2
       ;;
-    --pool) GARM_TARGET="pool"; shift ;;
-    --dind) GATE_VARIANT="dind"; shift ;;
+    --pool) GARM_TARGET="pool"; EXPL_GARM_TARGET="pool"; shift ;;
+    --dind) GATE_VARIANT="dind"; EXPL_GATE_VARIANT="dind"; shift ;;
     -h|--help) usage; exit 0 ;;
     preflight|config|pool|watch|verify|postjob|cleanup|all) COMMAND="$1"; shift ;;
     *) usage >&2; die "unknown argument: $1" ;;
@@ -1787,6 +1893,10 @@ run_all() {
 main() {
   init_arch
   validate_modes
+  case "${COMMAND}" in
+    preflight|all) save_modes ;;
+    *) load_saved_modes; validate_modes ;;
+  esac
   case "${COMMAND}" in
     preflight) step_preflight ;;
     config)    step_config ;;
