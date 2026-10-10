@@ -109,7 +109,10 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// ceiling, an unknown flavor, a reserved extra_env name) fails closed as a
 	// provider_fault before a network or volume ever exists for the attempt.
 	// extra_specs is read from the STDIN BootstrapInstance.extra_specs field,
-	// NOT GARM_POOL_EXTRASPECS, which is empty for scale sets (research.md §1).
+	// NOT GARM_POOL_EXTRASPECS, which GARM leaves empty ("null") for scale-set
+	// commands other than CreateInstance (research.md §1.D). Since GARM v0.2.0
+	// this payload also carries GARM's own runner_install_template, which
+	// Parse accepts and ignores (extraspecs.garmReservedKeys).
 	specs, err := extraspecs.Parse(bootstrap.ExtraSpecs)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("invalid extra_specs for %q: %w", instanceName, err)

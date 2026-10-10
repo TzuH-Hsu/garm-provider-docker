@@ -450,3 +450,85 @@ func TestSchemaJSONIsValidParseableSchema(t *testing.T) {
 		t.Errorf("published schema must set additionalProperties:false, got %v", m["additionalProperties"])
 	}
 }
+
+// --- GARM-reserved keys (ADR-005 amendment 2026-10-11) ----------------------
+
+// garmWrapper is a base64 JSON string, the encoding GARM uses for the
+// []byte runner_install_template it injects.
+const garmWrapper = "IyEvYmluL2Jhc2gKZWNobyB3cmFwcGVyCg=="
+
+// TestParseAcceptsAndIgnoresGarmInjectedRunnerInstallTemplate: GARM v0.2.x
+// injects runner_install_template into every CreateInstance extra_specs
+// (util.MaybeAddWrapperToExtraSpecs). It is accepted and has no effect.
+func TestParseAcceptsAndIgnoresGarmInjectedRunnerInstallTemplate(t *testing.T) {
+	cases := map[string]string{
+		"injected-only":       `{"runner_install_template":"` + garmWrapper + `"}`,
+		"with-admin-settings": `{"dind_mode":"none","runner_install_template":"` + garmWrapper + `","flavor":"big"}`,
+		"null-value":          `{"runner_install_template":null}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := Parse(json.RawMessage(raw))
+			if err != nil {
+				t.Fatalf("Parse(%s) = %v, want success", raw, err)
+			}
+			if _, err := got.Resolve(testConfig()); err != nil {
+				t.Fatalf("Resolve after Parse(%s) = %v, want success", raw, err)
+			}
+		})
+	}
+
+	withAdmin, err := Parse(json.RawMessage(cases["with-admin-settings"]))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if withAdmin.DindMode != "none" || withAdmin.Flavor != "big" {
+		t.Errorf("admin settings beside the reserved key were lost: %+v", withAdmin)
+	}
+}
+
+// TestParseStillRejectsUnknownKeysBesideReservedKey: the reserved-key
+// allowance is an exact-name allowlist, not a loosening of
+// additionalProperties:false.
+func TestParseStillRejectsUnknownKeysBesideReservedKey(t *testing.T) {
+	cases := map[string]string{
+		"unknown-admin-key":    `{"runner_install_template":"` + garmWrapper + `","privileged":true}`,
+		"raw-image":            `{"runner_install_template":"` + garmWrapper + `","image":"evil/image:latest"}`,
+		"case-variant":         `{"Runner_Install_Template":"` + garmWrapper + `"}`,
+		"garm-extra-context":   `{"extra_context":{"k":"v"}}`,
+		"garm-pre-install":     `{"pre_install_scripts":{"00-x.sh":"ZWNobw=="}}`,
+		"garm-boot-debug":      `{"enable_boot_debug":true}`,
+		"non-object-null":      `null`,
+		"non-object-array":     `["runner_install_template"]`,
+		"reserved-wrong-type":  `{"runner_install_template":{"nested":true}}`,
+		"reserved-wrong-type2": `{"runner_install_template":42}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(json.RawMessage(raw)); err == nil {
+				t.Fatalf("Parse(%s) = nil, want rejection", raw)
+			}
+		})
+	}
+}
+
+// TestStripGarmReservedKeysDoesNotRewriteUntouchedPayloads: a payload without
+// a reserved key reaches the schema byte-for-byte unchanged.
+func TestStripGarmReservedKeysDoesNotRewriteUntouchedPayloads(t *testing.T) {
+	raw := json.RawMessage(`{ "dind_mode" : "none" }`)
+	got, err := stripGarmReservedKeys(raw)
+	if err != nil {
+		t.Fatalf("stripGarmReservedKeys: %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Errorf("payload rewritten: got %s, want %s", got, raw)
+	}
+
+	stripped, err := stripGarmReservedKeys(json.RawMessage(`{"runner_install_template":"` + garmWrapper + `","dind_mode":"none"}`))
+	if err != nil {
+		t.Fatalf("stripGarmReservedKeys: %v", err)
+	}
+	if strings.Contains(string(stripped), "runner_install_template") {
+		t.Errorf("reserved key not stripped: %s", stripped)
+	}
+}
