@@ -22,6 +22,35 @@ func watcherArgv(exe string) []string {
 	return []string{exe, StatusWatcherArg}
 }
 
+// watcherExecEnvVars are the only variables the watcher's exec environment
+// carries, and only when set in the provider. They hold no secret, and they
+// must be present when the process starts:
+//
+//   - SSL_CERT_FILE and SSL_CERT_DIR: Go's Unix (non-macOS) root-CA loader
+//     honours them, so a GARM callback trusted through them — rather than the
+//     bootstrap CA bundle — must stay trusted in the watcher. The roots are
+//     loaded once, on first use, so they are set before the process starts
+//     rather than later.
+//   - GODEBUG: runtime settings (x509 and TLS behaviour among them) that the
+//     runtime reads at start-up.
+//
+// Proxy variables are not here: proxy URLs can carry credentials, so they
+// travel in the stdin request (statusWatchRequest.ProxyEnv) instead.
+var watcherExecEnvVars = []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "GODEBUG"}
+
+// watcherExecEnv returns the watcher's environment: the set
+// watcherExecEnvVars of this process, and nothing else. Never nil, because a
+// nil environment would make the child inherit this process's.
+func watcherExecEnv() []string {
+	env := []string{}
+	for _, k := range watcherExecEnvVars {
+		if v, ok := os.LookupEnv(k); ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
 // watcherProcAttr is how the watcher is started:
 //
 //   - stdin is the read end of a private pipe the request is written into;
@@ -29,16 +58,19 @@ func watcherArgv(exe string) []string {
 //     stderr until EOF, so a watcher holding either pipe would keep GARM's
 //     CreateInstance call open until the watcher exits. No other descriptor
 //     is inherited (the runtime opens everything close-on-exec);
-//   - an empty, non-nil environment: nothing from GARM's environment is
-//     passed on, and the request is not in it either;
+//   - env: only watcherExecEnvVars (watcherExecEnv); nothing else from GARM's
+//     environment is passed on, and the request is not in it either;
 //   - Setsid: a new session and process group, so signals aimed at the
 //     provider process or its group do not reach the watcher, and the
 //     watcher has no controlling terminal;
 //   - working directory "/", so it pins no directory.
-func watcherProcAttr(stdin, devNull *os.File) *os.ProcAttr {
+func watcherProcAttr(stdin, devNull *os.File, env []string) *os.ProcAttr {
+	if env == nil {
+		env = []string{}
+	}
 	return &os.ProcAttr{
 		Dir:   "/",
-		Env:   []string{},
+		Env:   env,
 		Files: []*os.File{stdin, devNull, devNull},
 		Sys:   &syscall.SysProcAttr{Setsid: true},
 	}
@@ -69,7 +101,7 @@ func startDetachedWatcher(_ context.Context, req statusWatchRequest) (err error)
 	}
 	defer pw.Close()
 
-	proc, err := os.StartProcess(exe, watcherArgv(exe), watcherProcAttr(pr, devNull))
+	proc, err := os.StartProcess(exe, watcherArgv(exe), watcherProcAttr(pr, devNull, watcherExecEnv()))
 	_ = pr.Close() // the watcher holds its own copy
 	if err != nil {
 		return fmt.Errorf("starting the status watcher: %w", err)

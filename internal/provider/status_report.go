@@ -26,9 +26,7 @@ import (
 // Jobs"). It is the provider's signal that the runner is truly online.
 const runnerListeningMarker = "Listening for Jobs"
 
-// statusPostTimeout bounds one status POST, retries included, so a slow or
-// unreachable GARM callback cannot stretch CreateInstance beyond the
-// configured wait by more than this per report.
+// statusPostTimeout bounds one status POST by the watcher, retries included.
 const statusPostTimeout = 20 * time.Second
 
 // maxLogLineBytes is the read buffer for scanning runner output. Longer lines
@@ -44,20 +42,22 @@ const (
 
 // reportRunnerStatus performs provider-side runner status reporting through
 // GARM's instance callback (ADR-002 amendment), the step GARM's userdata
-// templates perform from inside a VM:
+// templates perform from inside a VM. CreateInstance only checks that
+// reporting applies and starts a detached watcher process (status_watch.go),
+// handing it the request over a private pipe; the watcher then
 //
-//  1. report "installing" (credentials are delivered and the runner is
+//  1. reports "installing" (credentials are delivered and the runner is
 //     starting);
-//  2. hand the rest to a detached watcher process (status_watch.go), which
-//     waits, bounded by [status_report].timeout_seconds, for the runner to
-//     print runnerListeningMarker on stdout;
-//  3. the watcher, and only it, then reports "idle".
+//  2. waits, bounded by [status_report].timeout_seconds, for the runner to
+//     print runnerListeningMarker on stdout and confirms it is still running;
+//  3. reports "idle" — or, if the runner never got there, "installing" again
+//     with the reason.
 //
-// CreateInstance never waits for the runner to come online: GARM bounds the
+// No network I/O to GARM happens inside CreateInstance: GARM bounds the
 // provider call (since cloudbase/garm#817, by runner_bootstrap_timeout and the
-// optional exec_timeout_seconds) and kills it on expiry, so a synchronous wait
-// could turn a healthy create into a failed one. Only the "installing" report
-// (seconds, bounded by statusPostTimeout) happens in the call.
+// optional exec_timeout_seconds) and kills it on expiry, so neither a slow
+// callback nor a slow runner may delay it. The added latency is the watcher
+// handoff alone (bounded by watcherHandoffTimeout).
 //
 // GARM v0.2.1 scale sets move a runner to "active" with a CHECKED transition
 // that "pending" and "installing" may not take, so without this a scale-set
@@ -98,21 +98,13 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		return
 	}
 
-	reporter, err := metadata.NewStatusReporter(b.CallbackURL, b.InstanceToken, b.CACertBundle)
-	if err != nil {
+	// Validate the callback URL here (no network I/O) so a bad URL is logged
+	// by CreateInstance instead of by a watcher whose output is discarded.
+	if _, err := metadata.NewStatusReporter(b.CallbackURL, b.InstanceToken, b.CACertBundle); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: cannot report runner status: invalid callback URL (continuing)",
 			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
 		return
 	}
-
-	if err := postStatus(ctx, reporter, metadata.RunnerStatusInstalling, statusMessageInstalling); err != nil {
-		// A runner GARM still has at "pending" cannot legally move to "idle",
-		// so there is nothing to gain from waiting for it.
-		slog.WarnContext(ctx, "CreateInstance: failed to report runner status installing; skipping the idle report (continuing)",
-			"instance", b.Name, "error", err)
-		return
-	}
-	slog.InfoContext(ctx, "CreateInstance: reported runner status", "instance", b.Name, "status", metadata.RunnerStatusInstalling)
 
 	req := statusWatchRequest{
 		Instance:      b.Name,
@@ -129,7 +121,7 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
 		return
 	}
-	slog.InfoContext(ctx, "CreateInstance: started the runner status watcher; it reports idle once the runner is listening for jobs",
+	slog.InfoContext(ctx, "CreateInstance: started the runner status watcher; it reports installing, then idle once the runner is listening for jobs",
 		"instance", b.Name, "timeout", sr.Timeout())
 }
 

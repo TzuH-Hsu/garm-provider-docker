@@ -5,10 +5,14 @@ package provider
 import (
 	"context"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -54,7 +58,7 @@ func TestWatcherProcAttr(t *testing.T) {
 	}
 	defer devNull.Close()
 
-	attr := watcherProcAttr(pr, devNull)
+	attr := watcherProcAttr(pr, devNull, nil)
 	if attr.Env == nil || len(attr.Env) != 0 {
 		t.Errorf("watcher env = %v, want empty and non-nil (nil would inherit the provider's environment)", attr.Env)
 	}
@@ -113,8 +117,8 @@ func TestRunStatusWatcherRejectsBadRequests(t *testing.T) {
 }
 
 // TestCreateInstanceDoesNotWaitForRunner is the core of the GARM exec-timeout
-// fix: CreateInstance reports installing, hands the rest to the watcher, and
-// returns at once even with the largest timeout and a runner that never comes
+// fix: CreateInstance makes no callback request at all, hands everything to
+// the watcher, and returns at once even with the largest timeout and a runner that never comes
 // online. The handoff carries the token, callback URL, container and deadline.
 func TestCreateInstanceDoesNotWaitForRunner(t *testing.T) {
 	meta := newJITMetadataServer(t)
@@ -136,8 +140,9 @@ func TestCreateInstanceDoesNotWaitForRunner(t *testing.T) {
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("CreateInstance took %v; it must not wait for the runner", d)
 	}
-	if s := rec.seen(); strings.Join(s, ",") != "installing" {
-		t.Fatalf("reported statuses = %v, want [installing] from CreateInstance itself", s)
+	// No callback I/O inside CreateInstance: even installing is the watcher's.
+	if s := rec.seen(); len(s) != 0 {
+		t.Fatalf("CreateInstance itself reported %v, want nothing (the watcher reports)", s)
 	}
 	if len(got) != 1 {
 		t.Fatalf("watcher started %d times, want 1", len(got))
@@ -202,8 +207,8 @@ func TestRunStatusWatchStopsAtDeadline(t *testing.T) {
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("watcher ran %v past a 300ms deadline", d)
 	}
-	if s := rec.seen(); strings.Join(s, ",") != "installing" || rec.lastMessage() != statusMessageNotListening {
-		t.Fatalf("reports = %v / %q, want one installing with the not-listening message", s, rec.lastMessage())
+	if s := rec.seen(); strings.Join(s, ",") != "installing,installing" || rec.lastMessage() != statusMessageNotListening {
+		t.Fatalf("reports = %v / %q, want installing, then installing with the not-listening message", s, rec.lastMessage())
 	}
 }
 
@@ -431,5 +436,67 @@ func TestDetachedWatcherUsesCarriedProxy(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the watcher's idle report never went through the carried proxy")
+	}
+}
+
+// TestWatcherExecEnvCarriesOnlyTrustAndRuntimeSettings: the watcher's exec
+// environment holds SSL_CERT_FILE, SSL_CERT_DIR and GODEBUG when set, and
+// nothing else — not the proxy variables (possibly credentialed; they go in
+// the stdin request) and not anything else GARM set.
+func TestWatcherExecEnvCarriesOnlyTrustAndRuntimeSettings(t *testing.T) {
+	t.Setenv("SSL_CERT_FILE", "/etc/garm/ca.pem")
+	t.Setenv("SSL_CERT_DIR", "/etc/garm/certs")
+	t.Setenv("GODEBUG", "x509negativeserial=1")
+	t.Setenv("HTTPS_PROXY", "http://proxyuser:proxy-secret@proxy.example.test:3128")
+	t.Setenv("GARM_COMMAND", "CreateInstance")
+
+	got := strings.Join(watcherExecEnv(), "\n")
+	want := "SSL_CERT_FILE=/etc/garm/ca.pem\nSSL_CERT_DIR=/etc/garm/certs\nGODEBUG=x509negativeserial=1"
+	if got != want {
+		t.Fatalf("watcher exec env = %q, want %q", got, want)
+	}
+}
+
+// TestDetachedWatcherTrustsSSLCertFile: a GARM callback whose CA is trusted
+// only through SSL_CERT_FILE (no bootstrap CA bundle) stays trusted in the
+// detached watcher. Go honours SSL_CERT_FILE on Unix systems other than
+// macOS, where the platform verifier is used instead.
+func TestDetachedWatcherTrustsSSLCertFile(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("Go ignores SSL_CERT_FILE on macOS (platform verifier)")
+	}
+	const containerID = "watcher-sslcert-container"
+	dockerAPI := fakeDockerAPI(t, containerID, "2026-10-10 17:45:14Z: Listening for Jobs")
+	reports := make(chan string, 4)
+	cb := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		reports <- string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cb.Close()
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cb.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSL_CERT_FILE", caFile)
+	t.Setenv("SSL_CERT_DIR", t.TempDir()) // empty: only the file above is trusted
+
+	if err := startDetachedWatcher(context.Background(), statusWatchRequest{
+		Instance: "sslcert", ContainerID: containerID,
+		DockerHost:  "tcp://" + strings.TrimPrefix(dockerAPI.URL, "http://"),
+		CallbackURL: cb.URL + "/api/v1/callbacks", InstanceToken: testInstanceToken,
+		Deadline: time.Now().Add(30 * time.Second),
+	}); err != nil {
+		t.Fatalf("startDetachedWatcher: %v", err)
+	}
+	for _, want := range []string{`"status":"installing"`, `"status":"idle"`} {
+		select {
+		case got := <-reports:
+			if !strings.Contains(got, want) {
+				t.Fatalf("report = %s, want %s", got, want)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatalf("no %s report: the watcher did not trust the callback through SSL_CERT_FILE", want)
+		}
 	}
 }
