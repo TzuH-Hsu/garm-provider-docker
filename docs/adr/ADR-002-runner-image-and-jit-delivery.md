@@ -91,7 +91,13 @@ Status: Accepted (2026-07-19)
 > or reports `installing` again with the reason when it gives up, and exits
 > no later than about 25 s past `timeout_seconds` regardless. The token's
 > lifetime in memory is extended accordingly; it is still never in the
-> container, on disk, or in any process's argv or environment.
+> container, on disk, or in any process's argv or environment. The provider's
+> proxy variables travel in the same stdin request and are installed in the
+> watcher in-process, so its requests take the provider's network path. The
+> watcher reports `idle` only after inspecting the container and finding it
+> still running: a stopped container's logs replay a "Listening for Jobs" line
+> printed before it exited (verified on a live daemon), and an `idle` dead
+> runner would never be reaped.
 >
 > The credential-invisibility design goal is unchanged: the runner container
 > still never calls GARM and never sees the instance token or the callback

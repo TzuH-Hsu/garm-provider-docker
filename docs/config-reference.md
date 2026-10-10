@@ -217,6 +217,12 @@ process (via `docker top`) to stay up for 5 seconds, within the same
 listener process starts slightly before it is connected to GitHub), so prefer a
 readable log driver. The provider never changes the container's log driver.
 
+A readiness signal is confirmed against the container's state before `idle` is
+reported: a stopped container's logs still replay a `Listening for Jobs` line
+it printed before exiting, so a runner that is no longer running is reported
+`installing` with "runner container stopped before it was ready for jobs"
+instead.
+
 If the runner is not listening in time, it is left `installing`, so GARM's
 `runner_bootstrap_timeout` still reaps it if it never comes up. `idle` is never
 reported early for that reason. Both reports are best-effort: a callback error
@@ -238,7 +244,11 @@ GARM kills the provider binary and marks the create failed. Because only the
 count against either limit and needs no coordination with them. The watcher
 holds the instance token in memory for at most `timeout_seconds` plus about 25
 seconds for its final report, then exits; it receives the token over a private
-stdin pipe, never through its command line or environment. If GARM (or its
+stdin pipe, never through its command line or environment. The provider's
+proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, either case) travel the
+same way, so the watcher's requests to GARM and to a `tcp://` Docker host take
+the same network path as the provider's own; proxy credentials are never
+logged. If GARM (or its
 service manager) is restarted while a watcher runs, the watcher may be stopped
 with it; the runner then stays `installing` and GARM's bootstrap timeout
 applies.
