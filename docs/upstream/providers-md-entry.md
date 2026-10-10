@@ -92,7 +92,7 @@ Add garm-provider-docker to the list of supported providers
 ## Summary
 
 Adds `garm-provider-docker` (https://github.com/TzuH-Hsu/garm-provider-docker,
-Apache-2.0, `v0.2.0` tagged and released) as a new row in each of the two
+Apache-2.0, `<RELEASE>` tagged and released) as a new row in each of the two
 provider tables — the root `README.md` and `doc/providers.md` — alphabetically
 between CloudStack and GCP, keeping them in sync.
 
@@ -108,6 +108,13 @@ ceiling that a pool's `extra_specs` can never exceed — and that ceiling
 itself defaults to `["none"]` (fail-closed), so no pool can obtain a
 privileged DinD sidecar unless an operator explicitly widens it.
 
+Verification: a real job was run through the provider on GARM
+`<GARM_VERSION>` (scale-set dispatch, provider interface v0.1.0) for both
+`dind_mode=none` and `privileged-sidecar`, with the runner and all
+job-scoped Docker resources torn down afterwards. Not yet verified: the
+non-JIT path, an arm64 host, and pool/webhook dispatch. No claim of
+production use is made.
+
 This is a documentation-only change: one new row in each of the two
 provider tables, `README.md` and `doc/providers.md`, kept in sync, in
 each table's own existing format and alphabetical position — no other
@@ -118,7 +125,7 @@ file touched.
 - [ ] Both tables render correctly (row count, column alignment) when
       previewed as Markdown
 - [ ] The linked repository (https://github.com/TzuH-Hsu/garm-provider-docker)
-      is public, reachable, and its `v0.2.0` release is still the latest
+      is public, reachable, and its `<RELEASE>` release is still the latest
 - [ ] `README.md` and `doc/providers.md` list the same set of providers in
       the same order
 - [ ] No other content in either file was modified
@@ -127,8 +134,9 @@ file touched.
 Note what the body deliberately does **not** claim: unlike the comparable
 CloudStack PR ("We've been running this provider for a few weeks now and
 we've done thousands of builds with it" — see below), this body makes no
-production-usage claim, because none can be substantiated yet. See the
-checklist's end-to-end-testing item.
+production-usage claim, because none can be substantiated. It states only
+the GARM version actually verified (placeholders to fill in once the
+compatibility-fix release exists); see the checklist's end-to-end item.
 
 ## (c) Upstream requirements found
 
@@ -170,7 +178,7 @@ checklist's end-to-end-testing item.
   day/within hours off a single maintainer review. #612 volunteered
   real-world usage evidence ("thousands of builds") that was not required
   by any documented policy but was plainly persuasive — this repo cannot
-  make an equivalent claim yet (see the checklist below).
+  make an equivalent claim (see the checklist below).
 
 ## (d) Pre-submission checklist
 
@@ -187,18 +195,28 @@ checklist's end-to-end-testing item.
    `ghcr.io/tzuh-hsu/garm-runner-noble` are both tagged `:v0.2.0` and
    `:latest` on GHCR. Re-run the equivalent `gh release view` / package
    API checks at submission time in case a newer tag has since shipped.
-3. **End-to-end validation — state this plainly.** As of 2026-09-26, **no
-   end-to-end run of this provider against a live GARM instance has been
-   recorded in this repository.** `docs/demo-m0.md`'s own "Known unverified
-   until this demo passes" section lists exactly this as open, and the
-   repository's history shows only the commit that added the demo runbook
-   (`9adf693`), never one recording that it was executed. The M0–M4 unit
-   and `docker:dind`-backed integration-test suite passes, but that is a
-   different claim from "this has run a real job through a real GARM
-   instance." Either run `docs/demo-m0.md`'s runbook before submitting, or
-   disclose this status honestly in the PR if you submit first — do not
-   imply production usage (the way the CloudStack PR's "thousands of
-   builds" line does) that has not happened.
+3. **End-to-end validation - state this plainly.** A live run against
+   GARM v0.2.1 (scale sets, provider interface v0.1.0) passed for both
+   `dind_mode=none` and `privileged-sidecar`; the recorded results are in
+   the "Results" and "Still unverified" sections of `docs/demo-m0.md`.
+   **However, it passed only with the GARM v0.2.x compatibility fix, which
+   is not yet released: the `v0.2.0` release binary fails on GARM v0.2.x**
+   (`CreateInstance` rejects GARM's injected `runner_install_template`;
+   `GetInstance`/`DeleteInstance` fail with "missing pool ID"). Before
+   submitting:
+   1. Wait for the release that contains the compatibility fix (expected
+      `v0.2.1`) and re-run the gate (`docs/demo-m0.md`) against that
+      release binary, not a branch build.
+   2. Resolve or document the open runner-status issue: GARM logs
+      `invalid runner status transition from pending to active` and shows
+      the runner as `pending` for its lifetime because runner callbacks
+      are disabled by default; the job itself succeeds.
+   3. Fill in the placeholders in the PR body (`<RELEASE>` and
+      `<GARM_VERSION>`) from the re-run. Do not claim compatibility with
+      "GARM" generically, and do not imply production usage (the way the
+      CloudStack PR's "thousands of builds" line does); the gate is a
+      limited verification, not production evidence. Still unverified: the
+      non-JIT path, an arm64 host, and pool/webhook mode.
 4. **This repo's own `README.md` "Status" section** has been refreshed
    (companion commit `docs(readme): update release status for v0.2.0`) to
    state the current `v0.2.0` release facts instead of the old `v0.1.0`
