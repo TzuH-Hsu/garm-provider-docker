@@ -158,6 +158,25 @@ func TestValidatePoolInfoAcceptsBase64(t *testing.T) {
 	}
 }
 
+// TestValidatePoolInfoGarmReservedRunnerInstallTemplate: an admin may set
+// runner_install_template (GARM requires it when a pool/scale set has no
+// install template), so ValidatePoolInfo accepts and ignores it like
+// CreateInstance does — but an unknown key beside it is still rejected.
+func TestValidatePoolInfoGarmReservedRunnerInstallTemplate(t *testing.T) {
+	p, _ := newTestProvider(t)
+	ok := `{"dind_mode": "none", "runner_install_template": "IyEvYmluL2Jhc2gK"}`
+	if err := p.ValidatePoolInfo(context.Background(), "", "", "", ok); err != nil {
+		t.Errorf("ValidatePoolInfo with runner_install_template = %v, want nil", err)
+	}
+	if err := p.ValidatePoolInfo(context.Background(), "", "", "", base64.StdEncoding.EncodeToString([]byte(ok))); err != nil {
+		t.Errorf("ValidatePoolInfo with base64 runner_install_template = %v, want nil", err)
+	}
+	bad := `{"runner_install_template": "IyEvYmluL2Jhc2gK", "docker_host": "tcp://evil:2375"}`
+	if err := p.ValidatePoolInfo(context.Background(), "", "", "", bad); err == nil {
+		t.Error("ValidatePoolInfo with an unknown key beside runner_install_template = nil, want error")
+	}
+}
+
 // TestV011RunDispatch drives the four v0.1.1 commands through
 // garm-provider-common's own EnvironmentV011.Run, proving *Provider satisfies
 // the versioned interface at RUNTIME (the same dispatch the binary uses under

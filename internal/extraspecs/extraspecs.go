@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -157,6 +158,72 @@ func reservedEnvName(name string) bool {
 	return false
 }
 
+// garmReservedKeys is the explicit allowlist of extra_specs keys that GARM
+// itself owns (ADR-005, amended 2026-10-11). They are accepted and IGNORED: Parse
+// strips them before schema validation and decoding, so they never reach
+// Resolve and never influence provisioning. Every other unknown key is still
+// rejected by the schema's additionalProperties:false.
+//
+//   - runner_install_template: since GARM v0.2.0, GARM's CreateInstance path
+//     (util.MaybeAddWrapperToExtraSpecs, called from runner/pool/pool.go for
+//     pools and workers/provider/instance_manager.go for scale sets) injects
+//     this key into the BootstrapInstance extra_specs whenever the admin did
+//     not set it, carrying GARM's rendered userdata wrapper (a []byte, so a
+//     base64 JSON string). An admin may also set it explicitly: GARM REQUIRES
+//     it when the pool/scale set has no install template. It drives GARM's
+//     cloud-init/userdata install flow, which this provider does not use — the
+//     runner image is prebuilt and fetches its JIT credentials directly from
+//     the metadata service (ADR-002) — so it has no meaning here.
+//
+// GARM's other extra_specs-level settings (extra_context, pre_install_scripts,
+// enable_boot_debug) are never injected by GARM, only ever admin-supplied, and
+// likewise have no effect on this provider; they stay rejected so a pool that
+// sets them fails loudly instead of silently doing nothing.
+var garmReservedKeys = []string{"runner_install_template"}
+
+// stripGarmReservedKeys returns raw with every garmReservedKeys entry removed
+// from the top-level object. raw is returned unchanged when it is not a JSON
+// object (the schema then rejects it) or carries no reserved key. A reserved
+// key whose value is not a JSON string is rejected: GARM encodes
+// runner_install_template as base64 of a []byte, and GARM itself fails to
+// decode any other type, so anything else is a malformed payload.
+func stripGarmReservedKeys(raw json.RawMessage) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return raw, nil
+	}
+
+	kept := make(map[string]json.RawMessage, len(fields))
+	stripped := false
+	for name, value := range fields {
+		if !isGarmReservedKey(name) {
+			kept[name] = value
+			continue
+		}
+		var asString string
+		if err := json.Unmarshal(value, &asString); err != nil {
+			return nil, fmt.Errorf("extra_specs.%s is reserved for GARM and must be a JSON string (GARM encodes it as base64): %w", name, err)
+		}
+		stripped = true
+	}
+	if !stripped {
+		return raw, nil
+	}
+
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-encode extra_specs after removing GARM-reserved keys: %w", err)
+	}
+	return out, nil
+}
+
+// isGarmReservedKey reports whether name is on the garmReservedKeys allowlist.
+// Matching is exact (case-sensitive): GARM writes the key with exactly this
+// spelling, and a near-miss spelling stays an unknown key the schema rejects.
+func isGarmReservedKey(name string) bool {
+	return slices.Contains(garmReservedKeys, name)
+}
+
 // Parse schema-validates raw (draft-07, additionalProperties:false) FAIL-CLOSED,
 // decodes it into an ExtraSpecs, and enforces the two CONFIG-INDEPENDENT env
 // gates: the env-name charset (H3) and the hard-reserved set (H2). It performs
@@ -168,9 +235,19 @@ func reservedEnvName(name string) bool {
 // An empty/nil payload is treated as {} (garm-provider-common initializes a
 // missing extra_specs to {} anyway), so a pool with no extra_specs parses to
 // the zero ExtraSpecs.
+//
+// GARM-owned keys (garmReservedKeys, e.g. the runner_install_template GARM
+// v0.2.x injects into every CreateInstance payload) are stripped BEFORE schema
+// validation, so they are accepted and ignored; every other unknown key is
+// still rejected fail-closed.
 func Parse(raw json.RawMessage) (ExtraSpecs, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		raw = json.RawMessage("{}")
+	}
+
+	raw, err := stripGarmReservedKeys(raw)
+	if err != nil {
+		return ExtraSpecs{}, err
 	}
 
 	result, err := compiledSchema.Validate(gojsonschema.NewBytesLoader(raw))
