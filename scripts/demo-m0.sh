@@ -845,7 +845,7 @@ step_watch() {
   sample_workflow_yaml
   echo
 
-  log "Watching docker ps (managed containers) + GARM's runner list, every ${WATCH_INTERVAL_SECONDS}s"
+  log "Watching docker ps (managed runner containers) + GARM's runner list, every ${WATCH_INTERVAL_SECONDS}s"
   log "(Ctrl+C to stop early and move on to Step 4; stops on its own after ${WATCH_MAX_ITERATIONS} iterations, 0 = unbounded)."
 
   trap 'log "stopping watch (Ctrl+C)"; trap - INT; return 0' INT
@@ -853,7 +853,7 @@ step_watch() {
   local iterations=0
   while (( WATCH_MAX_ITERATIONS == 0 || iterations < WATCH_MAX_ITERATIONS )); do
     echo "--- $(date -u +%FT%TZ) ---"
-    docker ps --filter 'label=garm.docker/managed=true' \
+    docker ps --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' \
       --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Labels}}' || true
     watch_runner_list
     sleep "${WATCH_INTERVAL_SECONDS}"
@@ -1190,17 +1190,26 @@ step_postjob() {
     ok "no managed runner container remains"
   fi
 
-  local leftover_c leftover_n leftover_v
+  # Persistent cache volumes (garm.docker/cache=true, ADR-003) are excluded by
+  # label, not by name: they survive jobs by design and are reported
+  # informationally. Everything else managed must be gone.
+  local leftover_c leftover_n leftover_v cache_v
   leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}')"
   leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
-  leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
+  cache_v="$(docker volume ls --filter 'label=garm.docker/cache=true' --format '{{.Name}}')"
+  leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}' \
+    | { if [[ -n "${cache_v}" ]]; then command grep -vxF -f <(printf '%s\n' "${cache_v}") || true; else cat; fi; })"
   if [[ -z "${leftover_c}" && -z "${leftover_n}" && -z "${leftover_v}" ]]; then
-    ok "no leftover garm.docker/managed=true containers, networks, or volumes"
+    ok "no leftover job-scoped garm.docker/managed=true containers, networks, or volumes"
   else
     bad "leftover managed resources found"
     [[ -n "${leftover_c}" ]] && printf '    containers: %s\n' "${leftover_c}"
     [[ -n "${leftover_n}" ]] && printf '    networks: %s\n' "${leftover_n}"
     [[ -n "${leftover_v}" ]] && printf '    volumes: %s\n' "${leftover_v}"
+  fi
+  if [[ -n "${cache_v}" ]]; then
+    log "info: persistent cache volumes (garm.docker/cache=true, kept by design):"
+    printf '    %s\n' "${cache_v}"
   fi
   log "Note: the per-job network and the named workspace volume both carry"
   log "garm.docker/managed=true (ADR-001/ADR-004), so DeleteInstance's"
