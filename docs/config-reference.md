@@ -191,13 +191,14 @@ is verified running, the provider reports the runner's status to GARM's
 instance callback (`POST {callback-url}/status`, authenticated with the
 instance token it already holds for the credential fetch):
 
-1. `installing` right away, from `CreateInstance` itself (a few seconds at
-   most);
+1. `installing` right away;
 2. `idle` once the runner's own stdout shows `Listening for Jobs` (read
-   through the Docker logs API), waiting at most `timeout_seconds`. This wait
-   does **not** happen inside `CreateInstance`: a detached watcher process
-   (the provider binary re-executed in its own session) does it, so
-   `CreateInstance` returns as soon as the runner is started. See "Interaction
+   through the Docker logs API), waiting at most `timeout_seconds`.
+
+Neither report is made inside `CreateInstance`: a detached watcher process
+(the provider binary re-executed in its own session) makes both, so
+`CreateInstance` returns as soon as the runner is started and the watcher has
+received its request (a handoff bounded by 5 seconds). See "Interaction
    with GARM's provider timeouts" below.
 
 Only **JIT** runners are reported (scale sets always use JIT; pools do unless
@@ -226,8 +227,9 @@ instead.
 If the runner is not listening in time, it is left `installing`, so GARM's
 `runner_bootstrap_timeout` still reaps it if it never comes up. `idle` is never
 reported early for that reason. Both reports are best-effort: a callback error
-is logged (with the token redacted) and `CreateInstance` still succeeds. If the
-`installing` report fails, the watcher is not started. A watcher that gives up
+never affects `CreateInstance`. If the watcher cannot be started, `CreateInstance`
+logs a warning (token redacted) and still succeeds. If the `installing` report
+fails, the watcher does not wait for the runner. A watcher that gives up
 (timeout, or the runner container stopped) reports `installing` once more with
 a message saying why, so the outcome is visible in GARM's instance events
 (`garm-cli runner show`). The watcher's own output goes nowhere (its stdout and
@@ -240,15 +242,20 @@ a provider's `CreateInstance` call. Newer GARM (from
 of 2026-10-11) bounds it by the pool's or scale set's `runner_bootstrap_timeout`
 and, if set, the smaller `[provider.external].exec_timeout_seconds`; on expiry
 GARM kills the provider binary and marks the create failed. Because only the
-`installing` report runs inside `CreateInstance`, `timeout_seconds` does not
-count against either limit and needs no coordination with them. The watcher
+watcher handoff runs inside `CreateInstance`, neither the callback's latency
+nor `timeout_seconds` counts against either limit, and no coordination with
+them is needed. The watcher
 holds the instance token in memory for at most `timeout_seconds` plus about 25
 seconds for its final report, then exits; it receives the token over a private
 stdin pipe, never through its command line or environment. The provider's
 proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, either case) travel the
 same way, so the watcher's requests to GARM and to a `tcp://` Docker host take
 the same network path as the provider's own; proxy credentials are never
-logged. If GARM (or its
+logged. `SSL_CERT_FILE`, `SSL_CERT_DIR` and `GODEBUG` (when set) are the only
+variables in the watcher's own environment: Go's Unix root-CA loader honours
+the first two, so a GARM callback trusted through them rather than the
+bootstrap CA bundle stays trusted, and the runtime reads `GODEBUG` at start-up.
+They hold no secrets. If GARM (or its
 service manager) is restarted while a watcher runs, the watcher may be stopped
 with it; the runner then stays `installing` and GARM's bootstrap timeout
 applies.
