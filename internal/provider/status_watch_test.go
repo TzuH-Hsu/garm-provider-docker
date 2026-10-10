@@ -500,3 +500,90 @@ func TestDetachedWatcherTrustsSSLCertFile(t *testing.T) {
 		}
 	}
 }
+
+func TestReaperVerdict(t *testing.T) {
+	for _, tt := range []struct {
+		comm string
+		err  error
+		want bool
+	}{
+		{"systemd\n", nil, true},
+		{"docker-init\n", nil, true},
+		{"tini\n", nil, true},
+		{"catatonit\n", nil, true},
+		{"garm\n", nil, false},
+		{"garm-provider-d\n", nil, false},
+		{"sleep\n", nil, false},
+		{"", errors.New("permission denied"), true},
+	} {
+		if got := reaperVerdict(tt.comm, tt.err); got != tt.want {
+			t.Errorf("reaperVerdict(%q, %v) = %v, want %v", tt.comm, tt.err, got, tt.want)
+		}
+	}
+}
+
+// withReaperCheck overrides the reaper check and the detach function.
+func withReaperCheck(t *testing.T, reaped bool, pid1 string) *[]statusWatchRequest {
+	t.Helper()
+	prevCheck, prevDetach := orphanReaperCheck, detachWatcher
+	var detached []statusWatchRequest
+	orphanReaperCheck = func() (bool, string) { return reaped, pid1 }
+	detachWatcher = func(_ context.Context, req statusWatchRequest) error {
+		detached = append(detached, req)
+		return nil
+	}
+	t.Cleanup(func() { orphanReaperCheck, detachWatcher = prevCheck, prevDetach })
+	return &detached
+}
+
+func TestStartStatusWatcherDetachesWhenOrphansAreReaped(t *testing.T) {
+	detached := withReaperCheck(t, true, "docker-init")
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	cb, rec := newStatusCallbackServer(t, nil)
+	p, _ := newTestProvider(t)
+	p.spawnStatusWatcher = p.startStatusWatcher
+
+	if _, err := p.CreateInstance(context.Background(), statusBootstrap(meta.URL, cb.URL)); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if len(*detached) != 1 {
+		t.Fatalf("detached watchers = %d, want 1", len(*detached))
+	}
+	if s := rec.seen(); len(s) != 0 {
+		t.Errorf("CreateInstance reported %v itself, want nothing", s)
+	}
+}
+
+// TestStartStatusWatcherRunsInProcessWithoutReaper: with GARM as PID 1 and no
+// init, the watcher would become a zombie, so it runs inside CreateInstance.
+func TestStartStatusWatcherRunsInProcessWithoutReaper(t *testing.T) {
+	detached := withReaperCheck(t, false, "garm")
+	meta := newJITMetadataServer(t)
+	defer meta.Close()
+	p, fake := newTestProvider(t)
+	p.spawnStatusWatcher = p.startStatusWatcher
+	b := statusBootstrap(meta.URL, "")
+	runner := spec.RunnerContainerName(b.Name)
+	cb, rec := newStatusCallbackServer(t, func(status string) int {
+		if status == "installing" {
+			printRunnerOnline(fake, runner)
+		}
+		return 0
+	})
+	b.CallbackURL = cb.URL + "/api/v1/callbacks"
+	logs := captureLogs(t)
+
+	if _, err := p.CreateInstance(context.Background(), b); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if len(*detached) != 0 {
+		t.Fatalf("a watcher was detached although orphans are not reaped")
+	}
+	if s := rec.seen(); strings.Join(s, ",") != "installing,idle" {
+		t.Fatalf("reports = %v, want installing, idle from the in-process watcher", s)
+	}
+	if out := logs.String(); !strings.Contains(out, "docker run --init") || !strings.Contains(out, "pid1=garm") {
+		t.Errorf("want a warning naming PID 1 and recommending --init, logs:\n%s", out)
+	}
+}
