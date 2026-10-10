@@ -191,9 +191,14 @@ is verified running, the provider reports the runner's status to GARM's
 instance callback (`POST {callback-url}/status`, authenticated with the
 instance token it already holds for the credential fetch):
 
-1. `installing` right away;
+1. `installing` right away, from `CreateInstance` itself (a few seconds at
+   most);
 2. `idle` once the runner's own stdout shows `Listening for Jobs` (read
-   through the Docker logs API), waiting at most `timeout_seconds`.
+   through the Docker logs API), waiting at most `timeout_seconds`. This wait
+   does **not** happen inside `CreateInstance`: a detached watcher process
+   (the provider binary re-executed in its own session) does it, so
+   `CreateInstance` returns as soon as the runner is started. See "Interaction
+   with GARM's provider timeouts" below.
 
 Only **JIT** runners are reported (scale sets always use JIT; pools do unless
 `disable_jit_config` is set). A non-JIT runner registers inside the container,
@@ -208,7 +213,7 @@ remote drivers with dual logging enabled). With the `none` driver the daemon
 refuses to return logs ("configured logging driver does not support reading"),
 so the provider falls back to waiting for the runner's `Runner.Listener`
 process (via `docker top`) to stay up for 5 seconds, within the same
-`timeout_seconds`, and logs a warning. The fallback is weaker evidence (the
+`timeout_seconds`, and records that in the `idle` event message. The fallback is weaker evidence (the
 listener process starts slightly before it is connected to GitHub), so prefer a
 readable log driver. The provider never changes the container's log driver.
 
@@ -216,7 +221,27 @@ If the runner is not listening in time, it is left `installing`, so GARM's
 `runner_bootstrap_timeout` still reaps it if it never comes up. `idle` is never
 reported early for that reason. Both reports are best-effort: a callback error
 is logged (with the token redacted) and `CreateInstance` still succeeds. If the
-`installing` report fails, the wait and the `idle` report are skipped.
+`installing` report fails, the watcher is not started. A watcher that gives up
+(timeout, or the runner container stopped) reports `installing` once more with
+a message saying why, so the outcome is visible in GARM's instance events
+(`garm-cli runner show`). The watcher's own output goes nowhere (its stdout and
+stderr are `/dev/null`, so it never holds GARM's pipes open); GARM's events and
+the runner status are where its result shows.
+
+**Interaction with GARM's provider timeouts.** GARM v0.2.1 puts no deadline on
+a provider's `CreateInstance` call. Newer GARM (from
+[cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), unreleased as
+of 2026-10-11) bounds it by the pool's or scale set's `runner_bootstrap_timeout`
+and, if set, the smaller `[provider.external].exec_timeout_seconds`; on expiry
+GARM kills the provider binary and marks the create failed. Because only the
+`installing` report runs inside `CreateInstance`, `timeout_seconds` does not
+count against either limit and needs no coordination with them. The watcher
+holds the instance token in memory for at most `timeout_seconds` plus about 25
+seconds for its final report, then exits; it receives the token over a private
+stdin pipe, never through its command line or environment. If GARM (or its
+service manager) is restarted while a watcher runs, the watcher may be stopped
+with it; the runner then stays `installing` and GARM's bootstrap timeout
+applies.
 
 This is required for **GARM v0.2.1 scale sets**: their job-started handler moves
 a runner to `active` with a checked status transition that only `idle` (or
@@ -228,7 +253,8 @@ way and also get accurate status.
 
 ```toml
 [status_report]
-# Bound on the wait for "Listening for Jobs". Default 90; range 0-600.
+# Bound on the detached watcher's wait for "Listening for Jobs".
+# Default 90; range 0-600. CreateInstance itself does not wait.
 # 0 disables status reporting entirely (no callback is made).
 timeout_seconds = 90
 ```

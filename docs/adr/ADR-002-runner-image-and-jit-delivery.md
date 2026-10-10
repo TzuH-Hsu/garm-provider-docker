@@ -76,6 +76,23 @@ Status: Accepted (2026-07-19)
 > process starts before its session with GitHub is open). The provider does
 > not override the container's log driver.
 >
+> **The wait never runs inside `CreateInstance`.** GARM v0.2.1 imposes no
+> deadline on the provider's create call, but `cloudbase/garm#817` (unreleased
+> as of 2026-10-11) bounds it by `runner_bootstrap_timeout` and the optional
+> `[provider.external].exec_timeout_seconds`, killing the binary and marking
+> the create failed on expiry; a synchronous wait could therefore turn a
+> healthy create into a failed one. `CreateInstance` only sends `installing`
+> (bounded by a 20 s POST timeout) and then re-executes the provider binary as
+> a detached watcher (hidden first argument, `os.StartProcess` with `Setsid`,
+> stdout/stderr on `/dev/null` so GARM's pipes are not held open, an empty
+> environment, and the request — token, callback URL, container ID,
+> deadline — written to a private stdin pipe, never argv or environment). The
+> watcher does the log follow (or the `docker top` fallback), reports `idle`,
+> or reports `installing` again with the reason when it gives up, and exits
+> no later than about 25 s past `timeout_seconds` regardless. The token's
+> lifetime in memory is extended accordingly; it is still never in the
+> container, on disk, or in any process's argv or environment.
+>
 > The credential-invisibility design goal is unchanged: the runner container
 > still never calls GARM and never sees the instance token or the callback
 > URL; `docker inspect` output is the same as before. The
