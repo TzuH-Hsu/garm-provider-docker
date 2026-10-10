@@ -1897,6 +1897,16 @@ main() {
     preflight|all) save_modes ;;
     *) load_saved_modes; validate_modes ;;
   esac
+  # In scale-set mode the scale set name is fixed up front, by preflight/all
+  # (generating and saving one if needed) or by any command given an explicit
+  # SCALESET_NAME, so every later step agrees from the start. Pool mode has no
+  # scale set name and never creates the file.
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    case "${COMMAND}" in
+      preflight|all) resolve_scaleset_name ;;
+      *) [[ -z "${SCALESET_NAME}" ]] || resolve_scaleset_name ;;
+    esac
+  fi
   case "${COMMAND}" in
     preflight) step_preflight ;;
     config)    step_config ;;
