@@ -58,6 +58,10 @@ type FakeClient struct {
 	// used to exercise the pull-failure creation-guard path.
 	PullErr error
 
+	// LogsErr, when non-nil, is returned by ContainerLogs instead of opening a
+	// log stream — an API-level logs failure (see fake_logs.go).
+	LogsErr error
+
 	// ExecErr, when non-nil, is returned by ExecStream instead of running —
 	// used to exercise the exec-delivery-failure creation-guard path.
 	ExecErr error
@@ -289,6 +293,17 @@ type fakeContainer struct {
 	// which is measured from this timestamp, not from allocation creation. Zero
 	// until the container has stopped.
 	finishedAt time.Time
+
+	// tty models container.Config.Tty: it decides whether ContainerLogs frames
+	// its output with the stdcopy multiplexing header (false, every container
+	// this provider creates) or returns raw bytes (true).
+	tty bool
+
+	// logs is what the container "printed" (AppendLog), and logNotify is closed
+	// and replaced whenever logs or state change, waking ContainerLogs
+	// followers (fake_logs.go).
+	logs      []fakeLogEntry
+	logNotify chan struct{}
 }
 
 // fakeNetwork models an in-memory Docker network.
@@ -630,6 +645,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.image = cfg.Image
 		c.env = append([]string(nil), cfg.Env...)
 		c.cmd = append([]string(nil), cfg.Cmd...)
+		c.tty = cfg.Tty
 		for k, v := range cfg.Labels {
 			c.labels[k] = v
 		}
@@ -742,6 +758,7 @@ func (f *FakeClient) ContainerStop(_ context.Context, containerID string, _ cont
 	}
 	c.state = "exited"
 	c.finishedAt = time.Now()
+	c.wakeLogFollowers()
 	return nil
 }
 
@@ -760,6 +777,7 @@ func (f *FakeClient) SetState(containerID, state string, oomKilled bool) {
 		if (state == "exited" || state == "dead") && c.finishedAt.IsZero() {
 			c.finishedAt = time.Now()
 		}
+		c.wakeLogFollowers()
 	}
 }
 
@@ -804,6 +822,7 @@ func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ co
 		return notFoundf("container %s not found", containerID)
 	}
 	delete(f.containers, c.id)
+	c.wakeLogFollowers()
 	f.RemoveOrder = append(f.RemoveOrder, "container:"+c.id)
 	return nil
 }
@@ -853,6 +872,7 @@ func (f *FakeClient) ContainerWait(_ context.Context, containerID string, _ cont
 		if c.finishedAt.IsZero() {
 			c.finishedAt = time.Now()
 		}
+		c.wakeLogFollowers()
 	}
 	statusCh <- container.WaitResponse{StatusCode: int64(f.BatchExitCode)}
 	return statusCh, errCh

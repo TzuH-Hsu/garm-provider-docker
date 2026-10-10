@@ -103,6 +103,15 @@ type Client interface {
 	// This is why CopyToContainer was removed from this interface entirely.
 	ExecStream(ctx context.Context, containerID string, cmd []string, stdin io.Reader) (exitCode int, err error)
 
+	// ContainerLogs streams a container's log output. For a container created
+	// WITHOUT a TTY — every container this provider creates — the stream is
+	// the daemon's multiplexed stdout/stderr framing and must be demultiplexed
+	// with pkg/stdcopy; with options.Follow it stays open until the container
+	// stops or ctx is cancelled. The caller must Close the returned reader.
+	// CreateInstance uses it, read-only and bounded, to see the runner print
+	// "Listening for Jobs" before reporting the runner idle to GARM.
+	ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error)
+
 	// NetworkCreate creates a labeled bridge network — the per-job network
 	// ADR-001 requires in every mode, and ADR-004's claim marker (the first
 	// resource created for an allocation). It returns a Conflict error
