@@ -102,6 +102,17 @@ Status: Accepted (2026-07-19)
 > printed before it exited (verified on a live daemon), and an `idle` dead
 > runner would never be reaped.
 >
+> A detached watcher is adopted by PID 1 when the provider exits. In a
+> container whose PID 1 is GARM itself (GARM's image has `/bin/garm` as its
+> entrypoint and its Docker quickstart uses no init), nothing waits for it and
+> each finished watcher stays a zombie. The provider therefore detaches only
+> when `/proc/1/comm` names a known init (systemd, docker-init, tini,
+> catatonit, ...); otherwise it runs the watcher inside `CreateInstance`,
+> bounded by `timeout_seconds`, and warns that GARM's container should run
+> with an init (`docker run --init`, Compose `init: true`). Verified on a live
+> daemon: an orphan under a non-init PID 1 stays a zombie, and under
+> `--init` (PID 1 `docker-init`) it is reaped.
+>
 > The credential-invisibility design goal is unchanged: the runner container
 > still never calls GARM and never sees the instance token or the callback
 > URL; `docker inspect` output is the same as before. The
