@@ -6,11 +6,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
@@ -68,6 +70,19 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 			"instance", b.Name)
 		return
 	}
+	if !b.JitConfigEnabled {
+		// Non-JIT runners register through config.sh inside the container, so
+		// GARM has no agent ID on the row; GARM's own bootstrap reports idle
+		// together with the agent_id read from .runner, which this provider
+		// cannot see. An ID-less idle would leave the row without an agent ID,
+		// and GARM skips removing the GitHub registration of a runner whose
+		// agent ID is 0 (runner/pool/pool.go DeleteRunner). Non-JIT only occurs
+		// on pools (scale sets always use JIT), and pools move runners to
+		// active with forced updates, so they do not need these reports.
+		slog.DebugContext(ctx, "CreateInstance: runner status reporting skipped for a non-JIT runner",
+			"instance", b.Name)
+		return
+	}
 	if b.CallbackURL == "" {
 		slog.WarnContext(ctx, "CreateInstance: GARM sent no callback URL; runner status is not reported and GARM keeps the runner pending",
 			"instance", b.Name)
@@ -113,6 +128,23 @@ func postStatus(ctx context.Context, r *metadata.StatusReporter, status, message
 	return r.PostStatus(postCtx, status, message)
 }
 
+// Readiness fallback when the runner's logs cannot be read (log driver "none",
+// or a remote driver with the daemon's dual-logging cache disabled): poll the
+// container's process list for the actions/runner listener and require it to
+// stay up for listenerSettle. Variables so tests can shorten them.
+var (
+	listenerPollInterval = time.Second
+	listenerSettle       = 5 * time.Second
+)
+
+// runnerListenerProcess is the actions/runner listener binary; run.sh starts
+// it as /actions-runner/bin/Runner.Listener.
+const runnerListenerProcess = "Runner.Listener"
+
+// errRunnerStopped reports that the runner container stopped (or vanished)
+// while the provider was waiting for it to come online.
+var errRunnerStopped = errors.New("runner container is no longer running")
+
 // errLogStreamEnded reports that the runner's log stream closed (the container
 // stopped) before the listening marker appeared.
 var errLogStreamEnded = errors.New("runner log stream ended before the runner was listening")
@@ -121,13 +153,23 @@ var errLogStreamEnded = errors.New("runner log stream ended before the runner wa
 // runnerListeningMarker (true), the stream ends because the container stopped,
 // or timeout elapses (false, with the reason). The stream is the daemon's
 // stdcopy-multiplexed framing (the runner has no TTY), demultiplexed here.
+// When the daemon cannot return the logs at all, it falls back to
+// waitListenerProcess within the same timeout.
 func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, timeout time.Duration) (bool, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	rc, err := p.cli.ContainerLogs(waitCtx, containerID, container.LogsOptions{ShowStdout: true, Follow: true})
 	if err != nil {
-		return false, err
+		if waitCtx.Err() != nil {
+			return false, waitCtx.Err()
+		}
+		// A real daemon answers 501 "configured logging driver does not
+		// support reading" for the "none" driver. The container's log driver
+		// is the operator's choice, so fall back instead of overriding it.
+		slog.WarnContext(ctx, "CreateInstance: cannot read the runner's logs; falling back to watching for the runner listener process, which is weaker evidence that the runner is online than its \"Listening for Jobs\" line. Use a log driver the daemon can read back (json-file or local, or enable dual logging) for exact detection",
+			"container_id", containerID, "error", err)
+		return p.waitListenerProcess(waitCtx, containerID)
 	}
 	defer rc.Close()
 
@@ -145,6 +187,55 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 		return false, waitCtx.Err()
 	}
 	return false, errLogStreamEnded
+}
+
+// waitListenerProcess polls the container's process list until the
+// actions/runner listener has been running continuously for listenerSettle
+// (true), the container stops (errRunnerStopped), or ctx ends.
+func (p *Provider) waitListenerProcess(ctx context.Context, containerID string) (bool, error) {
+	ticker := time.NewTicker(listenerPollInterval)
+	defer ticker.Stop()
+
+	var firstSeen time.Time
+	for {
+		top, err := p.cli.ContainerTop(ctx, containerID, nil)
+		switch {
+		case err != nil && (errdefs.IsNotFound(err) || errdefs.IsConflict(err)):
+			// The daemon answers 409 Conflict for top on a stopped container
+			// and 404 once it is removed.
+			return false, errRunnerStopped
+		case err == nil && hasProcess(top, runnerListenerProcess):
+			if firstSeen.IsZero() {
+				firstSeen = time.Now()
+			}
+			if time.Since(firstSeen) >= listenerSettle {
+				return true, nil
+			}
+		default:
+			// Not up yet (or a transient top failure): restart the settle.
+			firstSeen = time.Time{}
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// hasProcess reports whether any process's command line (the CMD/COMMAND
+// column of a top response) contains name.
+func hasProcess(top container.TopResponse, name string) bool {
+	col := slices.IndexFunc(top.Titles, func(t string) bool { return t == "CMD" || t == "COMMAND" })
+	if col < 0 {
+		return false
+	}
+	for _, proc := range top.Processes {
+		if col < len(proc) && strings.Contains(proc[col], name) {
+			return true
+		}
+	}
+	return false
 }
 
 // containsLine reports whether any line read from r contains marker. It stops

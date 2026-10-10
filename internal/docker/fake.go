@@ -58,6 +58,12 @@ type FakeClient struct {
 	// used to exercise the pull-failure creation-guard path.
 	PullErr error
 
+	// DefaultLogDriver models the daemon's configured default log driver
+	// (daemon.json "log-driver"), applied to a container created without an
+	// explicit HostConfig.LogConfig.Type. "" means json-file. Set it to
+	// "none" to model a host whose containers' logs cannot be read back.
+	DefaultLogDriver string
+
 	// LogsErr, when non-nil, is returned by ContainerLogs instead of opening a
 	// log stream — an API-level logs failure (see fake_logs.go).
 	LogsErr error
@@ -304,6 +310,15 @@ type fakeContainer struct {
 	// followers (fake_logs.go).
 	logs      []fakeLogEntry
 	logNotify chan struct{}
+
+	// logDriver models HostConfig.LogConfig.Type ("" is the daemon default,
+	// json-file). The "none" driver makes ContainerLogs fail the way the real
+	// daemon does (fake_logs.go).
+	logDriver string
+
+	// processes is the command lines ContainerTop reports while the container
+	// runs (SetProcesses).
+	processes []string
 }
 
 // fakeNetwork models an in-memory Docker network.
@@ -669,6 +684,10 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.runtime = hostConfig.Runtime
 		c.rawRuntime = hostConfig.Runtime
 		c.groupAdd = append([]string(nil), hostConfig.GroupAdd...)
+		c.logDriver = hostConfig.LogConfig.Type
+	}
+	if c.logDriver == "" {
+		c.logDriver = f.DefaultLogDriver
 	}
 	// Model the real daemon AUTO-CREATING any referenced NAMED volume that does
 	// not exist (verified on Docker Engine 29.6.1: `docker create -v missing:/x`
