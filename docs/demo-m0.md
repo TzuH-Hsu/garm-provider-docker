@@ -493,10 +493,25 @@ against a real daemon.
 
 ## Known open issue
 
-Still under investigation. While a job runs, GARM logs `invalid runner
-status transition from pending to active`, and the runner shows `RUNNER
-STATUS=pending` for its whole lifetime, because runner callbacks are
-disabled by default. The job itself succeeds.
+Root cause (GARM v0.2.1, scale sets): GARM's runner-status state machine
+has no `pending` to `active` edge (`RunnerStatusTransitions` in
+`params/params.go`: `pending` may only go to `failed`, `installing` or
+`terminated`; `active` is reachable only via `idle`). With runner
+callbacks disabled (the default), the runner stays `pending`. The
+scale-set `JobStarted` handler uses the transition-checked update, so it
+fails with `invalid runner status transition from pending to active`. The
+scale-set listener then does not acknowledge the message and refetches it,
+so the scale set processes no further messages (no new job pickup, no
+scale-up, `JobCompleted` delayed) until GARM's periodic consolidation
+removes the runner, up to about 5 minutes after the job. The job itself
+still succeeds. Pools are unaffected, because they use a forced update.
+
+Fixed upstream in cloudbase/garm#817 (commit `1a9aeff2ae`, "Allow pending
+and installing runners to become active"), present on `main` and
+`release/v0.2` but not in a tagged release as of 2026-10-11. A mitigation
+in this provider (provider-side status reporting) is being worked on
+separately. Until then, operators on GARM v0.2.1 with scale sets should
+expect this stall.
 
 ## Still unverified
 

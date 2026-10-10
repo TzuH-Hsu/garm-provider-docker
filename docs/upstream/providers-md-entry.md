@@ -207,10 +207,17 @@ compatibility-fix release exists); see the checklist's end-to-end item.
    1. Wait for the release that contains the compatibility fix (expected
       `v0.2.1`) and re-run the gate (`docs/demo-m0.md`) against that
       release binary, not a branch build.
-   2. Resolve or document the open runner-status issue: GARM logs
-      `invalid runner status transition from pending to active` and shows
-      the runner as `pending` for its lifetime because runner callbacks
-      are disabled by default; the job itself succeeds.
+   2. Resolve or document the runner-status stall (root cause in
+      `docs/demo-m0.md`, "Known open issue"): on GARM v0.2.1 scale sets
+      the runner stays `pending` (callbacks disabled by default), GARM's
+      `JobStarted` update fails with `invalid runner status transition
+      from pending to active`, and the scale set stalls (no new job
+      pickup or scale-up) until consolidation removes the runner, up to
+      about 5 minutes after the job; the job itself succeeds. Pools are
+      unaffected. Fixed upstream in cloudbase/garm#817 (`1a9aeff2ae`),
+      on `main` and `release/v0.2`, not in a tagged release as of
+      2026-10-11. A provider-side mitigation is being worked on
+      separately.
    3. Fill in the placeholders in the PR body (`<RELEASE>` and
       `<GARM_VERSION>`) from the re-run. Do not claim compatibility with
       "GARM" generically, and do not imply production usage (the way the
