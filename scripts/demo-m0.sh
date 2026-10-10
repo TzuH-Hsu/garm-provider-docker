@@ -323,8 +323,25 @@ validate_modes() {
 # labels - cannot be changed after creation, and the workflow's runs-on must
 # match exactly).
 resolve_scaleset_name() {
-  [[ -z "${SCALESET_NAME}" ]] || return 0
   local f="${PROVIDER_CONFIG_DIR}/scaleset-name"
+  if [[ -n "${SCALESET_NAME}" ]]; then
+    # An explicit name is persisted too, so later invocations that do not
+    # repeat it (watch, verify, postjob) agree with the scale set that was
+    # actually created. SCALESET_ID is never cached on disk (it is looked up
+    # by this name on each run), so nothing else needs invalidating.
+    [[ "${SCALESET_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+      || die "SCALESET_NAME '${SCALESET_NAME}' is invalid: use letters, digits, '.', '_' and '-', starting with a letter or digit"
+    local saved=""
+    [[ -s "${f}" ]] && saved="$(cat "${f}")"
+    if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
+      mkdir -p "${PROVIDER_CONFIG_DIR}" || die "could not create ${PROVIDER_CONFIG_DIR}"
+      printf '%s\n' "${SCALESET_NAME}" > "${f}"
+      if [[ -n "${saved}" ]]; then
+        log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
+      fi
+    fi
+    return 0
+  fi
   if [[ -s "${f}" ]]; then
     SCALESET_NAME="$(cat "${f}")"
     return 0
