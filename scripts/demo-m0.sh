@@ -175,6 +175,13 @@
 #                          to remove the runner container. Default: 300.
 set -uo pipefail
 
+# Everything this script creates (state directories, the generated provider
+# config GARM reads, the downloaded binary, the saved scale-set name) must not
+# be writable by group or others: a group-writable provider config would let
+# another account change runner_image. Hosts commonly default to umask 002, so
+# set it explicitly instead of inheriting it.
+umask 022
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # --- Configuration (env-overridable) ----------------------------------------
@@ -411,7 +418,7 @@ resolve_scaleset_name() {
     local saved=""
     [[ -s "${f}" ]] && saved="$(head -c 256 "${f}")"
     if [[ "${saved}" != "${SCALESET_NAME}" ]]; then
-      ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
+      ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
       printf '%s\n' "${SCALESET_NAME}" > "${f}"
       if [[ -n "${saved}" ]]; then
         log "saved scale set name changed: '${saved}' -> '${SCALESET_NAME}'"
@@ -434,7 +441,7 @@ resolve_scaleset_name() {
     SCALESET_NAME="${cached}"
     return 0
   fi
-  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
   SCALESET_NAME="garm-docker-gate-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
   printf '%s\n' "${SCALESET_NAME}" > "${f}"
 }
@@ -662,7 +669,7 @@ resolve_dind_image_digest() {
 # mutable dev tag, which requires the dev-only escape hatch.
 generate_provider_config() {
   local runner_image="$1" dind_image="${2:-}"
-  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0700
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
     cat > "${PROVIDER_CONFIG_FILE}" <<EOF
