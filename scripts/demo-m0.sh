@@ -102,7 +102,7 @@
 #   --version vX.Y.Z
 #                   Release to validate in the default "release" mode
 #                   (equivalent to PROVIDER_VERSION=vX.Y.Z). Ignored with
-#                   --from-source. Default: v0.2.0
+#                   --from-source. Default: v0.2.1
 #   --pool          Dispatch via a webhook-driven pool instead of a scale set
 #                   (equivalent to GARM_TARGET=pool)
 #   --dind          Run the DinD variant (privileged-sidecar) instead of
@@ -123,7 +123,7 @@
 #                          "release" mode (also selects the
 #                          ghcr.io/tzuh-hsu/garm-runner-noble tag whose
 #                          digest gets resolved). Ignored in "source" mode.
-#                          Default: v0.2.0
+#                          Default: v0.2.1
 #   GARM_TARGET           "scaleset" (default) or "pool" - see above.
 #   GATE_VARIANT          "none" (default) or "dind" - see above.
 #   SCALESET_NAME         Scale set name (= the workflow's runs-on value).
@@ -178,7 +178,7 @@ GARM_URL="${GARM_URL:-http://localhost:8080}"
 REPO="${REPO:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
-PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.0}"
+PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.1}"
 
 PROVIDER_NAME="${PROVIDER_NAME:-docker_demo}"
 PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-v0.1.0}"
@@ -410,6 +410,30 @@ build_provider_binary() {
   log "Built ${PROVIDER_BIN} (version ${version})"
 }
 
+# check_release_published fails early, before any download, when the
+# PROVIDER_VERSION release has no published SHA256SUMS asset (an HTTP HEAD
+# request; no GitHub token or gh CLI needed).
+check_release_published() {
+  if ! curl -fsSIL -o /dev/null "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/SHA256SUMS"; then
+    die "release ${PROVIDER_VERSION} not published yet (or unreachable: ${RELEASE_BASE_URL}/${PROVIDER_VERSION}/SHA256SUMS) - use --from-source to build from this checkout"
+  fi
+}
+
+# warn_if_known_incompatible_version warns (never blocks) when a release below
+# v0.2.1 is combined with scale-set dispatch: those releases are known to
+# fail against GARM v0.2.x scale sets (CreateInstance rejects GARM's injected
+# runner_install_template; Get/DeleteInstance fail with "missing pool ID").
+# Non vX.Y.Z version strings are not compared.
+warn_if_known_incompatible_version() {
+  [[ "${GARM_TARGET}" == "scaleset" ]] || return 0
+  local v="${PROVIDER_VERSION#v}" major minor patch
+  [[ "${v}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 0
+  major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+  if (( major == 0 && (minor < 2 || (minor == 2 && patch < 1)) )); then
+    warn "provider ${PROVIDER_VERSION} is known to FAIL against GARM v0.2.x scale sets (runner_install_template rejected; Get/DeleteInstance 'missing pool ID'). Use v0.2.1 or later, or --from-source. Continuing anyway (older GARM or --pool may still work)."
+  fi
+}
+
 # download_provider_binary fetches the PROVIDER_VERSION release's binary
 # asset for this host's OS_ARCH plus its SHA256SUMS file, and verifies the
 # binary against the matching SHA256SUMS line before it is ever executed -
@@ -419,6 +443,9 @@ build_provider_binary() {
 download_provider_binary() {
   require_cmd curl
   mkdir -p "${PROVIDER_BIN_DIR}" || die "could not create ${PROVIDER_BIN_DIR}"
+
+  check_release_published
+  warn_if_known_incompatible_version
 
   local asset="garm-provider-docker_${PROVIDER_VERSION}_linux_${OS_ARCH}"
   local asset_path="${PROVIDER_BIN_DIR}/${asset}"
@@ -900,6 +927,42 @@ verify_labels() {
   fi
 }
 
+# Runner workdir and DinD socket dir; keep in sync with internal/spec
+# (RunnerWorkDir in mounts.go, DindSocketDir in dind.go).
+RUNNER_WORKDIR="/actions-runner/_work"
+DIND_SOCKET_DIR="/run"
+
+# job_network_name prints the name of the labeled per-job network of instance "$1".
+job_network_name() {
+  docker network ls \
+    --filter "label=garm.docker/managed=true" \
+    --filter "label=garm.docker/resource=job-network" \
+    --filter "label=garm.docker/instance-name=$1" \
+    --format '{{.Name}}' | head -n1
+}
+
+# instance_volume_name prints the name of instance "$1"'s labeled volume of
+# resource kind "$2" (workspace, socket, dind-state).
+instance_volume_name() {
+  docker volume ls \
+    --filter "label=garm.docker/managed=true" \
+    --filter "label=garm.docker/resource=$2" \
+    --filter "label=garm.docker/instance-name=$1" \
+    --format '{{.Name}}' | head -n1
+}
+
+# container_networks prints the names of the networks container "$1" is attached to.
+container_networks() {
+  docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$1"
+}
+
+# container_has_volume_mount succeeds when container "$1" has a named-volume
+# mount of volume "$2" at destination "$3".
+container_has_volume_mount() {
+  docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Destination}}{{println}}{{end}}' "$1" \
+    | grep -qxF "volume|$2|$3"
+}
+
 # verify_topology checks the two OTHER per-allocation resources every
 # CreateInstance provisions alongside the runner container as of M1
 # (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's F4/
@@ -912,34 +975,41 @@ verify_topology() {
   local cid="$1"
   local instance
   instance="$(label_value "${cid}" garm.docker/instance-name)"
-  log "-- (a, continued) job network + workspace volume --"
+  log "-- (a, continued) job network + workspace volume (labeled AND wired to the runner) --"
   if [[ -z "${instance}" ]]; then
     bad "cannot check the job network/workspace volume - garm.docker/instance-name was missing on the runner container"
     return
   fi
 
-  local net_id
-  net_id="$(docker network ls \
-    --filter "label=garm.docker/managed=true" \
-    --filter "label=garm.docker/resource=job-network" \
-    --filter "label=garm.docker/instance-name=${instance}" \
-    --format '{{.ID}}' | head -n1)"
-  if [[ -n "${net_id}" ]]; then
-    ok "per-job network exists and carries garm.docker/resource=job-network (ADR-001/ADR-004 claim marker)"
-  else
+  local net_name
+  net_name="$(job_network_name "${instance}")"
+  if [[ -z "${net_name}" ]]; then
     bad "no labeled per-job network found for instance ${instance}"
+  else
+    ok "per-job network exists and carries garm.docker/resource=job-network (${net_name}; ADR-001/ADR-004 claim marker)"
+    if container_networks "${cid}" | grep -qxF "${net_name}"; then
+      ok "runner container is attached to the labeled per-job network ${net_name}"
+    else
+      bad "runner container is NOT attached to the labeled per-job network ${net_name} (attached to: $(container_networks "${cid}" | tr '\n' ' '))"
+    fi
+    if container_networks "${cid}" | grep -qx bridge; then
+      bad "runner container is attached to the default 'bridge' network"
+    else
+      ok "runner container is not attached to the default 'bridge' network"
+    fi
   fi
 
   local vol_name
-  vol_name="$(docker volume ls \
-    --filter "label=garm.docker/managed=true" \
-    --filter "label=garm.docker/resource=workspace" \
-    --filter "label=garm.docker/instance-name=${instance}" \
-    --format '{{.Name}}' | head -n1)"
-  if [[ -n "${vol_name}" ]]; then
-    ok "named workspace volume exists and carries garm.docker/resource=workspace (${vol_name})"
-  else
+  vol_name="$(instance_volume_name "${instance}" workspace)"
+  if [[ -z "${vol_name}" ]]; then
     bad "no labeled workspace volume found for instance ${instance}"
+  else
+    ok "named workspace volume exists and carries garm.docker/resource=workspace (${vol_name})"
+    if container_has_volume_mount "${cid}" "${vol_name}" "${RUNNER_WORKDIR}"; then
+      ok "runner container mounts the labeled workspace volume ${vol_name} at ${RUNNER_WORKDIR}"
+    else
+      bad "runner container does not mount the labeled workspace volume ${vol_name} at ${RUNNER_WORKDIR}"
+    fi
   fi
 
   local cache_vols
@@ -1041,6 +1111,25 @@ verify_dind_topology() {
       bad "no labeled ${res} volume for instance ${instance}"
     fi
   done
+
+  local net_name sock_vol
+  net_name="$(job_network_name "${instance}")"
+  if [[ -n "${net_name}" ]] && container_networks "${did}" | grep -qxF "${net_name}"; then
+    ok "sidecar is attached to the same labeled per-job network ${net_name}"
+  else
+    bad "sidecar is not attached to the labeled per-job network '${net_name}'"
+  fi
+  sock_vol="$(instance_volume_name "${instance}" socket)"
+  if [[ -n "${sock_vol}" ]] && container_has_volume_mount "${cid}" "${sock_vol}" "${DIND_SOCKET_DIR}"; then
+    ok "runner mounts the labeled socket volume ${sock_vol} at ${DIND_SOCKET_DIR}"
+  else
+    bad "runner does not mount the labeled socket volume '${sock_vol}' at ${DIND_SOCKET_DIR}"
+  fi
+  if [[ -n "${sock_vol}" ]] && container_has_volume_mount "${did}" "${sock_vol}" "${DIND_SOCKET_DIR}"; then
+    ok "sidecar mounts the labeled socket volume ${sock_vol} at ${DIND_SOCKET_DIR}"
+  else
+    bad "sidecar does not mount the labeled socket volume '${sock_vol}' at ${DIND_SOCKET_DIR}"
+  fi
 
   local runner_mem dind_mem
   runner_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "${cid}")"
@@ -1301,7 +1390,7 @@ Flags:
                        instead of downloading/pinning a published release
                        (equivalent to PROVIDER_SOURCE=source)
   --version vX.Y.Z    Release to validate in the default "release" mode
-                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.0
+                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.1
   --pool              Dispatch via a webhook-driven pool instead of the default
                        scale set (equivalent to GARM_TARGET=pool). Needs GitHub
                        to be able to reach GARM's webhook endpoint.
@@ -1322,7 +1411,7 @@ while [[ $# -gt 0 ]]; do
     -y|--yes) ASSUME_YES=1; shift ;;
     --from-source) PROVIDER_SOURCE="source"; shift ;;
     --version)
-      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.0"
+      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.1"
       PROVIDER_VERSION="$2"
       shift 2
       ;;
