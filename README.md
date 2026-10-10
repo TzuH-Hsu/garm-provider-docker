@@ -86,6 +86,16 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   (see [research.md §1.D](docs/research.md)). On GARM **v0.2.1 and
   earlier**, register the provider with `interface_version = "v0.1.0"`
   (see [Register with GARM](#register-with-garm) for why).
+- **Runner status reported by the provider.** After delivering credentials,
+  the provider reports the runner `installing` to GARM's instance callback,
+  then `idle` once the runner logs `Listening for Jobs` (bounded wait,
+  default 90 s). GARM v0.2.1 **scale sets need this**: they only move a
+  runner to `active` from `idle`, so a runner left at `pending` stalls the
+  scale set when it picks up a job (relaxed upstream in
+  [cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), not in
+  a release as of 2026-10-11). It is on by default; the call is made by the
+  provider process, so the runner container still never sees the instance
+  token. See [`[status_report]`](docs/config-reference.md#status_report-runner-status-reported-to-garm).
 
 ## Install
 
