@@ -141,9 +141,10 @@ storage_driver = "overlay2"
 
 [status_report]
   # Provider-side runner status reporting to GARM's instance callback. After
-  # delivering credentials the provider reports the runner "installing",
-  # waits up to timeout_seconds for it to log "Listening for Jobs", then
-  # reports it "idle"; on timeout it stays "installing" and GARM's
+  # delivering credentials the provider reports the runner "installing" and
+  # returns; a detached watcher waits up to timeout_seconds for the runner to
+  # log "Listening for Jobs", then reports it "idle" (CreateInstance never
+  # waits, so this does not count against GARM's provider timeouts); on timeout it stays "installing" and GARM's
   # runner_bootstrap_timeout applies. Required for GARM v0.2.1 scale sets.
   # The runner container never sees the instance token or callback URL.
   # Default: 90. Range 0-600; 0 disables status reporting entirely.

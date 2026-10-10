@@ -10,6 +10,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,7 +113,7 @@ func TestLiveWaitRunnerListening(t *testing.T) {
 	id := runLiveContainer(t, p, `echo "[entrypoint] starting"; echo "Listening for Jobs" >&2; sleep 2; echo "$(date -u '+%Y-%m-%d %H:%M:%SZ'): Listening for Jobs"; sleep 60`)
 
 	start := time.Now()
-	ok, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
 	if !ok {
 		t.Fatalf("waitRunnerListening = false (%v), want true", err)
 	}
@@ -124,7 +127,7 @@ func TestLiveWaitRunnerListeningStreamEndsWhenContainerExits(t *testing.T) {
 	id := runLiveContainer(t, p, `echo "[entrypoint] giving up"; sleep 1; exit 1`)
 
 	start := time.Now()
-	ok, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
 	if ok || !errors.Is(err, errLogStreamEnded) {
 		t.Fatalf("waitRunnerListening = %v, %v; want false, errLogStreamEnded", ok, err)
 	}
@@ -138,7 +141,7 @@ func TestLiveWaitRunnerListeningTimesOut(t *testing.T) {
 	id := runLiveContainer(t, p, `echo "[entrypoint] waiting"; sleep 60`)
 
 	start := time.Now()
-	ok, err := p.waitRunnerListening(context.Background(), id, 2*time.Second)
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 2*time.Second)
 	if ok || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitRunnerListening = %v, %v; want false, deadline exceeded", ok, err)
 	}
@@ -186,7 +189,7 @@ func TestLiveWaitRunnerListeningFallsBackWhenLogsUnreadable(t *testing.T) {
 	id := runLiveContainerWithLogDriver(t, p, `sleep 1; n=Runner; sh -c "sleep 60; : /actions-runner/bin/$n.Listener run"`, "none")
 
 	start := time.Now()
-	ok, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 30*time.Second)
 	if !ok {
 		t.Fatalf("waitRunnerListening = false (%v), want true via the process fallback", err)
 	}
@@ -201,8 +204,76 @@ func TestLiveWaitRunnerListeningFallbackTimesOutWithoutListener(t *testing.T) {
 	p := newLiveProvider(t)
 	id := runLiveContainerWithLogDriver(t, p, `sleep 60`, "none")
 
-	ok, err := p.waitRunnerListening(context.Background(), id, 3*time.Second)
+	ok, _, err := p.waitRunnerListening(context.Background(), id, 3*time.Second)
 	if ok || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitRunnerListening = %v, %v; want false, deadline exceeded", ok, err)
+	}
+}
+
+// TestLiveDetachedWatcherReportsIdle runs the real handoff against a real
+// daemon: the provider (this test binary, via TestMain) starts the detached
+// watcher and returns at once; the watcher, in its own session and with the
+// request only on its stdin, follows the runner's logs and reports idle.
+func TestLiveDetachedWatcherReportsIdle(t *testing.T) {
+	p := newLiveProvider(t)
+	id := runLiveContainer(t, p, `sleep 3; echo "$(date -u '+%Y-%m-%d %H:%M:%SZ'): Listening for Jobs"; sleep 60`)
+	host := os.Getenv("DOCKER_HOST")
+	if host == "" {
+		host = "unix:///var/run/docker.sock"
+	}
+
+	idle := make(chan struct{})
+	var once sync.Once
+	cb, rec := newStatusCallbackServer(t, func(status string) int {
+		if status == "idle" {
+			once.Do(func() { close(idle) })
+		}
+		return 0
+	})
+
+	start := time.Now()
+	if err := startDetachedWatcher(context.Background(), statusWatchRequest{
+		Instance: "live", ContainerID: id, DockerHost: host,
+		CallbackURL: cb.URL + "/api/v1/callbacks", InstanceToken: testInstanceToken,
+		Deadline: time.Now().Add(60 * time.Second),
+	}); err != nil {
+		t.Fatalf("startDetachedWatcher: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("startDetachedWatcher took %v", d)
+	}
+
+	// While it waits, the watcher is its own session/process-group leader and
+	// its command line carries no request data.
+	time.Sleep(500 * time.Millisecond)
+	out, err := exec.Command("ps", "-A", "-o", "pid=,pgid=,command=").Output()
+	if err != nil {
+		t.Fatalf("ps: %v", err)
+	}
+	found := false
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, StatusWatcherArg) {
+			continue
+		}
+		found = true
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] != f[1] {
+			t.Errorf("watcher is not a process-group leader: %q", line)
+		}
+		if strings.Contains(line, testInstanceToken) || strings.Contains(line, cb.URL) {
+			t.Errorf("watcher command line exposes request data: %q", line)
+		}
+	}
+	if !found {
+		t.Error("no watcher process found while it should be waiting for the runner")
+	}
+
+	select {
+	case <-idle:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the detached watcher never reported idle (reports: %v)", rec.seen())
+	}
+	if d := time.Since(start); d < 2*time.Second {
+		t.Errorf("idle after %v, before the runner printed the listening line", d)
 	}
 }

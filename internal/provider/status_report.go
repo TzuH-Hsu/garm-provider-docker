@@ -47,9 +47,16 @@ const (
 //
 //  1. report "installing" (credentials are delivered and the runner is
 //     starting);
-//  2. wait, bounded by [status_report].timeout_seconds, for the runner to
+//  2. hand the rest to a detached watcher process (status_watch.go), which
+//     waits, bounded by [status_report].timeout_seconds, for the runner to
 //     print runnerListeningMarker on stdout;
-//  3. only then report "idle".
+//  3. the watcher, and only it, then reports "idle".
+//
+// CreateInstance never waits for the runner to come online: GARM bounds the
+// provider call (since cloudbase/garm#817, by runner_bootstrap_timeout and the
+// optional exec_timeout_seconds) and kills it on expiry, so a synchronous wait
+// could turn a healthy create into a failed one. Only the "installing" report
+// (seconds, bounded by statusPostTimeout) happens in the call.
 //
 // GARM v0.2.1 scale sets move a runner to "active" with a CHECKED transition
 // that "pending" and "installing" may not take, so without this a scale-set
@@ -61,8 +68,9 @@ const (
 //
 // Everything here is best-effort and only logs: status reporting must never
 // fail or roll back an otherwise-healthy allocation. The instance token and
-// the callback URL stay in this process's memory; the runner container never
-// sees either.
+// the callback URL stay in provider memory (this process, then the watcher,
+// which receives them over a private pipe); the runner container never sees
+// either.
 func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapInstance, containerID string) {
 	sr := p.cfg.StatusReport
 	if !sr.Enabled() {
@@ -105,20 +113,22 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 	}
 	slog.InfoContext(ctx, "CreateInstance: reported runner status", "instance", b.Name, "status", metadata.RunnerStatusInstalling)
 
-	timeout := sr.Timeout()
-	listening, err := p.waitRunnerListening(ctx, containerID, timeout)
-	if !listening {
-		slog.WarnContext(ctx, "CreateInstance: runner did not report listening for jobs in time; leaving it installing so GARM's bootstrap timeout still applies",
-			"instance", b.Name, "timeout", timeout, "error", err)
+	req := statusWatchRequest{
+		Instance:      b.Name,
+		ContainerID:   containerID,
+		DockerHost:    p.cfg.DockerHost,
+		CallbackURL:   b.CallbackURL,
+		InstanceToken: b.InstanceToken,
+		CACertBundle:  b.CACertBundle,
+		Deadline:      time.Now().Add(sr.Timeout()),
+	}
+	if err := p.spawnStatusWatcher(ctx, req); err != nil {
+		slog.WarnContext(ctx, "CreateInstance: could not start the runner status watcher; the runner stays installing (continuing)",
+			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
 		return
 	}
-
-	if err := postStatus(ctx, reporter, metadata.RunnerStatusIdle, statusMessageIdle); err != nil {
-		slog.WarnContext(ctx, "CreateInstance: failed to report runner status idle (continuing)",
-			"instance", b.Name, "error", err)
-		return
-	}
-	slog.InfoContext(ctx, "CreateInstance: reported runner status", "instance", b.Name, "status", metadata.RunnerStatusIdle)
+	slog.InfoContext(ctx, "CreateInstance: started the runner status watcher; it reports idle once the runner is listening for jobs",
+		"instance", b.Name, "timeout", sr.Timeout())
 }
 
 // postStatus sends one status report under its own bounded context.
@@ -155,21 +165,24 @@ var errLogStreamEnded = errors.New("runner log stream ended before the runner wa
 // stdcopy-multiplexed framing (the runner has no TTY), demultiplexed here.
 // When the daemon cannot return the logs at all, it falls back to
 // waitListenerProcess within the same timeout.
-func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, timeout time.Duration) (bool, error) {
+//
+// viaProcess reports that the fallback (not the log line) decided readiness.
+func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, timeout time.Duration) (ok, viaProcess bool, err error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	rc, err := p.cli.ContainerLogs(waitCtx, containerID, container.LogsOptions{ShowStdout: true, Follow: true})
 	if err != nil {
 		if waitCtx.Err() != nil {
-			return false, waitCtx.Err()
+			return false, false, waitCtx.Err()
 		}
 		// A real daemon answers 501 "configured logging driver does not
 		// support reading" for the "none" driver. The container's log driver
 		// is the operator's choice, so fall back instead of overriding it.
-		slog.WarnContext(ctx, "CreateInstance: cannot read the runner's logs; falling back to watching for the runner listener process, which is weaker evidence that the runner is online than its \"Listening for Jobs\" line. Use a log driver the daemon can read back (json-file or local, or enable dual logging) for exact detection",
+		slog.WarnContext(ctx, "cannot read the runner's logs; falling back to watching for the runner listener process, which is weaker evidence that the runner is online than its \"Listening for Jobs\" line. Use a log driver the daemon can read back (json-file or local, or enable dual logging) for exact detection",
 			"container_id", containerID, "error", err)
-		return p.waitListenerProcess(waitCtx, containerID)
+		ok, err := p.waitListenerProcess(waitCtx, containerID)
+		return ok, true, err
 	}
 	defer rc.Close()
 
@@ -181,12 +194,12 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 	}()
 
 	if containsLine(pr, runnerListeningMarker) {
-		return true, nil
+		return true, false, nil
 	}
 	if waitCtx.Err() != nil {
-		return false, waitCtx.Err()
+		return false, false, waitCtx.Err()
 	}
-	return false, errLogStreamEnded
+	return false, false, errLogStreamEnded
 }
 
 // waitListenerProcess polls the container's process list until the

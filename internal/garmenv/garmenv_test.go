@@ -278,7 +278,7 @@ func newFakeProvider(t *testing.T) (*provider.Provider, *docker.FakeClient) {
 		Network:          config.Network{EnableJobNetwork: true},
 	}
 	fake := docker.NewFakeClient()
-	p, err := provider.New(fake, cfg, testControllerID)
+	p, err := provider.New(fake, cfg, testControllerID, provider.WithInProcessStatusWatcher())
 	if err != nil {
 		t.Fatalf("provider.New: %v", err)
 	}

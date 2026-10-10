@@ -54,7 +54,7 @@ func newTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 		// (enable_job_network=false) out of the common test config.
 		Network: config.Network{EnableJobNetwork: true, Internal: false},
 	}
-	p, err := New(fake, cfg, "controller-abc")
+	p, err := New(fake, cfg, "controller-abc", WithInProcessStatusWatcher())
 	if err != nil {
 		t.Fatalf("New returned unexpected error: %v", err)
 	}
