@@ -509,6 +509,24 @@ build_runner_image() {
     || die "docker build of the runner image failed"
 }
 
+# imagetools_digest prints the sha256:<64 hex> digest of image reference "$1"
+# via `docker buildx imagetools inspect`. It deliberately does NOT use
+# `--format '{{.Manifest.Digest}}'`: some buildx versions ignore that
+# template and print the multi-line Name/MediaType/Digest table instead
+# (docker/buildx#1175; the fix, docker/buildx#4006, was still open when this
+# was written). `{{json .Manifest}}` is honored consistently, and the FIRST
+# "digest" key in its output is the top-level manifest (index) digest -
+# it precedes the nested "manifests" array. Extracted without jq.
+imagetools_digest() {
+  local ref="$1" out digest
+  out="$(docker buildx imagetools inspect "${ref}" --format '{{json .Manifest}}' 2>/dev/null)" \
+    || die "failed to resolve a digest for ${ref} - is 'docker buildx' available, and can this host reach its registry?"
+  digest="$(printf '%s\n' "${out}" | grep -m1 -oE '"digest": *"sha256:[0-9a-f]{64}"' | grep -oE 'sha256:[0-9a-f]{64}')" || true
+  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "unexpected output from 'docker buildx imagetools inspect ${ref}': no top-level sha256 digest found (an old or unusual buildx version may format this differently; try upgrading docker buildx)"
+  printf '%s' "${digest}"
+}
+
 # resolve_runner_image_digest resolves ghcr.io/tzuh-hsu/garm-runner-noble's
 # PROVIDER_VERSION tag to its current manifest-list digest via `docker
 # buildx imagetools inspect` (no pull required) and prints the resulting
@@ -521,10 +539,7 @@ resolve_runner_image_digest() {
   local ref="${RUNNER_IMAGE_REPO}:${PROVIDER_VERSION}"
   log "Resolving digest for ${ref} (docker buildx imagetools inspect)..." >&2
   local digest
-  digest="$(docker buildx imagetools inspect "${ref}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-    || die "failed to resolve a digest for ${ref} - is 'docker buildx' available, and can this host reach ghcr.io?"
-  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || die "unexpected digest format from 'docker buildx imagetools inspect ${ref}': '${digest}'"
+  digest="$(imagetools_digest "${ref}")"
   log "Resolved ${ref} -> ${digest}" >&2
   printf '%s@%s' "${RUNNER_IMAGE_REPO}" "${digest}"
 }
@@ -536,10 +551,7 @@ resolve_dind_image_digest() {
   require_cmd docker
   log "Resolving digest for ${DIND_IMAGE_SOURCE} (docker buildx imagetools inspect)..." >&2
   local digest
-  digest="$(docker buildx imagetools inspect "${DIND_IMAGE_SOURCE}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-    || die "failed to resolve a digest for ${DIND_IMAGE_SOURCE} - can this host reach its registry?"
-  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || die "unexpected digest format from 'docker buildx imagetools inspect ${DIND_IMAGE_SOURCE}': '${digest}'"
+  digest="$(imagetools_digest "${DIND_IMAGE_SOURCE}")"
   log "Resolved ${DIND_IMAGE_SOURCE} -> ${digest}" >&2
   printf '%s@%s' "${DIND_IMAGE_SOURCE}" "${digest}"
 }
