@@ -12,11 +12,11 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/cloudbase/garm-provider-common/execution"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/garmenv"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/provider"
 )
@@ -38,7 +38,10 @@ func run() int {
 	command := os.Getenv("GARM_COMMAND")
 	slog.InfoContext(ctx, "starting garm-provider-docker", "command", command)
 
-	env, err := execution.GetEnvironment()
+	// garmenv mirrors garm-provider-common's execution.GetEnvironment except
+	// for one relaxation GARM v0.2.x scale sets need: no pool ID on
+	// Delete/Get/Start/StopInstance under interface v0.1.1 (see its package doc).
+	env, err := garmenv.GetEnvironment()
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to read execution environment", "command", command, "error", err)
 		return 1
