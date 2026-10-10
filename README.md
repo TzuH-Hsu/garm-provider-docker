@@ -69,7 +69,9 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   `extra_env` by an operator allowlist (default **empty**) plus a
   hard-reserved name set rejected even if an operator allowlists it by
   mistake. No `extra_specs` field, ever, can set a raw image reference,
-  `docker_host`, or the `privileged` flag. See
+  `docker_host`, or the `privileged` flag. The one exception to "unknown
+  keys are rejected" is GARM's own `runner_install_template`, which GARM
+  v0.2.x injects into every create and which is accepted and ignored. See
   [`docs/config-reference.md`](docs/config-reference.md) and
   [ADR-005](docs/adr/ADR-005-config-and-extra-specs-schema.md).
 - **v0.1.0 + v0.1.1 interface.** The one binary satisfies both GARM
@@ -78,6 +80,14 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   `GetConfigJSONSchema`, `GetExtraSpecsJSONSchema`, `ValidatePoolInfo`);
   omitting it (or setting `v0.1.0`) gets the original eight lifecycle
   methods only.
+- **Pools and scale sets.** Both work with GARM v0.2.x. Under `v0.1.1`,
+  GARM sends scale-set delete/get/start/stop calls without a pool ID; the
+  provider accepts that (see
+  [research.md §1.D](docs/research.md)). On GARM **v0.2.1 and earlier**,
+  prefer `interface_version = "v0.1.0"`: GARM's own v0.1.1 `ListInstances`
+  wrapper misreports every successful list as an error
+  (`returned error: %!s(<nil>)`), which breaks GARM's runner reconciliation
+  until a GARM release ships the upstream fix.
 
 ## Install
 
@@ -169,7 +179,7 @@ Add a `[[provider]]` section to GARM's own `config.toml` (commonly
   [provider.external]
     provider_executable = "/opt/garm/providers.d/garm-provider-docker"
     config_file = "/etc/garm/garm-provider-docker.toml"
-    interface_version = "v0.1.1"  # or "v0.1.0" / omit for the 8-method-only surface
+    interface_version = "v0.1.1"  # or "v0.1.0" / omit for the 8-method-only surface (recommended on GARM <= v0.2.1, see Features)
 ```
 
 Restart/reload GARM, confirm with `garm-cli provider list`, then create a

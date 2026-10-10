@@ -12,7 +12,7 @@ maintained separately.
 Three inputs feed every provider decision, in strict trust order (ADR-001/ADR-005):
 
 1. **Provider config** (TOML) — set by the host **operator**, the most trusted tier.
-2. **Pool `extra_specs`** (JSON) — set by a **GARM admin**, a narrower and more dynamic tier. Read from the stdin `BootstrapInstance.extra_specs` field, **never** `GARM_POOL_EXTRASPECS` (which is empty for scale sets).
+2. **Pool `extra_specs`** (JSON) — set by a **GARM admin**, a narrower and more dynamic tier. Read from the stdin `BootstrapInstance.extra_specs` field, **never** `GARM_POOL_EXTRASPECS` (which GARM leaves empty for scale-set commands other than `CreateInstance`).
 3. **The workflow payload** — controlled by anyone who can open a PR; **never** consulted for a privileged decision.
 
 `extra_specs` can select *within* what the operator config allows; it can never
@@ -56,6 +56,21 @@ and the `privileged` flag out of this channel: they have no field at all.
 | `storage_driver` | `overlay2` \| `vfs` | Defaults to the configured `storage_driver`. |
 | `runner_labels` | array of strings | Appended to the runner's labels. **Non-JIT mode only** — in JIT mode GARM bakes the label set server-side, so these are inert. |
 | `extra_env` | object of string→string | Extra runner-container env. Governed by an **operator allowlist** and a **hard-reserved** set (see below). |
+
+### GARM-reserved keys (accepted and ignored)
+
+GARM itself writes some keys into `extra_specs`. These — and only these — are
+removed before the schema check, so they are accepted and have **no effect**
+on this provider:
+
+| Key | Why it appears | Effect here |
+|---|---|---|
+| `runner_install_template` | GARM v0.2.0+ injects its rendered userdata wrapper (base64) into every `CreateInstance` payload unless the admin set the key; GARM also *requires* an admin to set it on a pool/scale set with no install template. | None — it drives GARM's userdata install flow, which this provider does not use (prebuilt runner image, ADR-002). Must be a JSON string. |
+
+Every other unknown key is still rejected, including next to a reserved key.
+GARM's other install-flow keys (`extra_context`, `pre_install_scripts`,
+`enable_boot_debug`) are never injected by GARM and have no effect here, so
+they are rejected rather than silently ignored (ADR-005 amendment 2026-10-11).
 
 ### Ceilings, the extra_env allowlist, and the hard-reserved set (read this)
 

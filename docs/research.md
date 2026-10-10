@@ -24,6 +24,8 @@ Per-command additions:
 - `ListInstances` → `GARM_POOL_ID` (+ extraspecs in v0.1.1)
 - `RemoveAllInstances` → no extra vars
 
+> **Correction (2026-10-11, verified against `cloudbase/garm@v0.2.1`):** the v0.1.1 additions above are filled from `PoolInfo`, which the **scale-set** callers never populate. For a scale-set instance GARM v0.2.1 therefore sends `GARM_POOL_ID=""` and `GARM_POOL_EXTRASPECS=base64("null")` on `Delete`/`Get`/`Start`/`Stop`Instance, and the pseudo pool ID plus `base64("null")` on `ListInstances`; only `CreateInstance` carries a populated `GARM_POOL_EXTRASPECS` (base64 of the stdin `extra_specs`, `runner/providers/v0.1.1/external.go:74-86`). See §1.D for the consequences.
+
 `GARM_COMMAND` values (`execution/common/commands.go`): `CreateInstance`, `DeleteInstance`, `GetInstance`, `ListInstances`, `StartInstance`, `StopInstance`, `RemoveAllInstances`, `GetVersion`; v0.1.1-only: `GetSupportedInterfaceVersions`, `ValidatePoolInfo`, `GetConfigJSONSchema`, `GetExtraSpecsJSONSchema`.
 
 The actual command strings are `"StartInstance"`/`"StopInstance"` — the doc says `Start`/`Stop`, which is stale.
@@ -89,6 +91,31 @@ The `cloudconfig` helpers in `garm-provider-common` are cloud-init-only and opti
 The wire protocol is identical (same `BootstrapInstance`, same interface). Pools go through `garm/runner/pool/pool.go` (`PoolID` = real UUID; `GARM_POOL_EXTRASPECS` = pool's real `ExtraSpecs`). Scale sets go through `garm/workers/provider/instance_manager.go`: `PoolID = pseudoPoolID() = "<scaleSet.Name>-<entityID>"` (commented `"This is temporary..."`); `getProviderBaseParams` fills only `ControllerInfo`, leaving `PoolInfo` zero — so `GARM_POOL_EXTRASPECS` decodes to empty for scale-set instances even though **stdin `extra_specs` IS correctly populated** from `scaleSet.ExtraSpecs`.
 
 **Consequence: a provider cannot tell pools and scale sets apart** from `GARM_POOL_EXTRASPECS` alone; it must rely on stdin `extra_specs`.
+
+#### 1.D update (2026-10-11): the wire protocol is NOT identical — superseded claim and evidence
+
+> **Superseded (2026-10-11).** The opening claim of §1.D — "the wire protocol is identical" between pools and scale sets — and the §2.D conclusion that providers are "compatible by construction" are **wrong for GARM v0.2.x** under interface `v0.1.1`. The original text is kept above for history. The evidence came from a real-job gate (GARM v0.2.1, scale set, provider v0.2.0) and was then traced in `cloudbase/garm@v0.2.1` (tag commit `1546384`) and `cloudbase/garm-provider-common@v0.1.9` (the version GARM v0.2.1 itself pins).
+
+What GARM v0.2.1 actually sends, per command, under interface `v0.1.1` (`runner/providers/v0.1.1/external.go`):
+
+| Command | Pool | Scale set |
+|---|---|---|
+| `CreateInstance` (L73-131) | `GARM_POOL_ID` = pool UUID; stdin `BootstrapInstance`; `GARM_POOL_EXTRASPECS` = base64 of the stdin `extra_specs` | `GARM_POOL_ID` = pseudo ID `"<scaleSet.Name>-<entity.ID>"` (`workers/provider/instance_manager.go:150-153`); same stdin/extraspecs shape |
+| `DeleteInstance` (L134-168) | `GARM_INSTANCE_ID`, `GARM_POOL_ID` = pool UUID, pool `ExtraSpecs` | `GARM_INSTANCE_ID`, **`GARM_POOL_ID=""`**, `GARM_POOL_EXTRASPECS=base64("null")` — callers fill only `ControllerInfo` (`instance_manager.go:262-271` `getProviderBaseParams`, used by the delete at `:273-300`; `workers/scaleset/scaleset.go:527-533`) |
+| `GetInstance` (L171-223), `StopInstance` (L315-346), `StartInstance` (L349-381) | as Delete | as Delete (`GARM_POOL_ID=""`) |
+| `ListInstances` (L226-278) | `GARM_POOL_ID` = pool UUID (`runner/pool/pool.go:806`) | `GARM_POOL_ID` = pseudo ID (`scaleset.go:505-517`), extraspecs `base64("null")` |
+| `RemoveAllInstances` (L281-312) | no pool | no pool |
+| `GetVersion` and the four v0.1.1 self-description commands | never invoked by GARM v0.2.1 (no call sites) | same |
+
+Under `v0.1.0` (`runner/providers/v0.1.0/external.go`) GARM sends no `GARM_POOL_ID` for `Delete`/`Get`/`Start`/`Stop` at all, and garm-provider-common's v0.1.0 validation does not ask for one.
+
+Three concrete incompatibilities followed:
+
+1. **`runner_install_template` is injected into every `CreateInstance` `extra_specs` (pools and scale sets) since GARM v0.2.0.** `util.MaybeAddWrapperToExtraSpecs` (`util/util.go:134-163`, called from `runner/pool/pool.go:1098` and `workers/provider/instance_manager.go:209`) adds GARM's rendered userdata wrapper (a `[]byte`, so a base64 string) under that key unless the admin already set it; when a pool/scale set has no install template, GARM *requires* the admin to set it (`pool.go:1061-1069`, `instance_manager.go:171-178`). This provider's `additionalProperties:false` schema rejected it: `extra_specs failed schema validation: (root): Additional property runner_install_template is not allowed`. **Fix:** `runner_install_template` is now an explicit GARM-reserved key, stripped before schema validation and ignored (ADR-005 amendment 2026-10-11). Nothing else is injected by GARM; the other GARM-interpreted keys (`extra_context`, `pre_install_scripts`, `enable_boot_debug`, read by `runner/metadata.go` `GetRunnerInstallScript` (from L359) and `garm-provider-common/cloudconfig/util.go`) are admin-only and stay rejected.
+2. **Scale-set `Delete`/`Get`/`Start`/`Stop` fail environment validation.** garm-provider-common v0.1.9 `execution/v0.1.1/execution.go:90-97` requires `GARM_POOL_ID` for those commands, but GARM sends it empty for scale sets (row above). Result: `failed to validate execution environment: missing pool ID`, retried forever, instance stuck in `pending_delete`. No released garm-provider-common fixes this (v0.1.9 is the latest tag; `main` is unchanged), and GARM `main` still leaves `PoolInfo` empty for scale sets. **Fix:** this provider reads the environment through `internal/garmenv`, which mirrors the library reader and relaxes only that one check for only those four commands (none of which consumes the pool ID).
+3. **`ListInstances` under v0.1.1 always fails on the GARM side in v0.2.1** — an upstream GARM bug, not a provider bug. `runner/providers/v0.1.1/external.go:248-255` tests `if err == nil` (inverted), so a *successful* provider call is reported as `provider binary ... returned error: %!s(<nil>)`. It breaks scale-set runner consolidation (`scaleset.go:517`) and pool reconciliation (`pool.go:806`) for every v0.1.1 external provider. Fixed on GARM `main` by `488cf98b` ("Improve metrics", 2026-09-11), unreleased as of this update. The v0.1.0 code path (`runner/providers/v0.1.0/external.go:215`) is correct. **Operator guidance:** on GARM ≤ v0.2.1, `interface_version = "v0.1.0"` avoids this; `v0.1.1` works for create/get/delete with this provider but GARM's own list-based reconciliation keeps erroring until a GARM release includes `488cf98b`.
+
+Forward note: GARM `main` (`e03045fc`, 2026-09-04, unreleased) replaces the scale-set pseudo pool ID with a UUIDv5 and lists both shapes during migration. This provider's label-scoped `ListInstances` filters on whatever `GARM_POOL_ID` is sent, so both shapes keep working.
 
 Timeouts: `PoolReapTimeoutInterval` = 5 min (`garm/runner/common/pool.go:27`); `DefaultRunnerBootstrapTimeout` = 20 min (`garm/util/appdefaults/appdefaults.go:26`).
 
@@ -176,7 +203,7 @@ Structure notes worth keeping:
 - Official cloud VM providers: openstack, aws, azure, gcp, oci, equinix — all active, following the cloud-init pattern.
 - Community: `flatcar/linode`, `imtf-group/hetzner`, `nexthop-ai/cloudstack`, `nikolai-in/proxmox`; `AndyA/garm-provider-pm2` (process-based, stale since 2023).
 
-**Market gap confirmed:** no other Docker-native GARM provider exists besides werdnum's unfinished proof-of-concept. None of the surveyed providers has scale-set-specific code — the wire-protocol identity between pools and scale sets (§1.D) makes them compatible by construction, and this new provider inherits that same compatibility for free.
+**Market gap confirmed:** no other Docker-native GARM provider exists besides werdnum's unfinished proof-of-concept. None of the surveyed providers has scale-set-specific code — the wire-protocol identity between pools and scale sets (§1.D) makes them compatible by construction, and this new provider inherits that same compatibility for free. *(Superseded 2026-10-11: not true for GARM v0.2.x under interface v0.1.1 — see the §1.D update.)*
 
 ---
 
@@ -236,7 +263,7 @@ Best-practice reference for release engineering beyond the cloudbase baseline: `
 
 ## 4. Key design inputs derived from research
 
-- **Use stdin `extra_specs`, not `GARM_POOL_EXTRASPECS`.** The env var is empty for scale-set instances (§1.D) — the stdin `BootstrapInstance.extra_specs` field is populated correctly for both pools and scale sets and is the only reliable source.
+- **Use stdin `extra_specs`, not `GARM_POOL_EXTRASPECS`.** The env var is empty for scale-set instances (§1.D) — the stdin `BootstrapInstance.extra_specs` field is populated correctly for both pools and scale sets and is the only reliable source. *(2026-10-11: that stdin payload also carries GARM's own `runner_install_template` since GARM v0.2.0, which must be accepted and ignored; and scale-set `Delete`/`Get`/`Start`/`Stop` arrive without a pool ID — see the §1.D update.)*
 - **Key any internal cache/state on the normalized `repo_url`, not `pool_id`.** `pool_id` is a real UUID for pools but a synthetic, non-stable string for scale sets (§1.D) — `repo_url` is the one identity field both entity types provide consistently.
 - **The instance-id resolver must accept either `ProviderID` or `Name`.** GARM falls back to `Name` when `ProviderID` is empty (§1.E); `Get`/`Delete`/`Start`/`Stop`Instance must look up containers by either.
 - **`DeleteInstance` must be idempotent and exit `30` on not-found** (treated as success by GARM) — no bespoke reconciliation loop is needed on the provider side.
