@@ -127,6 +127,11 @@ type Config struct {
 	// extra_specs.extra_env may set — defaulting to EMPTY (fail-closed: no
 	// extra env passes unless the operator opts a name in). See extra_specs.go.
 	ExtraSpecs ExtraSpecsPolicy `toml:"extra_specs"`
+
+	// StatusReport is the [status_report] table: provider-side runner status
+	// reporting to GARM's instance callback, on by default. See
+	// status_report.go.
+	StatusReport StatusReport `toml:"status_report"`
 }
 
 // Load reads the TOML config file at path, applies defaults, and validates
@@ -189,6 +194,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.Cache.validate(); err != nil {
 		return fmt.Errorf("[cache]: %w", err)
+	}
+	if err := c.StatusReport.validate(); err != nil {
+		return fmt.Errorf("[status_report]: %w", err)
 	}
 
 	return nil

@@ -83,6 +83,9 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //     `docker exec`-run `tar -x` with an atomic .delivered marker, and verify
 //     BOTH the runner and (in DinD modes) the sidecar are running before
 //     reporting success
+//  9. report the runner "installing" to GARM's instance callback and, once the
+//     runner logs "Listening for Jobs" (bounded wait), "idle" — best-effort,
+//     never failing the create ([status_report], ADR-002 amendment)
 //
 // Any error after the claim marker exists triggers a nonce-keyed best-effort
 // rollback of THIS attempt's resources — network, all volumes, the runner AND
@@ -442,6 +445,15 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 			return guarded(err)
 		}
 	}
+
+	// 10. Report the runner's status to GARM's instance callback — installing
+	// now, idle once the runner logs that it is listening for jobs — bounded by
+	// [status_report].timeout_seconds (ADR-002 amendment). GARM v0.2.1 scale
+	// sets cannot move a runner to active from the pending status GARM creates
+	// it in, so without this a scale-set runner that takes a job wedges GARM's
+	// listener. Best-effort: it only logs, and it runs after every rollback
+	// point, so it can never fail or tear down this allocation.
+	p.reportRunnerStatus(ctx, bootstrap, created.ID)
 
 	// CreateInstance reports running (research.md §2.A): the container is up and
 	// the runner registers once its entrypoint consumes the delivered
