@@ -87,12 +87,27 @@ func WithRetry(maxRetries int, backoff time.Duration) Option {
 // deployments fronted by a private CA verify correctly (ADR-002 F16). An
 // empty bundle uses the system roots alone.
 func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Option) (*Client, error) {
+	return newClient(metadataURLField, baseURL, instanceToken, caCertBundle, opts...)
+}
+
+// metadataURLField and callbackURLField name the two token-bearing GARM URLs
+// in validation errors, so an operator can tell which bootstrap field failed.
+const (
+	metadataURLField = "metadata-url"
+	callbackURLField = "callback-url"
+)
+
+// newClient is the shared constructor behind NewClient and NewStatusReporter:
+// both endpoints authenticate with the same Bearer instance token, so both get
+// the identical transport-security treatment — URL validation, CA bundle, and
+// the token-safe redirect policy (ADR-002 F5). field names the URL in errors.
+func newClient(field, baseURL, instanceToken string, caCertBundle []byte, opts ...Option) (*Client, error) {
 	// The instance token is sent as a Bearer header on every request, so the
 	// transport must not be cleartext: require https, permitting plain http
 	// only to a loopback host (which keeps httptest-based tests working and
-	// covers a co-located metadata service), and reject any userinfo in the
-	// URL (ADR-002 F5).
-	if err := validateMetadataURL(baseURL); err != nil {
+	// covers a co-located GARM), and reject any userinfo in the URL
+	// (ADR-002 F5).
+	if err := validateTokenURL(field, baseURL); err != nil {
 		return nil, err
 	}
 
@@ -119,7 +134,7 @@ func NewClient(baseURL, instanceToken string, caCertBundle []byte, opts ...Optio
 	// capture its origin so checkRedirect can reject any cross-origin hop.
 	base, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid metadata-url %q: %w", baseURL, err)
+		return nil, fmt.Errorf("invalid %s %q: %w", field, baseURL, err)
 	}
 
 	c := &Client{
@@ -209,15 +224,22 @@ func originKey(u *url.URL) string {
 // token, with a loopback-only exception for plain http, and no userinfo
 // credentials embedded in the URL.
 func validateMetadataURL(raw string) error {
+	return validateTokenURL(metadataURLField, raw)
+}
+
+// validateTokenURL is validateMetadataURL's rule applied to any URL the Bearer
+// instance token is sent to (the metadata-url and the callback-url); field
+// names that URL in error messages.
+func validateTokenURL(field, raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("invalid metadata-url %q: %w", raw, err)
+		return fmt.Errorf("invalid %s %q: %w", field, raw, err)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("metadata-url %q has no host", raw)
+		return fmt.Errorf("%s %q has no host", field, raw)
 	}
 	if u.User != nil {
-		return fmt.Errorf("metadata-url %q must not embed userinfo credentials", raw)
+		return fmt.Errorf("%s %q must not embed userinfo credentials", field, raw)
 	}
 	switch u.Scheme {
 	case "https":
@@ -226,9 +248,9 @@ func validateMetadataURL(raw string) error {
 		if isLoopbackHost(u.Hostname()) {
 			return nil
 		}
-		return fmt.Errorf("metadata-url %q uses cleartext http to a non-loopback host; https is required to protect the instance token", raw)
+		return fmt.Errorf("%s %q uses cleartext http to a non-loopback host; https is required to protect the instance token", field, raw)
 	default:
-		return fmt.Errorf("metadata-url %q must use https (or http to a loopback host), got scheme %q", raw, u.Scheme)
+		return fmt.Errorf("%s %q must use https (or http to a loopback host), got scheme %q", field, raw, u.Scheme)
 	}
 }
 
