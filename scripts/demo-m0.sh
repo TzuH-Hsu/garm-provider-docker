@@ -318,15 +318,23 @@ resolve_scaleset_name() {
 }
 
 # lookup_scaleset_id fills SCALESET_ID (when unset) by finding this scale
-# set's row in `garm-cli scaleset list --repo` and extracting the UUID from
-# it. Best-effort: leaves SCALESET_ID empty when the scale set is not there
-# yet (callers handle that).
+# set's row in `garm-cli scaleset list --repo` and taking its ID column.
+# GARM v0.2.x scale-set IDs are small integers (the table's first column,
+# `ID`), not UUIDs, so the row is matched on the EXACT value of the
+# `Scale Set Name` column (a substring match could hit another scale set
+# whose name merely contains this one) and the ID must be all digits.
+# Best-effort: leaves SCALESET_ID empty when the scale set is not there yet
+# (callers handle that).
 lookup_scaleset_id() {
   [[ -z "${SCALESET_ID}" ]] || return 0
   SCALESET_ID="$(garm-cli scaleset list --repo "${REPO}" 2>/dev/null \
-    | grep -F -- "${SCALESET_NAME}" \
-    | grep -Eo '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}' \
-    | head -n1)" || true
+    | awk -F'|' -v name="${SCALESET_NAME}" '
+        {
+          id = $2; n = $3
+          gsub(/^[ \t]+|[ \t]+$/, "", id)
+          gsub(/^[ \t]+|[ \t]+$/, "", n)
+          if (n == name && id ~ /^[0-9]+$/) { print id; exit }
+        }')" || true
 }
 
 # detect_arch maps `uname -m` to the amd64/arm64 vocabulary this provider,
