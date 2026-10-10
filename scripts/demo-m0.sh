@@ -629,10 +629,32 @@ smoke_test_binary() {
   fi
 }
 
+# warn_if_unservice_readable_paths warns (never fails) when the provider
+# binary or config directory sits under /tmp or the invoking user's home:
+# GARM's service user typically cannot read a home directory, and /tmp is
+# usually cleared on reboot. The defaults are kept for backward
+# compatibility (they work when GARM runs as the same user, e.g. a
+# containerised dev GARM); set PROVIDER_BIN_DIR/PROVIDER_CONFIG_DIR to a
+# directory readable by GARM's service user otherwise (docs/demo-m0.md,
+# Prerequisites).
+warn_if_unservice_readable_paths() {
+  local var dir
+  for var in PROVIDER_BIN_DIR PROVIDER_CONFIG_DIR; do
+    dir="${!var}"
+    case "${dir}" in
+      /tmp|/tmp/*|/private/tmp|/private/tmp/*)
+        warn "${var} (${dir}) is under /tmp: it is usually cleared on reboot and may not be readable by GARM's service user. Use a directory readable by GARM's service user (see docs/demo-m0.md, Prerequisites)." ;;
+      "${HOME}"|"${HOME}"/*)
+        warn "${var} (${dir}) is under \$HOME: GARM's service user typically cannot read a home directory, so GARM may fail to execute the provider or read its config. Use a directory readable by GARM's service user (see docs/demo-m0.md, Prerequisites)." ;;
+    esac
+  done
+}
+
 step_preflight() {
   log "=== Step 0: preflight (source: ${PROVIDER_SOURCE}, target: ${GARM_TARGET}, variant: ${GATE_VARIANT}, arch: ${OS_ARCH}) ==="
 
   require_cmd docker
+  warn_if_unservice_readable_paths
 
   if docker info >/dev/null 2>&1; then
     ok "docker is reachable"
