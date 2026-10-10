@@ -139,6 +139,16 @@ storage_driver = "overlay2"
   # see docs/config-reference.md for the full reserved set.
   allowed_env = ["MY_CI_FLAG", "TZ"]
 
+[status_report]
+  # Provider-side runner status reporting to GARM's instance callback. After
+  # delivering credentials the provider reports the runner "installing",
+  # waits up to timeout_seconds for it to log "Listening for Jobs", then
+  # reports it "idle"; on timeout it stays "installing" and GARM's
+  # runner_bootstrap_timeout applies. Required for GARM v0.2.1 scale sets.
+  # The runner container never sees the instance token or callback URL.
+  # Default: 90. Range 0-600; 0 disables status reporting entirely.
+  timeout_seconds = 90
+
 # Named [flavors.<name>] entries: per-pool overrides for
 # runner_memory/dind_memory/runner_image, selected via extra_specs.flavor.
 # No default - flavors are entirely optional. A flavor is the ONLY channel

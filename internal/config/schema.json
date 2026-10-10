@@ -162,6 +162,19 @@
           "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
         }
       }
+    },
+    "status_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Provider-side runner status reporting to GARM's instance callback (ADR-002 amendment). After credential delivery the provider reports the runner 'installing', waits for the runner to log 'Listening for Jobs', then reports it 'idle'. Required for GARM v0.2.1 scale sets. Config-only, never an extra_specs channel.",
+      "properties": {
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600,
+          "description": "Upper bound on how long CreateInstance waits for the runner to come online before returning with the runner left 'installing'. Defaults to 90. 0 disables status reporting entirely."
+        }
+      }
     }
   }
 }

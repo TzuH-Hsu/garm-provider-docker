@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
@@ -17,6 +19,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/provider"
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
 // These tests replay the exact environment and stdin GARM v0.2.1 hands an
@@ -144,30 +147,128 @@ func withStdin(t *testing.T, data []byte) {
 	})
 }
 
-// newMetadataServer serves the three JIT credential files GARM's metadata
-// service hands a JIT runner.
-func newMetadataServer(t *testing.T) *httptest.Server {
+// garmAPI stands in for the two GARM v0.2.1 endpoints a provider touches with
+// the instance token: the metadata service (the three JIT credential files)
+// and the instance callback's status route. The status route models GARM's
+// rules: the instance middleware accepts the token only while the runner is
+// pending or installing (auth/instance_middleware.go), and the update is a
+// checked transition (params.RunnerStatusTransitions, database/sql
+// validateRunnerStatusTransition).
+type garmAPI struct {
+	*httptest.Server
+
+	mu           sync.Mutex
+	runnerStatus string
+	reported     []string
+
+	// onStatus, when set, runs after a status is accepted (the test's runner
+	// "comes online" here).
+	onStatus func(status string)
+}
+
+// garmRunnerStatusTransitions is GARM v0.2.1's params.RunnerStatusTransitions
+// (params/params.go), restricted to the statuses this harness can reach.
+var garmRunnerStatusTransitions = map[string][]string{
+	"pending":    {"failed", "installing", "terminated", "pending"},
+	"installing": {"failed", "idle", "terminated", "installing"},
+	"idle":       {"offline", "active", "terminated", "idle"},
+}
+
+func (g *garmAPI) status() (string, []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.runnerStatus, append([]string(nil), g.reported...)
+}
+
+func newMetadataServer(t *testing.T) *garmAPI {
 	t.Helper()
 	files := map[string]string{
 		"/credentials/runner":                "RUNNER-FILE",
 		"/credentials/credentials":           "CREDENTIALS-FILE",
 		"/credentials/credentials_rsaparams": "RSAPARAMS-FILE",
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	g := &garmAPI{runnerStatus: "pending"}
+	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testInstanceTok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/callbacks/status" {
+			g.handleStatus(t, w, r)
+			return
+		}
 		body, ok := files[r.URL.Path]
-		if !ok || r.Header.Get("Authorization") != "Bearer "+testInstanceTok {
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		_, _ = w.Write([]byte(body))
 	}))
-	t.Cleanup(srv.Close)
-	return srv
+	t.Cleanup(g.Close)
+	return g
+}
+
+func (g *garmAPI) handleStatus(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	var msg struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		AgentID *int64 `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if msg.AgentID != nil {
+		t.Errorf("status update carries agent_id %d; GARM would reject a mismatch", *msg.AgentID)
+	}
+	g.mu.Lock()
+	current := g.runnerStatus
+	if current != "pending" && current != "installing" {
+		g.mu.Unlock()
+		w.WriteHeader(http.StatusUnauthorized) // the token is no longer accepted
+		return
+	}
+	if !slices.Contains(garmRunnerStatusTransitions[current], msg.Status) {
+		g.mu.Unlock()
+		t.Errorf("invalid runner status transition from %s to %s", current, msg.Status)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	g.runnerStatus = msg.Status
+	g.reported = append(g.reported, msg.Status)
+	hook := g.onStatus
+	g.mu.Unlock()
+	if hook != nil {
+		hook(msg.Status)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// runnerComesOnline makes the fake runner container print the actions/runner
+// listening line once the provider has reported it installing, as the real
+// runner does a few seconds after credential delivery.
+func runnerComesOnline(g *garmAPI, fake *docker.FakeClient) {
+	g.onStatus = func(status string) {
+		if status == "installing" {
+			fake.AppendLog(spec.RunnerContainerName(testInstanceName), docker.LogStdout, "2026-10-10 17:45:14Z: Listening for Jobs")
+		}
+	}
+}
+
+// assertRunnerIdle checks the provider walked GARM's runner status from
+// pending through installing to idle — the only status from which GARM v0.2.1
+// scale sets can move a runner to active when it picks up a job.
+func assertRunnerIdle(t *testing.T, g *garmAPI) {
+	t.Helper()
+	final, reported := g.status()
+	if final != "idle" || strings.Join(reported, ",") != "installing,idle" {
+		t.Fatalf("runner status = %q after reports %v, want idle after [installing idle]", final, reported)
+	}
 }
 
 // newFakeProvider builds a real *provider.Provider over the in-memory Docker
 // fake, scoped to the same controller ID GARM sends.
-func newFakeProvider(t *testing.T) *provider.Provider {
+func newFakeProvider(t *testing.T) (*provider.Provider, *docker.FakeClient) {
 	t.Helper()
 	cfg := config.Config{
 		DockerHost:       "unix:///var/run/docker.sock",
@@ -176,11 +277,12 @@ func newFakeProvider(t *testing.T) *provider.Provider {
 		AllowedDindModes: []string{config.DindModeNone},
 		Network:          config.Network{EnableJobNetwork: true},
 	}
-	p, err := provider.New(docker.NewFakeClient(), cfg, testControllerID)
+	fake := docker.NewFakeClient()
+	p, err := provider.New(fake, cfg, testControllerID)
 	if err != nil {
 		t.Fatalf("provider.New: %v", err)
 	}
-	return p
+	return p, fake
 }
 
 // runCommand reads the environment the way main does and dispatches it.
@@ -198,14 +300,16 @@ func runCommand(t *testing.T, p *provider.Provider) (string, error) {
 // Before the fix, Create failed on the injected runner_install_template and
 // Delete/Get failed environment validation with "missing pool ID".
 func TestGarmV021ScaleSetLifecycleReplay(t *testing.T) {
-	p := newFakeProvider(t)
+	p, fake := newFakeProvider(t)
 	md := newMetadataServer(t)
+	runnerComesOnline(md, fake)
 
 	setScaleSetCreateEnv(t, scaleSetBootstrap(md.URL))
 	out, err := runCommand(t, p)
 	if err != nil {
 		t.Fatalf("CreateInstance (GARM v0.2.1 scale-set payload) = %v, want success", err)
 	}
+	assertRunnerIdle(t, md)
 	var created params.ProviderInstance
 	if err := json.Unmarshal([]byte(out), &created); err != nil {
 		t.Fatalf("decoding CreateInstance output %q: %v", out, err)
@@ -258,7 +362,7 @@ func assertListed(t *testing.T, p *provider.Provider, want int) {
 // for an instance that no longer exists reaches the provider (no env failure)
 // and maps to GARM's idempotent not-found exit code.
 func TestGarmV021ScaleSetDeleteOfMissingInstanceIsNotFound(t *testing.T) {
-	p := newFakeProvider(t)
+	p, _ := newFakeProvider(t)
 	setScaleSetDeleteOrGetEnv(t, execcommon.DeleteInstanceCommand)
 	_, err := runCommand(t, p)
 	if err == nil {
@@ -273,7 +377,7 @@ func TestGarmV021ScaleSetDeleteOfMissingInstanceIsNotFound(t *testing.T) {
 // does not open the channel — an admin-supplied unknown key next to GARM's
 // injected runner_install_template is still rejected (ADR-005 fail-closed).
 func TestGarmV021ScaleSetCreateRejectsAdminUnknownKey(t *testing.T) {
-	p := newFakeProvider(t)
+	p, _ := newFakeProvider(t)
 	md := newMetadataServer(t)
 	b := scaleSetBootstrap(md.URL)
 	b.ExtraSpecs = json.RawMessage(`{"privileged":true,"runner_install_template":"` + runnerInstallWrapper + `"}`)
@@ -417,8 +521,9 @@ func setV010Env(t *testing.T, command execcommon.ExecutionCommand, poolID, insta
 // runner_install_template (it is added before the interface wrapper runs);
 // Get/Delete arrive with no GARM_POOL_ID variable at all.
 func TestGarmV021ScaleSetLifecycleReplayV010(t *testing.T) {
-	p := newFakeProvider(t)
+	p, fake := newFakeProvider(t)
 	md := newMetadataServer(t)
+	runnerComesOnline(md, fake)
 	b := scaleSetBootstrap(md.URL)
 
 	setV010Env(t, execcommon.CreateInstanceCommand, b.PoolID, "")
@@ -435,6 +540,7 @@ func TestGarmV021ScaleSetLifecycleReplayV010(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &created); err != nil || created.Name != testInstanceName {
 		t.Fatalf("CreateInstance output %q (decode err %v), want instance %q", out, err, testInstanceName)
 	}
+	assertRunnerIdle(t, md)
 
 	assertListedV010(t, p, 1)
 
