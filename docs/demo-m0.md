@@ -186,7 +186,12 @@ to the scale set (or pool). Preflight validates exactly that JSON against
 the generated config with the provider's own `ValidatePoolInfo` before
 anything touches Docker. The test workflow runs `docker run --rm
 hello-world` and a `docker build` of a trivial Dockerfile inside the job,
-which proves a non-root job can use the sidecar's daemon. Step 4 then also
+which proves a non-root job can use the sidecar's daemon, and a step that
+writes a file into `$GITHUB_WORKSPACE` and reads it back through
+`docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt`
+(must print `ok`), which proves the sidecar daemon sees the runner's
+workspace (the sidecar mounts the same workspace volume at
+`/actions-runner/_work`). Step 4 then also
 verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
 bind mounts on either container, `DOCKER_HOST`, labeled socket and
 `dind-state` volumes, and the flavor's memory limits).
@@ -337,7 +342,8 @@ the scale set's name (or the pool's tags with `--pool`), and a job that does
 `echo hello && env | sort | head` (plus a short `sleep` so the ephemeral
 runner stays up long enough for Step 4's checks — this runner is
 single-job ephemeral by design, `ADR-002`; the `--dind` variant adds
-`docker run --rm hello-world` and a `docker build` step). Then polls
+`docker run --rm hello-world`, a `docker build` step and a shared-workspace
+step). Then polls
 `docker ps --filter label=garm.docker/managed=true --filter label=garm.docker/role=runner` and GARM's runner list
 (`garm-cli scaleset runner list <id>`, the id looked up by name, or
 `SCALESET_ID`) every few seconds until you've triggered the workflow and a
