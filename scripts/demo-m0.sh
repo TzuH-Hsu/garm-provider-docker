@@ -82,7 +82,8 @@
 #   preflight   Step 0: environment checks; obtain the provider binary +
 #               runner image (release: download+verify / resolve digest;
 #               source: build both locally); generate a demo provider
-#               config.toml; smoke-test the binary against it
+#               config.toml; smoke-test the binary against it; install
+#               the binary and config only after every step succeeded
 #   config      Step 1: print the config.toml [[provider]] snippet to
 #               register with GARM, and pause for confirmation
 #   pool        Step 2: print the garm-cli scaleset add (or, with --pool,
@@ -670,33 +671,96 @@ write_file_atomic() {
   fi
 }
 
-# install_provider_binary moves the verified or freshly built binary "$1" into
-# place as PROVIDER_BIN (mode 0755, replacing any symlink there) and confirms
-# the installed file is a regular file we own that others cannot write.
-install_provider_binary() {
+# --- Staging -----------------------------------------------------------------
+#
+# GARM executes PROVIDER_BIN and reads PROVIDER_CONFIG_FILE directly, so
+# preflight must not touch either until everything it does has succeeded: the
+# download/build, the runner and DinD digest resolution, config generation and
+# the smoke test. Until then the new binary and config live in private (0700)
+# staging directories created INSIDE their target directories, so the final
+# rename(2) never crosses a filesystem and is atomic. A trap removes the
+# staging directories on any exit; a SIGKILL can leave a .stage.* directory
+# behind, which is safe to delete.
+
+STAGE_BIN_DIR=""
+STAGE_CFG_DIR=""
+STAGE_BIN=""
+STAGE_CFG=""
+
+# cleanup_staging removes the staging directories (idempotent).
+cleanup_staging() {
+  [[ -z "${STAGE_BIN_DIR}" ]] || rm -rf "${STAGE_BIN_DIR}"
+  [[ -z "${STAGE_CFG_DIR}" ]] || rm -rf "${STAGE_CFG_DIR}"
+  STAGE_BIN_DIR=""
+  STAGE_CFG_DIR=""
+}
+
+# create_staging ensures both target directories and creates the staging
+# directories inside them (mktemp -d creates them with mode 0700). The traps
+# make the EXIT cleanup run on Ctrl+C / termination as well as on die.
+create_staging() {
+  ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
+  trap cleanup_staging EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  STAGE_BIN_DIR="$(mktemp -d "${PROVIDER_BIN_DIR}/.stage.XXXXXX")" \
+    || die "could not create a staging directory in ${PROVIDER_BIN_DIR}"
+  STAGE_CFG_DIR="$(mktemp -d "${PROVIDER_CONFIG_DIR}/.stage.XXXXXX")" \
+    || die "could not create a staging directory in ${PROVIDER_CONFIG_DIR}"
+  STAGE_BIN="${STAGE_BIN_DIR}/garm-provider-docker"
+  STAGE_CFG="${STAGE_CFG_DIR}/config.toml"
+}
+
+# stage_provider_binary makes the verified or freshly built binary "$1" the
+# staged binary (mode 0755). Nothing under PROVIDER_BIN_DIR other than the
+# staging directory is touched.
+stage_provider_binary() {
   chmod 0755 "$1" || die "could not chmod $1"
-  mv -f "$1" "${PROVIDER_BIN}" || die "could not install ${PROVIDER_BIN}"
-  path_is_private "${PROVIDER_BIN}" f \
-    || die "${PROVIDER_BIN} must be a regular file owned by you and not writable by group or others."
+  mv -f "$1" "${STAGE_BIN}" || die "could not stage ${STAGE_BIN}"
+  path_is_private "${STAGE_BIN}" f \
+    || die "${STAGE_BIN} must be a regular file owned by you and not writable by group or others."
+}
+
+# publish_staged_artifacts moves the staged binary and config into place with
+# rename(2) (replacing any symlink there rather than following it), then drops
+# the staging directories and the cleanup traps. Every precondition is checked
+# BEFORE the first rename so a failure leaves both live files untouched. The
+# binary goes first: GARM runs the binary with the config on every provider
+# call, so for the short window between the two renames the pair is NEW binary
+# + OLD config, and a newer binary is expected to read the previous config
+# (omitted keys take their defaults) whereas an older binary can silently
+# ignore keys a newer config relies on (it decodes the config non-strictly).
+publish_staged_artifacts() {
+  [[ ! -d "${PROVIDER_BIN}" ]] || die "${PROVIDER_BIN} is a directory; remove it and re-run."
+  [[ ! -d "${PROVIDER_CONFIG_FILE}" ]] || die "${PROVIDER_CONFIG_FILE} is a directory; remove it and re-run."
+  path_is_private "${STAGE_BIN}" f && [[ -f "${STAGE_CFG}" ]] \
+    || die "internal error: the staged artifacts are missing or have the wrong owner or mode."
+  mv -f "${STAGE_BIN}" "${PROVIDER_BIN}" \
+    || die "could not install ${PROVIDER_BIN}; the previous binary and config are unchanged."
+  mv -f "${STAGE_CFG}" "${PROVIDER_CONFIG_FILE}" \
+    || die "installed the new ${PROVIDER_BIN} but could not install ${PROVIDER_CONFIG_FILE}; re-run preflight so they match."
+  cleanup_staging
+  trap - EXIT HUP INT TERM
+  log "Installed ${PROVIDER_BIN} and ${PROVIDER_CONFIG_FILE}"
 }
 
 # --- Step 0: preflight -------------------------------------------------------
 
 build_provider_binary() {
   log "Building provider binary from source (go build -ldflags version stamp)..."
-  ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
   local version
   version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
   local bin_tmp
-  bin_tmp="$(mktemp "${PROVIDER_BIN}.XXXXXX")" || die "could not create a temporary file next to ${PROVIDER_BIN}"
+  bin_tmp="$(mktemp "${STAGE_BIN_DIR}/build.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
   if ! ( cd "${REPO_ROOT}" && go build \
       -ldflags "-X github.com/TzuH-Hsu/garm-provider-docker/internal/version.Version=${version}" \
       -o "${bin_tmp}" . ); then
-    rm -f "${bin_tmp}"
     die "go build failed"
   fi
-  install_provider_binary "${bin_tmp}"
-  log "Built ${PROVIDER_BIN} (version ${version})"
+  stage_provider_binary "${bin_tmp}"
+  log "Built ${STAGE_BIN} (version ${version})"
 }
 
 # check_release_published fails early, before any download, when the
@@ -731,15 +795,14 @@ warn_if_known_incompatible_version() {
 # "garm-provider-docker_<version>_<goos>_<goarch>" convention exactly.
 download_provider_binary() {
   require_cmd curl
-  ensure_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR 0755
 
   check_release_published
   warn_if_known_incompatible_version
 
   local asset="garm-provider-docker_${PROVIDER_VERSION}_linux_${OS_ARCH}"
   local asset_path sums_path
-  asset_path="$(mktemp "${PROVIDER_BIN_DIR}/${asset}.XXXXXX")" || die "could not create a temporary file in ${PROVIDER_BIN_DIR}"
-  sums_path="$(mktemp "${PROVIDER_BIN_DIR}/SHA256SUMS.XXXXXX")" || die "could not create a temporary file in ${PROVIDER_BIN_DIR}"
+  asset_path="$(mktemp "${STAGE_BIN_DIR}/${asset}.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
+  sums_path="$(mktemp "${STAGE_BIN_DIR}/SHA256SUMS.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
 
   log "Downloading ${asset} (release ${PROVIDER_VERSION})..."
   curl -fsSL -o "${asset_path}" "${RELEASE_BASE_URL}/${PROVIDER_VERSION}/${asset}" \
@@ -760,8 +823,8 @@ download_provider_binary() {
   ok "SHA256SUMS verified for ${asset} (${expected})"
 
   rm -f "${sums_path}"
-  install_provider_binary "${asset_path}"
-  log "Installed verified binary: ${PROVIDER_BIN}"
+  stage_provider_binary "${asset_path}"
+  log "Staged verified binary: ${STAGE_BIN}"
 }
 
 build_runner_image() {
@@ -817,7 +880,8 @@ resolve_dind_image_digest() {
   printf '%s@%s' "${DIND_IMAGE_SOURCE}" "${digest}"
 }
 
-# generate_provider_config writes the demo provider config.toml. In
+# generate_provider_config writes the demo provider config.toml to its staging
+# path (publish_staged_artifacts installs it). In
 # "release" mode it pins runner_image by digest and leaves digest-pin
 # enforcement ON (no allow_unpinned_runner_image) - this is meant to be
 # exactly what a real operator's minimal config looks like (see
@@ -825,9 +889,7 @@ resolve_dind_image_digest() {
 # mutable dev tag, which requires the dev-only escape hatch.
 generate_provider_config() {
   local runner_image="$1" dind_image="${2:-}"
-  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
-  local cfg_tmp
-  cfg_tmp="$(mktemp "${PROVIDER_CONFIG_FILE}.XXXXXX")" || die "could not create a temporary file next to ${PROVIDER_CONFIG_FILE}"
+  local cfg_tmp="${STAGE_CFG}"
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
     cat > "${cfg_tmp}" <<EOF
@@ -878,22 +940,18 @@ EOF
   fi
   # config.toml holds no secrets and must be readable by GARM's service
   # account, so it is 0644 regardless of the mode of any earlier file.
-  [[ ! -d "${PROVIDER_CONFIG_FILE}" ]] || die "${PROVIDER_CONFIG_FILE} is a directory; remove it and re-run."
-  if ! chmod 0644 "${cfg_tmp}" || ! mv -f "${cfg_tmp}" "${PROVIDER_CONFIG_FILE}"; then
-    rm -f "${cfg_tmp}"
-    die "could not write ${PROVIDER_CONFIG_FILE}"
-  fi
-  log "Wrote provider config: ${PROVIDER_CONFIG_FILE}"
+  chmod 0644 "${cfg_tmp}" || die "could not chmod ${cfg_tmp}"
+  log "Staged provider config: ${STAGE_CFG}"
 }
 
-# smoke_test_binary runs the obtained binary once with GARM_COMMAND=GetVersion
-# against the just-generated config, so a broken download (wrong arch, a
+# smoke_test_binary runs the STAGED binary once with GARM_COMMAND=GetVersion
+# against the STAGED config, so a broken download (wrong arch, a
 # corrupted binary that passed the checksum check for the wrong reason -
 # it should not, but this is cheap insurance) or a config the CURRENT
 # loader rejects surfaces here, immediately, rather than opaquely inside
 # GARM's own provider-subprocess log later.
 smoke_test_binary() {
-  log "Smoke-testing the provider binary (GARM_COMMAND=GetVersion) against the generated config..."
+  log "Smoke-testing the staged provider binary (GARM_COMMAND=GetVersion) against the staged config..."
   # main.go writes its structured log lines to stderr and the GetVersion
   # result (a bare version string) to stdout (see main.go's run()), so stdout
   # alone is the clean "reported version" value; stderr is captured
@@ -901,10 +959,10 @@ smoke_test_binary() {
   local out err rc=0
   out="$(GARM_COMMAND=GetVersion \
       GARM_CONTROLLER_ID=demo-preflight \
-      GARM_PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_FILE}" \
-      "${PROVIDER_BIN}" 2>"${PROVIDER_CONFIG_DIR}/.smoke-test-stderr")" || rc=$?
-  err="$(cat "${PROVIDER_CONFIG_DIR}/.smoke-test-stderr" 2>/dev/null)"
-  rm -f "${PROVIDER_CONFIG_DIR}/.smoke-test-stderr"
+      GARM_PROVIDER_CONFIG_FILE="${STAGE_CFG}" \
+      "${STAGE_BIN}" 2>"${STAGE_CFG_DIR}/.smoke-test-stderr")" || rc=$?
+  err="$(cat "${STAGE_CFG_DIR}/.smoke-test-stderr" 2>/dev/null)"
+  rm -f "${STAGE_CFG_DIR}/.smoke-test-stderr"
   if [[ "${rc}" -ne 0 ]]; then
     die "the provider binary failed GetVersion against the generated config (exit ${rc}): ${err}"
   fi
@@ -918,9 +976,9 @@ smoke_test_binary() {
     local vrc=0
     err="$(GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=ValidatePoolInfo \
         GARM_CONTROLLER_ID=demo-preflight \
-        GARM_PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_FILE}" \
+        GARM_PROVIDER_CONFIG_FILE="${STAGE_CFG}" \
         GARM_POOL_EXTRASPECS="${DIND_EXTRA_SPECS}" \
-        "${PROVIDER_BIN}" 2>&1 </dev/null)" || vrc=$?
+        "${STAGE_BIN}" 2>&1 </dev/null)" || vrc=$?
     if [[ "${vrc}" -ne 0 ]]; then
       die "the provider rejected the DinD extra_specs ${DIND_EXTRA_SPECS} (exit ${vrc}): ${err}"
     fi
@@ -983,6 +1041,10 @@ step_preflight() {
     warn "curl not found; skipping the GARM_URL reachability probe"
   fi
 
+  # Everything below is staged; the live binary and config (which GARM may
+  # already be using) are replaced only once every step has succeeded.
+  create_staging
+
   local runner_image
   case "${PROVIDER_SOURCE}" in
     release)
@@ -1008,6 +1070,7 @@ step_preflight() {
 
   generate_provider_config "${runner_image}" "${dind_image}"
   smoke_test_binary
+  publish_staged_artifacts
 
   log "Preflight complete."
   log "  Mode            : ${PROVIDER_SOURCE}"
@@ -1016,9 +1079,10 @@ step_preflight() {
   log "  Runner image    : ${runner_image}"
   [[ -z "${dind_image}" ]] || log "  DinD image      : ${dind_image}"
 
-  # Record the modes only now: they describe the artifacts preflight just
-  # produced (binary, runner/DinD image, config.toml), so a failed preflight
-  # must not leave modes saved that the installed config does not match.
+  # Record the modes only now, after the artifacts are installed: they
+  # describe the artifacts preflight just produced (binary, runner/DinD image,
+  # config.toml), so a failed preflight must not leave modes saved that the
+  # installed config does not match.
   # (die exits before reaching this line.) For `all`, later steps in this
   # process already use the effective modes held in the variables.
   save_modes
