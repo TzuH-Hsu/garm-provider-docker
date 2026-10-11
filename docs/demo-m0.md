@@ -204,7 +204,9 @@ writes a file into `$GITHUB_WORKSPACE` and reads it back through
 `docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt`
 (must print `ok`), which proves the sidecar daemon sees the runner's
 workspace (the sidecar mounts the same workspace volume at
-`/actions-runner/_work`). Step 4 then also
+`/actions-runner/_work`). The same step then has a nested container write
+`gate-nested.txt` into the workspace and reads it back from the runner, which
+proves the sidecar's workspace mount is writable end to end. Step 4 then also
 verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
 bind mounts on either container, `DOCKER_HOST`, labeled socket and
 `dind-state` volumes, and the flavor's memory limits).
@@ -554,6 +556,12 @@ refreshes the totals:
   PASS line per `verify` run.
 - `postjob` now exempts only persistent cache volumes (`cache=true` and no
   instance-name) from the leftover check (e04451f); it adds no PASS line.
+- `verify` now requires the workspace volume to be mounted read-write at
+  `/actions-runner/_work` on the runner container and, in the `--dind`
+  variant, on the sidecar too (both mounts are read-write by contract). This
+  adds one PASS line per `verify` run for the runner and one more for the
+  sidecar in `--dind`. The `--dind` sample workflow step also has a nested
+  container write a file into the workspace that the runner reads back.
 
 `preflight` and the saved-state handling also changed after those runs
 (remembered modes, scale-set name persistence, and staged installation in

@@ -1358,12 +1358,16 @@ EOF
           cd "$RUNNER_TEMP/dind-gate"
           printf 'FROM alpine:3.20\nRUN echo built-inside-dind\n' > Dockerfile
           docker build -t dind-gate:test .
-      - name: shared workspace is visible to the sidecar daemon
+      - name: shared workspace is visible to, and writable by, the sidecar daemon
         run: |
           echo ok > "$GITHUB_WORKSPACE/gate-shared.txt"
           out="$(docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt)"
           echo "sidecar saw: ${out}"
           test "${out}" = ok
+          docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 sh -c 'echo nested > /w/gate-nested.txt'
+          back="$(cat "$GITHUB_WORKSPACE/gate-nested.txt")"
+          echo "runner read back: ${back}"
+          test "${back}" = nested
       - name: hold the runner briefly for scripts/demo-m0.sh verify
         run: sleep 60
 EOF
@@ -1523,6 +1527,22 @@ container_mount_rw() {
     | awk -F'|' -v d="$2" '$1 == d { print $2; exit }'
 }
 
+# verify_workspace_mount_rw checks that container "$1" ("$2" names it) has its
+# workspace volume mounted READ-WRITE at RUNNER_WORKDIR. Both the runner and
+# the DinD sidecar get the same NamedWorkspaceMount (internal/spec/mounts.go,
+# NamedWorkspaceMount: no ReadOnly; used for the runner in mounts.go and for the
+# sidecar in dind.go), and jobs, including nested containers started through
+# the sidecar's daemon, write into the job workspace.
+verify_workspace_mount_rw() {
+  local rw
+  rw="$(container_mount_rw "$1" "${RUNNER_WORKDIR}")"
+  case "${rw}" in
+    true)  ok "$2 mounts its workspace volume read-write at ${RUNNER_WORKDIR}" ;;
+    false) bad "$2 mounts its workspace volume READ-ONLY at ${RUNNER_WORKDIR} (the spec mounts it read-write; job and nested-container writes into the workspace would fail)" ;;
+    *)     bad "$2 has no mount at ${RUNNER_WORKDIR}, so its workspace read-write flag cannot be checked" ;;
+  esac
+}
+
 # verify_no_extra_privileges checks "$1" ("$2" names it) has none of the
 # privilege widenings the spec never sets on the runner: no added
 # capabilities, devices or security options, and no host PID/IPC/UTS/user
@@ -1612,6 +1632,7 @@ verify_topology() {
       bad "runner container does not mount the labeled workspace volume ${vol_name} at ${RUNNER_WORKDIR}"
     fi
   fi
+  verify_workspace_mount_rw "${cid}" "runner container"
 
   local tmpfs_opts
   tmpfs_opts="$(docker inspect -f '{{index .HostConfig.Tmpfs "'"${RUNNER_CRED_DIR}"'"}}' "${cid}" 2>/dev/null)"
@@ -1782,6 +1803,7 @@ verify_dind_topology() {
   else
     bad "sidecar does not mount the labeled workspace volume '${ws_vol}' at ${RUNNER_WORKDIR} (a nested 'docker run -v \"\$PWD\":/work' would bind an empty path)"
   fi
+  verify_workspace_mount_rw "${did}" "sidecar"
 
   if [[ "$(container_mount_dests "${did}" | tr '\n' ' ')" == "${RUNNER_WORKDIR} ${DIND_SOCKET_DIR} ${DIND_STATE_DIR} " ]]; then
     ok "sidecar has exactly the socket, dind-state and workspace mounts (no cache volumes)"
