@@ -319,6 +319,14 @@ Either way, Step 0 finishes by running the obtained binary once
 download/build or a config the current loader rejects is caught here, not
 later inside GARM's own provider-subprocess log.
 
+Preflight stages everything first: the binary and `config.toml` are written
+to private `.stage.*` directories inside `PROVIDER_BIN_DIR` and
+`PROVIDER_CONFIG_DIR`, and the smoke test runs against those staged files.
+Only once the download or build, the digest resolution and the smoke test
+have all succeeded are they renamed into place (binary first, then config)
+and `gate-modes` written, so a failed re-run leaves the installed binary,
+config and saved modes as they were.
+
 ### Step 1 — register the provider with GARM
 
 Prints the exact `[[provider]]` section to add to GARM's own `config.toml`
