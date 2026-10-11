@@ -319,13 +319,18 @@ Either way, Step 0 finishes by running the obtained binary once
 download/build or a config the current loader rejects is caught here, not
 later inside GARM's own provider-subprocess log.
 
-Preflight stages everything first: the binary and `config.toml` are written
-to private `.stage.*` directories inside `PROVIDER_BIN_DIR` and
-`PROVIDER_CONFIG_DIR`, and the smoke test runs against those staged files.
-Only once the download or build, the digest resolution and the smoke test
-have all succeeded are they renamed into place (binary first, then config)
-and `gate-modes` written, so a failed re-run leaves the installed binary,
-config and saved modes as they were.
+Preflight stages everything first: the binary, `config.toml` and
+`gate-modes` are written to private `.stage.*` directories inside
+`PROVIDER_BIN_DIR` and `PROVIDER_CONFIG_DIR`, the smoke test runs against the
+staged files, and with `--from-source` the runner image is built under a
+temporary tag. Only once the download or build, the digest resolution and the
+smoke test have all succeeded does it publish: retag the runner image to
+`RUNNER_IMAGE_TAG`, then rename the binary, the config and `gate-modes` into
+place, in that order. A failed re-run leaves the installed files and the
+runner image tag as they were; if a publish step itself fails, the steps
+already done are rolled back. The one window it cannot close is a hard kill
+(SIGKILL, power loss) between the renames, which can leave a mix of old and
+new files; re-run `preflight` to bring them back in line.
 
 ### Step 1 — register the provider with GARM
 

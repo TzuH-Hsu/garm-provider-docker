@@ -83,7 +83,8 @@
 #               runner image (release: download+verify / resolve digest;
 #               source: build both locally); generate a demo provider
 #               config.toml; smoke-test the binary against it; install
-#               the binary and config only after every step succeeded
+#               the binary, config, gate-modes (and the --from-source
+#               runner image tag) only after every step succeeded
 #   config      Step 1: print the config.toml [[provider]] snippet to
 #               register with GARM, and pause for confirmation
 #   pool        Step 2: print the garm-cli scaleset add (or, with --pool,
@@ -458,16 +459,19 @@ explicit_mode_value() {
   esac
 }
 
-# save_modes records the effective modes (called by preflight and all).
-save_modes() {
-  local f key content=""
-  f="$(modes_file)"
+# stage_modes writes the effective modes (called by preflight and all) to
+# STAGE_MODES, a file in the config staging directory; publish_staged_artifacts
+# renames it to modes_file() together with the binary and config, so every
+# fallible write happens before anything live is replaced.
+stage_modes() {
+  local key content=""
   for key in ${MODE_KEYS}; do
     content+="${key}=${!key}"$'\n'
   done
-  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
-  write_file_atomic "${f}" 0600 <<< "${content%$'\n'}"
-  log "recorded modes in ${f}"
+  STAGE_MODES="${STAGE_CFG_DIR}/gate-modes"
+  if ! printf '%s' "${content}" > "${STAGE_MODES}" || ! chmod 0600 "${STAGE_MODES}"; then
+    die "could not stage ${STAGE_MODES}"
+  fi
 }
 
 # load_saved_modes applies the modes saved by an earlier preflight to every
@@ -675,24 +679,39 @@ write_file_atomic() {
 #
 # GARM executes PROVIDER_BIN and reads PROVIDER_CONFIG_FILE directly, so
 # preflight must not touch either until everything it does has succeeded: the
-# download/build, the runner and DinD digest resolution, config generation and
-# the smoke test. Until then the new binary and config live in private (0700)
-# staging directories created INSIDE their target directories, so the final
-# rename(2) never crosses a filesystem and is atomic. A trap removes the
-# staging directories on any exit; a SIGKILL can leave a .stage.* directory
-# behind, which is safe to delete.
+# download/build, the runner and DinD digest resolution, config generation,
+# the smoke test and the preparation of gate-modes. Until then the new binary,
+# config and gate-modes live in private (0700) staging directories created
+# INSIDE their target directories, so the final rename(2)s never cross a
+# filesystem and are atomic. In source mode the runner image is built under a
+# temporary tag for the same reason. A trap removes the staging directories
+# and the temporary tag on any exit; a SIGKILL can leave a .stage.* directory
+# behind, which is safe to delete (the temporary tag is garm-demo-runner-stage:*).
 
 STAGE_BIN_DIR=""
 STAGE_CFG_DIR=""
 STAGE_BIN=""
 STAGE_CFG=""
+STAGE_MODES=""
+STAGE_IMAGE_TAG=""
 
-# cleanup_staging removes the staging directories (idempotent).
+# PUBLISHED lists the publish steps completed so far, newest first (image,
+# bin, cfg, modes), and PREV_IMAGE_ID is the image RUNNER_IMAGE_TAG pointed at
+# before the retag; both exist only so a failed publish can be rolled back.
+PUBLISHED=""
+PREV_IMAGE_ID=""
+
+# cleanup_staging rolls back a half-finished publish (a signal can interrupt
+# one), then removes the staging directories and the temporary image tag
+# (idempotent; never fails).
 cleanup_staging() {
+  [[ -z "${PUBLISHED}" ]] || rollback_published || true
   [[ -z "${STAGE_BIN_DIR}" ]] || rm -rf "${STAGE_BIN_DIR}"
   [[ -z "${STAGE_CFG_DIR}" ]] || rm -rf "${STAGE_CFG_DIR}"
+  [[ -z "${STAGE_IMAGE_TAG}" ]] || docker image rm "${STAGE_IMAGE_TAG}" >/dev/null 2>&1 || true
   STAGE_BIN_DIR=""
   STAGE_CFG_DIR=""
+  STAGE_IMAGE_TAG=""
 }
 
 # create_staging ensures both target directories and creates the staging
@@ -723,28 +742,113 @@ stage_provider_binary() {
     || die "${STAGE_BIN} must be a regular file owned by you and not writable by group or others."
 }
 
-# publish_staged_artifacts moves the staged binary and config into place with
-# rename(2) (replacing any symlink there rather than following it), then drops
-# the staging directories and the cleanup traps. Every precondition is checked
-# BEFORE the first rename so a failure leaves both live files untouched. The
-# binary goes first: GARM runs the binary with the config on every provider
-# call, so for the short window between the two renames the pair is NEW binary
-# + OLD config, and a newer binary is expected to read the previous config
-# (omitted keys take their defaults) whereas an older binary can silently
-# ignore keys a newer config relies on (it decodes the config non-strictly).
+# keep_rollback_copy "$1" "$2" saves the current live object "$1" (if any) as
+# "$2" inside a staging directory on the same filesystem: a hard link to the
+# object itself (a symlink stays a symlink), else a copy. The rename that later
+# replaces "$1" leaves the saved object intact.
+keep_rollback_copy() {
+  [[ -e "$1" || -L "$1" ]] || return 0
+  ln -P "$1" "$2" 2>/dev/null || cp -pP "$1" "$2"
+}
+
+# restore_live "$1" "$2" puts the saved object "$2" back as "$1" (atomic
+# rename), or removes "$1" when there was nothing there before.
+restore_live() {
+  if [[ -e "$2" || -L "$2" ]]; then
+    mv -f "$2" "$1"
+  else
+    rm -f "$1"
+  fi
+}
+
+# restore_image points RUNNER_IMAGE_TAG back at the previous image (or removes
+# the tag when it did not exist).
+restore_image() {
+  if [[ -n "${PREV_IMAGE_ID}" ]]; then
+    docker tag "${PREV_IMAGE_ID}" "${RUNNER_IMAGE_TAG}"
+  else
+    docker image rm "${RUNNER_IMAGE_TAG}" >/dev/null
+  fi
+}
+
+# rollback_published undoes the completed publish steps, newest first. It
+# returns non-zero when any restore failed.
+rollback_published() {
+  local step failed=0
+  for step in ${PUBLISHED}; do
+    case "${step}" in
+      modes) restore_live "$(modes_file)" "${STAGE_CFG_DIR}/prev-gate-modes" || failed=1 ;;
+      cfg)   restore_live "${PROVIDER_CONFIG_FILE}" "${STAGE_CFG_DIR}/prev-config.toml" || failed=1 ;;
+      bin)   restore_live "${PROVIDER_BIN}" "${STAGE_BIN_DIR}/prev-bin" || failed=1 ;;
+      image) restore_image || failed=1 ;;
+    esac
+  done
+  PUBLISHED=""
+  return "${failed}"
+}
+
+# publish_fail "$1" rolls back and exits with message "$1".
+publish_fail() {
+  if rollback_published; then
+    die "$1; the previous binary, config, gate-modes and runner image tag were restored."
+  fi
+  die "$1; restoring the previous artifacts was incomplete - re-run preflight to bring binary, config and gate-modes back in line."
+}
+
+# publish_staged_artifacts installs the staged artifacts and drops the staging
+# directories and cleanup traps. Everything fallible that can be prepared is
+# done BEFORE the first change (staged files, destination and ownership
+# checks, rollback copies of the live binary, config and gate-modes), so the
+# publish itself is the runner image retag followed by three rename(2)s, each
+# replacing a symlink rather than following it. If a step fails, the completed
+# ones are rolled back and the run exits non-zero.
+#
+# Order: (1) retag the runner image (source mode only) - the only step that
+# talks to the Docker daemon, hence the likeliest to fail, and failing it
+# leaves every file untouched; (2) the binary before (3) the config: GARM runs
+# the binary with the config on every provider call, so the brief window
+# between the renames is NEW binary + OLD config, and a newer binary is
+# expected to read the previous config (omitted keys take their defaults)
+# whereas an older binary can silently ignore keys a newer config relies on (it
+# decodes the config non-strictly); (4) gate-modes last, because it only
+# records what the other artifacts are.
+#
+# Residual window, stated plainly: between the renames GARM can observe a mix
+# of old and new artifacts, and a SIGKILL or power loss in that window leaves
+# the mix in place (the rollback is a best-effort restore, not a transaction).
+# Re-running preflight always brings the set back in line.
 publish_staged_artifacts() {
+  local modes_live
+  modes_live="$(modes_file)"
   [[ ! -d "${PROVIDER_BIN}" ]] || die "${PROVIDER_BIN} is a directory; remove it and re-run."
   [[ ! -d "${PROVIDER_CONFIG_FILE}" ]] || die "${PROVIDER_CONFIG_FILE} is a directory; remove it and re-run."
-  if ! path_is_private "${STAGE_BIN}" f || [[ ! -f "${STAGE_CFG}" ]]; then
+  [[ ! -d "${modes_live}" ]] || die "${modes_live} is a directory; remove it and re-run."
+  if ! path_is_private "${STAGE_BIN}" f || [[ ! -f "${STAGE_CFG}" ]] || [[ ! -f "${STAGE_MODES}" ]]; then
     die "internal error: the staged artifacts are missing or have the wrong owner or mode."
   fi
-  mv -f "${STAGE_BIN}" "${PROVIDER_BIN}" \
-    || die "could not install ${PROVIDER_BIN}; the previous binary and config are unchanged."
-  mv -f "${STAGE_CFG}" "${PROVIDER_CONFIG_FILE}" \
-    || die "installed the new ${PROVIDER_BIN} but could not install ${PROVIDER_CONFIG_FILE}; re-run preflight so they match."
+  keep_rollback_copy "${PROVIDER_BIN}" "${STAGE_BIN_DIR}/prev-bin" \
+    || die "could not save a rollback copy of ${PROVIDER_BIN}; nothing was changed."
+  keep_rollback_copy "${PROVIDER_CONFIG_FILE}" "${STAGE_CFG_DIR}/prev-config.toml" \
+    || die "could not save a rollback copy of ${PROVIDER_CONFIG_FILE}; nothing was changed."
+  keep_rollback_copy "${modes_live}" "${STAGE_CFG_DIR}/prev-gate-modes" \
+    || die "could not save a rollback copy of ${modes_live}; nothing was changed."
+
+  if [[ -n "${STAGE_IMAGE_TAG}" ]]; then
+    PREV_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${RUNNER_IMAGE_TAG}" 2>/dev/null)" || PREV_IMAGE_ID=""
+    docker tag "${STAGE_IMAGE_TAG}" "${RUNNER_IMAGE_TAG}" \
+      || die "could not tag the staged runner image as ${RUNNER_IMAGE_TAG}; nothing was changed."
+    PUBLISHED="image ${PUBLISHED}"
+  fi
+  mv -f "${STAGE_BIN}" "${PROVIDER_BIN}" || publish_fail "could not install ${PROVIDER_BIN}"
+  PUBLISHED="bin ${PUBLISHED}"
+  mv -f "${STAGE_CFG}" "${PROVIDER_CONFIG_FILE}" || publish_fail "could not install ${PROVIDER_CONFIG_FILE}"
+  PUBLISHED="cfg ${PUBLISHED}"
+  mv -f "${STAGE_MODES}" "${modes_live}" || publish_fail "could not install ${modes_live}"
+  PUBLISHED=""
+
   cleanup_staging
   trap - EXIT HUP INT TERM
-  log "Installed ${PROVIDER_BIN} and ${PROVIDER_CONFIG_FILE}"
+  log "Installed ${PROVIDER_BIN}, ${PROVIDER_CONFIG_FILE} and ${modes_live}"
 }
 
 # --- Step 0: preflight -------------------------------------------------------
@@ -828,9 +932,16 @@ download_provider_binary() {
   log "Staged verified binary: ${STAGE_BIN}"
 }
 
+# build_runner_image builds the runner image under a unique temporary tag. The
+# generated source-mode config references RUNNER_IMAGE_TAG itself (a mutable
+# tag; allow_unpinned_runner_image), so that tag must keep pointing at the
+# previous image until preflight has succeeded: publish_staged_artifacts
+# retags the staged image to RUNNER_IMAGE_TAG, and cleanup_staging removes
+# the temporary tag on every exit.
 build_runner_image() {
-  log "Building runner image ${RUNNER_IMAGE_TAG} from runner-images/noble ..."
-  docker build -t "${RUNNER_IMAGE_TAG}" "${REPO_ROOT}/runner-images/noble" \
+  STAGE_IMAGE_TAG="garm-demo-runner-stage:$$-${RANDOM}${RANDOM}"
+  log "Building runner image from runner-images/noble as ${STAGE_IMAGE_TAG} (${RUNNER_IMAGE_TAG} is retagged only after preflight succeeds) ..."
+  docker build -t "${STAGE_IMAGE_TAG}" "${REPO_ROOT}/runner-images/noble" \
     || die "docker build of the runner image failed"
 }
 
@@ -1071,6 +1182,12 @@ step_preflight() {
 
   generate_provider_config "${runner_image}" "${dind_image}"
   smoke_test_binary
+  # The modes describe the artifacts preflight just produced (binary, runner and
+  # DinD image, config.toml), so they are published together with them and never
+  # on their own: a failed preflight must not leave modes saved that the
+  # installed config does not match. For `all`, later steps in this process
+  # already use the effective modes held in the variables.
+  stage_modes
   publish_staged_artifacts
 
   log "Preflight complete."
@@ -1079,14 +1196,6 @@ step_preflight() {
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
   log "  Runner image    : ${runner_image}"
   [[ -z "${dind_image}" ]] || log "  DinD image      : ${dind_image}"
-
-  # Record the modes only now, after the artifacts are installed: they
-  # describe the artifacts preflight just produced (binary, runner/DinD image,
-  # config.toml), so a failed preflight must not leave modes saved that the
-  # installed config does not match.
-  # (die exits before reaching this line.) For `all`, later steps in this
-  # process already use the effective modes held in the variables.
-  save_modes
 }
 
 # --- Step 1: register the provider with GARM --------------------------------
