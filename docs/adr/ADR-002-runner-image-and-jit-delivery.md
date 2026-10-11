@@ -41,6 +41,13 @@ Status: Accepted (2026-07-19)
 > the transition table in `cloudbase/garm#817` (commit `1a9aeff2`), which is
 > not in any release as of 2026-10-11.
 >
+> Provider-side reporting narrows the stall rather than removing it: a job
+> assigned while the row is still `installing` fails the checked update
+> (`installing` allows only `failed`, `idle`, `terminated`, `installing`),
+> and the listener refetches the unacknowledged message at once, so the
+> retry succeeds as soon as `idle` is posted. If `idle` is never posted
+> (timeout, `0`), the stall persists as above.
+>
 > The provider now reports status itself, from the provider process, using
 > the instance token it already holds for the credential fetch:
 > `POST {callback-url}/status` with `{"status": "installing", ...}` once the

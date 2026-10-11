@@ -213,11 +213,15 @@ compatibility-fix release exists); see the checklist's end-to-end item.
       `invalid runner status transition from pending to active`, and the
       scale set stalls until consolidation removes the runner. Fixed
       upstream in cloudbase/garm#817 (`1a9aeff2ae`), on `main` and
-      `release/v0.2`, not in a tagged release as of 2026-10-11. This
-      provider avoids it from `v0.2.1` by reporting `installing` and
-      `idle` itself (`[status_report]`, on by default); the gate confirmed
-      the `pending`, `installing`, `idle`, `active` sequence with no
-      invalid-transition error.
+      `release/v0.2`, not in a tagged release as of 2026-10-11. From
+      `v0.2.1` this provider narrows it by reporting `installing` and
+      `idle` itself (`[status_report]`, on by default): if a job is
+      assigned before `idle` is posted, GARM briefly retries `JobStarted`
+      (`invalid runner status transition from installing to active`) until
+      it is; if `idle` is never posted (timeout, reporting disabled) the
+      stall returns. The gate saw the `pending`, `installing`, `idle`,
+      `active` sequence with no such error, but that ordering is not
+      guaranteed. Do not describe it as fixed.
    3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.1`,
       `<GARM_VERSION>` = `v0.2.1`). Do not claim compatibility with
       "GARM" generically, and do not imply production usage (the way the

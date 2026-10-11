@@ -603,14 +603,25 @@ Fixed upstream in cloudbase/garm#817 (commit `1a9aeff2ae`, "Allow pending
 and installing runners to become active"), present on `main` and
 `release/v0.2` but not in a tagged release as of 2026-10-11.
 
-**Mitigated in this provider since v0.2.1.** The provider reports the
+**Narrowed by this provider since v0.2.1.** The provider reports the
 runner `installing` and then `idle` to GARM itself (`[status_report]`, on
-by default), so the runner is `idle` before a job is assigned and the
-`idle` to `active` transition is valid. The gate above confirms it with the
-release binary on GARM v0.2.1: the runner went `pending`, `installing`,
-`idle`, `active`, there was no `invalid runner status transition` error in
-GARM's log, and teardown followed the job end within seconds. Operators who
-disable it (`timeout_seconds = 0`) will see the stall on GARM v0.2.1 scale sets.
+by default; `idle` follows `Listening for Jobs`, so it is not instant). This
+shrinks the stall to a short window rather than removing it. If GARM
+delivers `JobStarted` while the row is still `installing` (the runner can
+start polling before `idle` is posted), the checked update fails with
+`invalid runner status transition from installing to active`, because
+`RunnerStatusTransitions` allows `installing` only to `failed`, `idle`,
+`terminated` or `installing`. The scale-set listener
+(`handleSessionMessage` and `loop` in `workers/scaleset/scaleset_listener.go`)
+does not acknowledge the message and refetches it immediately, so once the
+watcher posts `idle` the retried `JobStarted` applies: a brief, self-clearing
+burst of that error. The original stall (until GARM's consolidation, up to
+about 5 minutes) returns when `idle` is never posted: `timeout_seconds`
+expires before the runner is listening, status reporting is disabled
+(`timeout_seconds = 0`), or the runner is non-JIT. The gate runs above showed
+`idle` 30 to 40 s before `active` and no transition error in GARM's log, but
+that ordering is not guaranteed. Upstream cloudbase/garm#817 removes the
+race and the stall entirely once it is in a release.
 
 ## Still unverified
 
