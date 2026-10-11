@@ -1563,6 +1563,28 @@ verify_no_extra_privileges() {
   fi
 }
 
+# verify_ipv6_disabled checks "$1" ("$2" names it) was created with IPv6
+# disabled in its network namespace (internal/spec/mounts.go, RunnerIPv6Sysctl)
+# and that Docker therefore wrote no ::1 line into its /etc/hosts. The job
+# network has no IPv6, so a ::1 localhost mapping makes a server bound to
+# `localhost` unreachable for clients that skip ::1 (Node, AI_ADDRCONFIG).
+verify_ipv6_disabled() {
+  local cid="$1" what="$2" sysctl hosts_file
+  sysctl="$(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "${cid}" 2>/dev/null)"
+  if [[ "${sysctl}" == "1" ]]; then
+    ok "${what}: net.ipv6.conf.all.disable_ipv6=1"
+  else
+    bad "${what}: net.ipv6.conf.all.disable_ipv6 is '${sysctl}' (the spec sets 1)"
+  fi
+  if ! hosts_file="$(docker exec "${cid}" cat /etc/hosts 2>/dev/null)"; then
+    bad "${what}: cannot read /etc/hosts to check for a ::1 localhost mapping"
+  elif printf '%s\n' "${hosts_file}" | grep -q '::1'; then
+    bad "${what}: /etc/hosts still maps localhost to ::1 (the network has no IPv6)"
+  else
+    ok "${what}: /etc/hosts has no ::1 localhost mapping"
+  fi
+}
+
 # cache_disabled_in_config succeeds when the provider config file sets
 # `enabled = false` inside its [cache] table. [cache].enabled defaults to true
 # (internal/config/cache.go defaultCache, wired in config.go), and when the
@@ -1659,6 +1681,7 @@ verify_topology() {
   esac
 
   verify_no_extra_privileges "${cid}" "runner container"
+  verify_ipv6_disabled "${cid}" "runner container"
 
   local cache_vols scoped_cache
   scoped_cache="$(job_scoped_cache_volumes)"

@@ -128,6 +128,30 @@ Status: Accepted (2026-07-19)
 > `enable_runner_callbacks` opt-in discussed below (which would have put the
 > token in the container) remains unbuilt and is not needed for this.
 
+> **Amendment (2026-10-11): the runner container has IPv6 disabled.** The
+> runner is created with `HostConfig.Sysctls`
+> `net.ipv6.conf.all.disable_ipv6=1` (`internal/spec/mounts.go`,
+> `RunnerIPv6Sysctl`), unconditionally. Docker writes `::1 localhost
+> ip6-localhost ip6-loopback` into every bridge-network container's
+> `/etc/hosts`, but the per-job network carries no IPv6. A server that binds
+> `localhost` through plain `getaddrinfo` therefore listens on `::1` only,
+> while a Node client resolves with `AI_ADDRCONFIG`, drops `::1` because the
+> container has no non-loopback IPv6 address, and dials `127.0.0.1`
+> (`ECONNREFUSED`; seen with Astro's `@astrojs/cloudflare` prerender). On a VM
+> host or a GitHub-hosted runner `localhost` maps to `127.0.0.1` only, so the
+> same job passes there. With IPv6 disabled in the container's network
+> namespace Docker omits the `::1` lines and `localhost` is IPv4-only,
+> matching those hosts. `net.*` sysctls are per network namespace, so this
+> needs no privilege and changes nothing on the host. Only the `all` key is
+> set: it is the one the daemon consults when writing `/etc/hosts`, and it
+> also covers `lo` and `eth0`, which already exist when the sysctl is applied
+> (verified live on Docker 29.9: `default` alone leaves the `::1` line in
+> place). The DinD sidecar is unchanged; it runs `dockerd`, not job code, and
+> containers it launches get their own network namespaces. There is no
+> config knob. The compatibility cost: a job that binds or dials `::1`
+> explicitly (or a service that needs IPv6 loopback) will not work in the
+> runner container, which already could not use IPv6 beyond loopback.
+
 ## Context
 
 GARM (see ADR-001 for the provider/GARM split of responsibilities) generates just-in-time (JIT) runner configuration for scale-set pools and expects the provider to get that configuration onto the instance it creates. The provider receives a bootstrap payload on stdin that includes an instance token; it must turn that into a running, registered GitHub Actions runner without ever letting GARM's credentials — the instance token, the metadata/callback URLs backing it, or (further upstream) the GitHub App key — reach the container's environment or filesystem. This is one of the project's explicit security red lines and the primary acceptance criterion for the M0 milestone (see plan.md): `docker inspect` of a running runner must show no host Docker socket, no GARM credentials, and no GitHub App key, in either its environment or its mounts.

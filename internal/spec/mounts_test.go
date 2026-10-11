@@ -125,6 +125,34 @@ func TestBuildRunnerContainer(t *testing.T) {
 	}
 }
 
+// TestBuildRunnerContainerDisablesIPv6: the runner is created with IPv6
+// disabled in its network namespace, so Docker writes no `::1 localhost` line
+// into /etc/hosts (the job network has no IPv6; see RunnerIPv6Sysctl). It is
+// unconditional (present with and without the optional inputs) and is the
+// only sysctl set.
+func TestBuildRunnerContainerDisablesIPv6(t *testing.T) {
+	for name, s := range map[string]RunnerContainerSpec{
+		"minimal": {Image: "x"},
+		"full": {
+			Image:               "x",
+			WorkspaceVolumeName: "job-1-nonce-workspace",
+			NetworkName:         "job-1-net",
+			SocketVolumeName:    "job-1-socket",
+			MemoryBytes:         1 << 30,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, host := BuildRunnerContainer(s)
+			if got := host.Sysctls["net.ipv6.conf.all.disable_ipv6"]; got != "1" {
+				t.Errorf("Sysctls[net.ipv6.conf.all.disable_ipv6] = %q, want \"1\"; Sysctls = %v", got, host.Sysctls)
+			}
+			if len(host.Sysctls) != 1 {
+				t.Errorf("Sysctls = %v, want only the IPv6 sysctl", host.Sysctls)
+			}
+		})
+	}
+}
+
 func TestNamedWorkspaceMount(t *testing.T) {
 	m := NamedWorkspaceMount("test-instance-01-workspace")
 	if m.Type != mount.TypeVolume {
