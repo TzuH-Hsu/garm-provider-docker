@@ -538,11 +538,12 @@ results were recorded, in d5d8d65; run live against both variants):
   (sidecar). The GitHub job succeeded (`docker run hello-world`,
   `docker build`, and the shared-workspace step). `postjob` PASS.
 
-**Changes since the recorded runs, not yet exercised live.** The totals
-above (24 and 45 PASS lines) are those of the script as recorded in d5d8d65.
-The gate checks changed afterwards, and those changes will be exercised by
-the next full gate run, against the v0.2.1 release binary, which will also
-refresh the totals:
+**Changes since the recorded runs (not covered by the totals above).** The
+totals above (24 and 45 PASS lines) are those of the script as recorded in
+d5d8d65. The gate changed afterwards. None of these changes has been part of
+a full two-variant gate run (some were spot-checked when they landed); the
+next full gate run, against the v0.2.1 release binary, covers them and
+refreshes the totals:
 
 - `verify` now fails when no volume is mounted at the externals path while
   `[cache]` is enabled (187f0e7); this was informational before. The
