@@ -113,7 +113,8 @@ storage_driver = "overlay2"
   toolcache_path = "/opt/hostedtoolcache"
 
   # Where the pnpm store volume mounts inside the runner
-  # (npm_config_store_dir). Default: "/opt/pnpm-store".
+  # (exported as npm_config_store_dir for pnpm <= 10 and pnpm_config_store_dir
+  # for pnpm >= 11). Default: "/opt/pnpm-store".
   pnpm_store_path = "/opt/pnpm-store"
 
   # Opt-in for org/enterprise-keyed shared caches (ADR-003). Default:

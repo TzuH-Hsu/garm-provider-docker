@@ -141,6 +141,9 @@ allow_org_shared = false
 	if !strings.Contains(envA, "npm_config_store_dir=/opt/pnpm-store") {
 		t.Errorf("(c) job A missing npm_config_store_dir")
 	}
+	if !strings.Contains(envA, "pnpm_config_store_dir=/opt/pnpm-store") {
+		t.Errorf("(c) job A missing pnpm_config_store_dir (read by pnpm >= 11)")
+	}
 
 	// (d) write a marker into the toolcache volume through job A's runner.
 	marker := "cachehit-" + randHex(t)
@@ -239,8 +242,8 @@ allow_org_shared = false
 	if !strings.Contains(envOrg, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
 		t.Error("org-scoped runner should still get an ephemeral RUNNER_TOOL_CACHE")
 	}
-	if strings.Contains(envOrg, "npm_config_store_dir=") {
-		t.Error("org-scoped runner must NOT get npm_config_store_dir (no persistent pnpm store)")
+	if strings.Contains(envOrg, "npm_config_store_dir=") || strings.Contains(envOrg, "pnpm_config_store_dir=") {
+		t.Error("org-scoped runner must NOT get npm_config_store_dir or pnpm_config_store_dir (no persistent pnpm store)")
 	}
 	if n := len(lines(dockerOut(t, "volume", "ls", "-q", "--filter", "label=garm.docker/repo="+orgKey))); n != 0 {
 		t.Errorf("org pool produced %d cache volumes, want 0 (withheld by default)", n)

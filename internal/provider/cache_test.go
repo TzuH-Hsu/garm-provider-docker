@@ -350,6 +350,9 @@ func TestCreateInstanceMountsRepoCaches(t *testing.T) {
 	if !envHas(c, "npm_config_store_dir=/opt/pnpm-store") {
 		t.Errorf("npm_config_store_dir not set: %v", c.Config.Env)
 	}
+	if !envHas(c, "pnpm_config_store_dir=/opt/pnpm-store") {
+		t.Errorf("pnpm_config_store_dir not set: %v", c.Config.Env)
+	}
 }
 
 // TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete: two allocations for
@@ -466,12 +469,12 @@ func TestCreateInstanceOrgScopeWithholdsCaches(t *testing.T) {
 	} else if extMount.Name != ext[0] || extMount.RW {
 		t.Errorf("externals mount = %+v, want %q mounted READ-ONLY", extMount, ext[0])
 	}
-	// RUNNER_TOOL_CACHE is still set (ephemeral); npm_config_store_dir is not.
+	// RUNNER_TOOL_CACHE is still set (ephemeral); the pnpm store envs are not.
 	if !envHas(c, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
 		t.Error("RUNNER_TOOL_CACHE should still be set (ephemeral toolcache) for a cache-ineligible pool")
 	}
-	if envHasPrefix(c, "npm_config_store_dir=") {
-		t.Error("npm_config_store_dir must be absent when no persistent pnpm store is mounted")
+	if envHasPrefix(c, "npm_config_store_dir=") || envHasPrefix(c, "pnpm_config_store_dir=") {
+		t.Error("pnpm store envs must be absent when no persistent pnpm store is mounted")
 	}
 }
 
@@ -513,8 +516,8 @@ func TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes(t *testing.T) {
 	if envHasPrefix(c, "RUNNER_TOOL_CACHE=") {
 		t.Error("RUNNER_TOOL_CACHE must be absent when the cache feature is disabled")
 	}
-	if envHasPrefix(c, "npm_config_store_dir=") {
-		t.Error("npm_config_store_dir must be absent when the cache feature is disabled")
+	if envHasPrefix(c, "npm_config_store_dir=") || envHasPrefix(c, "pnpm_config_store_dir=") {
+		t.Error("pnpm store envs must be absent when the cache feature is disabled")
 	}
 	// No externals mount ⇒ no consumer-side seed-gate env either.
 	if envHasPrefix(c, spec.RunnerExternalsSeededMarkerEnv+"=") {

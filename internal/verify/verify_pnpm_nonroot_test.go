@@ -152,6 +152,9 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 	if !strings.Contains(containerEnvVerify(t, runner), "npm_config_store_dir="+h4StorePath) {
 		t.Errorf("runner is missing npm_config_store_dir=%s", h4StorePath)
 	}
+	if !strings.Contains(containerEnvVerify(t, runner), "pnpm_config_store_dir="+h4StorePath) {
+		t.Errorf("runner is missing pnpm_config_store_dir=%s", h4StorePath)
+	}
 
 	// The store dir must be owned by the runner user (the H4 entrypoint chown ran
 	// on the fresh, root-owned volume before privileges were dropped).

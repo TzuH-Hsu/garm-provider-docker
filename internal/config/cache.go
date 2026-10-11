@@ -88,7 +88,8 @@ type Cache struct {
 	ToolcachePath string `toml:"toolcache_path"`
 
 	// PnpmStorePath is where the pnpm store volume mounts inside the runner and
-	// the value of npm_config_store_dir, which pnpm honors as its store-dir.
+	// the value of npm_config_store_dir (pnpm <= 10) and pnpm_config_store_dir
+	// (pnpm >= 11), which pnpm honors as its store-dir.
 	// RESOLVED for M2 (ADR-003 open question): a named volume mounted at a fixed
 	// path plus npm_config_store_dir pointing pnpm at it — verified on Docker
 	// Engine 29.6.1 (`pnpm config get store-dir` and `pnpm store path` resolve
