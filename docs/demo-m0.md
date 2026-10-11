@@ -124,7 +124,7 @@ is specific to this provider and this demo.
 - **`release`** (default) — validates a **published release**, exactly as
   an operator would install it:
   1. Downloads the `garm-provider-docker_<version>_linux_<arch>` binary
-     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.1`)
+     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.2`)
      for this host's architecture, plus that release's `SHA256SUMS`.
   2. Verifies the downloaded binary against `SHA256SUMS` — **failing hard**
      (not warning) on any mismatch or missing entry — before it is ever
@@ -250,7 +250,7 @@ It does **not** exercise:
 
 ```sh
 export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
-scripts/demo-m0.sh                         # scale set, dind_mode=none, v0.2.1 release
+scripts/demo-m0.sh                         # scale set, dind_mode=none, v0.2.2 release
 scripts/demo-m0.sh --dind                  # same, plus the privileged-sidecar variant
 scripts/demo-m0.sh --pool                  # webhook-driven pool instead of a scale set
 ```
@@ -263,7 +263,7 @@ from this checkout".
 passing `--version` below `v0.2.1` with a scale-set target prints a warning
 (it does not block; older GARM or `--pool` may still work).
 
-This downloads and verifies the `v0.2.1` release (default), then runs every
+This downloads and verifies the `v0.2.2` release (default), then runs every
 step below in order, pausing for a confirmed manual action wherever one is
 needed (adding the `[[provider]]` section to GARM's config, creating the
 pool, confirming the GitHub UI). Pass `-y`/`--yes` to auto-confirm every
@@ -304,7 +304,7 @@ Checks `docker` and `garm-cli` are present and reachable/authenticated,
 then, depending on mode:
 
 - **release** (default): downloads the `PROVIDER_VERSION` (default
-  `v0.2.1`) binary asset for this host's architecture and its
+  `v0.2.2`) binary asset for this host's architecture and its
   `SHA256SUMS`, verifies the checksum (hard failure on mismatch), resolves
   `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s digest via `docker
   buildx imagetools inspect`, and generates a provider `config.toml` with

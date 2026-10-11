@@ -16,8 +16,8 @@
 # per-job topology (job network, named workspace volume, DinD modes,
 # persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
 # failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
-# a published release that passes this gate (v0.2.1 once published; until then
-# use --from-source). The script keeps
+# a published release that passes this gate (v0.2.1 and v0.2.2 have; for an
+# unpublished one use --from-source). The script keeps
 # dind_mode=none as its own default (the smallest, most portable slice -
 # DinD modes are a deliberate operator opt-in and out of scope for this
 # gate, see docs/demo-m0.md), but everything else it exercises is the
@@ -106,7 +106,7 @@
 #   --version vX.Y.Z
 #                   Release to validate in the default "release" mode
 #                   (equivalent to PROVIDER_VERSION=vX.Y.Z). Ignored with
-#                   --from-source. Default: v0.2.1
+#                   --from-source. Default: v0.2.2
 #   --pool          Dispatch via a webhook-driven pool instead of a scale set
 #                   (equivalent to GARM_TARGET=pool)
 #   --dind          Run the DinD variant (privileged-sidecar) instead of
@@ -127,7 +127,7 @@
 #                          "release" mode (also selects the
 #                          ghcr.io/tzuh-hsu/garm-runner-noble tag whose
 #                          digest gets resolved). Ignored in "source" mode.
-#                          Default: v0.2.1
+#                          Default: v0.2.2
 #   GARM_TARGET           "scaleset" (default) or "pool" - see above.
 #   GATE_VARIANT          "none" (default) or "dind" - see above.
 #   SCALESET_NAME         Scale set name (= the workflow's runs-on value).
@@ -201,7 +201,7 @@ EXPL_GARM_TARGET="${GARM_TARGET:-}"
 EXPL_GATE_VARIANT="${GATE_VARIANT:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
-PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.1}"
+PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.2}"
 
 PROVIDER_NAME="${PROVIDER_NAME:-docker_demo}"
 PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-v0.1.0}"
@@ -2155,7 +2155,7 @@ Flags:
                        instead of downloading/pinning a published release
                        (equivalent to PROVIDER_SOURCE=source)
   --version vX.Y.Z    Release to validate in the default "release" mode
-                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.1
+                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.2
   --pool              Dispatch via a webhook-driven pool instead of the default
                        scale set (equivalent to GARM_TARGET=pool). Needs GitHub
                        to be able to reach GARM's webhook endpoint.
@@ -2180,7 +2180,7 @@ while [[ $# -gt 0 ]]; do
     -y|--yes) ASSUME_YES=1; shift ;;
     --from-source) PROVIDER_SOURCE="source"; EXPL_PROVIDER_SOURCE="source"; shift ;;
     --version)
-      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.1"
+      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.2"
       PROVIDER_VERSION="$2"
       EXPL_PROVIDER_VERSION="$2"
       shift 2
