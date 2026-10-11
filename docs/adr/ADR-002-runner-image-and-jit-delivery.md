@@ -168,6 +168,29 @@ Status: Accepted (2026-07-19)
 > compatibility cost: a job that binds or dials `::1` explicitly (or a service
 > that needs IPv6 loopback) will not work in the runner container, which
 > already could not use IPv6 beyond loopback.
+>
+> On a Docker host whose kernel has no IPv6 (booted with `ipv6.disable=1`, or
+> built without it) there is no `/proc/sys/net/ipv6`, and the daemon cannot
+> apply the sysctl. The create succeeds and the start fails; Docker 29.1.3
+> with runc 1.3.4 reports `open sysctl net.ipv6.conf.all.disable_ipv6 file:
+> ... no such file or directory`. `CreateInstance` therefore treats a create
+> or start error that names this sysctl, by key or by its path below
+> `/proc`, as "host has no IPv6": it logs one warning, removes the rejected
+> runner, and creates and starts it once more without the sysctl
+> (`internal/provider/runner_start.go`). Context cancellation and every
+> other error are not retried, and the retry happens at most once; labels,
+> mounts, the claim network, the create-nonce rollback and credential
+> delivery are unchanged, and the cache volumes are revalidated again
+> before the second start. On such a host `::1` cannot exist and Docker
+> writes no `::1` lines, so `localhost` is IPv4-only without the sysctl. The
+> live checks report this case as a warning (no sysctl, no
+> `/proc/sys/net/ipv6`) rather than a failure. Verified with the real
+> provider binary (`TestVerifyM1WP2Allocation`) on Ubuntu 24.04 arm64 booted
+> with `ipv6.disable=1` and Docker 29.1.3: the allocation succeeds after one
+> retry and tears down cleanly, and fails at `ContainerStart` without the
+> retry. There is no knob to skip the sysctl up front: the retry costs one
+> extra create on such hosts only, and probing the host first would add a
+> Docker call to every allocation.
 
 ## Context
 

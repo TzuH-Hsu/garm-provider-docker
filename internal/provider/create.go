@@ -79,7 +79,9 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //  7. create the runner container on the job network, with the workspace volume
 //     at the runner workdir, a credential tmpfs, the configured memory limit,
 //     and — in DinD modes — DOCKER_HOST plus the shared socket volume mount
-//  8. start it, deliver the credentials by streaming an in-memory tar into a
+//  8. start it (on a host without IPv6 that rejects the runner's IPv6 sysctl,
+//     recreate and start it once without the sysctl), deliver the
+//     credentials by streaming an in-memory tar into a
 //     `docker exec`-run `tar -x` with an atomic .delivered marker, and verify
 //     BOTH the runner and (in DinD modes) the sidecar are running before
 //     reporting success
@@ -384,48 +386,21 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		DiagVolumeName:      plan.diagVolume,
 	})
 
-	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.RunnerContainerName(instanceName))
+	// 5b/6. Create the runner, revalidate the cache volumes it references, and
+	// start it; the entrypoint then blocks waiting for the delivery marker. A
+	// host without IPv6 that rejects the runner's IPv6 sysctl gets one retry
+	// without it (createAndStartRunner). Any failure is rolled back by the
+	// nonce-keyed guard, which also removes a created-but-not-started runner.
+	runnerID, err := p.createAndStartRunner(ctx, cfg, hostCfg, instanceName, plan)
 	if err != nil {
-		// We hold the claim network exclusively, so a container-create failure
-		// (including an ambiguous daemon leak of a nonce-tagged container) is
-		// handled by the nonce-keyed rollback: it removes any container this
-		// attempt leaked along with our network and volume, and never touches a
-		// stale/foreign container carrying a different nonce.
-		return guarded(fmt.Errorf("failed to create container for %q: %w", instanceName, err))
-	}
-
-	// 5b. Revalidate the cache volumes the runner now references (ADR-003 W2
-	// structural redesign). The externals volume was ensured+seeded, and the
-	// toolcache/pnpm/diag volumes ensured, BEFORE this ContainerCreate. The
-	// provider's own opportunistic GC never removes a cache volume itself — it
-	// only DETECTS a stale/superseded one and LOGS the operator's manual purge
-	// command (ADR-003's cache-GC-safety amendment); but an operator-run manual
-	// `docker volume prune` (or some other external actor) could still remove a
-	// still-current cache in that ensure→mount gap — before this container pins
-	// it in use — and real Moby then AUTO-CREATES the missing named volume
-	// UNLABELED during ContainerCreate, so the runner would mount an EMPTY
-	// read-only externals tree (or an empty cache). Confirm every referenced
-	// cache volume still carries our full identity; if any does not, remove the
-	// just-created (not-yet-started) runner and FAIL the allocation CLOSED —
-	// WITHOUT deleting the mismatched volume (it is left as cruft, never
-	// name-deleted — a Moby auto-created unlabeled volume and a foreign one are
-	// indistinguishable, B2). GARM's retry then reconciles AROUND the slot
-	// (EnsureCacheVolume label-as-identity), so there is no wedge.
-	if rerr := p.revalidateReferencedCaches(ctx, plan); rerr != nil {
-		p.bestEffortRemoveContainer(ctx, created.ID)
-		return guarded(rerr)
-	}
-
-	// 6. Start it; the entrypoint now blocks waiting for the delivery marker.
-	if err := p.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
-		return guarded(fmt.Errorf("failed to start container for %q: %w", instanceName, err))
+		return guarded(err)
 	}
 
 	// 7. Deliver the credentials into the running container's tmpfs by streaming
 	// the in-memory tar into a `docker exec`-run `tar -x` (memory → exec stdin →
 	// tmpfs, never host disk; docker cp cannot write a running container's user
 	// tmpfs — see docker.Client.ExecStream).
-	code, err := p.cli.ExecStream(ctx, created.ID, credentialDeliverCmd, archive)
+	code, err := p.cli.ExecStream(ctx, runnerID, credentialDeliverCmd, archive)
 	if err != nil {
 		return guarded(fmt.Errorf("failed to deliver credentials to %q: %w", instanceName, err))
 	}
@@ -437,7 +412,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// (ADR-001 "verify BOTH containers running"; ADR-002 F7): a runner — or, in
 	// DinD modes, a sidecar — that exited during or right after delivery must
 	// not be reported to GARM as a healthy running instance.
-	if err := p.verifyRunning(ctx, created.ID, "runner", instanceName); err != nil {
+	if err := p.verifyRunning(ctx, runnerID, "runner", instanceName); err != nil {
 		return guarded(err)
 	}
 	if dindEnabled {
@@ -453,7 +428,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// it in, so without this a scale-set runner that takes a job wedges GARM's
 	// listener. Best-effort: it only logs, and it runs after every rollback
 	// point, so it can never fail or tear down this allocation.
-	p.reportRunnerStatus(ctx, bootstrap, created.ID)
+	p.reportRunnerStatus(ctx, bootstrap, runnerID)
 
 	// CreateInstance reports running (research.md §2.A): the container is up and
 	// the runner registers once its entrypoint consumes the delivered

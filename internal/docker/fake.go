@@ -89,6 +89,17 @@ type FakeClient struct {
 	// starting — used to exercise the start-failure creation-guard path.
 	StartErr error
 
+	// HostLacksIPv6 models a daemon host whose kernel has no IPv6 stack
+	// (booted with ipv6.disable=1, or built without IPv6): no container has
+	// /proc/sys/net/ipv6, so a container created with a net.ipv6.* sysctl is
+	// rejected when the runtime applies it. On a real runc-based daemon that
+	// happens at ContainerStart, after the create succeeded; the fake returns
+	// the same error text (IPv6SysctlUnsupportedError). With
+	// IPv6SysctlFailsAtCreate the rejection moves to ContainerCreate and
+	// nothing is recorded, for a daemon that validates the sysctl up front.
+	HostLacksIPv6           bool
+	IPv6SysctlFailsAtCreate bool
+
 	// InspectErr, when non-nil, is returned by ContainerInspect instead of
 	// inspecting — used to exercise the resolver's non-NotFound error path.
 	InspectErr error
@@ -222,6 +233,7 @@ type CreatedContainer struct {
 	Cmd         []string
 	Mounts      []mount.Mount
 	NetworkMode container.NetworkMode
+	Sysctls     map[string]string
 }
 
 type fakeContainer struct {
@@ -246,6 +258,10 @@ type fakeContainer struct {
 	// exact thing the real daemon honors for the short syntax but rejects for
 	// the Mounts long syntax (see rejectUnsupportedTmpfsMount).
 	tmpfsMounts map[string]string
+
+	// sysctls models HostConfig.Sysctls as requested at ContainerCreate, so
+	// ContainerStart can reject a net.ipv6.* key on a HostLacksIPv6 host.
+	sysctls map[string]string
 
 	// networkMode models HostConfig.NetworkMode — the user-defined per-job
 	// network the runner joins as its sole attachment (ADR-001). Recorded at
@@ -634,6 +650,11 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	if f.CreateErr != nil && !f.CreateErrLeaksContainer {
 		return container.CreateResponse{}, f.CreateErr
 	}
+	if f.HostLacksIPv6 && f.IPv6SysctlFailsAtCreate {
+		if key := ipv6SysctlKey(hostConfig); key != "" {
+			return container.CreateResponse{}, IPv6SysctlUnsupportedError(key)
+		}
+	}
 
 	// Docker-name uniqueness: the real daemon rejects a create whose name is
 	// already in use with a 409 Conflict (NEW-5). Model that here, unless an
@@ -685,6 +706,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 		c.rawRuntime = hostConfig.Runtime
 		c.groupAdd = append([]string(nil), hostConfig.GroupAdd...)
 		c.logDriver = hostConfig.LogConfig.Type
+		c.sysctls = cloneLabels(hostConfig.Sysctls)
 	}
 	if c.logDriver == "" {
 		c.logDriver = f.DefaultLogDriver
@@ -720,6 +742,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	if hostConfig != nil {
 		rec.Mounts = append([]mount.Mount(nil), hostConfig.Mounts...)
 		rec.NetworkMode = hostConfig.NetworkMode
+		rec.Sysctls = cloneLabels(hostConfig.Sysctls)
 	}
 	f.Created = append(f.Created, rec)
 
@@ -751,6 +774,13 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	c := f.find(containerID)
 	if c == nil {
 		return notFoundf("container %s not found", containerID)
+	}
+	if f.HostLacksIPv6 {
+		for k := range c.sysctls {
+			if strings.HasPrefix(k, "net.ipv6.") {
+				return IPv6SysctlUnsupportedError(k)
+			}
+		}
 	}
 	if isUserDefinedNetwork(c.networkMode) && f.findNetworkByName(c.networkMode) == nil && f.networks[c.networkMode] == nil {
 		return fmt.Errorf("failed to start container %s: network %s not found", containerID, c.networkMode)
@@ -1284,4 +1314,27 @@ func notFoundf(format string, a ...any) error {
 // check (NEW-5) both rely on this shape.
 func conflictf(format string, a ...any) error {
 	return errdefs.Conflict(fmt.Errorf(format, a...))
+}
+
+// ipv6SysctlKey returns the first net.ipv6.* key in hostConfig.Sysctls, or "".
+func ipv6SysctlKey(hostConfig *container.HostConfig) string {
+	if hostConfig == nil {
+		return ""
+	}
+	for k := range hostConfig.Sysctls {
+		if strings.HasPrefix(k, "net.ipv6.") {
+			return k
+		}
+	}
+	return ""
+}
+
+// IPv6SysctlUnsupportedError is the error a runc-based daemon returns from
+// ContainerStart when it cannot apply sysctl key because the host kernel has
+// no IPv6 (no /proc/sys/net/ipv6). The text is what Docker 29.1.3 with runc
+// 1.3.4 reported for net.ipv6.conf.all.disable_ipv6 on a kernel booted with
+// ipv6.disable=1.
+func IPv6SysctlUnsupportedError(key string) error {
+	path := "proc/./sys/" + strings.ReplaceAll(key, ".", "/")
+	return errdefs.System(fmt.Errorf("failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl %s file: unsafe procfs detected: openat2 fsmount:fscontext:%s: no such file or directory", key, path))
 }

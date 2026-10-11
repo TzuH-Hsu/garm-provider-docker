@@ -68,7 +68,9 @@ const (
 	// namespaced, so this needs no privilege and touches nothing on the host.
 	// Only `all` is set: it is the key the daemon consults when writing
 	// /etc/hosts and it also covers lo and eth0, which already exist when the
-	// sysctl is applied, so `default` (new interfaces only) adds nothing.
+	// sysctl is applied, so `default` (new interfaces only) adds nothing. A
+	// host whose kernel has no IPv6 cannot apply it at all; CreateInstance
+	// then recreates the runner once without it (provider.createAndStartRunner).
 	RunnerIPv6Sysctl = "net.ipv6.conf.all.disable_ipv6"
 )
 

@@ -1563,27 +1563,36 @@ verify_no_extra_privileges() {
   fi
 }
 
-# verify_ipv6_disabled checks "$1" ("$2" names it) was created with IPv6
-# disabled in its network namespace (internal/spec/mounts.go, RunnerIPv6Sysctl)
-# and that IPv6 is off on its loopback, so ::1 is never usable as `localhost`.
-# The job network has no IPv6; with ::1 live, a server bound to `localhost`
-# would sit on ::1, unreachable for clients that skip it (Node, AI_ADDRCONFIG).
-# /etc/hosts is only reported: Engine 25 and earlier keep a dead
-# `::1 localhost` line even with the sysctl, while 26+ omits it.
+# verify_ipv6_disabled checks "$1" ("$2" names it) cannot use ::1 as
+# `localhost`. The job network has no IPv6; with ::1 live, a server bound to
+# `localhost` would sit on ::1, unreachable for clients that skip it (Node,
+# AI_ADDRCONFIG). Normally that holds because the runner is created with IPv6
+# disabled in its network namespace (internal/spec/mounts.go, RunnerIPv6Sysctl),
+# which leaves IPv6 off on lo. On a Docker host whose kernel has no IPv6 at all
+# the daemon cannot apply that sysctl and the provider recreates the runner
+# without it; there /proc/sys/net/ipv6 is absent, ::1 cannot exist, and both
+# checks are reported as such rather than failed. /etc/hosts is only reported:
+# Engine 25 and earlier keep a dead `::1 localhost` line, 26+ omits it.
 verify_ipv6_disabled() {
-  local cid="$1" what="$2" sysctl lo_disabled hosts_line
+  local cid="$1" what="$2" sysctl lo_ipv6 hosts_line
   sysctl="$(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "${cid}" 2>/dev/null)"
+  # "1"/"0" from lo, "absent" when the kernel has no IPv6, "" if exec failed.
+  lo_ipv6="$(docker exec "${cid}" sh -c 'if [ -d /proc/sys/net/ipv6 ]; then cat /proc/sys/net/ipv6/conf/lo/disable_ipv6; else echo absent; fi' 2>/dev/null)"
+
   if [[ "${sysctl}" == "1" ]]; then
     ok "${what}: net.ipv6.conf.all.disable_ipv6=1"
+  elif [[ "${lo_ipv6}" == "absent" ]]; then
+    warn "${what}: created without net.ipv6.conf.all.disable_ipv6: the Docker host has no IPv6, so the provider retried without the sysctl"
   else
     bad "${what}: net.ipv6.conf.all.disable_ipv6 is '${sysctl}' (the spec sets 1)"
   fi
-  lo_disabled="$(docker exec "${cid}" cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null)"
-  if [[ "${lo_disabled}" == "1" ]]; then
-    ok "${what}: IPv6 is disabled on lo, so ::1 is not usable as localhost"
-  else
-    bad "${what}: lo disable_ipv6 is '${lo_disabled}' (want 1; ::1 would be usable as localhost)"
-  fi
+
+  case "${lo_ipv6}" in
+    1) ok "${what}: IPv6 is disabled on lo, so ::1 is not usable as localhost" ;;
+    absent) ok "${what}: the host kernel has no IPv6, so ::1 is not usable as localhost" ;;
+    *) bad "${what}: lo disable_ipv6 is '${lo_ipv6}' (want 1; ::1 would be usable as localhost)" ;;
+  esac
+
   hosts_line="$(docker exec "${cid}" grep '^::1' /etc/hosts 2>/dev/null)"
   log "${what}: /etc/hosts ::1 line: ${hosts_line:-(none)}"
 }
