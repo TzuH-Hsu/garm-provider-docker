@@ -100,6 +100,14 @@ type FakeClient struct {
 	HostLacksIPv6           bool
 	IPv6SysctlFailsAtCreate bool
 
+	// IPv6SysctlDenied models a host that HAS IPv6 but where the runtime may
+	// not write the sysctl (a read-only /proc/sys, a rootless or policy-
+	// restricted runtime): the same rejection as HostLacksIPv6, at the same
+	// point, but with "permission denied" instead of "no such file or
+	// directory" (IPv6SysctlDeniedError). It also honors
+	// IPv6SysctlFailsAtCreate.
+	IPv6SysctlDenied bool
+
 	// InspectErr, when non-nil, is returned by ContainerInspect instead of
 	// inspecting — used to exercise the resolver's non-NotFound error path.
 	InspectErr error
@@ -650,9 +658,11 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	if f.CreateErr != nil && !f.CreateErrLeaksContainer {
 		return container.CreateResponse{}, f.CreateErr
 	}
-	if f.HostLacksIPv6 && f.IPv6SysctlFailsAtCreate {
+	if f.IPv6SysctlFailsAtCreate {
 		if key := ipv6SysctlKey(hostConfig); key != "" {
-			return container.CreateResponse{}, IPv6SysctlUnsupportedError(key)
+			if err := f.ipv6SysctlErr(key); err != nil {
+				return container.CreateResponse{}, err
+			}
 		}
 	}
 
@@ -775,10 +785,10 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	if c == nil {
 		return notFoundf("container %s not found", containerID)
 	}
-	if f.HostLacksIPv6 {
-		for k := range c.sysctls {
-			if strings.HasPrefix(k, "net.ipv6.") {
-				return IPv6SysctlUnsupportedError(k)
+	for k := range c.sysctls {
+		if strings.HasPrefix(k, "net.ipv6.") {
+			if err := f.ipv6SysctlErr(k); err != nil {
+				return err
 			}
 		}
 	}
@@ -1329,12 +1339,35 @@ func ipv6SysctlKey(hostConfig *container.HostConfig) string {
 	return ""
 }
 
+// ipv6SysctlErr is the rejection this fake host gives a net.ipv6.* sysctl, or
+// nil when it applies it (callers hold f.mu).
+func (f *FakeClient) ipv6SysctlErr(key string) error {
+	switch {
+	case f.HostLacksIPv6:
+		return IPv6SysctlUnsupportedError(key)
+	case f.IPv6SysctlDenied:
+		return IPv6SysctlDeniedError(key)
+	}
+	return nil
+}
+
 // IPv6SysctlUnsupportedError is the error a runc-based daemon returns from
 // ContainerStart when it cannot apply sysctl key because the host kernel has
 // no IPv6 (no /proc/sys/net/ipv6). The text is what Docker 29.1.3 with runc
 // 1.3.4 reported for net.ipv6.conf.all.disable_ipv6 on a kernel booted with
 // ipv6.disable=1.
 func IPv6SysctlUnsupportedError(key string) error {
+	return runcSysctlError(key, "no such file or directory")
+}
+
+// IPv6SysctlDeniedError is the same runc rejection for a host that has IPv6
+// but where the sysctl may not be written ("permission denied"). The wording
+// follows IPv6SysctlUnsupportedError; it was not observed on a live daemon.
+func IPv6SysctlDeniedError(key string) error {
+	return runcSysctlError(key, "permission denied")
+}
+
+func runcSysctlError(key, reason string) error {
 	path := "proc/./sys/" + strings.ReplaceAll(key, ".", "/")
-	return errdefs.System(fmt.Errorf("failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl %s file: unsafe procfs detected: openat2 fsmount:fscontext:%s: no such file or directory", key, path))
+	return errdefs.System(fmt.Errorf("failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl %s file: unsafe procfs detected: openat2 fsmount:fscontext:%s: %s", key, path, reason))
 }

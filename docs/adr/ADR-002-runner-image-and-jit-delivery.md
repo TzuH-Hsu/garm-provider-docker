@@ -173,23 +173,35 @@ Status: Accepted (2026-07-19)
 > built without it) there is no `/proc/sys/net/ipv6`, and the daemon cannot
 > apply the sysctl. The create succeeds and the start fails; Docker 29.1.3
 > with runc 1.3.4 reports `open sysctl net.ipv6.conf.all.disable_ipv6 file:
-> ... no such file or directory`. `CreateInstance` therefore treats a create
-> or start error that names this sysctl, by key or by its path below
-> `/proc`, as "host has no IPv6": it logs one warning, removes the rejected
-> runner, and creates and starts it once more without the sysctl
-> (`internal/provider/runner_start.go`). Context cancellation and every
-> other error are not retried, and the retry happens at most once; labels,
-> mounts, the claim network, the create-nonce rollback and credential
-> delivery are unchanged, and the cache volumes are revalidated again
-> before the second start. On such a host `::1` cannot exist and Docker
-> writes no `::1` lines, so `localhost` is IPv4-only without the sysctl. The
-> live checks report this case as a warning (no sysctl, no
-> `/proc/sys/net/ipv6`) rather than a failure. Verified with the real
-> provider binary (`TestVerifyM1WP2Allocation`) on Ubuntu 24.04 arm64 booted
-> with `ipv6.disable=1` and Docker 29.1.3: the allocation succeeds after one
-> retry and tears down cleanly, and fails at `ContainerStart` without the
-> retry. There is no knob to skip the sysctl up front: the retry costs one
-> extra create on such hosts only, and probing the host first would add a
+> ... no such file or directory`. `CreateInstance` therefore classifies a
+> create or start error that names this sysctl, by key or by its path below
+> `/proc` (`internal/provider/runner_start.go`):
+>
+> - with `no such file or directory`: the host has no IPv6. `::1` cannot
+>   exist in the runner and Docker writes no `::1` lines, so dropping the
+>   sysctl loses nothing. One warning says so.
+> - any other reason (permission denied, read-only `/proc/sys`, a runtime or
+>   security policy): the sysctl could not be applied while IPv6 may still be
+>   enabled, so `localhost` can resolve to `::1` and the split described
+>   above can come back. This degraded case is still retried, because failing
+>   every allocation on such a host, with no knob to drop the sysctl, is
+>   worse; the warning carries the daemon's error and says that IPv6 may
+>   remain enabled, and the live checks fail it by name.
+>
+> In both cases the provider removes the rejected runner and creates and
+> starts it once more without the sysctl. Context cancellation and every
+> other error are not retried, the retry happens at most once, and a failed
+> removal stops it; labels, mounts, the claim network, the create-nonce
+> rollback and credential delivery are unchanged, and the cache volumes are
+> revalidated again before the second start. The live checks report a runner
+> without the sysctl and without `/proc/sys/net/ipv6` as a warning, and fail
+> a runner without the sysctl whose `lo` has IPv6 enabled. Verified with the
+> real provider binary (`TestVerifyM1WP2Allocation`) on Ubuntu 24.04 arm64
+> booted with `ipv6.disable=1` and Docker 29.1.3: the allocation succeeds
+> after one retry and tears down cleanly, and fails at `ContainerStart`
+> without the retry. The refused class was not reproduced on a live daemon.
+> There is no knob to skip the sysctl up front: the retry costs one extra
+> create on affected hosts only, and probing the host first would add a
 > Docker call to every allocation.
 
 ## Context
