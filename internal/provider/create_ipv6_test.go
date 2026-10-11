@@ -23,6 +23,11 @@ func runnerCreates(fake *docker.FakeClient, instanceName string) []docker.Create
 	return out
 }
 
+const (
+	warnHostHasNoIPv6 = "the Docker host has no IPv6"
+	warnIPv6MayRemain = "IPv6 may remain enabled in the runner"
+)
+
 func TestCreateInstanceRunnerGetsIPv6Sysctl(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -54,10 +59,14 @@ func TestCreateInstanceRetriesWithoutIPv6SysctlWhenStartRejectsIt(t *testing.T) 
 
 	p, fake := newTestProvider(t)
 	fake.HostLacksIPv6 = true
+	logs := captureLogs(t)
 
 	inst, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err != nil {
 		t.Fatalf("CreateInstance returned unexpected error: %v", err)
+	}
+	if out := logs.String(); !strings.Contains(out, warnHostHasNoIPv6) || strings.Contains(out, warnIPv6MayRemain) {
+		t.Errorf("want the host-has-no-IPv6 warning only, got logs:\n%s", out)
 	}
 
 	creates := runnerCreates(fake, inst.Name)
@@ -118,6 +127,46 @@ func TestCreateInstanceRetriesWithoutIPv6SysctlWhenCreateRejectsIt(t *testing.T)
 	}
 	if len(fake.RemoveOrder) != 0 {
 		t.Errorf("RemoveOrder = %v, want nothing removed", fake.RemoveOrder)
+	}
+}
+
+// A sysctl that exists but may not be written (permission denied) is also
+// retried once without it, but the warning names the degraded case: IPv6 may
+// stay enabled in the runner.
+func TestCreateInstanceRetriesWithoutIPv6SysctlWhenDeniedAndWarnsDegraded(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newTestProvider(t)
+	fake.IPv6SysctlDenied = true
+	logs := captureLogs(t)
+
+	inst, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	if err != nil {
+		t.Fatalf("CreateInstance returned unexpected error: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{warnIPv6MayRemain, "localhost can resolve to ::1", "ADR-002", "permission denied"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("degraded warning lacks %q; logs:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, warnHostHasNoIPv6) {
+		t.Errorf("a refused sysctl must not be logged as a host without IPv6; logs:\n%s", out)
+	}
+
+	creates := runnerCreates(fake, inst.Name)
+	if len(creates) != 2 {
+		t.Fatalf("runner creates = %d, want 2 (one retry)", len(creates))
+	}
+	if _, ok := creates[1].Sysctls[spec.RunnerIPv6Sysctl]; ok {
+		t.Errorf("retried runner create still carries %s", spec.RunnerIPv6Sysctl)
+	}
+	if !inspectRunner(t, fake, inst.Name).State.Running {
+		t.Error("runner is not running after the retry")
+	}
+	if n := listAll(t, p); n != 1 {
+		t.Errorf("containers = %d, want 1 (the rejected runner must be removed)", n)
 	}
 }
 
@@ -183,27 +232,34 @@ func TestCreateInstanceIPv6SysctlRetryStopsWhenRemovalFails(t *testing.T) {
 	}
 }
 
-func TestIsIPv6SysctlUnsupported(t *testing.T) {
+func TestClassifyIPv6SysctlError(t *testing.T) {
+	const key = "net.ipv6.conf.all.disable_ipv6"
 	cases := []struct {
 		name string
 		err  error
-		want bool
+		want ipv6SysctlRejection
 	}{
-		{"nil", nil, false},
-		{"runc start error", docker.IPv6SysctlUnsupportedError(spec.RunnerIPv6Sysctl), true},
-		{"older runc wording", errors.New("OCI runtime create failed: container_linux.go:380: starting container process caused: process_linux.go:545: container init caused: write sysctl key net.ipv6.conf.all.disable_ipv6: open /proc/sys/net/ipv6/conf/all/disable_ipv6: no such file or directory: unknown"), true},
-		{"path only", errors.New("OCI runtime error: open `/proc/sys/net/ipv6/conf/all/disable_ipv6`: No such file or directory"), true},
-		{"docker 29.1.3 runc 1.3.4", errors.New("Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv6.conf.all.disable_ipv6 file: unsafe procfs detected: openat2 fsmount:fscontext:proc/./sys/net/ipv6/conf/all/disable_ipv6: no such file or directory"), true},
-		{"unrelated start error", errors.New("failed to start container: network job-net not found"), false},
-		{"other sysctl", errors.New("open sysctl net.ipv4.ip_unprivileged_port_start file: no such file or directory"), false},
-		{"default key only", errors.New("open sysctl net.ipv6.conf.default.disable_ipv6 file: no such file or directory"), false},
-		{"canceled while starting", fmt.Errorf("starting with %s: %w", spec.RunnerIPv6Sysctl, context.Canceled), false},
-		{"deadline while starting", fmt.Errorf("starting with %s: %w", spec.RunnerIPv6Sysctl, context.DeadlineExceeded), false},
+		{"nil", nil, ipv6SysctlNotRejected},
+		{"runc 1.3.4, no IPv6 (Docker 29.1.3, ipv6.disable=1)", errors.New("Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv6.conf.all.disable_ipv6 file: unsafe procfs detected: openat2 fsmount:fscontext:proc/./sys/net/ipv6/conf/all/disable_ipv6: no such file or directory"), ipv6SysctlMissing},
+		{"fake no-IPv6 host", docker.IPv6SysctlUnsupportedError(key), ipv6SysctlMissing},
+		{"older runc, no IPv6", errors.New("OCI runtime create failed: container_linux.go:380: starting container process caused: process_linux.go:545: container init caused: write sysctl key net.ipv6.conf.all.disable_ipv6: open /proc/sys/net/ipv6/conf/all/disable_ipv6: no such file or directory: unknown"), ipv6SysctlMissing},
+		{"path only, capitalized ENOENT", errors.New("OCI runtime error: open `/proc/sys/net/ipv6/conf/all/disable_ipv6`: No such file or directory"), ipv6SysctlMissing},
+		{"permission denied", docker.IPv6SysctlDeniedError(key), ipv6SysctlRefused},
+		{"older runc, permission denied", errors.New("write sysctl key net.ipv6.conf.all.disable_ipv6: open /proc/sys/net/ipv6/conf/all/disable_ipv6: permission denied"), ipv6SysctlRefused},
+		{"read-only file system", errors.New("open sysctl net.ipv6.conf.all.disable_ipv6 file: reason: open /proc/sys/net/ipv6/conf/all/disable_ipv6: read-only file system"), ipv6SysctlRefused},
+		{"operation not permitted", errors.New("write sysctl key net.ipv6.conf.all.disable_ipv6: operation not permitted"), ipv6SysctlRefused},
+		{"policy rejection", errors.New("sysctl \"net.ipv6.conf.all.disable_ipv6\" is not allowed by the runtime policy"), ipv6SysctlRefused},
+		{"unrelated start error", errors.New("failed to start container: network job-net not found"), ipv6SysctlNotRejected},
+		{"unrelated ENOENT", errors.New("failed to start container: open /etc/foo: no such file or directory"), ipv6SysctlNotRejected},
+		{"other sysctl", errors.New("open sysctl net.ipv4.ip_unprivileged_port_start file: no such file or directory"), ipv6SysctlNotRejected},
+		{"default key only", errors.New("open sysctl net.ipv6.conf.default.disable_ipv6 file: no such file or directory"), ipv6SysctlNotRejected},
+		{"canceled while starting", fmt.Errorf("starting with %s: no such file or directory: %w", key, context.Canceled), ipv6SysctlNotRejected},
+		{"deadline while starting", fmt.Errorf("starting with %s: %w", key, context.DeadlineExceeded), ipv6SysctlNotRejected},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isIPv6SysctlUnsupported(tc.err); got != tc.want {
-				t.Errorf("isIPv6SysctlUnsupported(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := classifyIPv6SysctlError(tc.err); got != tc.want {
+				t.Errorf("classifyIPv6SysctlError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

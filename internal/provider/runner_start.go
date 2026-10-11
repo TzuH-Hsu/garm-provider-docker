@@ -17,27 +17,53 @@ import (
 // runtime names when it cannot open it ("sys/net/ipv6/conf/all/disable_ipv6").
 var ipv6SysctlPath = "sys/" + strings.ReplaceAll(spec.RunnerIPv6Sysctl, ".", "/")
 
-// isIPv6SysctlUnsupported reports whether a ContainerCreate or ContainerStart
-// error says the daemon could not apply spec.RunnerIPv6Sysctl, which happens
-// when the host kernel has no IPv6 (ipv6.disable=1, IPv6 compiled out) and
-// /proc/sys/net/ipv6 does not exist. The create succeeds and runc fails the
-// start; Docker 29.1.3 with runc 1.3.4 on a kernel booted with ipv6.disable=1
-// reports "OCI runtime create failed: runc create failed: unable to start
-// container process: error during container init: open sysctl
-// net.ipv6.conf.all.disable_ipv6 file: unsafe procfs detected: openat2
-// fsmount:fscontext:proc/./sys/net/ipv6/conf/all/disable_ipv6: no such file
-// or directory" (older runc: "write sysctl key net.ipv6.conf.all.disable_ipv6:
-// open /proc/sys/net/ipv6/conf/all/disable_ipv6: ..."). The match is
-// deliberately narrow: the error must name this sysctl, by key or by its path
-// below /proc, and must not be a context cancellation or deadline, so no
-// unrelated create or start failure is ever retried. A create-time rejection
-// is matched the same way, for a daemon or runtime that checks earlier.
-func isIPv6SysctlUnsupported(err error) bool {
+// ipv6SysctlRejection classifies a ContainerCreate/ContainerStart error with
+// respect to spec.RunnerIPv6Sysctl.
+type ipv6SysctlRejection int
+
+const (
+	// ipv6SysctlNotRejected: the error is not about the IPv6 sysctl (or there
+	// is no error, or it is a context cancellation/deadline). Never retried.
+	ipv6SysctlNotRejected ipv6SysctlRejection = iota
+	// ipv6SysctlMissing: the sysctl does not exist because the host kernel has
+	// no IPv6 (ipv6.disable=1, IPv6 built out). IPv6 cannot be enabled in the
+	// runner either, so dropping the sysctl loses nothing.
+	ipv6SysctlMissing
+	// ipv6SysctlRefused: the sysctl exists or may exist but could not be
+	// applied (permission denied, read-only /proc/sys, a runtime or security
+	// policy). Dropping it can leave IPv6, and ::1, usable in the runner.
+	ipv6SysctlRefused
+)
+
+// classifyIPv6SysctlError decides whether a create or start error is the
+// daemon failing to apply spec.RunnerIPv6Sysctl, and why. The error must name
+// the sysctl, by key or by its path below /proc, and must not be a context
+// cancellation or deadline; anything else is ipv6SysctlNotRejected. A named
+// error is ipv6SysctlMissing only when it also carries the ENOENT text "no
+// such file or directory" (any case); every other reason is
+// ipv6SysctlRefused.
+//
+// On a kernel booted with ipv6.disable=1, Docker 29.1.3 with runc 1.3.4
+// creates the container and fails the start with "OCI runtime create failed:
+// runc create failed: unable to start container process: error during
+// container init: open sysctl net.ipv6.conf.all.disable_ipv6 file: unsafe
+// procfs detected: openat2 fsmount:fscontext:proc/./sys/net/ipv6/conf/all/
+// disable_ipv6: no such file or directory"; older runc says "write sysctl key
+// net.ipv6.conf.all.disable_ipv6: open /proc/sys/net/ipv6/conf/all/
+// disable_ipv6: no such file or directory". A create-time rejection is
+// classified the same way, for a daemon or runtime that checks earlier.
+func classifyIPv6SysctlError(err error) ipv6SysctlRejection {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
+		return ipv6SysctlNotRejected
 	}
 	msg := err.Error()
-	return strings.Contains(msg, spec.RunnerIPv6Sysctl) || strings.Contains(msg, ipv6SysctlPath)
+	if !strings.Contains(msg, spec.RunnerIPv6Sysctl) && !strings.Contains(msg, ipv6SysctlPath) {
+		return ipv6SysctlNotRejected
+	}
+	if strings.Contains(strings.ToLower(msg), "no such file or directory") {
+		return ipv6SysctlMissing
+	}
+	return ipv6SysctlRefused
 }
 
 // withoutIPv6Sysctl returns a copy of hostCfg without spec.RunnerIPv6Sysctl,
@@ -58,21 +84,39 @@ func withoutIPv6Sysctl(hostCfg *container.HostConfig) *container.HostConfig {
 }
 
 // createAndStartRunner creates the runner container, revalidates the cache
-// volumes it references, and starts it. If the daemon rejects the IPv6 sysctl
-// (a host without IPv6, see isIPv6SysctlUnsupported) at create or at start, it
-// removes the container that attempt left behind and tries exactly once more
-// without the sysctl: on such a host IPv6 cannot be enabled in the container
-// anyway, so `localhost` is already IPv4-only. Any other failure is returned
-// as is. On error the returned ID, when non-empty, is a container that still
-// exists; the caller's nonce-keyed rollback removes it either way.
+// volumes it references, and starts it. If the daemon cannot apply the IPv6
+// sysctl at create or at start (classifyIPv6SysctlError), it logs a warning,
+// removes the container that attempt left behind, and tries exactly once more
+// without the sysctl. Both classes are retried, because failing every
+// allocation on such a host, with no knob to turn the sysctl off, is worse
+// than running the runner without it; the warning says which case applies:
+//
+//   - ipv6SysctlMissing: the host kernel has no IPv6, so ::1 cannot exist in
+//     the runner and `localhost` stays IPv4-only. Nothing is lost.
+//   - ipv6SysctlRefused: the sysctl could not be applied for another reason.
+//     IPv6 may stay enabled in the runner, so `localhost` can resolve to ::1
+//     and a server bound to localhost may be unreachable via 127.0.0.1 (the
+//     split ADR-002's IPv6 amendment describes). This degraded case is logged
+//     with the daemon's error and flagged by the live checks.
+//
+// Any other failure is returned as is. On error the returned ID, when
+// non-empty, is a container that still exists; the caller's nonce-keyed
+// rollback removes it either way.
 func (p *Provider) createAndStartRunner(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, instanceName string, plan cachePlan) (string, error) {
 	id, err := p.createAndStartRunnerOnce(ctx, cfg, hostCfg, instanceName, plan)
-	if err == nil || !isIPv6SysctlUnsupported(err) || hostCfg.Sysctls[spec.RunnerIPv6Sysctl] == "" {
+	if err == nil || hostCfg.Sysctls[spec.RunnerIPv6Sysctl] == "" {
 		return id, err
 	}
-
-	slog.WarnContext(ctx, "CreateInstance: the Docker host cannot apply the runner's IPv6 sysctl (no IPv6 in the host kernel); recreating the runner once without it, which leaves localhost IPv4-only on such a host",
-		"instance", instanceName, "sysctl", spec.RunnerIPv6Sysctl, "error", err)
+	switch classifyIPv6SysctlError(err) {
+	case ipv6SysctlMissing:
+		slog.WarnContext(ctx, "CreateInstance: the Docker host has no IPv6 (the runner's IPv6 sysctl does not exist); recreating the runner once without it. ::1 cannot exist in the runner, so localhost stays IPv4-only",
+			"instance", instanceName, "sysctl", spec.RunnerIPv6Sysctl, "error", err)
+	case ipv6SysctlRefused:
+		slog.WarnContext(ctx, "CreateInstance: the Docker daemon could not apply the runner's IPv6 sysctl for a reason other than missing IPv6; recreating the runner once without it. IPv6 may remain enabled in the runner, so localhost can resolve to ::1 and a server bound to localhost may be unreachable via 127.0.0.1 (see ADR-002, the runner IPv6 amendment)",
+			"instance", instanceName, "sysctl", spec.RunnerIPv6Sysctl, "error", err)
+	default:
+		return id, err
+	}
 	if id != "" {
 		if rerr := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); rerr != nil && !errdefs.IsNotFound(rerr) {
 			return id, errors.Join(err, fmt.Errorf("failed to remove runner container %s before retrying without the IPv6 sysctl: %w", id, rerr))

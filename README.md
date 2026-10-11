@@ -69,10 +69,12 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   is then refused by clients such as Node that skip `::1`
   (`ECONNREFUSED 127.0.0.1`); with the sysctl Docker 26+ also drops the line.
   Engine 25 and earlier already disable IPv6 there and keep a harmless, dead
-  `::1 localhost` line. On a host whose kernel has no IPv6 the daemon cannot
-  apply the sysctl; the provider then logs a warning and recreates the runner
-  once without it (`localhost` is IPv4-only there anyway). Jobs that bind or
-  dial `::1` explicitly do not work. See
+  `::1 localhost` line. If the daemon cannot apply the sysctl, the provider
+  logs a warning and recreates the runner once without it: on a host whose
+  kernel has no IPv6 `localhost` is IPv4-only anyway, while any other refusal
+  (permission, read-only `/proc/sys`, policy) is a degraded case where IPv6
+  may stay enabled, which the warning and the live checks call out. Jobs that
+  bind or dial `::1` explicitly do not work. See
   [ADR-002](docs/adr/ADR-002-runner-image-and-jit-delivery.md).
 - **Fail-closed `extra_specs`.** The GARM-admin trust tier (pool
   `extra_specs`) is bounded by a published, `additionalProperties: false`

@@ -1571,8 +1571,11 @@ verify_no_extra_privileges() {
 # which leaves IPv6 off on lo. On a Docker host whose kernel has no IPv6 at all
 # the daemon cannot apply that sysctl and the provider recreates the runner
 # without it; there /proc/sys/net/ipv6 is absent, ::1 cannot exist, and both
-# checks are reported as such rather than failed. /etc/hosts is only reported:
-# Engine 25 and earlier keep a dead `::1 localhost` line, 26+ omits it.
+# checks are reported as such rather than failed. If the daemon refused the
+# sysctl for another reason (permission, read-only /proc/sys, policy), the
+# provider also retries without it but warns that IPv6 may remain enabled;
+# that degraded case fails here by name. /etc/hosts is only reported: Engine
+# 25 and earlier keep a dead `::1 localhost` line, 26+ omits it.
 verify_ipv6_disabled() {
   local cid="$1" what="$2" sysctl lo_ipv6 hosts_line
   sysctl="$(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "${cid}" 2>/dev/null)"
@@ -1584,13 +1587,14 @@ verify_ipv6_disabled() {
   elif [[ "${lo_ipv6}" == "absent" ]]; then
     warn "${what}: created without net.ipv6.conf.all.disable_ipv6: the Docker host has no IPv6, so the provider retried without the sysctl"
   else
-    bad "${what}: net.ipv6.conf.all.disable_ipv6 is '${sysctl}' (the spec sets 1)"
+    bad "${what}: net.ipv6.conf.all.disable_ipv6 is '${sysctl}' although the host has IPv6 (the spec sets 1): degraded, the daemon refused the sysctl and the provider retried without it (see its warning), or the spec no longer sets it"
   fi
 
   case "${lo_ipv6}" in
     1) ok "${what}: IPv6 is disabled on lo, so ::1 is not usable as localhost" ;;
     absent) ok "${what}: the host kernel has no IPv6, so ::1 is not usable as localhost" ;;
-    *) bad "${what}: lo disable_ipv6 is '${lo_ipv6}' (want 1; ::1 would be usable as localhost)" ;;
+    0) bad "${what}: IPv6 is enabled on lo, so ::1 is usable as localhost and a server bound to localhost may be unreachable via 127.0.0.1 (degraded: the IPv6 sysctl was not applied)" ;;
+    *) bad "${what}: cannot read lo disable_ipv6 ('${lo_ipv6}'); cannot tell whether ::1 is usable as localhost" ;;
   esac
 
   hosts_line="$(docker exec "${cid}" grep '^::1' /etc/hosts 2>/dev/null)"

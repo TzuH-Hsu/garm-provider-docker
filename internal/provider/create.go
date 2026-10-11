@@ -79,8 +79,8 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //  7. create the runner container on the job network, with the workspace volume
 //     at the runner workdir, a credential tmpfs, the configured memory limit,
 //     and — in DinD modes — DOCKER_HOST plus the shared socket volume mount
-//  8. start it (on a host without IPv6 that rejects the runner's IPv6 sysctl,
-//     recreate and start it once without the sysctl), deliver the
+//  8. start it (if the daemon cannot apply the runner's IPv6 sysctl,
+//     recreate and start it once without the sysctl, with a warning), deliver the
 //     credentials by streaming an in-memory tar into a
 //     `docker exec`-run `tar -x` with an atomic .delivered marker, and verify
 //     BOTH the runner and (in DinD modes) the sidecar are running before
