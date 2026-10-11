@@ -351,22 +351,30 @@ enabled = false
 		t.Errorf("(b) workspace volume labels incorrect: %s", volLabels)
 	}
 
-	// IPv6 is disabled in the runner's namespace, loopback included, so ::1 is
-	// never usable as `localhost` and a server bound to localhost lands on
-	// 127.0.0.1, which clients that skip ::1 can reach. lo is checked rather
-	// than /etc/hosts: Engine 25 and earlier keep a dead `::1 localhost` line
-	// even with the sysctl (they already disable IPv6 on lo for IPv4-only
-	// networks), while 26+ omits it.
+	// ::1 is never usable as `localhost` in the runner, so a server bound to
+	// localhost lands on 127.0.0.1, which clients that skip ::1 can reach.
+	// Normally the runner carries the IPv6 sysctl and lo has IPv6 disabled. On
+	// a Docker host whose kernel has no IPv6 the daemon cannot apply the
+	// sysctl, the provider recreates the runner without it, and
+	// /proc/sys/net/ipv6 is absent: ::1 cannot exist, so that is reported, not
+	// failed. /etc/hosts is only logged: Engine 25 and earlier keep a dead
+	// `::1 localhost` line even with the sysctl, while 26+ omits it.
 	ipv6Sysctl := dockerOut(t, "inspect", containerID, "-f", "{{index .HostConfig.Sysctls \"net.ipv6.conf.all.disable_ipv6\"}}")
-	if ipv6Sysctl != "1" {
+	loOut, loErr := dockerTry("exec", containerID, "sh", "-c", "if [ -d /proc/sys/net/ipv6 ]; then cat /proc/sys/net/ipv6/conf/lo/disable_ipv6; else echo absent; fi")
+	loIPv6 := strings.TrimSpace(loOut)
+	switch {
+	case ipv6Sysctl == "1":
+		// The normal case: the sysctl was applied.
+	case loErr == nil && loIPv6 == "absent":
+		t.Logf("[ipv6] WARN: runner created without net.ipv6.conf.all.disable_ipv6: the Docker host has no IPv6, so the provider retried without the sysctl")
+	default:
 		t.Errorf("(ipv6) runner HostConfig.Sysctls net.ipv6.conf.all.disable_ipv6 = %q, want 1", ipv6Sysctl)
 	}
-	loDisabled, err := dockerTry("exec", containerID, "cat", "/proc/sys/net/ipv6/conf/lo/disable_ipv6")
-	if err != nil || strings.TrimSpace(loDisabled) != "1" {
-		t.Errorf("(ipv6) runner lo disable_ipv6 = %q (err %v), want 1: ::1 would be usable as localhost", strings.TrimSpace(loDisabled), err)
+	if loErr != nil || (loIPv6 != "1" && loIPv6 != "absent") {
+		t.Errorf("(ipv6) runner lo disable_ipv6 = %q (err %v), want 1 (or no IPv6 in the kernel): ::1 would be usable as localhost", loIPv6, loErr)
 	}
 	hostsFile, _ := dockerTry("exec", containerID, "cat", "/etc/hosts")
-	t.Logf("[ipv6] sysctl=%s lo.disable_ipv6=%s; /etc/hosts (informational):\n%s", ipv6Sysctl, strings.TrimSpace(loDisabled), hostsFile)
+	t.Logf("[ipv6] sysctl=%q lo.disable_ipv6=%s; /etc/hosts (informational):\n%s", ipv6Sysctl, loIPv6, hostsFile)
 
 	// M0 security: no host docker.sock mount, no token/metadata in env.
 	mounts := dockerOut(t, "inspect", containerID, "-f", "{{json .Mounts}}")
