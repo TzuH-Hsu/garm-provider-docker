@@ -521,9 +521,8 @@ that GARM injects, and `DeleteInstance`/`GetInstance` failed with
 `ListInstances` bug was also hit. The first two are fixed in the
 scale-set compatibility fix.
 
-**Full rerun with the current script** (every check that exists in
-`scripts/demo-m0.sh` at the time of writing, run live against both
-variants):
+**Full rerun** (every check that existed in `scripts/demo-m0.sh` when these
+results were recorded, in d5d8d65; run live against both variants):
 
 - `none` variant: `verify` all checks PASS (24 PASS lines), including exact
   per-job network attachment, the credential tmpfs (noexec, nosuid, nodev,
@@ -538,6 +537,26 @@ variants):
   group for the socket, and memory limits of 6GiB (runner) / 4GiB
   (sidecar). The GitHub job succeeded (`docker run hello-world`,
   `docker build`, and the shared-workspace step). `postjob` PASS.
+
+**Changes since the recorded runs, not yet exercised live.** The totals
+above (24 and 45 PASS lines) are those of the script as recorded in d5d8d65.
+The gate checks changed afterwards, and those changes will be exercised by
+the next full gate run, against the v0.2.1 release binary, which will also
+refresh the totals:
+
+- `verify` now fails when no volume is mounted at the externals path while
+  `[cache]` is enabled (187f0e7); this was informational before. The
+  existing read-only externals check is unchanged, so a clean run gains no
+  PASS line from it.
+- `verify` now asserts that no job-scoped volume (one with an instance-name)
+  carries `garm.docker/cache=true` (e04451f). On a clean run this adds one
+  PASS line per `verify` run.
+- `postjob` now exempts only persistent cache volumes (`cache=true` and no
+  instance-name) from the leftover check (e04451f); it adds no PASS line.
+
+`preflight` and the saved-state handling also changed after those runs
+(remembered modes, scale-set name persistence, and staged installation in
+51b49aa and 7abea8f), so the recorded runs do not cover them either.
 
 **Earlier runs** (kept briefly; superseded by the rerun above): the same
 variants were run as checks were added, in this order: the initial
