@@ -620,8 +620,9 @@ func validatePlatform(b params.BootstrapInstance) error {
 // toolCacheDir and pnpmStoreDir carry ADR-003's cache env: toolCacheDir becomes
 // RUNNER_TOOL_CACHE (set whenever the cache feature is enabled, from the
 // planCaches decision — possibly an ephemeral in-container path when the pool
-// is cache-ineligible), and pnpmStoreDir becomes npm_config_store_dir (set only
-// when a persistent pnpm store volume is mounted). diagDir, when set (a
+// is cache-ineligible), and pnpmStoreDir becomes npm_config_store_dir and
+// pnpm_config_store_dir (set only when a persistent pnpm store volume is
+// mounted). diagDir, when set (a
 // persistent diag volume is mounted), becomes GARM_DIAG_DIR so the entrypoint
 // can own the mounted _diag dir before dropping privileges. Any being "" omits
 // its env var.

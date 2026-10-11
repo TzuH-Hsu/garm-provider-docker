@@ -2,6 +2,7 @@ package spec
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/mount"
@@ -72,8 +73,10 @@ func TestBuildRunnerContainerNoCacheMountsWhenUnset(t *testing.T) {
 	}
 }
 
-// TestBuildRunnerEnvCacheEnv: RUNNER_TOOL_CACHE and npm_config_store_dir are
-// emitted when their fields are set, in BOTH JIT and non-JIT modes.
+// TestBuildRunnerEnvCacheEnv: RUNNER_TOOL_CACHE and the pnpm store envs are
+// emitted when their fields are set, in BOTH JIT and non-JIT modes. The store
+// path is emitted under both npm_config_store_dir (pnpm <= 10) and
+// pnpm_config_store_dir (pnpm >= 11): each pnpm major ignores the other's name.
 func TestBuildRunnerEnvCacheEnv(t *testing.T) {
 	for _, jit := range []bool{true, false} {
 		env := BuildRunnerEnv(RunnerEnvOptions{
@@ -89,7 +92,10 @@ func TestBuildRunnerEnvCacheEnv(t *testing.T) {
 			t.Errorf("jit=%v: env missing RUNNER_TOOL_CACHE: %v", jit, env)
 		}
 		if !slices.Contains(env, "npm_config_store_dir=/opt/pnpm-store") {
-			t.Errorf("jit=%v: env missing npm_config_store_dir: %v", jit, env)
+			t.Errorf("jit=%v: env missing npm_config_store_dir (pnpm <= 10): %v", jit, env)
+		}
+		if !slices.Contains(env, "pnpm_config_store_dir=/opt/pnpm-store") {
+			t.Errorf("jit=%v: env missing pnpm_config_store_dir (pnpm >= 11): %v", jit, env)
 		}
 	}
 }
@@ -105,11 +111,11 @@ func TestBuildRunnerEnvNoCacheEnvWhenUnset(t *testing.T) {
 		RunnerWorkDir:    RunnerWorkDir,
 	})
 	for _, e := range disabled {
-		if len(e) >= len("RUNNER_TOOL_CACHE=") && e[:len("RUNNER_TOOL_CACHE=")] == "RUNNER_TOOL_CACHE=" {
+		if strings.HasPrefix(e, "RUNNER_TOOL_CACHE=") {
 			t.Errorf("cache-disabled env unexpectedly set RUNNER_TOOL_CACHE: %q", e)
 		}
-		if len(e) >= len("npm_config_store_dir=") && e[:len("npm_config_store_dir=")] == "npm_config_store_dir=" {
-			t.Errorf("cache-disabled env unexpectedly set npm_config_store_dir: %q", e)
+		if strings.HasPrefix(e, "npm_config_store_dir=") || strings.HasPrefix(e, "pnpm_config_store_dir=") {
+			t.Errorf("cache-disabled env unexpectedly set a pnpm store env: %q", e)
 		}
 	}
 
@@ -123,8 +129,8 @@ func TestBuildRunnerEnvNoCacheEnvWhenUnset(t *testing.T) {
 		t.Error("RUNNER_TOOL_CACHE should be set even for an ephemeral (cache-ineligible) toolcache")
 	}
 	for _, e := range toolOnly {
-		if len(e) >= len("npm_config_store_dir=") && e[:len("npm_config_store_dir=")] == "npm_config_store_dir=" {
-			t.Errorf("npm_config_store_dir must be absent when no pnpm store volume is mounted: %q", e)
+		if strings.HasPrefix(e, "npm_config_store_dir=") || strings.HasPrefix(e, "pnpm_config_store_dir=") {
+			t.Errorf("pnpm store envs must be absent when no pnpm store volume is mounted: %q", e)
 		}
 	}
 }

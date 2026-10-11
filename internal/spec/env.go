@@ -7,6 +7,16 @@ import (
 	"strings"
 )
 
+// The two environment variables that point pnpm at its store. pnpm <= 10 reads
+// only the npm_config_ spelling and pnpm >= 11 reads only the pnpm_config_ one,
+// so the provider sets both. npm 11 prints a one-line "Unknown env config
+// store-dir" warning for the npm_config_ one on every npm/npx call; that is
+// cosmetic and unavoidable while pnpm 10 is supported (ADR-003, W2 amendment).
+const (
+	PnpmStoreDirEnvNpm  = "npm_config_store_dir"
+	PnpmStoreDirEnvPnpm = "pnpm_config_store_dir"
+)
+
 // EntityScope identifies which GitHub entity level a bootstrap payload's
 // repo_url refers to.
 type EntityScope string
@@ -128,12 +138,15 @@ type RunnerEnvOptions struct {
 	// volume backs it there). Emitted in both JIT and non-JIT modes.
 	ToolCacheDir string
 
-	// PnpmStoreDir, when non-empty, is emitted as npm_config_store_dir — the
-	// env pnpm honors as its store-dir (verified on Docker Engine 29.6.1:
-	// `pnpm config get store-dir`/`pnpm store path` resolve to it, and package
-	// content is reused across containers sharing the volume). Set ONLY when a
-	// persistent pnpm store volume is actually mounted, so a cache-ineligible
-	// allocation leaves pnpm on its own default store. Emitted in both modes.
+	// PnpmStoreDir, when non-empty, is emitted as BOTH npm_config_store_dir and
+	// pnpm_config_store_dir — the envs pnpm honors as its store-dir. pnpm <= 10
+	// reads only the npm_config_ spelling and pnpm >= 11 reads only the
+	// pnpm_config_ one (each ignores the other; verified against pnpm 10.16.1
+	// and 11.28.5), so both are set to keep the persistent store working across
+	// the pnpm major boundary. Package content is reused across containers
+	// sharing the volume. Set ONLY when a persistent pnpm store volume is
+	// actually mounted, so a cache-ineligible allocation leaves pnpm on its own
+	// default store. Emitted in both modes.
 	PnpmStoreDir string
 
 	// Entity is the parsed repo/org/enterprise scope (ParseEntity),
@@ -196,7 +209,10 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 		env = append(env, "RUNNER_TOOL_CACHE="+opts.ToolCacheDir)
 	}
 	if opts.PnpmStoreDir != "" {
-		env = append(env, "npm_config_store_dir="+opts.PnpmStoreDir)
+		env = append(env,
+			PnpmStoreDirEnvNpm+"="+opts.PnpmStoreDir,
+			PnpmStoreDirEnvPnpm+"="+opts.PnpmStoreDir,
+		)
 	}
 
 	if opts.JITConfigEnabled {

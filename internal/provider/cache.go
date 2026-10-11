@@ -30,10 +30,10 @@ type cachePlan struct {
 	// the path are non-empty).
 	toolcacheVolume string
 
-	// pnpmPath is the npm_config_store_dir value AND the pnpm mount target, set
-	// ONLY when a persistent pnpm store volume is mounted (cache-eligible).
-	// Empty means pnpm uses its own default store and no npm_config_store_dir is
-	// injected.
+	// pnpmPath is the npm_config_store_dir / pnpm_config_store_dir value AND the
+	// pnpm mount target, set ONLY when a persistent pnpm store volume is mounted
+	// (cache-eligible). Empty means pnpm uses its own default store and neither
+	// store env is injected.
 	pnpmPath string
 
 	// pnpmVolume is the persistent pnpm store volume's name, set alongside
