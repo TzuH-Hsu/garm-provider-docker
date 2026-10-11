@@ -55,6 +55,21 @@ const (
 	// — so 16 MiB is comfortable headroom while still bounding a misbehaving or
 	// hostile writer inside the container.
 	credentialTmpfsSizeBytes = 16 << 20
+
+	// RunnerIPv6Sysctl is the per-network-namespace sysctl the runner container
+	// is created with. Docker writes `::1 localhost ip6-localhost ip6-loopback`
+	// into the container's /etc/hosts, but the per-job network carries no IPv6,
+	// so a server that binds `localhost` through plain getaddrinfo lands on
+	// ::1 only, while a Node client (which resolves with AI_ADDRCONFIG and so
+	// drops ::1 when no non-loopback IPv6 address exists) dials 127.0.0.1 and
+	// gets ECONNREFUSED. Disabling IPv6 in the container's namespace makes
+	// Docker omit the ::1 lines, so `localhost` resolves to 127.0.0.1 alone,
+	// as on a VM host or a GitHub-hosted runner. net.* sysctls are
+	// namespaced, so this needs no privilege and touches nothing on the host.
+	// Only `all` is set: it is the key the daemon consults when writing
+	// /etc/hosts and it also covers lo and eth0, which already exist when the
+	// sysctl is applied, so `default` (new interfaces only) adds nothing.
+	RunnerIPv6Sysctl = "net.ipv6.conf.all.disable_ipv6"
 )
 
 // CredentialTmpfsMap returns the HostConfig.Tmpfs short-syntax entry for the
@@ -245,6 +260,9 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	host := &container.HostConfig{
 		Tmpfs:  CredentialTmpfsMap(),
 		Mounts: mounts,
+		// Runner only; the DinD sidecar keeps the daemon default. Jobs that
+		// bind or dial ::1 explicitly do not work (see RunnerIPv6Sysctl).
+		Sysctls: map[string]string{RunnerIPv6Sysctl: "1"},
 	}
 	if s.SocketVolumeName != "" {
 		// DinD modes (WP3): the runner mounts the shared socket volume at
