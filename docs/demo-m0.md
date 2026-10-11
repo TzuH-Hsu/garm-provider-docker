@@ -414,8 +414,11 @@ only variable names, and even the informational `Config.Env` dump redacts
 anything `TOKEN`/`METADATA_URL`/`CALLBACK_URL`-shaped as a defense-in-depth
 display safeguard; the credential tmpfs contents (c); and the install-dir
 symlink plus a running-process check (d). It also logs, informationally
-only (not PASS/FAIL), how many `garm.docker/cache=true` volumes exist —
-these persist across jobs by design (`ADR-003`). None of these ever print
+only (not PASS/FAIL), how many persistent cache volumes exist — these
+persist across jobs by design (`ADR-003`). It also FAILs if any job-scoped
+volume (one carrying a `garm.docker/instance-name` label) also carries
+`garm.docker/cache=true`: teardown skips cache-labeled volumes, so that
+combination would leak the volume. None of these ever print
 credential file *contents* — only filenames, permissions, and variable
 *names*.
 
@@ -427,8 +430,10 @@ cannot check this itself), then polls for the runner container to
 disappear (bounded by `POST_JOB_WAIT_SECONDS`, default 300s — GARM's own
 reaper/polling cadence governs how quickly this happens, `docs/research.md`
 §1.F) and checks for any leftover `garm.docker/managed=true` container,
-**network**, or volume (volumes labeled `garm.docker/cache=true` are
-excluded by label and listed informationally). The per-job network and the named workspace volume
+**network**, or volume. Only persistent cache volumes (`garm.docker/cache=true`
+and no `garm.docker/instance-name`) are excluded by label and listed
+informationally; a volume with an instance-name is job-scoped and counts as a
+leftover even if it also carries `cache=true`. The per-job network and the named workspace volume
 both carry `garm.docker/managed=true` (as of M1 — `ADR-001`/`ADR-004`), so
 `DeleteInstance`'s teardown removes both explicitly; a leftover one is a
 real failure this check catches. This is distinct from the persistent,
@@ -468,7 +473,7 @@ to reclaim them.
 | Step 4(c) times out or reports missing credential files | The provider's fetch-first `docker exec`-streamed tar delivery didn't complete before the entrypoint's `GARM_CRED_WAIT_SECONDS` (120s default) expired, or the exec itself failed | Check the provider's own stderr (surfaced via GARM's logs, see above) for a `failed to deliver credentials` error; check `docker logs <runner>` for the entrypoint's `waiting up to ...s for the delivery marker` message and whether it timed out. A slow/overloaded Docker daemon or a metadata-service fetch that ran close to the 60s aggregate deadline are the two likely causes (`ADR-002`). |
 | Step 4(d) reports `/actions-runner/.runner` is NOT a symlink, or the runner process never starts | `actions/runner`'s `run.sh` (or the JIT/non-JIT path in `myoung34/github-runner`) rejected the symlinked config file, or replaced it with a real file | This is exactly the open question `ADR-002` flags as a verification item. If confirmed, the documented fallback is a container-scoped writable-layer copy destroyed at teardown (never host-backed shared storage) — see `ADR-002`'s "symlink compatibility" note for the fallback design; this repo's entrypoint (`runner-images/noble/entrypoint.sh`) would need updating to implement it before this gate could be considered passing. |
 | Step 4(e) times out waiting for the container to disappear | GARM hasn't yet noticed (via its own GitHub-runner-list polling) that the ephemeral runner finished, or `DeleteInstance` itself is failing | Runner callbacks are not implemented in this provider (deferred, `ADR-002`) — there is no config field or code path for them — so GARM always learns a job finished by polling, and there is no fixed upper bound faster than GARM's own reap cycle. If it never resolves, check GARM's logs for a `DeleteInstance` error against this provider, and try `garm-cli runner list --repo <REPO>` to see GARM's own view of runner state. |
-| Step 4(e) reports a leftover managed network or volume (persistent `garm.docker/cache=true` volumes are excluded) | The named job network/workspace volume (M1) failed to tear down — a real bug, not the old "anonymous volume" behavior | Check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` for what's left, and the provider's stderr (via GARM's logs) for a teardown error (`internal/topology/teardown.go`). |
+| Step 4(e) reports a leftover managed network or volume (persistent cache volumes — `garm.docker/cache=true` with no instance-name — are excluded) | The named job network/workspace volume (M1) failed to tear down — a real bug, not the old "anonymous volume" behavior | Check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` for what's left, and the provider's stderr (via GARM's logs) for a teardown error (`internal/topology/teardown.go`). |
 | `garm-cli pool add` rejects `--image`/`--flavor` as invalid | Confusing these with a real cloud image/flavor | For this provider these two flags are placeholders only — any non-empty value satisfies `garm-cli`; see Step 2 above. |
 
 ## Recording a result

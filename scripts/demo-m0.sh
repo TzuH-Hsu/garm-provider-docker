@@ -1626,9 +1626,45 @@ verify_topology() {
 
   verify_no_extra_privileges "${cid}" "runner container"
 
-  local cache_vols
-  cache_vols="$(docker volume ls --filter 'label=garm.docker/cache=true' --format '{{.Name}}' | wc -l | tr -d ' ')"
-  log "  (informational, not PASS/FAIL: ${cache_vols} garm.docker/cache=true volume(s) present - toolcache/pnpm/externals/diag persist across jobs by design, ADR-003)"
+  local cache_vols scoped_cache
+  scoped_cache="$(job_scoped_cache_volumes)"
+  if [[ -n "${scoped_cache}" ]]; then
+    bad "job-scoped volume(s) also carry garm.docker/cache=true (teardown would skip them, so they would leak): $(printf '%s' "${scoped_cache}" | tr '\n' ' ')"
+  else
+    ok "no job-scoped volume carries garm.docker/cache=true (cache volumes have no instance-name)"
+  fi
+  cache_vols="$(persistent_cache_volumes | sed '/^$/d' | wc -l | tr -d ' ')"
+  log "  (informational, not PASS/FAIL: ${cache_vols} persistent cache volume(s) present - toolcache/pnpm/externals/diag persist across jobs by design, ADR-003)"
+}
+
+# job_scoped_cache_volumes prints the names of managed volumes that carry
+# garm.docker/cache=true AND garm.docker/instance-name. That combination must
+# never exist: a persistent cache volume carries cache=true and NO
+# instance-name (internal/spec/labels.go: LabelCache, MatchesPredicate), while
+# the job-scoped workspace/socket/dind-state volumes carry an instance-name and
+# must be torn down. A job-scoped volume that also gained cache=true would be
+# skipped by teardown (MatchesPredicate rejects cache=true), i.e. leak.
+job_scoped_cache_volumes() {
+  docker volume ls \
+    --filter 'label=garm.docker/managed=true' \
+    --filter 'label=garm.docker/cache=true' \
+    --filter 'label=garm.docker/instance-name' \
+    --format '{{.Name}}'
+}
+
+# persistent_cache_volumes prints the names of the legitimate persistent cache
+# volumes (ADR-003): managed, cache=true, and no instance-name. Volumes that
+# carry an instance-name are deliberately NOT exempted here, whatever else
+# they are labeled.
+persistent_cache_volumes() {
+  local all scoped
+  all="$(docker volume ls --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/cache=true' --format '{{.Name}}')"
+  scoped="$(job_scoped_cache_volumes)"
+  if [[ -n "${scoped}" ]]; then
+    printf '%s\n' "${all}" | command grep -vxF -f <(printf '%s\n' "${scoped}") || true
+  else
+    printf '%s\n' "${all}"
+  fi
 }
 
 # verify_no_host_mounts fails if container "$1" ("$2" names it in output) has
@@ -1932,13 +1968,15 @@ step_postjob() {
     ok "no managed runner container remains"
   fi
 
-  # Persistent cache volumes (garm.docker/cache=true, ADR-003) are excluded by
-  # label, not by name: they survive jobs by design and are reported
-  # informationally. Everything else managed must be gone.
+  # Persistent cache volumes (garm.docker/cache=true and NO instance-name,
+  # ADR-003) are excluded by label, not by name: they survive jobs by design
+  # and are reported informationally. A volume that carries an instance-name is
+  # job-scoped even if it also has cache=true (a labeling regression), so it is
+  # NOT exempted and shows up as leftover. Everything else managed must be gone.
   local leftover_c leftover_n leftover_v cache_v
   leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}')"
   leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
-  cache_v="$(docker volume ls --filter 'label=garm.docker/cache=true' --format '{{.Name}}')"
+  cache_v="$(persistent_cache_volumes)"
   leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}' \
     | { if [[ -n "${cache_v}" ]]; then command grep -vxF -f <(printf '%s\n' "${cache_v}") || true; else cat; fi; })"
   if [[ -z "${leftover_c}" && -z "${leftover_n}" && -z "${leftover_v}" ]]; then
@@ -1950,7 +1988,7 @@ step_postjob() {
     [[ -n "${leftover_v}" ]] && printf '    volumes: %s\n' "${leftover_v}"
   fi
   if [[ -n "${cache_v}" ]]; then
-    log "info: persistent cache volumes (garm.docker/cache=true, kept by design):"
+    log "info: persistent cache volumes (garm.docker/cache=true, no instance-name, kept by design):"
     printf '    %s\n' "${cache_v}"
   fi
   log "Note: the per-job network and the named workspace volume both carry"
