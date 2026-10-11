@@ -187,48 +187,47 @@ compatibility-fix release exists); see the checklist's end-to-end item.
    other provider has been inserted between CloudStack and GCP (or that the
    table hasn't been restructured again). As of 2026-09-26 it still has
    exactly the 10 rows listed in (a).
-2. **Re-verify the release facts.** As of 2026-09-26: `v0.2.0` is published
-   (`draft: false`, `prerelease: false`) at
-   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.0,
+2. **Re-verify the release facts.** As of 2026-10-11: `v0.2.1` is published
+   (`draft: false`, `prerelease: false`, the latest release) at
+   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.1,
    with `linux/amd64` and `linux/arm64` binaries and a `SHA256SUMS` file;
    `ghcr.io/tzuh-hsu/garm-provider-docker` and
-   `ghcr.io/tzuh-hsu/garm-runner-noble` are both tagged `:v0.2.0` and
+   `ghcr.io/tzuh-hsu/garm-runner-noble` are both tagged `:v0.2.1` and
    `:latest` on GHCR. Re-run the equivalent `gh release view` / package
    API checks at submission time in case a newer tag has since shipped.
-3. **End-to-end validation - state this plainly.** A live run against
-   GARM v0.2.1 (scale sets, provider interface v0.1.0) passed for both
-   `dind_mode=none` and `privileged-sidecar`; the recorded results are in
-   the "Results" and "Still unverified" sections of `docs/demo-m0.md`.
-   **However, it passed only with the GARM v0.2.x compatibility fix, which
-   is not yet released: the `v0.2.0` release binary fails on GARM v0.2.x**
-   (`CreateInstance` rejects GARM's injected `runner_install_template`;
-   `GetInstance`/`DeleteInstance` fail with "missing pool ID"). Before
-   submitting:
-   1. Wait for the release that contains the compatibility fix (expected
-      `v0.2.1`) and re-run the gate (`docs/demo-m0.md`) against that
-      release binary, not a branch build.
-   2. Resolve or document the runner-status stall (root cause in
-      `docs/demo-m0.md`, "Known open issue"): on GARM v0.2.1 scale sets
-      the runner stays `pending` (callbacks disabled by default), GARM's
-      `JobStarted` update fails with `invalid runner status transition
-      from pending to active`, and the scale set stalls (no new job
-      pickup or scale-up) until consolidation removes the runner, up to
-      about 5 minutes after the job; the job itself succeeds. Pools are
-      unaffected. Fixed upstream in cloudbase/garm#817 (`1a9aeff2ae`),
-      on `main` and `release/v0.2`, not in a tagged release as of
-      2026-10-11. A provider-side mitigation is being worked on
-      separately.
-   3. Fill in the placeholders in the PR body (`<RELEASE>` and
-      `<GARM_VERSION>`) from the re-run. Do not claim compatibility with
+3. **End-to-end validation - state this plainly.** The `v0.2.1` release
+   binary passed a live run against GARM v0.2.1 (scale sets, provider
+   interface v0.1.0) for both `dind_mode=none` and `privileged-sidecar`,
+   on 2026-10-11; the recorded results are in the "Results" and "Still
+   unverified" sections of `docs/demo-m0.md`. `v0.2.0` does not work on
+   GARM v0.2.x (`CreateInstance` rejects GARM's injected
+   `runner_install_template`; `GetInstance`/`DeleteInstance` fail with
+   "missing pool ID"), so name `v0.2.1` as the release, never `v0.2.0`.
+   Before submitting:
+   1. Re-check that `v0.2.1` is still the latest release; if a newer tag
+      shipped, re-run the gate (`docs/demo-m0.md`) against that release
+      binary, not a branch build.
+   2. Mention the runner-status stall only if it is relevant (root cause in
+      `docs/demo-m0.md`, "Known upstream issue"): on GARM v0.2.1 scale sets
+      a runner left at `pending` makes GARM's `JobStarted` update fail with
+      `invalid runner status transition from pending to active`, and the
+      scale set stalls until consolidation removes the runner. Fixed
+      upstream in cloudbase/garm#817 (`1a9aeff2ae`), on `main` and
+      `release/v0.2`, not in a tagged release as of 2026-10-11. This
+      provider avoids it from `v0.2.1` by reporting `installing` and
+      `idle` itself (`[status_report]`, on by default); the gate confirmed
+      the `pending`, `installing`, `idle`, `active` sequence with no
+      invalid-transition error.
+   3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.1`,
+      `<GARM_VERSION>` = `v0.2.1`). Do not claim compatibility with
       "GARM" generically, and do not imply production usage (the way the
       CloudStack PR's "thousands of builds" line does); the gate is a
       limited verification, not production evidence. Still unverified: the
       non-JIT path, an arm64 host, and pool/webhook mode.
-4. **This repo's own `README.md` "Status" section** has been refreshed
-   (companion commit `docs(readme): update release status for v0.2.0`) to
-   state the current `v0.2.0` release facts instead of the old `v0.1.0`
-   draft-release wording, so the linked repository no longer contradicts
-   this PR's own claims.
+4. **This repo's own `README.md` "Status" section** states the current
+   `v0.2.1` release facts, so the linked repository does not contradict
+   this PR's own claims. Re-check it against the release at submission
+   time.
 5. **Submission commands** (instructions only — not executed as part of
    preparing this kit):
 

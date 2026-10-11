@@ -18,9 +18,8 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"). The end-to-end claim is reserved
-for a published release that passes this gate (`v0.2.1` once published;
-until then use `--from-source`). The runbook keeps `dind_mode=none` as its own
+work against GARM v0.2.x (see "Results"); the published `v0.2.1` release
+passes this gate. The runbook keeps `dind_mode=none` as its own
 default (the smallest, most portable slice) and treats the DinD modes as
 out of scope for this particular gate (see "What this demo does not cover"
 below), but everything else it exercises is the CURRENT provider, not the
@@ -44,7 +43,7 @@ is specific to this provider and this demo.
 - [Troubleshooting](#troubleshooting)
 - [Recording a result](#recording-a-result)
 - [Results](#results)
-- [Known open issue](#known-open-issue)
+- [Known upstream issue](#known-upstream-issue)
 - [Still unverified](#still-unverified)
 <!-- /TOC -->
 
@@ -259,7 +258,7 @@ scripts/demo-m0.sh --pool                  # webhook-driven pool instead of a sc
 Release mode first checks that the release is published (an HTTP HEAD
 request for its `SHA256SUMS`) and fails early, before any download, if it
 is not: "release vX.Y.Z not published yet - use --from-source to build
-from this checkout". Until `v0.2.1` is published, run with `--from-source`.
+from this checkout".
 `v0.2.0` and earlier are known to fail against GARM v0.2.x scale sets, so
 passing `--version` below `v0.2.1` with a scale-set target prints a warning
 (it does not block; older GARM or `--pool` may still work).
@@ -501,85 +500,91 @@ re-running it:
 
 ## Results
 
-The gate has been run end to end against a live GARM, for both variants.
+The gate has been run end to end against a live GARM with the published
+`v0.2.1` release binary, for both variants, on 2026-10-11, using
+`scripts/demo-m0.sh` at fa4351c.
 
 **Environment**
 
 - GARM v0.2.1 (systemd service, API on loopback), scale-set dispatch (no
   webhook); provider `interface_version` v0.1.0.
 - Docker Engine 29.9.0 on Ubuntu 26.04, amd64.
-- A pre-release build of the provider (from the scale-set compatibility fix
-  line, which later runs also combined with a separate provider-side
-  runner-status reporting change); not a published release.
+- Provider: the `v0.2.1` release binary
+  (`garm-provider-docker_v0.2.1_linux_amd64`, sha256
+  `0b64de5687051b1309006107191afb1e9d5ee1bd35098275b493c3e1da94fa00`,
+  checked against the release's `SHA256SUMS`); `GetVersion` reports
+  `v0.2.1`. Release mode, `-y`.
 - Runner image
-  `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:299d1e366519860d98795a861566c1ddff990b9b7089ab7289f9609b426da64e`.
+  `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:10b82dc44bed23d5f38da655a1021247ca943457b263e9ba0f32e7188e5199ff`
+  (the `:v0.2.1` digest).
 - DinD image
   `docker:dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470`.
+
+**Results**
+
+- `none` variant: `verify` 26 PASS, 0 FAIL; the GitHub job succeeded;
+  `postjob` 2 PASS, 0 FAIL ("no managed runner container remains" and "no
+  leftover job-scoped garm.docker/managed=true containers, networks, or
+  volumes"); the persistent cache volumes are reported as informational.
+- `--dind` variant: `verify` 48 PASS, 0 FAIL; the GitHub job succeeded
+  (`docker run hello-world`, `docker build`, and the shared-workspace step,
+  which printed `sidecar saw: ok` and `runner read back: nested`); `postjob`
+  2 PASS, 0 FAIL. An earlier `--dind` run of the same binary, whose test
+  workflow predated the nested write-back step, also gave 48 PASS, 0 FAIL
+  and a successful job.
+
+Each variant was preflighted separately (`preflight`, then `preflight
+--dind`), because the saved variant is part of the remembered modes; the
+`--dind` config is a superset of the default one, and the `none` scale set
+carries no `extra_specs`, so it behaves the same under either. The `none`
+run used a test workflow with a 120 s hold instead of the 30 s in the sample
+printed by the script; the steps are otherwise the same.
+
+The totals are 2 PASS lines higher for `none` (24 to 26) and 3 higher for
+`--dind` (45 to 48) than in the previous recorded runs (d5d8d65): the
+job-scoped cache-label assertion (one line per `verify` run), the workspace
+volume mounted read-write on the runner, and, in `--dind`, on the sidecar.
+What the run exercised:
+
+- **Externals mount.** The externals volume was present and read-only, so
+  that check passed; it adds no PASS line. The failure branch (no volume at
+  the externals path while `[cache]` is enabled) was not triggered live; it
+  is covered by the script's logic only.
+- **Cache-label assertion.** No job-scoped volume carried
+  `garm.docker/cache=true`.
+- **Workspace read-write.** The workspace volume was mounted read-write at
+  `/actions-runner/_work` on the runner, and on the sidecar in `--dind`.
+- **Nested write-back.** In `--dind`, a nested container wrote a file into
+  the workspace and the runner read it back.
+- **Narrowed `postjob` leftover check.** Only persistent cache volumes
+  (including the externals volume seeded for the new runner image) were
+  exempted; nothing else remained.
+- **Runner status.** In both runs GARM's runner list showed `pending`,
+  `installing`, `idle`, then `active` once the job started, and GARM's log
+  has no `invalid runner status transition` line (see "Known upstream
+  issue").
+- **Teardown.** The runner container was gone within a few seconds of the
+  job completing (about 6 s for both `none` and the final `--dind`
+  run), with no leftover container, network or job-scoped volume.
 
 **First attempt failed, which is why the gate exists.** With the v0.2.0
 release binary, `CreateInstance` rejected the `runner_install_template`
 that GARM injects, and `DeleteInstance`/`GetInstance` failed with
 "missing pool ID" for scale-set instances. A separate GARM v0.1.1
-`ListInstances` bug was also hit. The first two are fixed in the
-scale-set compatibility fix.
+`ListInstances` bug was also hit. The first two are fixed in `v0.2.1`.
 
-**Full rerun** (every check that existed in `scripts/demo-m0.sh` when these
-results were recorded, in d5d8d65; run live against both variants):
-
-- `none` variant: `verify` all checks PASS (24 PASS lines), including exact
-  per-job network attachment, the credential tmpfs (noexec, nosuid, nodev,
-  size 16 MiB, mode 0700, runner uid/gid), the read-only externals volume,
-  no added capabilities, devices or security options, and no host
-  namespaces. The GitHub job succeeded. `postjob` PASS ("no leftover
-  job-scoped garm.docker/managed=true containers, networks, or volumes");
-  the persistent cache volumes are reported as informational.
-- `--dind` variant: `verify` all checks PASS (45 PASS lines), including the
-  sidecar's sole per-job network attachment, its exact mount set (socket,
-  dind-state, workspace), no host namespaces, the runner's supplementary
-  group for the socket, and memory limits of 6GiB (runner) / 4GiB
-  (sidecar). The GitHub job succeeded (`docker run hello-world`,
-  `docker build`, and the shared-workspace step). `postjob` PASS.
-
-**Changes since the recorded runs (not covered by the totals above).** The
-totals above (24 and 45 PASS lines) are those of the script as recorded in
-d5d8d65. The gate changed afterwards. None of these changes has been part of
-a full two-variant gate run (some were spot-checked when they landed); the
-next full gate run, against the v0.2.1 release binary, covers them and
-refreshes the totals:
-
-- `verify` now fails when no volume is mounted at the externals path while
-  `[cache]` is enabled (187f0e7); this was informational before. The
-  existing read-only externals check is unchanged, so a clean run gains no
-  PASS line from it.
-- `verify` now asserts that no job-scoped volume (one with an instance-name)
-  carries `garm.docker/cache=true` (e04451f). On a clean run this adds one
-  PASS line per `verify` run.
-- `postjob` now exempts only persistent cache volumes (`cache=true` and no
-  instance-name) from the leftover check (e04451f); it adds no PASS line.
-- `verify` now requires the workspace volume to be mounted read-write at
-  `/actions-runner/_work` on the runner container and, in the `--dind`
-  variant, on the sidecar too (both mounts are read-write by contract). This
-  adds one PASS line per `verify` run for the runner and one more for the
-  sidecar in `--dind`. The `--dind` sample workflow step also has a nested
-  container write a file into the workspace that the runner reads back.
-
-`preflight` and the saved-state handling also changed after those runs
-(remembered modes, scale-set name persistence, and staged installation in
-51b49aa and 7abea8f), so the recorded runs do not cover them either.
-
-**Earlier runs** (kept briefly; superseded by the rerun above): the same
-variants were run as checks were added, in this order: the initial
-verification (labels, topology, credentials, symlink, sidecar flags and
-memory), then the network and volume wiring checks, the dind-state mount
-and architecture guard, and finally the sidecar workspace mount with the
-shared-workspace workflow step. Each passed when first added.
+**Earlier runs** (superseded by the results above): the gate was run
+repeatedly against pre-release builds as checks were added, covering the
+initial verification, the network and volume wiring checks, the dind-state
+mount and architecture guard, and the sidecar workspace mount. Each passed
+when first added.
 
 Verified as a consequence: tmpfs credential delivery against a real
 daemon, a symlinked `.runner` being accepted by `actions/runner` in JIT
 mode, the scale-set path against a live GARM, and the `--dind` variant
 against a real daemon.
 
-## Known open issue
+## Known upstream issue
 
 Root cause (GARM v0.2.1, scale sets): GARM's runner-status state machine
 has no `pending` to `active` edge (`RunnerStatusTransitions` in
@@ -596,10 +601,16 @@ still succeeds. Pools are unaffected, because they use a forced update.
 
 Fixed upstream in cloudbase/garm#817 (commit `1a9aeff2ae`, "Allow pending
 and installing runners to become active"), present on `main` and
-`release/v0.2` but not in a tagged release as of 2026-10-11. A mitigation
-in this provider (provider-side status reporting) is being worked on
-separately. Until then, operators on GARM v0.2.1 with scale sets should
-expect this stall.
+`release/v0.2` but not in a tagged release as of 2026-10-11.
+
+**Mitigated in this provider since v0.2.1.** The provider reports the
+runner `installing` and then `idle` to GARM itself (`[status_report]`, on
+by default), so the runner is `idle` before a job is assigned and the
+`idle` to `active` transition is valid. The gate above confirms it with the
+release binary on GARM v0.2.1: the runner went `pending`, `installing`,
+`idle`, `active`, there was no `invalid runner status transition` error in
+GARM's log, and teardown followed the job end within seconds. Operators who
+disable it (`timeout_seconds = 0`) will see the stall on GARM v0.2.1 scale sets.
 
 ## Still unverified
 
