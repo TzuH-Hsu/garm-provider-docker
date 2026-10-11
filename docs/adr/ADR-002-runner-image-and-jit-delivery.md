@@ -45,8 +45,10 @@ Status: Accepted (2026-07-19)
 > assigned while the row is still `installing` fails the checked update
 > (`installing` allows only `failed`, `idle`, `terminated`, `installing`),
 > and the listener refetches the unacknowledged message at once, so the
-> retry succeeds as soon as `idle` is posted. If `idle` is never posted
-> (timeout, `0`), the stall persists as above.
+> retry succeeds as soon as `idle` is posted. Whenever `idle` is not
+> posted (timeout, `0`, an `installing` or `idle` callback that still fails
+> after its retries, a watcher that cannot start, or a GARM restart while the
+> watcher waits), the stall persists as above.
 >
 > The provider now reports status itself, from the provider process, using
 > the instance token it already holds for the credential fetch:
