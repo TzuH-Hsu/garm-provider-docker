@@ -18,8 +18,9 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"); the published `v0.2.1` and
-`v0.2.2` releases pass this gate. The runbook keeps `dind_mode=none` as its own
+work against GARM v0.2.x (see "Results"); the published `v0.2.2` release
+passes the current gate. `v0.2.1` passed an earlier revision of it (26 and 48
+PASS, script at fa4351c) and fails the IPv6 checks added for `v0.2.2`. The runbook keeps `dind_mode=none` as its own
 default (the smallest, most portable slice) and treats the DinD modes as
 out of scope for this particular gate (see "What this demo does not cover"
 below), but everything else it exercises is the CURRENT provider, not the
@@ -570,8 +571,8 @@ that GARM injects, and `DeleteInstance`/`GetInstance` failed with
 "missing pool ID" for scale-set instances. A separate GARM v0.1.1
 `ListInstances` bug was also hit. The first two are fixed in `v0.2.1`.
 
-**Earlier runs** (superseded by the results above): `v0.2.1` passed with
-26 PASS for `none` and 48 for `--dind` (runner image digest
+**Earlier runs** (superseded by the results above): `v0.2.1` passed the
+earlier gate revision with 26 PASS for `none` and 48 for `--dind` (runner image digest
 `sha256:10b82dc4...`), and before that the gate was run repeatedly against
 pre-release builds as checks were added. Each passed when first added.
 

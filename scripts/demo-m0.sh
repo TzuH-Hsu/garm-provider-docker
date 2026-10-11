@@ -16,8 +16,9 @@
 # per-job topology (job network, named workspace volume, DinD modes,
 # persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
 # failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
-# a published release that passes this gate (v0.2.1 and v0.2.2 have; for an
-# unpublished one use --from-source). The script keeps
+# a published release that passes this gate (v0.2.2 does; v0.2.1 passed an
+# earlier revision but fails the IPv6 checks added for v0.2.2; for an
+# unpublished release use --from-source). The script keeps
 # dind_mode=none as its own default (the smallest, most portable slice -
 # DinD modes are a deliberate operator opt-in and out of scope for this
 # gate, see docs/demo-m0.md), but everything else it exercises is the
