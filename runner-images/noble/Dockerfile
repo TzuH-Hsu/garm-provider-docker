@@ -17,6 +17,50 @@ LABEL org.opencontainers.image.source="https://github.com/TzuH-Hsu/garm-provider
       org.opencontainers.image.description="GARM external Docker provider runner image (Ubuntu Noble base, ADR-002 JIT-aware entrypoint)" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# Commonly needed apt-level dependencies (README "What is in the image"). Runner
+# jobs have NO passwordless sudo, so a job cannot apt-get install anything itself:
+# system packages must be in the image, while languages and toolchains come from
+# the setup-* actions. The base already ships the usual CLI tooling (jq, zip,
+# unzip, xz, zstd, rsync, ssh, gpg, git, curl, wget, gh, build-essential, python3
+# with venv and pip), so only the verified gaps are added here:
+#   - the shared libraries a headless Chrome / Chromium for Testing needs
+#     (Puppeteer, Playwright's Chromium and Lighthouse CI download one at job
+#     time; the list is the missing set `ldd` reports for Chrome for Testing 155
+#     on this base, which is also what Puppeteer documents for Debian/Ubuntu);
+#   - fontconfig plus a minimal font set (fonts-liberation, fonts-noto-color-emoji)
+#     so pages render text and emoji instead of tofu boxes;
+#   - `file`, which the base lacks and build scripts routinely call.
+# Every package exists for both amd64 and arm64 (images.yml builds both).
+# --no-install-recommends and the apt list cleanup keep the layer small.
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      file \
+      fontconfig \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+      libasound2t64 \
+      libatk-bridge2.0-0t64 \
+      libatk1.0-0t64 \
+      libatspi2.0-0t64 \
+      libcairo2 \
+      libcups2t64 \
+      libdbus-1-3 \
+      libgbm1 \
+      libnspr4 \
+      libnss3 \
+      libpango-1.0-0 \
+      libx11-6 \
+      libxcb1 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxext6 \
+      libxfixes3 \
+      libxkbcommon0 \
+      libxrandr2; \
+    rm -rf /var/lib/apt/lists/*
+
 # Provide pnpm so W1's persistent pnpm store (npm_config_store_dir=/opt/pnpm-store,
 # ADR-003) is actually usable — the myoung34 base ships Node but NOT pnpm, npm, or
 # corepack (verified: Node 18 present, npm/corepack absent), so W1's store mount
