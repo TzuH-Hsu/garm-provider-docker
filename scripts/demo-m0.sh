@@ -817,6 +817,18 @@ publish_fail() {
 # of old and new artifacts, and a SIGKILL or power loss in that window leaves
 # the mix in place (the rollback is a best-effort restore, not a transaction).
 # Re-running preflight always brings the set back in line.
+#
+# Signals: the publish below is a few renames plus at most one `docker tag`, so
+# HUP, INT and TERM are ignored from the first change until the publish (or,
+# on failure, the rollback) has finished. Otherwise a signal landing right
+# after a rename but before it is recorded in PUBLISHED would make the
+# rollback skip that step and leave a half-restored set; finishing a
+# consistent publish or rollback is preferable to a prompt exit. bash discards
+# an ignored signal rather than deferring it, so a Ctrl+C during this window
+# has no effect (it lasts well under a second); child processes such as
+# `docker tag` inherit the ignored disposition, which is what we want here.
+# The EXIT trap is untouched, so a genuine failure still rolls back and cleans
+# up. SIGKILL cannot be ignored and remains the residual window above.
 publish_staged_artifacts() {
   local modes_live
   modes_live="$(modes_file)"
@@ -833,6 +845,7 @@ publish_staged_artifacts() {
   keep_rollback_copy "${modes_live}" "${STAGE_CFG_DIR}/prev-gate-modes" \
     || die "could not save a rollback copy of ${modes_live}; nothing was changed."
 
+  trap '' HUP INT TERM
   if [[ -n "${STAGE_IMAGE_TAG}" ]]; then
     PREV_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${RUNNER_IMAGE_TAG}" 2>/dev/null)" || PREV_IMAGE_ID=""
     docker tag "${STAGE_IMAGE_TAG}" "${RUNNER_IMAGE_TAG}" \
