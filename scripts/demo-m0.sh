@@ -735,8 +735,9 @@ stage_provider_binary() {
 publish_staged_artifacts() {
   [[ ! -d "${PROVIDER_BIN}" ]] || die "${PROVIDER_BIN} is a directory; remove it and re-run."
   [[ ! -d "${PROVIDER_CONFIG_FILE}" ]] || die "${PROVIDER_CONFIG_FILE} is a directory; remove it and re-run."
-  path_is_private "${STAGE_BIN}" f && [[ -f "${STAGE_CFG}" ]] \
-    || die "internal error: the staged artifacts are missing or have the wrong owner or mode."
+  if ! path_is_private "${STAGE_BIN}" f || [[ ! -f "${STAGE_CFG}" ]]; then
+    die "internal error: the staged artifacts are missing or have the wrong owner or mode."
+  fi
   mv -f "${STAGE_BIN}" "${PROVIDER_BIN}" \
     || die "could not install ${PROVIDER_BIN}; the previous binary and config are unchanged."
   mv -f "${STAGE_CFG}" "${PROVIDER_CONFIG_FILE}" \
