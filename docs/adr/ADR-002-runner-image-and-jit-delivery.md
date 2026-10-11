@@ -204,6 +204,22 @@ Status: Accepted (2026-07-19)
 > create on affected hosts only, and probing the host first would add a
 > Docker call to every allocation.
 
+> **Amendment (2026-10-11): what the base image carries.** Runner jobs have no
+> passwordless sudo, so a job cannot install system packages, and the
+> `setup-*` actions only supply languages and toolchains. The policy is
+> therefore: the base image carries the commonly needed apt-level
+> dependencies (the shared libraries a headless Chrome needs, a minimal font
+> set, and the few everyday CLI tools the `myoung34` base lacks), languages
+> and toolchains come from `setup-*` at job time, and a repository with
+> exotic needs gets a derived image selected through a provider flavor (the
+> config-only image selection described under "Version updates" below). The
+> image does not try to mirror GitHub-hosted runner images, and it is not
+> grown for one repository's niche dependency. The entrypoint also raises the
+> open-file soft limit from Docker's 1024 to 65536 (clamped to the hard
+> limit, best effort, never fatal) before the privilege drop, as hosted
+> runners do. The package list and the reasoning behind each entry are in
+> `runner-images/noble/README.md`.
+
 ## Context
 
 GARM (see ADR-001 for the provider/GARM split of responsibilities) generates just-in-time (JIT) runner configuration for scale-set pools and expects the provider to get that configuration onto the instance it creates. The provider receives a bootstrap payload on stdin that includes an instance token; it must turn that into a running, registered GitHub Actions runner without ever letting GARM's credentials — the instance token, the metadata/callback URLs backing it, or (further upstream) the GitHub App key — reach the container's environment or filesystem. This is one of the project's explicit security red lines and the primary acceptance criterion for the M0 milestone (see plan.md): `docker inspect` of a running runner must show no host Docker socket, no GARM credentials, and no GitHub App key, in either its environment or its mounts.

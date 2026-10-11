@@ -52,6 +52,9 @@ readonly DOCKER_WAIT_SECONDS="${WAIT_FOR_DOCKER_SECONDS:-120}"
 # present and the wait returns immediately.
 readonly EXTERNALS_WAIT_SECONDS="${GARM_EXTERNALS_WAIT_SECONDS:-600}"
 readonly POLL_INTERVAL_SECONDS=1
+# Open-file soft limit the runner and its jobs get (GitHub-hosted runners are
+# around 65536); clamped to the container's hard limit by raise_nofile_soft_limit.
+readonly NOFILE_SOFT_TARGET=65536
 
 log() {
   printf '[entrypoint] %s\n' "$*" >&2
@@ -250,6 +253,41 @@ prepare_cache_dirs() {
     chown "${RUNNER_USER}:${RUNNER_USER}" "${dir}"
     log "prepared cache dir ${dir} (owned by ${RUNNER_USER})"
   done
+}
+
+# raise_nofile_soft_limit lifts the open-file soft limit (RLIMIT_NOFILE) toward
+# NOFILE_SOFT_TARGET while still root. Docker starts containers with a 1024 soft
+# limit (the hard limit is typically 524288), far below the ~65536 a GitHub-hosted
+# runner gives a job, and bundlers, test runners and watchers routinely exceed
+# 1024. Raising the SOFT limit needs no privilege and never goes past the hard
+# cap; gosu keeps rlimits across the privilege drop, so run.sh and every job step
+# inherit it. The target is clamped to the hard limit. This is best effort and
+# must never keep a runner from starting: any failure is logged and ignored.
+raise_nofile_soft_limit() {
+  local soft hard target
+  soft="$(ulimit -Sn)"
+  hard="$(ulimit -Hn)"
+
+  if [[ "${soft}" == "unlimited" ]]; then
+    log "open-file soft limit is already unlimited"
+    return 0
+  fi
+
+  target="${NOFILE_SOFT_TARGET}"
+  if [[ "${hard}" != "unlimited" ]] && (( hard < target )); then
+    target="${hard}"
+  fi
+  if (( soft >= target )); then
+    log "open-file soft limit is ${soft} (target ${target}); leaving it"
+    return 0
+  fi
+
+  if ulimit -Sn "${target}" 2>/dev/null; then
+    log "raised open-file soft limit from ${soft} to ${target} (hard limit ${hard})"
+  else
+    log "could not raise open-file soft limit from ${soft} to ${target}; continuing"
+  fi
+  return 0
 }
 
 # resolve_workdir mirrors the base image's own convention: an absolute
@@ -507,6 +545,10 @@ main() {
   cd "${RUNNER_DIR}"
 
   run_concurrent_waits
+
+  # Raise the open-file soft limit while still root, so run.sh and the jobs it
+  # spawns inherit it across the gosu drop. Best effort; never fails the runner.
+  raise_nofile_soft_limit
 
   # DinD modes: make the runner user a member of the DinD socket group before
   # dropping privileges, so `docker` works as the unprivileged runner (F1).

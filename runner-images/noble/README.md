@@ -115,8 +115,10 @@ that could emit any of them.
    `docker info` until ready, bounded by `WAIT_FOR_DOCKER_SECONDS`,
    independently of and concurrently with step 1. Skipped entirely when
    `DOCKER_HOST` is unset.
-3. **DinD socket group membership, cache/diag directory ownership** — still
-   as root, before dropping privileges: in DinD modes, add the `runner` user
+3. **Open-file limit, DinD socket group membership, cache/diag directory
+   ownership** — still as root, before dropping privileges: raise the
+   open-file soft limit to 65536 or the hard limit, whichever is lower (see
+   "Open-file limit" above; best effort, never fatal); in DinD modes, add the `runner` user
    to the supplementary group owning the DinD socket (`DOCKER_SOCK_GID`) so
    an unprivileged `docker` call can reach it; then `mkdir`/`chown` any
    mounted persistent-cache directories (`RUNNER_TOOL_CACHE`,
@@ -160,6 +162,54 @@ that could emit any of them.
    entrypoint exits with an error rather than silently running as root.
 
 The script never echoes credential file contents.
+
+## What is in the image
+
+Runner jobs have **no passwordless sudo** (deliberately), so a job cannot
+`apt-get install` anything. The policy that follows:
+
+- **Languages and toolchains** (Node, Python, Go, Java, ...) come from the
+  `setup-*` actions at job time, via the toolcache.
+- **Commonly needed apt-level dependencies live in this base image.** This
+  image does not try to mirror GitHub-hosted runner images; it carries the
+  system packages that ordinary jobs routinely assume, and only those.
+- **Exotic needs get a derived image**, selected through a provider flavor
+  ([ADR-002](../../docs/adr/ADR-002-runner-image-and-jit-delivery.md),
+  ADR-005): `FROM` this image, `apt-get install` what the repository needs,
+  publish it, and point a flavor at it. Do not grow this image for one
+  repository's niche dependency.
+
+Already in the `myoung34/github-runner` base, and so not added here: `git`,
+`git-lfs`, `gh`, `curl`, `wget`, `jq`, `zip`, `unzip`, `xz-utils`, `zstd`,
+`bzip2`, `rsync`, `openssh-client`, `gnupg`, `build-essential` (gcc, g++, make,
+libc6-dev), `libssl-dev`, `pkg-config`, `python3` with `venv` and `pip`, `perl`,
+`patch`, `tzdata`, `locales`, plus Node and the Docker CLI. This image adds the
+following (the `apt-get` layer in the `Dockerfile`), each present for both
+`linux/amd64` and `linux/arm64`:
+
+| Packages | Why |
+|---|---|
+| `libnss3`, `libnspr4`, `libatk1.0-0t64`, `libatk-bridge2.0-0t64`, `libatspi2.0-0t64`, `libcups2t64`, `libdbus-1-3`, `libgbm1`, `libxkbcommon0`, `libasound2t64`, `libcairo2`, `libpango-1.0-0`, `libx11-6`, `libxcb1`, `libxext6`, `libxfixes3`, `libxcomposite1`, `libxdamage1`, `libxrandr2` | The shared libraries a headless Chrome / Chromium for Testing links against. Puppeteer, Playwright and Lighthouse CI download a browser at job time, but cannot install its system libraries without root. This is the set `ldd` reports as missing for Chrome for Testing on this base (it matches Puppeteer's documented Debian/Ubuntu list). `libgbm1` brings Mesa and LLVM with it on Noble, about 180 MB of the size increase. |
+| `fontconfig`, `fonts-liberation`, `fonts-noto-color-emoji` | A minimal font set so headless pages render text and emoji instead of empty boxes (screenshots, visual tests, PDF output). Not a full CJK or symbol font set; that is a derived-image job. |
+| `file` | Not in the base; build and packaging scripts call it routinely. |
+
+Deliberately **not** added: `xvfb` and a headed-browser stack (a derived image,
+if a repository needs headed tests), `cmake`/`ninja`, `sqlite3`, database
+clients, and network debugging tools.
+
+## Open-file limit
+
+Docker starts containers with an open-file soft limit of 1024 (hard limit
+typically 524288), while a GitHub-hosted runner gives jobs about 65536.
+Bundlers, test runners and file watchers hit 1024 quickly. The entrypoint
+therefore raises the **soft** limit to 65536 (clamped to the container's hard
+limit) in its root phase, before the `gosu` drop, so `run.sh` and every job step
+inherit it. This is best effort: if the limit cannot be raised it logs a line
+and the runner starts anyway. A runner whose soft limit is already at or above
+the target is left alone, so a Docker daemon or pool that sets a higher limit
+keeps it. It lives in the entrypoint rather than in a provider-side
+`HostConfig.Ulimits` entry so that it also applies to any image built `FROM`
+this one and does not depend on the provider version.
 
 ## pnpm (M2-W2)
 
