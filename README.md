@@ -134,10 +134,10 @@ the same tag:
    published as a non-pre-release, or a published pre-release later changed
    to a full release.
 
-`v0.2.1` is the latest published release: its release binaries and
+`v0.2.2` is the latest published release: its release binaries and
 `SHA256SUMS` checksum file are downloadable from the
-[v0.2.1 release page](https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.1),
-and its container images are on GHCR as both `:v0.2.1` and `:latest`. It
+[v0.2.2 release page](https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.2),
+and its container images are on GHCR as both `:v0.2.2` and `:latest`. It
 passed the end-to-end gate against GARM v0.2.1 for both `dind_mode=none` and
 `privileged-sidecar` (see [`docs/demo-m0.md`](docs/demo-m0.md)); `v0.2.0` does
 not work with GARM v0.2.x.
@@ -375,9 +375,9 @@ skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 
 ## Status
 
-M0 through M4 are implemented and tested on this branch. `v0.2.1` is the
+M0 through M4 are implemented and tested on this branch. `v0.2.2` is the
 latest published release, with release binaries and container images
-(`:v0.2.1` and `:latest`) on GHCR; `v0.1.0`'s tag and `:v0.1.0` images
+(`:v0.2.2` and `:latest`) on GHCR; `v0.1.0`'s tag and `:v0.1.0` images
 still exist, though its GitHub Release draft has since been removed. No
 upstream pull request has been published yet. See
 [`docs/plan.md`](docs/plan.md) for the milestone breakdown and
