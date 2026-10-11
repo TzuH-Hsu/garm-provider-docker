@@ -187,24 +187,24 @@ compatibility-fix release exists); see the checklist's end-to-end item.
    other provider has been inserted between CloudStack and GCP (or that the
    table hasn't been restructured again). As of 2026-09-26 it still has
    exactly the 10 rows listed in (a).
-2. **Re-verify the release facts.** As of 2026-10-11: `v0.2.1` is published
+2. **Re-verify the release facts.** As of 2026-10-11: `v0.2.2` is published
    (`draft: false`, `prerelease: false`, the latest release) at
-   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.1,
+   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.2,
    with `linux/amd64` and `linux/arm64` binaries and a `SHA256SUMS` file;
    `ghcr.io/tzuh-hsu/garm-provider-docker` and
-   `ghcr.io/tzuh-hsu/garm-runner-noble` are both tagged `:v0.2.1` and
+   `ghcr.io/tzuh-hsu/garm-runner-noble` are both tagged `:v0.2.2` and
    `:latest` on GHCR. Re-run the equivalent `gh release view` / package
    API checks at submission time in case a newer tag has since shipped.
-3. **End-to-end validation - state this plainly.** The `v0.2.1` release
+3. **End-to-end validation - state this plainly.** The `v0.2.2` release
    binary passed a live run against GARM v0.2.1 (scale sets, provider
    interface v0.1.0) for both `dind_mode=none` and `privileged-sidecar`,
    on 2026-10-11; the recorded results are in the "Results" and "Still
    unverified" sections of `docs/demo-m0.md`. `v0.2.0` does not work on
    GARM v0.2.x (`CreateInstance` rejects GARM's injected
    `runner_install_template`; `GetInstance`/`DeleteInstance` fail with
-   "missing pool ID"), so name `v0.2.1` as the release, never `v0.2.0`.
+   "missing pool ID"), so name `v0.2.2` as the release, never `v0.2.0`.
    Before submitting:
-   1. Re-check that `v0.2.1` is still the latest release; if a newer tag
+   1. Re-check that `v0.2.2` is still the latest release; if a newer tag
       shipped, re-run the gate (`docs/demo-m0.md`) against that release
       binary, not a branch build.
    2. Mention the runner-status stall only if it is relevant (root cause in
@@ -223,14 +223,14 @@ compatibility-fix release exists); see the checklist's end-to-end item.
       returns. The gate saw the `pending`, `installing`, `idle`,
       `active` sequence with no such error, but that ordering is not
       guaranteed. Do not describe it as fixed.
-   3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.1`,
+   3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.2`,
       `<GARM_VERSION>` = `v0.2.1`). Do not claim compatibility with
       "GARM" generically, and do not imply production usage (the way the
       CloudStack PR's "thousands of builds" line does); the gate is a
       limited verification, not production evidence. Still unverified: the
       non-JIT path, an arm64 host, and pool/webhook mode.
 4. **This repo's own `README.md` "Status" section** states the current
-   `v0.2.1` release facts, so the linked repository does not contradict
+   `v0.2.2` release facts, so the linked repository does not contradict
    this PR's own claims. Re-check it against the release at submission
    time.
 5. **Submission commands** (instructions only — not executed as part of
