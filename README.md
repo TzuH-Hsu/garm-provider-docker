@@ -62,13 +62,15 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   should plan for this manual step. See
   [ADR-003](docs/adr/ADR-003-cache-keying-and-lifecycle.md).
 - **IPv4-only `localhost` in the runner.** The runner container is created
-  with IPv6 disabled in its network namespace, so `localhost` resolves to
-  `127.0.0.1` only, as on a VM host or a GitHub-hosted runner. Docker would
-  otherwise add a `::1 localhost` line to `/etc/hosts` for a network that has
-  no IPv6, and a server bound to `localhost` (`::1`) is then refused by
-  clients such as Node that skip `::1` (`ECONNREFUSED 127.0.0.1`). Jobs that
-  bind or dial `::1` explicitly do not work. See
-  [ADR-002](docs/adr/ADR-002-runner-image-and-jit-delivery.md).
+  with IPv6 disabled in its network namespace, so `::1` is never usable and
+  `localhost` behaves as `127.0.0.1`, as on a VM host or a GitHub-hosted
+  runner. From Docker Engine 26 a container on a network without IPv6 would
+  otherwise keep `::1 localhost`, and a server bound to `localhost` (`::1`)
+  is then refused by clients such as Node that skip `::1`
+  (`ECONNREFUSED 127.0.0.1`); with the sysctl Docker 26+ also drops the line.
+  Engine 25 and earlier already disable IPv6 there and keep a harmless, dead
+  `::1 localhost` line. Jobs that bind or dial `::1` explicitly do not work.
+  See [ADR-002](docs/adr/ADR-002-runner-image-and-jit-delivery.md).
 - **Fail-closed `extra_specs`.** The GARM-admin trust tier (pool
   `extra_specs`) is bounded by a published, `additionalProperties: false`
   JSON Schema plus config-checked ceilings: `dind_mode` by

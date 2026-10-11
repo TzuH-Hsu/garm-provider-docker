@@ -351,18 +351,22 @@ enabled = false
 		t.Errorf("(b) workspace volume labels incorrect: %s", volLabels)
 	}
 
-	// IPv6 is disabled in the runner's namespace and Docker therefore wrote no
-	// `::1 localhost` line: `localhost` is IPv4-only, as on a VM host, so a
-	// server bound to localhost is reachable by clients that skip ::1.
+	// IPv6 is disabled in the runner's namespace, loopback included, so ::1 is
+	// never usable as `localhost` and a server bound to localhost lands on
+	// 127.0.0.1, which clients that skip ::1 can reach. lo is checked rather
+	// than /etc/hosts: Engine 25 and earlier keep a dead `::1 localhost` line
+	// even with the sysctl (they already disable IPv6 on lo for IPv4-only
+	// networks), while 26+ omits it.
 	ipv6Sysctl := dockerOut(t, "inspect", containerID, "-f", "{{index .HostConfig.Sysctls \"net.ipv6.conf.all.disable_ipv6\"}}")
 	if ipv6Sysctl != "1" {
 		t.Errorf("(ipv6) runner HostConfig.Sysctls net.ipv6.conf.all.disable_ipv6 = %q, want 1", ipv6Sysctl)
 	}
-	hostsFile, _ := dockerTry("exec", containerID, "cat", "/etc/hosts")
-	if !strings.Contains(hostsFile, "localhost") || strings.Contains(hostsFile, "::1") {
-		t.Errorf("(ipv6) runner /etc/hosts should map localhost to 127.0.0.1 only, with no ::1 entry:\n%s", hostsFile)
+	loDisabled, err := dockerTry("exec", containerID, "cat", "/proc/sys/net/ipv6/conf/lo/disable_ipv6")
+	if err != nil || strings.TrimSpace(loDisabled) != "1" {
+		t.Errorf("(ipv6) runner lo disable_ipv6 = %q (err %v), want 1: ::1 would be usable as localhost", strings.TrimSpace(loDisabled), err)
 	}
-	t.Logf("[ipv6] sysctl=%s; /etc/hosts has no ::1 entry", ipv6Sysctl)
+	hostsFile, _ := dockerTry("exec", containerID, "cat", "/etc/hosts")
+	t.Logf("[ipv6] sysctl=%s lo.disable_ipv6=%s; /etc/hosts (informational):\n%s", ipv6Sysctl, strings.TrimSpace(loDisabled), hostsFile)
 
 	// M0 security: no host docker.sock mount, no token/metadata in env.
 	mounts := dockerOut(t, "inspect", containerID, "-f", "{{json .Mounts}}")

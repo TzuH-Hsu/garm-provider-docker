@@ -131,26 +131,43 @@ Status: Accepted (2026-07-19)
 > **Amendment (2026-10-11): the runner container has IPv6 disabled.** The
 > runner is created with `HostConfig.Sysctls`
 > `net.ipv6.conf.all.disable_ipv6=1` (`internal/spec/mounts.go`,
-> `RunnerIPv6Sysctl`), unconditionally. Docker writes `::1 localhost
-> ip6-localhost ip6-loopback` into every bridge-network container's
-> `/etc/hosts`, but the per-job network carries no IPv6. A server that binds
-> `localhost` through plain `getaddrinfo` therefore listens on `::1` only,
-> while a Node client resolves with `AI_ADDRCONFIG`, drops `::1` because the
+> `RunnerIPv6Sysctl`), unconditionally. From Docker Engine 26, a container on
+> an IPv4-only network keeps `::1` on `lo` and gets `::1 localhost
+> ip6-localhost ip6-loopback` in its `/etc/hosts`. A server that binds
+> `localhost` through plain `getaddrinfo` then listens on `::1` only, while a
+> Node client resolves with `AI_ADDRCONFIG`, drops `::1` because the
 > container has no non-loopback IPv6 address, and dials `127.0.0.1`
 > (`ECONNREFUSED`; seen with Astro's `@astrojs/cloudflare` prerender). On a VM
 > host or a GitHub-hosted runner `localhost` maps to `127.0.0.1` only, so the
-> same job passes there. With IPv6 disabled in the container's network
-> namespace Docker omits the `::1` lines and `localhost` is IPv4-only,
-> matching those hosts. `net.*` sysctls are per network namespace, so this
-> needs no privilege and changes nothing on the host. Only the `all` key is
-> set: it is the one the daemon consults when writing `/etc/hosts`, and it
-> also covers `lo` and `eth0`, which already exist when the sysctl is applied
-> (verified live on Docker 29.9: `default` alone leaves the `::1` line in
-> place). The DinD sidecar is unchanged; it runs `dockerd`, not job code, and
-> containers it launches get their own network namespaces. There is no
-> config knob. The compatibility cost: a job that binds or dials `::1`
-> explicitly (or a service that needs IPv6 loopback) will not work in the
-> runner container, which already could not use IPv6 beyond loopback.
+> same job passes there. With the sysctl, `::1` is gone from `lo` and Docker
+> 26+ also leaves the `::1` lines out of `/etc/hosts`, so `localhost` is
+> IPv4-only. Engine 25 and earlier already disable IPv6 in such a container,
+> `lo` included, and ignore the sysctl when writing `/etc/hosts`: the `::1
+> localhost` line stays but points at nothing, and resolvers that sort by
+> reachability (glibc `getaddrinfo`, so Node) put `127.0.0.1` first. Measured
+> on a user-defined bridge network with Node 22 (`server.listen(port,
+> 'localhost')`, then `fetch('http://localhost:port')`):
+>
+> | Engine | `lo` IPv6 without the sysctl | Without the sysctl | With the sysctl |
+> |---|---|---|---|
+> | 24.0.9, 25.0.5 | disabled | passes (binds `127.0.0.1`) | passes; `::1 localhost` line kept |
+> | 26.1.4, 29.9.0 | enabled | `ECONNREFUSED 127.0.0.1` (binds `::1`) | passes; no `::1` lines |
+>
+> The one leftover on Engine 25 and earlier is that a lookup that prefers
+> IPv6 without checking reachability (`getent hosts localhost`) still returns
+> the dead `::1`; no real tool has been seen to trip on it. The live checks
+> (`internal/verify`, `scripts/demo-m0.sh`) therefore assert the sysctl and
+> `lo`'s `disable_ipv6=1`, which hold on every engine, and only report the
+> `/etc/hosts` line. `net.*` sysctls are per network namespace, so this needs
+> no privilege and changes nothing on the host. Only the `all` key is set: it
+> is the one the daemon consults when writing `/etc/hosts`, and it also covers
+> `lo` and `eth0`, which already exist when the sysctl is applied (verified
+> live on Docker 29.9: `default` alone leaves the `::1` line in place). The
+> DinD sidecar is unchanged; it runs `dockerd`, not job code, and containers
+> it launches get their own network namespaces. There is no config knob. The
+> compatibility cost: a job that binds or dials `::1` explicitly (or a service
+> that needs IPv6 loopback) will not work in the runner container, which
+> already could not use IPv6 beyond loopback.
 
 ## Context
 
