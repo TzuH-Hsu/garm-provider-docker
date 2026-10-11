@@ -218,8 +218,9 @@ compatibility-fix release exists); see the checklist's end-to-end item.
       `idle` itself (`[status_report]`, on by default): if a job is
       assigned before `idle` is posted, GARM briefly retries `JobStarted`
       (`invalid runner status transition from installing to active`) until
-      it is; if `idle` is never posted (timeout, reporting disabled) the
-      stall returns. The gate saw the `pending`, `installing`, `idle`,
+      it is; whenever `idle` is not posted (timeout, reporting disabled, a
+      failed callback or watcher, a GARM restart mid-wait) the stall
+      returns. The gate saw the `pending`, `installing`, `idle`,
       `active` sequence with no such error, but that ordering is not
       guaranteed. Do not describe it as fixed.
    3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.1`,

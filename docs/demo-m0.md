@@ -616,9 +616,13 @@ start polling before `idle` is posted), the checked update fails with
 does not acknowledge the message and refetches it immediately, so once the
 watcher posts `idle` the retried `JobStarted` applies: a brief, self-clearing
 burst of that error. The original stall (until GARM's consolidation, up to
-about 5 minutes) returns when `idle` is never posted: `timeout_seconds`
-expires before the runner is listening, or status reporting is disabled
-(`timeout_seconds = 0`). The gate runs above showed
+about 5 minutes) returns whenever `idle` is not posted: the wait times out, reporting is
+disabled (`timeout_seconds = 0`), a callback still fails after its retries (a
+failed `installing` report skips the wait, a failed `idle` report leaves the
+row `installing`), the watcher cannot be started, or GARM restarts while the
+watcher waits (see
+[`[status_report]`](config-reference.md#status_report-runner-status-reported-to-garm)).
+The gate runs above showed
 `idle` 30 to 40 s before `active` and no transition error in GARM's log, but
 that ordering is not guaranteed. Upstream cloudbase/garm#817 removes the
 race and the stall entirely once it is in a release.

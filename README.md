@@ -95,7 +95,8 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   [cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), not in
   a release as of 2026-10-11). Reporting narrows the stall to a brief,
   self-clearing retry window if a job is assigned before `idle` is posted;
-  it returns if `idle` never is (timeout, or reporting disabled). It is on by default; the call is made by the
+  it returns whenever `idle` is not posted (timeout, reporting disabled, a
+  failed callback or watcher, a GARM restart mid-wait). It is on by default; the call is made by the
   provider process, so the runner container still never sees the instance
   token. See [`[status_report]`](docs/config-reference.md#status_report-runner-status-reported-to-garm).
 
