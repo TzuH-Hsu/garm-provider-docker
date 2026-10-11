@@ -617,8 +617,8 @@ does not acknowledge the message and refetches it immediately, so once the
 watcher posts `idle` the retried `JobStarted` applies: a brief, self-clearing
 burst of that error. The original stall (until GARM's consolidation, up to
 about 5 minutes) returns when `idle` is never posted: `timeout_seconds`
-expires before the runner is listening, status reporting is disabled
-(`timeout_seconds = 0`), or the runner is non-JIT. The gate runs above showed
+expires before the runner is listening, or status reporting is disabled
+(`timeout_seconds = 0`). The gate runs above showed
 `idle` 30 to 40 s before `active` and no transition error in GARM's log, but
 that ordering is not guaranteed. Upstream cloudbase/garm#817 removes the
 race and the stall entirely once it is in a release.
