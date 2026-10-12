@@ -19,10 +19,16 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
+// testOSKey is the OS key newCacheProvider's runner image reports through its
+// garm.docker/os-release label (the Noble image's value).
+const testOSKey = "ubuntu-24.04"
+
 // newCacheProvider builds a Provider with the persistent cache feature enabled.
+// Its runner image carries the garm.docker/os-release label testOSKey.
 func newCacheProvider(t *testing.T, allowOrgShared bool) (*Provider, *docker.FakeClient) {
 	t.Helper()
 	fake := docker.NewFakeClient()
+	fake.ImageLabels["ghcr.io/example/runner@sha256:deadbeef"] = map[string]string{spec.LabelOSRelease: testOSKey}
 	cfg := config.Config{
 		DockerHost:       "unix:///var/run/docker.sock",
 		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
@@ -202,7 +208,7 @@ func TestRevalidateReferencedCachesClassification(t *testing.T) {
 
 	repoKey := "repo-reval"
 	id := spec.CacheVolumeIdentity{ControllerID: p.controllerID, RepoKey: repoKey}
-	warmName := spec.ToolcacheVolumeName(repoKey, "1")
+	warmName := spec.ToolcacheVolumeName(repoKey, testOSKey, "1")
 	want := id.ToolcacheLabels("1", time.Now())
 	seedVol(t, fake, warmName, want)
 
@@ -256,7 +262,7 @@ func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 
 	repoKey := spec.RepoKey(cacheRepoURL)
-	toolName := spec.ToolcacheVolumeName(repoKey, "1")
+	toolName := spec.ToolcacheVolumeName(repoKey, testOSKey, "1")
 
 	// Inject a TRANSIENT inspect failure targeted at the warm toolcache volume.
 	// The toolcache is VolumeInspect'd ONLY during the post-create revalidation
@@ -293,7 +299,7 @@ func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 
 	// The other referenced caches (pnpm/diag/externals) — inspected successfully —
 	// must also survive; none is an orphan.
-	if _, ok := volByName(t, fake, spec.PnpmVolumeName(repoKey, "9")); !ok {
+	if _, ok := volByName(t, fake, spec.PnpmVolumeName(repoKey, testOSKey, "9")); !ok {
 		t.Error("[NEW-H1] pnpm store cache was deleted")
 	}
 	if _, ok := volByName(t, fake, spec.DiagVolumeName(repoKey)); !ok {
@@ -320,8 +326,8 @@ func TestCreateInstanceMountsRepoCaches(t *testing.T) {
 	}
 
 	repoKey := spec.RepoKey(cacheRepoURL)
-	toolName := spec.ToolcacheVolumeName(repoKey, "1")
-	pnpmName := spec.PnpmVolumeName(repoKey, "9")
+	toolName := spec.ToolcacheVolumeName(repoKey, testOSKey, "1")
+	pnpmName := spec.PnpmVolumeName(repoKey, testOSKey, "9")
 
 	tv, ok := volByName(t, fake, toolName)
 	if !ok {
@@ -365,8 +371,8 @@ func TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete(t *testing.T) {
 	ctx := context.Background()
 
 	repoKey := spec.RepoKey(cacheRepoURL)
-	toolName := spec.ToolcacheVolumeName(repoKey, "1")
-	pnpmName := spec.PnpmVolumeName(repoKey, "9")
+	toolName := spec.ToolcacheVolumeName(repoKey, testOSKey, "1")
+	pnpmName := spec.PnpmVolumeName(repoKey, testOSKey, "9")
 
 	if _, err := p.CreateInstance(ctx, cacheBootstrap("job-1", cacheRepoURL, srv.URL)); err != nil {
 		t.Fatalf("CreateInstance job-1: %v", err)
@@ -490,10 +496,10 @@ func TestCreateInstanceOrgScopeOptInGetsCaches(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 	orgKey := spec.RepoKey(orgURL)
-	if _, ok := volByName(t, fake, spec.ToolcacheVolumeName(orgKey, "1")); !ok {
+	if _, ok := volByName(t, fake, spec.ToolcacheVolumeName(orgKey, testOSKey, "1")); !ok {
 		t.Error("org-scoped pool with allow_org_shared did not get a toolcache volume")
 	}
-	if _, ok := volByName(t, fake, spec.PnpmVolumeName(orgKey, "9")); !ok {
+	if _, ok := volByName(t, fake, spec.PnpmVolumeName(orgKey, testOSKey, "9")); !ok {
 		t.Error("org-scoped pool with allow_org_shared did not get a pnpm store volume")
 	}
 }

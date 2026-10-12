@@ -18,7 +18,7 @@ type CredentialFile struct {
 	// LocalName is the filename the bytes are written to inside the
 	// runner's credential tmpfs (/run/garm). Note: no leading dot — these
 	// are bare transport filenames. The runner image entrypoint
-	// (runner-images/noble/entrypoint.sh) polls the tmpfs for exactly
+	// (runner-images/common/entrypoint.sh) polls the tmpfs for exactly
 	// these bare names and, once present, installs them into the runner
 	// install dir as .runner / .credentials / .credentials_rsaparams
 	// (ADR-002). The dotting happens at install time, not at delivery

@@ -77,6 +77,23 @@ const (
 	// ExternalsVolumeIdentity.ExternalsLabels in externals.go.
 	LabelImageDigest = "garm.docker/image-digest"
 
+	// LabelOSRelease names the runner image's operating-system release, in two
+	// places with the same meaning (ADR-003 amendment 2026-10-12):
+	//
+	//   - on a runner IMAGE, as a build-time LABEL (runner-images/*/Dockerfile set
+	//     it to "ubuntu-24.04" / "ubuntu-26.04"); the provider reads it from the
+	//     image config at create time (RunnerOSKey);
+	//   - on a toolcache or pnpm store CACHE VOLUME, carrying the OS key that
+	//     volume was created for, so a reuse can refuse a volume built for a
+	//     different OS release (cacheIdentityLabelKeys).
+	//
+	// Toolcache and pnpm contents are OS-release specific (setup-python and
+	// setup-node install builds made for one Ubuntu release; pnpm's
+	// side-effects cache holds native addons linked against that release's
+	// glibc), so the two are keyed on it. Diag logs and externals are not: diag
+	// logs are plain text, and externals are already keyed on the image digest.
+	LabelOSRelease = "garm.docker/os-release"
+
 	// LabelOSType and LabelOSArch are informational labels carrying the
 	// bootstrap OS type/arch. They are NOT part of the ADR-004 teardown
 	// predicate; they exist so GetInstance/ListInstances can reconstruct a

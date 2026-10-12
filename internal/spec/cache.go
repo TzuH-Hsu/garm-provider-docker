@@ -219,6 +219,7 @@ var cacheIdentityLabelKeys = []string{
 	LabelImageDigest,
 	LabelGeneration,
 	LabelPnpmMajor,
+	LabelOSRelease,
 }
 
 // ValidateAdoptedCacheVolume checks that a cache volume returned by an idempotent
@@ -257,6 +258,12 @@ func ValidateAdoptedCacheVolume(name string, got, want map[string]string) error 
 //   - pnpm:      cache-kind + repo + repo-url-digest + pnpm-major
 //   - diag-logs: cache-kind + repo + repo-url-digest
 //   - externals: cache-kind + image-digest (shared across repos, so NO repo)
+//
+// os-release is deliberately NOT required for toolcache or pnpm, although every
+// volume the provider creates now carries it: volumes created before the OS key
+// existed (ADR-003 2026-10-12 amendment) must stay provably ours so the log-only
+// GC can report them as superseded instead of as foreign cruft. Adoption still
+// checks it, through cacheIdentityLabelKeys.
 //
 // An unrecognised or absent cache-kind returns nil, which ValidateCacheVolumeKind
 // treats as "not provably ours" and rejects.
@@ -437,20 +444,26 @@ const (
 )
 
 // ToolcacheVolumeName builds the toolcache volume name (ADR-003):
-// garm-cache-toolcache-<repokey>-<generation>. The <generation> salt bumps
+// garm-cache-toolcache-<repokey>-<oskey>-<generation>. The <oskey> is the
+// runner image's OS key (RunnerOSKey, ADR-003 2026-10-12 amendment), so runners
+// on different Ubuntu releases never share a toolcache: setup-python and
+// setup-node download builds made for one release. The <generation> salt bumps
 // whenever the image generation changes, giving a clean way to invalidate a
 // stale toolcache without an explicit GC pass (a new generation is simply a
 // new, empty volume).
-func ToolcacheVolumeName(repoKey, generation string) string {
-	return cacheVolumeNamePrefix + string(CacheKindToolcache) + "-" + repoKey + "-" + generation
+func ToolcacheVolumeName(repoKey, osKey, generation string) string {
+	return cacheVolumeNamePrefix + string(CacheKindToolcache) + "-" + repoKey + "-" + osKey + "-" + generation
 }
 
 // PnpmVolumeName builds the pnpm store volume name (ADR-003):
-// garm-cache-pnpm-<repokey>-<pnpmMajor>. The <pnpmMajor> salt bumps on a pnpm
-// major-version change, since the store's on-disk layout is tied to the pnpm
-// major (the store's own vN directory), so a major bump wants a fresh volume.
-func PnpmVolumeName(repoKey, pnpmMajor string) string {
-	return cacheVolumeNamePrefix + string(CacheKindPnpm) + "-" + repoKey + "-" + pnpmMajor
+// garm-cache-pnpm-<repokey>-<oskey>-<pnpmMajor>. The <oskey> separates Ubuntu
+// releases for the same reason as the toolcache: pnpm's side-effects cache
+// keeps built native addons, which link against the release's glibc. The
+// <pnpmMajor> salt bumps on a pnpm major-version change, since the store's
+// on-disk layout is tied to the pnpm major (the store's own vN directory), so
+// a major bump wants a fresh volume.
+func PnpmVolumeName(repoKey, osKey, pnpmMajor string) string {
+	return cacheVolumeNamePrefix + string(CacheKindPnpm) + "-" + repoKey + "-" + osKey + "-" + pnpmMajor
 }
 
 // CacheVolumeIdentity is the identity every cache-volume label set is derived
@@ -469,6 +482,14 @@ type CacheVolumeIdentity struct {
 	// (L7). The provider sets it from the same repo_url it derives RepoKey from;
 	// when empty (a spec-only unit test), the digest label is simply omitted.
 	RepoURLDigest string
+
+	// OSKey is the runner image's OS key (RunnerOSKey), carried as
+	// LabelOSRelease on the toolcache and pnpm store volumes only, so a reuse
+	// refuses a volume created for a different OS release. The diag-logs
+	// volume does not carry it: diag logs are plain text and stay shared
+	// across the OS releases a repository's pools run. Omitted when empty (a
+	// spec-only unit test).
+	OSKey string
 }
 
 // baseCacheLabels returns the labels every cache volume carries regardless of
@@ -503,17 +524,27 @@ func (c CacheVolumeIdentity) baseCacheLabels(kind CacheKind, lastUsed time.Time)
 }
 
 // ToolcacheLabels returns the label set for a toolcache volume (ADR-003): the
-// common cache labels plus generation=<gen>.
+// common cache labels plus generation=<gen> and, when set, os-release=<oskey>.
 func (c CacheVolumeIdentity) ToolcacheLabels(generation string, lastUsed time.Time) map[string]string {
 	labels := c.baseCacheLabels(CacheKindToolcache, lastUsed)
 	labels[LabelGeneration] = generation
+	c.addOSKey(labels)
 	return labels
 }
 
 // PnpmLabels returns the label set for a pnpm store volume (ADR-003): the
-// common cache labels plus pnpm-major=<major>.
+// common cache labels plus pnpm-major=<major> and, when set, os-release=<oskey>.
 func (c CacheVolumeIdentity) PnpmLabels(pnpmMajor string, lastUsed time.Time) map[string]string {
 	labels := c.baseCacheLabels(CacheKindPnpm, lastUsed)
 	labels[LabelPnpmMajor] = pnpmMajor
+	c.addOSKey(labels)
 	return labels
+}
+
+// addOSKey stamps the OS key on an OS-specific cache's label set. It is not
+// part of baseCacheLabels because the diag-logs volume must not carry it.
+func (c CacheVolumeIdentity) addOSKey(labels map[string]string) {
+	if c.OSKey != "" {
+		labels[LabelOSRelease] = c.OSKey
+	}
 }

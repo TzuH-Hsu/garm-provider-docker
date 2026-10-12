@@ -1,30 +1,36 @@
 //go:build dockerverify
 
-// This file verifies two properties of the REAL runner image
-// (runner-images/noble: its real Dockerfile and real entrypoint.sh) on a live
-// daemon:
+// This file verifies the REAL runner images (runner-images/noble and
+// runner-images/resolute: their real Dockerfiles and the shared real
+// entrypoint.sh) on a live daemon:
 //
 //   - the shared libraries a headless Chrome needs are installed, so a Chrome
 //     for Testing downloaded by a job (Puppeteer, Lighthouse CI) can start
 //     without apt (jobs have no passwordless sudo);
+//
+//   - the CI tooling jobs expect is present (pipx, clang-format, clang-tidy,
+//     cmake, ninja) and the runner user can install tools into /usr/local/bin
+//     and /usr/local/lib;
+//
+//   - the image carries the garm.docker/os-release label the provider keys the
+//     toolcache and pnpm store volumes on;
 //
 //   - the entrypoint raises the open-file soft limit for the runner user, and
 //     clamps it to the hard limit.
 //
 //     go test -tags dockerverify -v -run TestVerifyRunnerImage ./internal/verify/
 //
-// The image is built for the daemon's native platform and removed afterwards.
+// Each image is built for the daemon's native platform and removed afterwards.
 package verify
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
 // chromeLibs are sonames that Chrome for Testing links against and that the base
-// image does not ship (the apt layer in runner-images/noble/Dockerfile adds them).
+// images do not ship (the apt layer in each runner-images/*/Dockerfile adds them).
 var chromeLibs = []string{
 	"libnss3.so", "libnspr4.so", "libatk-1.0.so.0", "libatk-bridge-2.0.so.0",
 	"libcups.so.2", "libgbm.so.1", "libxkbcommon.so.0", "libasound.so.2",
@@ -32,13 +38,40 @@ var chromeLibs = []string{
 	"libXdamage.so.1", "libXrandr.so.2", "libatspi.so.0",
 }
 
+// imageExpectations is what each runner image must report beyond the shared
+// checks: its os-release label and the LLVM major its unversioned
+// clang-format/clang-tidy resolve to.
+var imageExpectations = map[string]struct {
+	osRelease string
+	llvmMajor string
+}{
+	"noble":    {osRelease: "ubuntu-24.04", llvmMajor: "18"},
+	"resolute": {osRelease: "ubuntu-26.04", llvmMajor: "22"},
+}
+
 func TestVerifyRunnerImageContents(t *testing.T) {
 	root := repoRoot(t)
-	tag := "garm-image-contents-verify:" + randHex(t)
-	if out, err := dockerTry("build", "-t", tag, filepath.Join(root, "runner-images", "noble")); err != nil {
-		t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
+	for _, name := range runnerImageNames {
+		t.Run(name, func(t *testing.T) {
+			verifyRunnerImageContents(t, root, name)
+		})
+	}
+}
+
+func verifyRunnerImageContents(t *testing.T, root, name string) {
+	want, ok := imageExpectations[name]
+	if !ok {
+		t.Fatalf("no expectations recorded for runner image %q", name)
+	}
+	tag := "garm-image-contents-verify-" + name + ":" + randHex(t)
+	if out, err := dockerTry(append([]string{"build", "-t", tag}, runnerImageBuildArgs(root, name)...)...); err != nil {
+		t.Fatalf("build real runner-images/%s image: %v\n%s", name, err, out)
 	}
 	defer func() { _, _ = dockerTry("rmi", "-f", tag) }()
+
+	if got := imageOSKey(t, tag); got != want.osRelease {
+		t.Errorf("OS key = %q, want %q (garm.docker/os-release label)", got, want.osRelease)
+	}
 
 	out := dockerOut(t, "run", "--rm", "--entrypoint", "ldconfig", tag, "-p")
 	for _, lib := range chromeLibs {
@@ -47,10 +80,26 @@ func TestVerifyRunnerImageContents(t *testing.T) {
 		}
 	}
 
-	for _, tool := range []string{"file", "fc-list"} {
+	for _, tool := range []string{"file", "fc-list", "pipx", "cmake", "ninja", "clang-format", "clang-tidy", "clang-format-" + want.llvmMajor, "clang-tidy-" + want.llvmMajor} {
 		if _, err := dockerTry("run", "--rm", "--entrypoint", "sh", tag, "-c", "command -v "+tool); err != nil {
 			t.Errorf("runner image is missing %s", tool)
 		}
+	}
+	for _, tool := range []string{"clang-format", "clang-tidy"} {
+		out := dockerOut(t, "run", "--rm", "--entrypoint", tool, tag, "--version")
+		if !strings.Contains(out, "version "+want.llvmMajor+".") {
+			t.Errorf("%s --version = %q, want LLVM %s", tool, strings.TrimSpace(out), want.llvmMajor)
+		}
+	}
+
+	// The runner user can add tools to /usr/local/bin and /usr/local/lib (no
+	// sudo in jobs), but the files the base ships there stay root-owned.
+	probe := "set -e; for d in /usr/local/bin /usr/local/lib; do " +
+		"touch \"$d/garm-write-probe\"; rm \"$d/garm-write-probe\"; done; " +
+		"mkdir /usr/local/lib/garm-dir-probe; rmdir /usr/local/lib/garm-dir-probe; " +
+		"test ! -w /usr/local/bin/pnpm"
+	if out, err := dockerTry("run", "--rm", "--user", "runner", "--entrypoint", "bash", tag, "-c", probe); err != nil {
+		t.Errorf("runner user cannot install into /usr/local/bin and /usr/local/lib as intended: %v\n%s", err, out)
 	}
 
 	// Open-file soft limit, against the REAL raise_nofile_soft_limit (entrypoint

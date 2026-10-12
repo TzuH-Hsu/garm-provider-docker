@@ -67,10 +67,13 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //     create-nonce. NetworkCreate's 409 is the atomic duplicate primitive —
 //     a same-instance managed collision returns exit 31 here
 //  3. create the named, labeled workspace volume — and, in DinD modes, the
-//     socket and dind-state volumes alongside it
+//     socket and dind-state volumes alongside it; pull the runner image if
+//     missing; then, when the cache feature is on, resolve the persistent
+//     caches, whose toolcache and pnpm volumes are keyed on the repository
+//     and the runner image's OS release (ADR-003)
 //  4. fetch the credentials provider-side, before the container exists, so a
 //     slow fetch can never outlive the entrypoint's credential wait
-//  5. pull the runner image if missing
+//  5. seed the image-digest-keyed externals cache (cache feature only)
 //  6. in DinD modes, pull the dind image and start the sidecar (privileged-
 //     sidecar or, WP4, sysbox-runc — the two differ only in Privileged/
 //     Runtime) on the job network FIRST, so the runner's entrypoint has a
@@ -261,13 +264,25 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		}
 	}
 
-	// 2c. Persistent, repo-scoped caches (ADR-003): resolve entity scope and,
-	// when eligible, create-or-reuse the toolcache and pnpm store volumes.
+	// 2c. Pull the runner image if missing (image comes from config/flavor;
+	// resolved.RunnerImage is EffectiveRunnerImage(extra_specs.flavor) — the
+	// named flavor is the ONLY image-varying channel, ADR-002). It comes before
+	// the caches because the toolcache and pnpm volumes are keyed on the
+	// image's OS release, read from the image itself (ADR-003, 2026-10-12
+	// amendment).
+	runnerImage := resolved.RunnerImage
+	if err := p.ensureImage(ctx, runnerImage); err != nil {
+		return guarded(err)
+	}
+
+	// 2d. Persistent, repo-scoped caches (ADR-003): resolve entity scope and,
+	// when eligible, create-or-reuse the toolcache and pnpm store volumes for
+	// this repository and the runner image's OS release.
 	// Cache volumes carry no instance-name/create-nonce, so the creation-guard
 	// rollback never removes them — a create that fails after this point leaves
 	// the warm cache intact for the next job. An org/enterprise pool without
 	// allow_org_shared (or a disabled cache) gets no persistent cache volumes.
-	plan, err := p.planCaches(ctx, bootstrap)
+	plan, err := p.planCaches(ctx, bootstrap, runnerImage)
 	if err != nil {
 		return guarded(err)
 	}
@@ -283,15 +298,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("failed to build credential archive for %q: %w", instanceName, err))
 	}
 
-	// 4. Pull the runner image if missing (image comes from config/flavor;
-	// resolved.RunnerImage is EffectiveRunnerImage(extra_specs.flavor) — the
-	// named flavor is the ONLY image-varying channel, ADR-002).
-	runnerImage := resolved.RunnerImage
-	if err := p.ensureImage(ctx, runnerImage); err != nil {
-		return guarded(err)
-	}
-
-	// 4b. Externals cache (ADR-003 W2): resolve the runner image's digest,
+	// 4. Externals cache (ADR-003 W2): resolve the runner image's digest,
 	// create-or-reuse the shared externals volume keyed on it, and SEED it once
 	// (blocking) so the runner mounts a fully-populated, read-only externals
 	// tree. Gated only on the cache feature being enabled — externals apply to

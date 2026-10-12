@@ -208,7 +208,7 @@ stale_cache_eviction_days = 30
 		supersededVol); err != nil {
 		t.Fatalf("(3) seed superseded volume: %v\n%s", err, out)
 	}
-	currentVol := spec.ToolcacheVolumeName(repoKey, "1")
+	currentVol := spec.ToolcacheVolumeName(repoKey, imageOSKey(t, imageA), "1")
 
 	// Trigger an opportunistic GC pass via ListInstances (it runs runCacheGC) and
 	// capture the provider's stderr, where the stale-cache operator log line goes.
@@ -339,7 +339,8 @@ stale_cache_eviction_days = 30
 // externals payload and pnpm) at the given tag, linux/amd64.
 func buildNobleRunnerImage(t *testing.T, root, tag string) {
 	t.Helper()
-	cmd := exec.Command("docker", "build", "--platform", "linux/amd64", "-t", tag, filepath.Join(root, "runner-images", "noble"))
+	args := append([]string{"build", "--platform", "linux/amd64", "-t", tag}, runnerImageBuildArgs(root, "noble")...)
+	cmd := exec.Command("docker", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build noble runner image: %v\n%s", err, out)
 	}

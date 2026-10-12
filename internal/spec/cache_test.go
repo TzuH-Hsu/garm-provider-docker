@@ -164,21 +164,21 @@ func TestCacheScopeAllowed(t *testing.T) {
 
 func TestCacheVolumeNames(t *testing.T) {
 	const repoKey = "octo-org-octo-repo-0123456789ab"
-	if got, want := ToolcacheVolumeName(repoKey, "1"), "garm-cache-toolcache-"+repoKey+"-1"; got != want {
+	if got, want := ToolcacheVolumeName(repoKey, testOSKey, "1"), "garm-cache-toolcache-"+repoKey+"-"+testOSKey+"-1"; got != want {
 		t.Errorf("ToolcacheVolumeName = %q, want %q", got, want)
 	}
-	if got, want := PnpmVolumeName(repoKey, "9"), "garm-cache-pnpm-"+repoKey+"-9"; got != want {
+	if got, want := PnpmVolumeName(repoKey, testOSKey, "9"), "garm-cache-pnpm-"+repoKey+"-"+testOSKey+"-9"; got != want {
 		t.Errorf("PnpmVolumeName = %q, want %q", got, want)
 	}
 	// A generation/pnpm-major bump produces a DIFFERENT volume name (fresh cache).
-	if ToolcacheVolumeName(repoKey, "1") == ToolcacheVolumeName(repoKey, "2") {
+	if ToolcacheVolumeName(repoKey, testOSKey, "1") == ToolcacheVolumeName(repoKey, testOSKey, "2") {
 		t.Error("a generation bump must produce a distinct toolcache volume name")
 	}
-	if PnpmVolumeName(repoKey, "9") == PnpmVolumeName(repoKey, "10") {
+	if PnpmVolumeName(repoKey, testOSKey, "9") == PnpmVolumeName(repoKey, testOSKey, "10") {
 		t.Error("a pnpm-major bump must produce a distinct pnpm volume name")
 	}
 	// Both are valid Docker resource names.
-	for _, n := range []string{ToolcacheVolumeName(repoKey, "1"), PnpmVolumeName(repoKey, "9")} {
+	for _, n := range []string{ToolcacheVolumeName(repoKey, testOSKey, "1"), PnpmVolumeName(repoKey, testOSKey, "9")} {
 		if err := ValidateDerivedName("cache volume", n); err != nil {
 			t.Errorf("cache volume name %q is invalid: %v", n, err)
 		}

@@ -77,7 +77,7 @@ const (
 	// DindSocketGIDEnv is the environment variable the provider sets on the
 	// runner (DinD modes only, BuildRunnerEnv) carrying DindSocketGID, so the
 	// runner-image entrypoint knows which GID to add the `runner` user to
-	// before dropping privileges (ADR-002; runner-images/noble/entrypoint.sh).
+	// before dropping privileges (ADR-002; runner-images/common/entrypoint.sh).
 	DindSocketGIDEnv = "DOCKER_SOCK_GID"
 )
 

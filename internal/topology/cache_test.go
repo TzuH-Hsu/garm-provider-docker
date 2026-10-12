@@ -14,6 +14,10 @@ import (
 
 const testRepoKey = "octo-org-octo-repo-0123456789ab"
 
+// testOSKey is the runner-image OS key the topology tests key toolcache and
+// pnpm volume names on (the Noble image's garm.docker/os-release value).
+const testOSKey = "ubuntu-24.04"
+
 func cacheIdentity() spec.CacheVolumeIdentity {
 	return spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey}
 }
@@ -54,7 +58,7 @@ func TestEnsureCacheVolumeMissThenHit(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	name := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	t1 := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
 	t2 := time.Date(2026, 7, 21, 11, 0, 0, 0, time.UTC)
 
@@ -124,7 +128,7 @@ func TestEnsureCacheVolumeReconcilesAroundForeignSquatter(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	name := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	foreignLabels := map[string]string{"someone": "else"}
 	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: foreignLabels}); err != nil {
 		t.Fatalf("seed foreign volume: %v", err)
@@ -183,7 +187,7 @@ func TestEnsureCacheVolumeReconcilesAroundRepokeyCollision(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	name := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	other := spec.CacheVolumeIdentity{ControllerID: testControllerID, RepoKey: testRepoKey, RepoURLDigest: "digest-of-a-DIFFERENT-repo"}
 	otherLabels := other.ToolcacheLabels("1", time.Now())
 	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: otherLabels}); err != nil {
@@ -229,7 +233,7 @@ func TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	name := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: map[string]string{}}); err != nil {
 		t.Fatalf("seed unlabeled volume: %v", err)
 	}
@@ -259,7 +263,7 @@ func TestEnsureCacheVolumeCrossControllerSharedReuseOK(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
 
-	name := spec.ToolcacheVolumeName(testRepoKey, "1")
+	name := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	peer := spec.CacheVolumeIdentity{ControllerID: "some-OTHER-controller", RepoKey: testRepoKey, RepoURLDigest: "shared-digest"}
 	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: peer.ToolcacheLabels("1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))}); err != nil {
 		t.Fatalf("seed peer-controller cache volume: %v", err)
@@ -277,8 +281,8 @@ func TestEnsureCacheVolumeDistinctKinds(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	tool := spec.ToolcacheVolumeName(testRepoKey, "1")
-	pnpm := spec.PnpmVolumeName(testRepoKey, "9")
+	tool := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
+	pnpm := spec.PnpmVolumeName(testRepoKey, testOSKey, "9")
 	if _, err := m.EnsureCacheVolume(ctx, tool, cacheIdentity().ToolcacheLabels("1", now)); err != nil {
 		t.Fatalf("toolcache ensure: %v", err)
 	}
@@ -305,7 +309,7 @@ func TestCacheVolumesSurviveTeardownAndSweep(t *testing.T) {
 	ctx := context.Background()
 
 	// A persistent cache volume for this repo.
-	cacheName := spec.ToolcacheVolumeName(testRepoKey, "1")
+	cacheName := spec.ToolcacheVolumeName(testRepoKey, testOSKey, "1")
 	if _, err := m.EnsureCacheVolume(ctx, cacheName, cacheIdentity().ToolcacheLabels("1", time.Now())); err != nil {
 		t.Fatalf("EnsureCacheVolume: %v", err)
 	}

@@ -44,7 +44,7 @@ func buildPnpmWrapperImage(t *testing.T, root, tag string) {
 	t.Helper()
 
 	nobleTag := "garm-h4-noble-real:latest"
-	if out, err := dockerTry("build", "--platform", "linux/amd64", "-t", nobleTag, filepath.Join(root, "runner-images", "noble")); err != nil {
+	if out, err := dockerTry(append([]string{"build", "--platform", "linux/amd64", "-t", nobleTag}, runnerImageBuildArgs(root, "noble")...)...); err != nil {
 		t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
 	}
 
@@ -77,7 +77,6 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 	token := randHex(t)
 	repoURL := "https://github.com/garm-h4-verify/repo-" + token
 	repoKey := spec.RepoKey(repoURL)
-	pnpmVol := spec.PnpmVolumeName(repoKey, "9")
 
 	// --- foreign snapshot (must be identical after) --------------------------
 	canaries := ensureForeignCanaries(t)
@@ -88,6 +87,8 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 
 	runnerTag := "garm-h4-verify-cli:" + token
 	buildPnpmWrapperImage(t, root, runnerTag)
+	osKey := imageOSKey(t, runnerTag)
+	pnpmVol := spec.PnpmVolumeName(repoKey, osKey, "9")
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
@@ -118,7 +119,7 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 
 	defer func() {
 		cleanupController(t, controllerID)
-		_, _ = dockerTry("volume", "rm", "-f", pnpmVol, spec.ToolcacheVolumeName(repoKey, "1"), spec.DiagVolumeName(repoKey))
+		_, _ = dockerTry("volume", "rm", "-f", pnpmVol, spec.ToolcacheVolumeName(repoKey, osKey, "1"), spec.DiagVolumeName(repoKey))
 		_, _ = dockerTry("rmi", "-f", runnerTag)
 		assertForeignPresent(t, canaries[0])
 		assertForeignPresent(t, canaries[1])

@@ -108,6 +108,12 @@ func (c *cachePlan) addCacheRef(name string, want map[string]string) {
 //     member repo into one cross-repo cache);
 //   - unparseable repo_url (unknown scope)  -> NO persistent cache (fail-safe).
 //
+// The toolcache and pnpm store volumes are also keyed on the runner image's OS
+// release (runnerOSKey, ADR-003 2026-10-12 amendment), so pools of the same
+// repository on, say, Ubuntu 24.04 and 26.04 images never share one: their
+// contents are built for one release. runnerImage must already be present
+// locally (CreateInstance pulls it first). The diag-logs volume stays per repo.
+//
 // In the no-persistent-cache cases RUNNER_TOOL_CACHE is still set to the
 // configured toolcache_path (an ephemeral in-container toolcache), so the runner
 // behaves consistently; only the persistent VOLUME is withheld.
@@ -119,7 +125,7 @@ func (c *cachePlan) addCacheRef(name string, want map[string]string) {
 // inside CreateInstance's guarded region for its own error handling (a
 // cache-volume create failure fails the allocation and rolls back the
 // allocation's OWN resources), but the caches themselves are never rolled back.
-func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapInstance) (cachePlan, error) {
+func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapInstance, runnerImage string) (cachePlan, error) {
 	if !p.cfg.Cache.Enabled {
 		return cachePlan{}, nil
 	}
@@ -135,17 +141,23 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 		return plan, nil
 	}
 
+	osKey, err := p.runnerOSKey(ctx, runnerImage)
+	if err != nil {
+		return cachePlan{}, err
+	}
+
 	repoKey := spec.RepoKey(bootstrap.RepoURL)
 	id := spec.CacheVolumeIdentity{
 		ControllerID:  p.controllerID,
 		RepoKey:       repoKey,
 		RepoURLDigest: spec.RepoURLDigest(bootstrap.RepoURL),
+		OSKey:         osKey,
 	}
 	// One creation timestamp for both volumes' last-used labels. time.Now() is
 	// here (the impure provider layer), not in the pure spec builders.
 	lastUsed := time.Now()
 
-	toolName := spec.ToolcacheVolumeName(repoKey, p.cfg.Cache.Generation)
+	toolName := spec.ToolcacheVolumeName(repoKey, osKey, p.cfg.Cache.Generation)
 	if err := spec.ValidateDerivedName("toolcache cache volume", toolName); err != nil {
 		return cachePlan{}, err
 	}
@@ -157,7 +169,7 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	plan.toolcacheVolume = toolRes.Name
 	plan.addCacheRef(toolRes.Name, toolLabels)
 
-	pnpmName := spec.PnpmVolumeName(repoKey, p.cfg.Cache.PnpmMajor)
+	pnpmName := spec.PnpmVolumeName(repoKey, osKey, p.cfg.Cache.PnpmMajor)
 	if err := spec.ValidateDerivedName("pnpm store cache volume", pnpmName); err != nil {
 		return cachePlan{}, err
 	}
@@ -187,9 +199,35 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 	plan.addCacheRef(diagRes.Name, diagLabels)
 
 	slog.InfoContext(ctx, "CreateInstance: repo-scoped caches resolved",
-		"instance", bootstrap.Name, "repo_key", repoKey,
+		"instance", bootstrap.Name, "repo_key", repoKey, "os_key", osKey,
 		"toolcache_volume", toolName, "toolcache_hit", toolRes.Hit,
 		"pnpm_volume", pnpmName, "pnpm_hit", pnpmRes.Hit,
 		"diag_volume", diagName, "diag_hit", diagRes.Hit)
 	return plan, nil
+}
+
+// runnerOSKey reads the OS key of the locally present runner image: its
+// garm.docker/os-release label, or a key derived from its content ID when the
+// label is absent (spec.RunnerOSKey). A malformed label fails the allocation
+// rather than guessing which caches the image may share.
+func (p *Provider) runnerOSKey(ctx context.Context, runnerImage string) (string, error) {
+	insp, _, err := p.cli.ImageInspectWithRaw(ctx, runnerImage)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect runner image %q for its OS release: %w", runnerImage, err)
+	}
+	var labels map[string]string
+	if insp.Config != nil {
+		labels = insp.Config.Labels
+	}
+	key, err := spec.RunnerOSKey(labels, insp.ID)
+	if err != nil {
+		return "", fmt.Errorf("runner image %q: %w", runnerImage, err)
+	}
+	if _, labelled := labels[spec.LabelOSRelease]; !labelled {
+		// Correct but costly: every rebuild of this image starts its toolcache
+		// and pnpm store cold. Say so, so an operator can add the label.
+		slog.InfoContext(ctx, "CreateInstance: runner image has no OS release label; keying its toolcache and pnpm store on the image digest (set the label to keep them warm across rebuilds)",
+			"image", runnerImage, "label", spec.LabelOSRelease, "os_key", key)
+	}
+	return key, nil
 }

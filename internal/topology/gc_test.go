@@ -67,8 +67,8 @@ func TestListStaleCachesReturnsDecidedKeepsOthers(t *testing.T) {
 	ctx := context.Background()
 	failIfVolumeRemoved(t, fake)
 
-	keepName := spec.ToolcacheVolumeName("keep", "1")
-	staleName := spec.ToolcacheVolumeName("stale", "1")
+	keepName := spec.ToolcacheVolumeName("keep", testOSKey, "1")
+	staleName := spec.ToolcacheVolumeName("stale", testOSKey, "1")
 	seedRawCacheVolume(t, fake, keepName, fullCacheID("keep").ToolcacheLabels("1", gcTime()))
 	seedRawCacheVolume(t, fake, staleName, fullCacheID("stale").ToolcacheLabels("1", gcTime()))
 
@@ -96,9 +96,9 @@ func TestListStaleCachesNeverRemovesEvenWhenAllStale(t *testing.T) {
 	failIfVolumeRemoved(t, fake)
 
 	names := []string{
-		spec.ToolcacheVolumeName("a", "1"),
-		spec.ToolcacheVolumeName("b", "1"),
-		spec.ToolcacheVolumeName("c", "1"),
+		spec.ToolcacheVolumeName("a", testOSKey, "1"),
+		spec.ToolcacheVolumeName("b", testOSKey, "1"),
+		spec.ToolcacheVolumeName("c", testOSKey, "1"),
 	}
 	for i, key := range []string{"a", "b", "c"} {
 		seedRawCacheVolume(t, fake, names[i], fullCacheID(key).ToolcacheLabels("1", gcTime()))
@@ -130,11 +130,11 @@ func TestListStaleCachesRequiresFullIdentity(t *testing.T) {
 	failIfVolumeRemoved(t, fake)
 
 	// Complete identity → reported.
-	completeName := spec.ToolcacheVolumeName("complete", "1")
+	completeName := spec.ToolcacheVolumeName("complete", testOSKey, "1")
 	seedRawCacheVolume(t, fake, completeName, fullCacheID("complete").ToolcacheLabels("1", gcTime()))
 
 	// Incomplete identity (no repo-url-digest) → skipped even though decide matches.
-	incompleteName := spec.ToolcacheVolumeName("incomplete", "1")
+	incompleteName := spec.ToolcacheVolumeName("incomplete", testOSKey, "1")
 	seedRawCacheVolume(t, fake, incompleteName, map[string]string{
 		spec.LabelManaged:      "true",
 		spec.LabelControllerID: testControllerID,
@@ -166,7 +166,7 @@ func TestListStaleCachesNeverTouchesForeignOrNonCache(t *testing.T) {
 
 	// Foreign controller's cache volume (different controller-id label).
 	foreign := spec.CacheVolumeIdentity{ControllerID: "other-controller", RepoKey: "evict", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/evict")}
-	foreignName := spec.ToolcacheVolumeName("evict", "1") + "-foreign"
+	foreignName := spec.ToolcacheVolumeName("evict", testOSKey, "1") + "-foreign"
 	seedRawCacheVolume(t, fake, foreignName, foreign.ToolcacheLabels("1", gcTime()))
 
 	// A job-scoped (non-cache) volume for THIS controller.
@@ -198,7 +198,7 @@ func TestListDiagVolumes(t *testing.T) {
 	diagName := spec.DiagVolumeName("repo-a")
 	seedRawCacheVolume(t, fake, diagName, id.DiagLabels(gcTime()))
 	// A toolcache volume (different kind) and a foreign diag volume must be excluded.
-	seedRawCacheVolume(t, fake, spec.ToolcacheVolumeName("repo-a", "1"), id.ToolcacheLabels("1", gcTime()))
+	seedRawCacheVolume(t, fake, spec.ToolcacheVolumeName("repo-a", testOSKey, "1"), id.ToolcacheLabels("1", gcTime()))
 	foreign := spec.CacheVolumeIdentity{ControllerID: "other", RepoKey: "repo-b", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/repo-b")}
 	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-b"), foreign.DiagLabels(gcTime()))
 	// An INCOMPLETE diag volume (no repo-url-digest) for this controller — the
@@ -237,10 +237,10 @@ func TestListUnprovableCacheCruft(t *testing.T) {
 	ctx := context.Background()
 
 	id := fullCacheID("repo-a")
-	oursName := spec.ToolcacheVolumeName("repo-a", "1")
+	oursName := spec.ToolcacheVolumeName("repo-a", testOSKey, "1")
 	seedRawCacheVolume(t, fake, oursName, id.ToolcacheLabels("1", gcTime()))
 
-	cruftName := spec.ToolcacheVolumeName("repo-b", "1") // cache-named but UNLABELED
+	cruftName := spec.ToolcacheVolumeName("repo-b", testOSKey, "1") // cache-named but UNLABELED
 	if _, err := fake.VolumeCreate(ctx, volume.CreateOptions{Name: cruftName, Labels: map[string]string{}}); err != nil {
 		t.Fatalf("seed cruft: %v", err)
 	}

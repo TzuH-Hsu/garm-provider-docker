@@ -22,7 +22,10 @@ func TestEvaluateCacheEviction(t *testing.T) {
 		StaleDays:   30,
 		Grace:       30 * time.Minute,
 	}
-	id := CacheVolumeIdentity{ControllerID: "ctrl-1", RepoKey: "repo-abc"}
+	id := CacheVolumeIdentity{ControllerID: "ctrl-1", RepoKey: "repo-abc", OSKey: testOSKey}
+	// preOSKey is a volume created before toolcache/pnpm volumes carried the OS
+	// key: no os-release label.
+	preOSKey := CacheVolumeIdentity{ControllerID: "ctrl-1", RepoKey: "repo-abc"}
 	ext := ExternalsVolumeIdentity{ControllerID: "ctrl-1", ImageDigest: digest}
 
 	tests := []struct {
@@ -30,6 +33,26 @@ func TestEvaluateCacheEviction(t *testing.T) {
 		labels    map[string]string
 		wantEvict bool
 	}{
+		{
+			name:      "pre-OS-key toolcache, current generation, past grace → evict",
+			labels:    withLastUsed(preOSKey.ToolcacheLabels("2", time.Time{}), lu(2*time.Hour)),
+			wantEvict: true,
+		},
+		{
+			name:      "pre-OS-key pnpm, current major, past grace → evict",
+			labels:    withLastUsed(preOSKey.PnpmLabels("9", time.Time{}), lu(2*time.Hour)),
+			wantEvict: true,
+		},
+		{
+			name:      "pre-OS-key toolcache, WITHIN grace → keep",
+			labels:    withLastUsed(preOSKey.ToolcacheLabels("2", time.Time{}), lu(5*time.Minute)),
+			wantEvict: false,
+		},
+		{
+			name:      "diag-logs never carries the OS key and is never superseded",
+			labels:    withLastUsed(preOSKey.DiagLabels(time.Time{}), lu(2*time.Hour)),
+			wantEvict: false,
+		},
 		{
 			name:      "current toolcache generation, fresh → keep",
 			labels:    withLastUsed(id.ToolcacheLabels("2", time.Time{}), lu(time.Hour)),
@@ -160,7 +183,7 @@ func TestEvaluateCacheEvictionUnknownDigestSkipsSupersession(t *testing.T) {
 // age backstop, so a very old but current-salt volume is kept.
 func TestEvaluateCacheEvictionStaleDaysZeroDisablesAge(t *testing.T) {
 	cfg := CacheGCConfig{Generation: "2", PnpmMajor: "9", StaleDays: 0, Grace: time.Minute}
-	id := CacheVolumeIdentity{ControllerID: "ctrl-1", RepoKey: "repo-abc"}
+	id := CacheVolumeIdentity{ControllerID: "ctrl-1", RepoKey: "repo-abc", OSKey: testOSKey}
 	old := withLastUsed(id.ToolcacheLabels("2", time.Time{}), lu(1000*24*time.Hour))
 	if evict, _ := EvaluateCacheEviction(old, cfg, gcNow); evict {
 		t.Error("StaleDays=0 must disable age eviction; a current-salt volume must be kept regardless of age")

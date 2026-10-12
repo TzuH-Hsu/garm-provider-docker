@@ -3,7 +3,7 @@
 // This file adds the M2 consumer-side externals seed-gate real-daemon
 // verification (ADR-003 W2 structural redesign, 2026-07-22). It exercises the
 // gate VERBATIM against the production runner entrypoint by SOURCING the REAL
-// runner-images/noble/entrypoint.sh (whose main is guarded not to run when
+// runner-images/common/entrypoint.sh (whose main is guarded not to run when
 // sourced) and invoking the REAL wait_for_externals_seeded under that file's own
 // `set -euo pipefail` — the same source-the-real-entrypoint discipline the H4
 // non-root tests use — so the behavior proven here is the production code, not a
@@ -41,7 +41,7 @@ func buildSeedGateImage(t *testing.T, root, tag string) {
 	dir := t.TempDir()
 
 	// Copy the real production entrypoint verbatim into the build context.
-	realEntrypoint := filepath.Join(root, "runner-images", "noble", "entrypoint.sh")
+	realEntrypoint := realEntrypointPath(root)
 	data, err := os.ReadFile(realEntrypoint)
 	if err != nil {
 		t.Fatalf("read real entrypoint.sh: %v", err)

@@ -1,4 +1,6 @@
-# M4-W1: builds and publishes this repo's two container images to GHCR.
+# M4-W1: builds and publishes this repo's container images to GHCR: the two
+# runner images (Ubuntu 24.04 Noble and Ubuntu 26.04 Resolute, ADR-002) and
+# the provider binary image.
 #
 # Four jobs, split by trigger and by which of them can reach GHCR at all:
 #
@@ -8,14 +10,14 @@
 #     so nothing a `docker pull <image>:<tag>` resolves changes yet. Each
 #     leg hands its digest to publish-tag as a run artifact.
 #   publish-tag — no matrix, `needs: publish-build`, so it only starts once
-#     EVERY build leg has succeeded. Checks that both digests are present,
-#     then points `<image>:<tag>` at them for both images. One failed build
-#     therefore publishes nothing under a tag, instead of advancing one
-#     image of the pair and not the other (#8). It never touches `:latest`.
+#     EVERY build leg has succeeded. Checks that every digest is present,
+#     then points `<image>:<tag>` at them for every image. One failed build
+#     therefore publishes nothing under a tag, instead of advancing some
+#     images of the set and not the others (#8). It never touches `:latest`.
 #
 #   On a GitHub release becoming a full (non-pre-release) release:
-#   promote-latest — moves `<image>:latest` to `<image>:<tag>` for both
-#     images. It runs on `release: released`, which fires when a full
+#   promote-latest — moves `<image>:latest` to `<image>:<tag>` for every
+#     image. It runs on `release: released`, which fires when a full
 #     release is published (including publishing release.yml's draft as
 #     one) or when a published pre-release is changed to a full release.
 #     A tag push alone therefore never moves `:latest` (#7): release.yml
@@ -130,19 +132,26 @@ jobs:
       packages: write
     strategy:
       # Still false here, on purpose: a failing leg can no longer publish a
-      # half-release (publish-tag below never starts unless both legs
+      # half-release (publish-tag below never starts unless every leg
       # succeeded), so letting the other leg finish costs nothing and
       # surfaces every failure in one run instead of one per re-run.
       fail-fast: false
       matrix:
         include:
-          # (a) the runner image (ADR-002): built from its own directory so
-          # entrypoint.sh's relative COPY resolves the same way it does for
-          # a local `docker build runner-images/noble`.
+          # (a) the runner images (ADR-002): each built from runner-images/
+          # with its own Dockerfile, so the entrypoint both share
+          # (runner-images/common/entrypoint.sh) resolves the same way it
+          # does for a local `docker build -f runner-images/<name>/Dockerfile
+          # runner-images`.
           - name: garm-runner-noble
             image: ghcr.io/tzuh-hsu/garm-runner-noble
-            context: runner-images/noble
+            context: runner-images
             dockerfile: runner-images/noble/Dockerfile
+            needs_version_arg: false
+          - name: garm-runner-resolute
+            image: ghcr.io/tzuh-hsu/garm-runner-resolute
+            context: runner-images
+            dockerfile: runner-images/resolute/Dockerfile
             needs_version_arg: false
           # (b) the provider binary image (plan.md M4 item 1): built from
           # the repo root so the root Dockerfile's `COPY . .` sees the
@@ -167,7 +176,7 @@ jobs:
       # It is checked against Docker's tag grammar (a leading `v<digit>`,
       # then only [A-Za-z0-9_.-]) HERE, before a long multi-arch build,
       # rather than letting publish-tag discover an untaggable name after
-      # both images are already sitting in the registry. publish-tag reads
+      # every image is already sitting in the registry. publish-tag reads
       # the same $GITHUB_REF_NAME in the same run and relies on this check.
       - name: Determine build metadata
         id: meta
@@ -259,7 +268,7 @@ jobs:
 
   # Real publish, stage 2 of 2. `needs: publish-build` means this job is
   # skipped unless every matrix leg above succeeded, so a tag only ever
-  # moves once BOTH images exist. `docker buildx imagetools create` with a
+  # moves once EVERY image exists. `docker buildx imagetools create` with a
   # single image-index source re-pushes that index's original bytes under
   # the new tag (buildx util/imagetools/create.go: "on single source,
   # return original bytes"), so `<image>:<tag>` resolves to exactly the
@@ -267,7 +276,7 @@ jobs:
   #
   # Honest limit: a registry has no multi-tag transaction, so the tag
   # writes below are still sequential. What this job guarantees is that
-  # none of them starts until both images are built and both digests are
+  # none of them starts until every image is built and every digest is
   # in hand; if a tag write itself fails part-way, re-running this job
   # re-applies every tag to the same digests.
   publish-tag:
@@ -302,20 +311,22 @@ jobs:
       # Two passes over the same fixed image list: the first only reads and
       # checks, so a missing or malformed digest fails the job before a
       # single tag is written. $GITHUB_REF_NAME was validated against the
-      # tag grammar by publish-build in this same run.
-      - name: Tag both images
+      # tag grammar by publish-build in this same run. The list must name
+      # every publish-build matrix leg.
+      - name: Tag every image
         run: |
           version="${GITHUB_REF_NAME}"
           dir="${RUNNER_TEMP}/digests"
           images=(
             ghcr.io/tzuh-hsu/garm-runner-noble
+            ghcr.io/tzuh-hsu/garm-runner-resolute
             ghcr.io/tzuh-hsu/garm-provider-docker
           )
 
           for image in "${images[@]}"; do
             file="${dir}/${image##*/}"
             if [ ! -s "${file}" ]; then
-              echo "::error::no digest artifact for ${image}; refusing to tag either image"
+              echo "::error::no digest artifact for ${image}; refusing to tag any image"
               exit 1
             fi
             digest="$(cat "${file}")"
@@ -333,16 +344,16 @@ jobs:
               "${image}@${digest}"
           done
 
-  # Moves `:latest` for both images to the release's `:<tag>` when that
+  # Moves `:latest` for every image to the release's `:<tag>` when that
   # GitHub release becomes a full release: its draft is published as a
   # non-pre-release, or an already-published pre-release is changed to a
   # full release. Both routes fire `release: released` (see the file
   # header for why that activity, why it fires here at all, and why the
   # `prerelease` check in `if:` is kept anyway). Publishing a pre-release
   # does not move `:latest`; promoting that pre-release later does.
-  # Nothing is built or checked out: both `:<tag>` images must already
-  # exist from the tag-push run, and this job refuses to move either
-  # `:latest` unless BOTH do, so the pair can never end up split across
+  # Nothing is built or checked out: every `:<tag>` image must already
+  # exist from the tag-push run, and this job refuses to move any
+  # `:latest` unless ALL do, so the set can never end up split across
   # releases.
   promote-latest:
     name: promote-latest
@@ -382,16 +393,17 @@ jobs:
       # before any `:latest` is written. A single image-index source is
       # re-pushed byte for byte, so `:latest` ends up at exactly the
       # digest `:<tag>` points to.
-      - name: Promote both images to latest
+      - name: Promote every image to latest
         run: |
           images=(
             ghcr.io/tzuh-hsu/garm-runner-noble
+            ghcr.io/tzuh-hsu/garm-runner-resolute
             ghcr.io/tzuh-hsu/garm-provider-docker
           )
 
           for image in "${images[@]}"; do
             if ! docker buildx imagetools inspect "${image}:${TAG}" > /dev/null; then
-              echo "::error::${image}:${TAG} not found or not readable; refusing to move :latest on either image"
+              echo "::error::${image}:${TAG} not found or not readable; refusing to move :latest on any image"
               exit 1
             fi
           done
@@ -422,8 +434,13 @@ jobs:
         include:
           - name: garm-runner-noble
             image: ghcr.io/tzuh-hsu/garm-runner-noble
-            context: runner-images/noble
+            context: runner-images
             dockerfile: runner-images/noble/Dockerfile
+            needs_version_arg: false
+          - name: garm-runner-resolute
+            image: ghcr.io/tzuh-hsu/garm-runner-resolute
+            context: runner-images
+            dockerfile: runner-images/resolute/Dockerfile
             needs_version_arg: false
           - name: garm-provider-docker
             image: ghcr.io/tzuh-hsu/garm-provider-docker
@@ -481,8 +498,8 @@ jobs:
             echo
             echo "- Synthetic version: \`${VERSION}\`"
             echo "- Tag that WOULD have been built: \`${TAGS}\`"
-            echo "- A pushed \`v*\` tag pushes both images by digest, then tags"
-            echo "  \`<image>:<tag>\` only after both built. \`<image>:latest\` moves"
+            echo "- A pushed \`v*\` tag pushes every image by digest, then tags"
+            echo "  \`<image>:<tag>\` only after all built. \`<image>:latest\` moves"
             echo "  only when the GitHub release for that tag becomes a full"
             echo "  (non-pre-release) release."
           } >> "$GITHUB_STEP_SUMMARY"
