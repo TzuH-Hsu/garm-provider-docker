@@ -128,7 +128,7 @@ func WorkspaceMount() mount.Mount {
 //
 // The target is RunnerWorkDir (/actions-runner/_work), which is exactly where
 // the runner image writes _work (RUNNER_WORKDIR resolved by
-// runner-images/noble/entrypoint.sh's resolve_workdir), so a job's checkout
+// runner-images/common/entrypoint.sh's resolve_workdir), so a job's checkout
 // lands on this dedicated volume rather than the container rootfs — the ADR-002
 // contract the WP9-flagged JIT-workdir check asserts.
 func NamedWorkspaceMount(name string) mount.Mount {

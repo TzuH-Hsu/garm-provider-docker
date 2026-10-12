@@ -203,8 +203,8 @@ func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 	// superseded generation "0" created 2h ago (past the 30m grace) and the current
 	// generation "1" created just now.
 	id := spec.CacheVolumeIdentity{ControllerID: "controller-abc", RepoKey: "repo-x", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/repo-x")}
-	superseded := spec.ToolcacheVolumeName("repo-x", "0")
-	current := spec.ToolcacheVolumeName("repo-x", "1")
+	superseded := spec.ToolcacheVolumeName("repo-x", testOSKey, "0")
+	current := spec.ToolcacheVolumeName("repo-x", testOSKey, "1")
 	seedVol(t, fake, superseded, id.ToolcacheLabels("0", time.Now().Add(-2*time.Hour)))
 	seedVol(t, fake, current, id.ToolcacheLabels("1", time.Now()))
 

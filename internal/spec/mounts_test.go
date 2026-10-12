@@ -168,7 +168,7 @@ func TestNamedWorkspaceMount(t *testing.T) {
 		t.Errorf("Target = %q, want %q (runner image RUNNER_WORKDIR)", m.Target, RunnerWorkDir)
 	}
 	if RunnerWorkDir != "/actions-runner/_work" {
-		t.Errorf("RunnerWorkDir = %q, want /actions-runner/_work (runner-images/noble RUNNER_DIR + _work)", RunnerWorkDir)
+		t.Errorf("RunnerWorkDir = %q, want /actions-runner/_work (runner-images RUNNER_DIR + _work)", RunnerWorkDir)
 	}
 }
 

@@ -64,7 +64,7 @@ func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 // and real entrypoint.sh) so F1 is proven against the production code VERBATIM,
 // not a re-implementation with softened error handling (N3). The base ships the
 // genuine `runner` user, gosu, the docker CLI, and getent/groupadd/usermod, and
-// its /entrypoint.sh is the ACTUAL runner-images/noble/entrypoint.sh whose
+// its /entrypoint.sh is the ACTUAL runner-images/common/entrypoint.sh whose
 // ensure_docker_socket_group carries the F1 fix.
 //
 // The ONLY deviation from production is the wrapper entrypoint: it SOURCES the
@@ -83,7 +83,7 @@ func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 
 	// 1. Build the REAL production runner image (real Dockerfile + entrypoint).
 	nobleTag := "garm-nr-noble-real:latest"
-	if out, err := dockerTry("build", "-t", nobleTag, filepath.Join(root, "runner-images", "noble")); err != nil {
+	if out, err := dockerTry(append([]string{"build", "-t", nobleTag}, runnerImageBuildArgs(root, "noble")...)...); err != nil {
 		t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
 	}
 

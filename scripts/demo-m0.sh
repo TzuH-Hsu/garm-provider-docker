@@ -34,14 +34,16 @@
 #   release    (default) Downloads the published vX.Y.Z release binary for
 #               this host's OS/arch, verifies it against the release's
 #               SHA256SUMS, and pins runner_image to the published
-#               ghcr.io/tzuh-hsu/garm-runner-noble image BY DIGEST
+#               ghcr.io/tzuh-hsu/garm-runner-<RUNNER_IMAGE_NAME> image
+#               (garm-runner-noble by default) BY DIGEST
 #               (resolved at run time via `docker buildx imagetools
 #               inspect`) - so this run validates exactly what a real
 #               operator installs, with digest-pin enforcement left ON
 #               (no allow_unpinned_runner_image).
 #   source     Builds the provider binary and the runner image from this
 #               checkout (the original M0-era behavior): a local `go
-#               build`, a local `docker build runner-images/noble`, and
+#               build`, a local `docker build` of runner-images/noble (or
+#               runner-images/resolute with --runner-image resolute), and
 #               allow_unpinned_runner_image=true (required for a mutable
 #               local tag). For development against uncommitted changes.
 #
@@ -77,7 +79,8 @@
 # argv or committed to an env var this script echoes.
 #
 # Usage:
-#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind] [COMMAND]
+#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
+#                      [--runner-image noble|resolute] [COMMAND]
 #
 # COMMAND (default: all):
 #   preflight   Step 0: environment checks; obtain the provider binary +
@@ -112,6 +115,12 @@
 #                   (equivalent to GARM_TARGET=pool)
 #   --dind          Run the DinD variant (privileged-sidecar) instead of
 #                   dind_mode=none (equivalent to GATE_VARIANT=dind)
+#   --runner-image noble|resolute
+#                   Runner image to gate: the Ubuntu 24.04 image (default)
+#                   or the Ubuntu 26.04 one (equivalent to
+#                   RUNNER_IMAGE_NAME=...). Release mode needs a release
+#                   that publishes that image (garm-runner-resolute exists
+#                   from v0.2.3 on).
 #   -h, --help      Show usage
 #
 # Environment variables (all optional unless noted - see docs/demo-m0.md):
@@ -126,8 +135,9 @@
 #                          modes above. --from-source sets this to "source".
 #   PROVIDER_VERSION      The vX.Y.Z release to download and validate in
 #                          "release" mode (also selects the
-#                          ghcr.io/tzuh-hsu/garm-runner-noble tag whose
-#                          digest gets resolved). Ignored in "source" mode.
+#                          ghcr.io/tzuh-hsu/garm-runner-<RUNNER_IMAGE_NAME>
+#                          tag whose digest gets resolved). Ignored in
+#                          "source" mode.
 #                          Default: v0.2.2
 #   GARM_TARGET           "scaleset" (default) or "pool" - see above.
 #   GATE_VARIANT          "none" (default) or "dind" - see above.
@@ -155,8 +165,11 @@
 #                          into. Default: <repo>/bin
 #   PROVIDER_CONFIG_DIR   Directory the generated demo provider config.toml
 #                          is written into. Default: ${TMPDIR:-/tmp}/garm-provider-docker-demo
+#   RUNNER_IMAGE_NAME     "noble" (default) or "resolute": which runner image
+#                          (runner-images/<name>, ghcr.io/tzuh-hsu/garm-runner-<name>)
+#                          the gate builds or pins. --runner-image sets it.
 #   RUNNER_IMAGE_TAG      Local tag for the runner image build. "source"
-#                          mode only. Default: garm-runner-noble:demo
+#                          mode only. Default: garm-runner-<RUNNER_IMAGE_NAME>:demo
 #   OS_ARCH               Runner OS architecture: "amd64" or "arm64".
 #                          Auto-detected from `uname -m` when unset. If set,
 #                          it must equal the host's architecture (the
@@ -200,6 +213,7 @@ EXPL_PROVIDER_VERSION="${PROVIDER_VERSION:-}"
 EXPL_PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-}"
 EXPL_GARM_TARGET="${GARM_TARGET:-}"
 EXPL_GATE_VARIANT="${GATE_VARIANT:-}"
+EXPL_RUNNER_IMAGE_NAME="${RUNNER_IMAGE_NAME:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.2}"
@@ -219,10 +233,16 @@ PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_DIR}/config.toml"
 # needs allow_unpinned_runner_image=true in the generated config (ADR-002/
 # ADR-005 F10; internal/config/config.go's validateDigestPinnedImage).
 # "release" mode never uses this - it pins runner_image by digest instead.
-RUNNER_IMAGE_TAG="${RUNNER_IMAGE_TAG:-garm-runner-noble:demo}"
+# The runner image to gate: runner-images/<name> in "source" mode,
+# ghcr.io/tzuh-hsu/garm-runner-<name> in "release" mode. RUNNER_IMAGE_TAG's
+# default and RUNNER_IMAGE_REPO follow it; set_runner_image_vars derives them
+# once the mode (possibly a saved one) is final.
+RUNNER_IMAGE_NAME="${RUNNER_IMAGE_NAME:-noble}"
+EXPL_RUNNER_IMAGE_TAG="${RUNNER_IMAGE_TAG:-}"
+RUNNER_IMAGE_TAG=""
 
 # The published runner image "release" mode resolves a digest for.
-RUNNER_IMAGE_REPO="ghcr.io/tzuh-hsu/garm-runner-noble"
+RUNNER_IMAGE_REPO=""
 
 # The GitHub release this repo's own release.yml publishes assets to.
 RELEASE_REPO_SLUG="TzuH-Hsu/garm-provider-docker"
@@ -404,8 +424,15 @@ ensure_private_dir() {
   chmod "$3" "$1" || die "could not set mode $3 on $1 ($2); fix it manually (chmod $3 $1)"
 }
 
+# set_runner_image_vars derives the runner image tag and repository from
+# RUNNER_IMAGE_NAME (validated by validate_modes before it is used).
+set_runner_image_vars() {
+  RUNNER_IMAGE_TAG="${EXPL_RUNNER_IMAGE_TAG:-garm-runner-${RUNNER_IMAGE_NAME}:demo}"
+  RUNNER_IMAGE_REPO="ghcr.io/tzuh-hsu/garm-runner-${RUNNER_IMAGE_NAME}"
+}
+
 # validate_modes rejects an unknown GARM_TARGET / GATE_VARIANT /
-# PROVIDER_INTERFACE_VERSION early.
+# PROVIDER_INTERFACE_VERSION / RUNNER_IMAGE_NAME early.
 validate_modes() {
   case "${PROVIDER_INTERFACE_VERSION}" in
     v0.1.0|v0.1.1) ;;
@@ -419,6 +446,11 @@ validate_modes() {
     none|dind) ;;
     *) die "GATE_VARIANT must be 'none' or 'dind', got '${GATE_VARIANT}'" ;;
   esac
+  case "${RUNNER_IMAGE_NAME}" in
+    noble|resolute) ;;
+    *) die "RUNNER_IMAGE_NAME must be 'noble' or 'resolute', got '${RUNNER_IMAGE_NAME}'" ;;
+  esac
+  set_runner_image_vars
   validate_inputs
   check_private_dir "${PROVIDER_BIN_DIR}" PROVIDER_BIN_DIR
   check_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR
@@ -432,7 +464,7 @@ validate_modes() {
 # variant and interface version. Format: KEY=value lines, parsed WITHOUT
 # sourcing or eval, keys and values strictly allowlisted.
 
-readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION"
+readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME"
 
 modes_file() { printf '%s/gate-modes' "${PROVIDER_CONFIG_DIR}"; }
 
@@ -444,6 +476,7 @@ mode_value_valid() {
     GARM_TARGET)                [[ "$2" =~ ^(scaleset|pool)$ ]] ;;
     GATE_VARIANT)               [[ "$2" =~ ^(none|dind)$ ]] ;;
     PROVIDER_INTERFACE_VERSION) [[ "$2" =~ ^v0\.1\.[01]$ ]] ;;
+    RUNNER_IMAGE_NAME)          [[ "$2" =~ ^(noble|resolute)$ ]] ;;
     *) return 1 ;;
   esac
 }
@@ -457,6 +490,7 @@ explicit_mode_value() {
     GARM_TARGET)                printf '%s' "${EXPL_GARM_TARGET}" ;;
     GATE_VARIANT)               printf '%s' "${EXPL_GATE_VARIANT}" ;;
     PROVIDER_INTERFACE_VERSION) printf '%s' "${EXPL_PROVIDER_INTERFACE_VERSION}" ;;
+    RUNNER_IMAGE_NAME)          printf '%s' "${EXPL_RUNNER_IMAGE_NAME}" ;;
   esac
 }
 
@@ -954,8 +988,11 @@ download_provider_binary() {
 # the temporary tag on every exit.
 build_runner_image() {
   STAGE_IMAGE_TAG="garm-demo-runner-stage:$$-${RANDOM}${RANDOM}"
-  log "Building runner image from runner-images/noble as ${STAGE_IMAGE_TAG} (${RUNNER_IMAGE_TAG} is retagged only after preflight succeeds) ..."
-  docker build -t "${STAGE_IMAGE_TAG}" "${REPO_ROOT}/runner-images/noble" \
+  log "Building runner image from runner-images/${RUNNER_IMAGE_NAME} as ${STAGE_IMAGE_TAG} (${RUNNER_IMAGE_TAG} is retagged only after preflight succeeds) ..."
+  # The build context is runner-images/, so the shared entrypoint in
+  # runner-images/common/ is in reach of every image's Dockerfile.
+  docker build -t "${STAGE_IMAGE_TAG}" \
+    -f "${REPO_ROOT}/runner-images/${RUNNER_IMAGE_NAME}/Dockerfile" "${REPO_ROOT}/runner-images" \
     || die "docker build of the runner image failed"
 }
 
@@ -977,7 +1014,7 @@ imagetools_digest() {
   printf '%s' "${digest}"
 }
 
-# resolve_runner_image_digest resolves ghcr.io/tzuh-hsu/garm-runner-noble's
+# resolve_runner_image_digest resolves ghcr.io/tzuh-hsu/garm-runner-<name>'s
 # PROVIDER_VERSION tag to its current manifest-list digest via `docker
 # buildx imagetools inspect` (no pull required) and prints the resulting
 # name@sha256:<digest> reference. This is the SAME digest for every
@@ -2138,7 +2175,8 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind] [COMMAND]
+Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
+                          [--runner-image noble|resolute] [COMMAND]
 
 COMMAND (default: all):
   preflight   Step 0: environment checks; obtain the provider binary + runner image, generate demo config, smoke-test it
@@ -2162,6 +2200,10 @@ Flags:
                        to be able to reach GARM's webhook endpoint.
   --dind              DinD variant: privileged-sidecar + docker run/build in the
                        job, instead of dind_mode=none (GATE_VARIANT=dind)
+  --runner-image noble|resolute
+                      Runner image to gate: Ubuntu 24.04 (default) or 26.04
+                       (RUNNER_IMAGE_NAME=...). Release mode needs a release
+                       that publishes it (resolute: v0.2.3 and later)
   -h, --help          Show this help
 
 The modes chosen for preflight (or all) are remembered, so later single steps
@@ -2188,6 +2230,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pool) GARM_TARGET="pool"; EXPL_GARM_TARGET="pool"; shift ;;
     --dind) GATE_VARIANT="dind"; EXPL_GATE_VARIANT="dind"; shift ;;
+    --runner-image)
+      [[ $# -ge 2 ]] || die "--runner-image requires an argument: noble or resolute"
+      RUNNER_IMAGE_NAME="$2"
+      EXPL_RUNNER_IMAGE_NAME="$2"
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     preflight|config|pool|watch|verify|postjob|cleanup|all) COMMAND="$1"; shift ;;
     *) usage >&2; die "unknown argument: $1" ;;

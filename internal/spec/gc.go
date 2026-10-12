@@ -65,8 +65,10 @@ type CacheGCConfig struct {
 //     generation, a pnpm volume whose pnpm-major != current, or an externals
 //     volume whose image-digest != the current runner image's digest — is
 //     flagged stale once it is older than Grace (so an in-flight older job is
-//     not flagged out from under itself). diag-logs volumes have no salt and
-//     are never superseded.
+//     not flagged out from under itself). A toolcache or pnpm volume with no
+//     os-release label is superseded too: it predates OS-keyed cache names
+//     (ADR-003 2026-10-12 amendment), so no allocation mounts it any more.
+//     diag-logs volumes have no salt and are never superseded.
 //   - AGE: any cache volume whose creation-time last-used is older than
 //     StaleDays is flagged stale regardless of salt. This is the deliberately
 //     COARSE, self-healing backstop (ADR-003 amendment): because last-used
@@ -100,9 +102,15 @@ func EvaluateCacheEviction(labels map[string]string, cfg CacheGCConfig, now time
 			if g := labels[LabelGeneration]; g != "" && g != cfg.Generation {
 				return true, "superseded toolcache generation " + g + " (current " + cfg.Generation + ")"
 			}
+			if labels[LabelOSRelease] == "" {
+				return true, preOSKeyReason
+			}
 		case CacheKindPnpm:
 			if m := labels[LabelPnpmMajor]; m != "" && m != cfg.PnpmMajor {
 				return true, "superseded pnpm-major " + m + " (current " + cfg.PnpmMajor + ")"
+			}
+			if labels[LabelOSRelease] == "" {
+				return true, preOSKeyReason
 			}
 		case CacheKindExternals:
 			// Skip when the current digest is unknown this pass (cfg.ImageDigest
@@ -122,6 +130,11 @@ func EvaluateCacheEviction(labels map[string]string, cfg CacheGCConfig, now time
 
 	return false, ""
 }
+
+// preOSKeyReason is the GC reason for a toolcache or pnpm volume created before
+// those volumes were keyed on the runner image's OS release: its name lacks the
+// OS key, so the provider never resolves to it again.
+const preOSKeyReason = "superseded: created before toolcache/pnpm volumes were keyed on the OS release, no longer mounted"
 
 // parseLastUsed reads the garm.docker/last-used label (RFC3339, the creation
 // instant a cache volume's builder stamps) into a time. The bool reports whether

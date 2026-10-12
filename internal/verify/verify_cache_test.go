@@ -44,10 +44,6 @@ func TestVerifyM2W1CacheHit(t *testing.T) {
 	orgURL := "https://github.com/garm-cache-verify-org-" + token
 	repoKey := spec.RepoKey(repoURL)
 	orgKey := spec.RepoKey(orgURL)
-	toolVol := spec.ToolcacheVolumeName(repoKey, "1")
-	pnpmVol := spec.PnpmVolumeName(repoKey, "9")
-	orgToolVol := spec.ToolcacheVolumeName(orgKey, "1")
-	t.Logf("[setup] controller=%s repoKey=%s\n  toolVol=%s\n  pnpmVol=%s", controllerID, repoKey, toolVol, pnpmVol)
 
 	// --- foreign snapshot: containers AND volumes must be untouched -----------
 	canaries := ensureForeignCanaries(t)
@@ -58,6 +54,15 @@ func TestVerifyM2W1CacheHit(t *testing.T) {
 	// --- build sleep runner image + the REAL provider binary -----------------
 	imageTag := "garm-m2w1-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
+
+	// The toolcache and pnpm volumes are keyed on the runner image's OS key
+	// (ADR-003, 2026-10-12 amendment); the sleep image has no os-release label,
+	// so the key is derived from its content ID.
+	osKey := imageOSKey(t, imageTag)
+	toolVol := spec.ToolcacheVolumeName(repoKey, osKey, "1")
+	pnpmVol := spec.PnpmVolumeName(repoKey, osKey, "9")
+	orgToolVol := spec.ToolcacheVolumeName(orgKey, osKey, "1")
+	t.Logf("[setup] controller=%s repoKey=%s\n  toolVol=%s\n  pnpmVol=%s", controllerID, repoKey, toolVol, pnpmVol)
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = root

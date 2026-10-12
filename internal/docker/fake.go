@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -53,6 +55,11 @@ type FakeClient struct {
 	// already present locally. A ref not in this set is reported NotFound,
 	// which is how CreateInstance's pull-if-missing branch is exercised.
 	PresentImages map[string]bool
+
+	// ImageLabels holds the image config labels ImageInspectWithRaw reports for
+	// a ref (e.g. garm.docker/os-release), keyed by the same ref string as
+	// PresentImages. A ref with no entry inspects with no labels.
+	ImageLabels map[string]map[string]string
 
 	// PullErr, when non-nil, is returned by ImagePull instead of pulling —
 	// used to exercise the pull-failure creation-guard path.
@@ -366,6 +373,7 @@ func NewFakeClient() *FakeClient {
 		networks:      make(map[string]*fakeNetwork),
 		volumes:       make(map[string]*fakeVolume),
 		PresentImages: make(map[string]bool),
+		ImageLabels:   make(map[string]map[string]string),
 	}
 }
 
@@ -416,7 +424,8 @@ func (f *FakeClient) ImagePull(_ context.Context, refStr string, _ image.PullOpt
 // from the ref (fakeImageID), NOT the ref string itself — so a caller that
 // keys on the image digest (M2-W2's externals cache) gets a stable, Docker-
 // name-safe token that differs across refs and agrees across inspects of the
-// same ref, exactly as the real daemon does.
+// same ref, exactly as the real daemon does. Config.Labels comes from
+// ImageLabels when the test set any for the ref.
 func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (types.ImageInspect, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -424,7 +433,11 @@ func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (typ
 	if !f.PresentImages[imageID] {
 		return types.ImageInspect{}, nil, notFoundf("image %s not found", imageID)
 	}
-	return types.ImageInspect{ID: fakeImageID(imageID)}, nil, nil
+	insp := types.ImageInspect{ID: fakeImageID(imageID)}
+	if labels, ok := f.ImageLabels[imageID]; ok {
+		insp.Config = &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: maps.Clone(labels)}}
+	}
+	return insp, nil, nil
 }
 
 // fakeImageID models the real daemon's content-addressable image ID: a stable

@@ -90,12 +90,13 @@ stale_cache_eviction_days = 30
 	digest := imageDigestHex(t, image)
 	extVol := spec.ExternalsVolumeName(digest)
 	diagVol := spec.DiagVolumeName(repoKey)
-	toolVol := spec.ToolcacheVolumeName(repoKey, "1")
+	osKey := imageOSKey(t, image)
+	toolVol := spec.ToolcacheVolumeName(repoKey, osKey, "1")
 	t.Logf("[setup] controller=%s repoKey=%s\n  extVol=%s\n  diagVol=%s", controllerID, repoKey, extVol, diagVol)
 
 	defer func() {
 		cleanupController(t, controllerID)
-		for _, v := range []string{extVol, diagVol, toolVol, spec.PnpmVolumeName(repoKey, "9")} {
+		for _, v := range []string{extVol, diagVol, toolVol, spec.PnpmVolumeName(repoKey, osKey, "9")} {
 			_, _ = dockerTry("volume", "rm", "-f", v)
 		}
 		_, _ = dockerTry("rmi", "-f", image, nobleTag)

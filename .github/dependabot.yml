@@ -168,9 +168,10 @@ updates:
     # against, so this filter silently stops filtering for that one
     # action and every bump for it (major included) lands in the group.
 
-  # Exactly two Dockerfiles are tracked by git: the root Dockerfile (the
-  # provider binary image) and runner-images/noble/Dockerfile (the runner
-  # image). A third Dockerfile can exist under .claude/worktrees/, but
+  # Exactly three Dockerfiles are tracked by git: the root Dockerfile (the
+  # provider binary image), runner-images/noble/Dockerfile and
+  # runner-images/resolute/Dockerfile (the two runner images). Further
+  # Dockerfiles can exist under .claude/worktrees/, but
   # that whole path is gitignored (see .gitignore), so it is invisible to
   # Dependabot by construction — it needs no `directories:` entry and no
   # `ignore:` exclusion.
@@ -178,6 +179,7 @@ updates:
     directories:
       - "/"
       - "/runner-images/noble"
+      - "/runner-images/resolute"
     schedule:
       interval: monthly
     # This repo's existing Docker-related commits use `build(docker):` and
@@ -198,7 +200,7 @@ updates:
         # rebuilt with base-OS CVE fixes, same tag, new digest) carries NO
         # semver update-type at all — there is no "minor" or "patch" to
         # classify it as. A minor/patch filter here would therefore
-        # exclude exactly the kind of update these two Dockerfiles mostly
+        # exclude exactly the kind of update these Dockerfiles mostly
         # produce, stranding each one as an ungrouped one-off PR instead
         # of batching it. The github-actions group above can safely filter
         # on update-types because every action bump there DOES have a
@@ -206,19 +208,21 @@ updates:
         # ecosystem's bumps mostly don't, so the filter would do the
         # opposite of what it does above.
         #
-        # Scope of the batching above: "directories:" lists two Dockerfiles
-        # and this one `groups:` block covers both, but that does NOT mean
-        # updates from both directories land in a single PR. Grouping is
-        # per directory unless `group-by: dependency-name` is also set, and
-        # even then it only merges updates that share the exact SAME
-        # dependency name across directories. The root Dockerfile and
-        # runner-images/noble/Dockerfile pin different images, so today
-        # this configuration produces one PR per directory when both have
+        # Scope of the batching above: "directories:" lists three
+        # Dockerfiles and this one `groups:` block covers all of them, but
+        # that does NOT mean updates from every directory land in a single
+        # PR. Grouping is per directory unless `group-by: dependency-name`
+        # is also set, and even then it only merges updates that share the
+        # exact SAME dependency name across directories. The root
+        # Dockerfile pins golang/distroless; the two runner Dockerfiles both
+        # pin myoung34/github-runner, but on different tags (ubuntu-noble,
+        # ubuntu-resolute) whose digests move independently, so this
+        # configuration produces one PR per directory when several have
         # pending updates — "batching" here means "the updates within one
-        # directory ride together," not "both Dockerfiles ride together."
-        # `group-by: dependency-name` is deliberately not added: it would
-        # not change behavior for two directories with no shared dependency
-        # names, and nobody has asked for cross-directory batching.
+        # directory ride together," not "the Dockerfiles ride together."
+        # `group-by: dependency-name` is deliberately not added: the two
+        # runner images are released and verified independently, and
+        # nobody has asked for cross-directory batching.
     ignore:
       # Dockerfile:49 pins `golang:1.25.0` as this image's build toolchain.
       # go.mod's `go 1.25.0` line is this repo's single source of truth for
@@ -263,10 +267,11 @@ updates:
           - "version-update:semver-major"
           - "version-update:semver-minor"
           - "version-update:semver-patch"
-    # runner-images/noble/Dockerfile:5-13 documents that its
-    # `myoung34/github-runner:ubuntu-noble` pin is deliberately the
-    # MANIFEST-LIST (index) digest, resolved via
-    # `docker buildx imagetools inspect myoung34/github-runner:ubuntu-noble`,
+    # runner-images/noble/Dockerfile and runner-images/resolute/Dockerfile
+    # document (in their header comments) that their
+    # `myoung34/github-runner:ubuntu-noble` / `:ubuntu-resolute` pins are
+    # deliberately the MANIFEST-LIST (index) digest, resolved via
+    # `docker buildx imagetools inspect myoung34/github-runner:<tag>`,
     # not a single-platform manifest digest — that is what lets the
     # multi-platform build in images.yml resolve the correct per-platform
     # image automatically instead of needing a build matrix here.
