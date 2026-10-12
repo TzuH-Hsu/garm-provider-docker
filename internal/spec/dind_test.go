@@ -45,7 +45,7 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 		StorageDriver:       "overlay2",
 		Privileged:          priv,
 		Runtime:             runtime,
-		NetworkName:         "job-1-net",
+		NetnsContainerID:    "runner-id-1",
 		SocketVolumeName:    "job-1-socket",
 		DindStateVolumeName: "job-1-dind-state",
 		WorkspaceVolumeName: "job-1-workspace",
@@ -78,9 +78,15 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 		t.Errorf("Runtime = %q, want empty (default runtime) for privileged-sidecar", host.Runtime)
 	}
 
-	// Same per-job network as the runner, as the sole attachment.
-	if host.NetworkMode != "job-1-net" || !host.NetworkMode.IsUserDefined() {
-		t.Errorf("NetworkMode = %q, want the user-defined job network", host.NetworkMode)
+	// Joins the runner's network namespace (shared netns amendment), so the
+	// inner daemon's published ports are reachable on the runner's 127.0.0.1.
+	if host.NetworkMode != "container:runner-id-1" || !host.NetworkMode.IsContainer() || host.NetworkMode.ConnectedContainer() != "runner-id-1" {
+		t.Errorf("NetworkMode = %q, want container:runner-id-1 (the runner's namespace)", host.NetworkMode)
+	}
+	// The sidecar sets no sysctl of its own: the runner owns the namespace
+	// and its IPv6 sysctl (RunnerIPv6Sysctl) covers both.
+	if len(host.Sysctls) != 0 {
+		t.Errorf("Sysctls = %v, want none on the sidecar", host.Sysctls)
 	}
 
 	if host.Resources.Memory != 4<<30 {
@@ -130,9 +136,65 @@ func TestBuildDindContainerSysboxRuncFlipsOnlyTwoFields(t *testing.T) {
 	if host.Runtime != "sysbox-runc" {
 		t.Errorf("Runtime = %q, want sysbox-runc", host.Runtime)
 	}
-	// Topology is unchanged from privileged-sidecar: same two named mounts.
+	// Same two named mounts as privileged-sidecar.
 	assertMount(t, host.Mounts, "job-1-socket", DindSocketDir)
 	assertMount(t, host.Mounts, "job-1-dind-state", DindStateDir)
+	// sysbox-runc keeps its own namespace on the per-job network
+	// (DindSharesRunnerNetns is false for it).
+	if host.NetworkMode != "job-1-net" || !host.NetworkMode.IsUserDefined() {
+		t.Errorf("NetworkMode = %q, want the user-defined job network", host.NetworkMode)
+	}
+}
+
+func TestBuildDindContainerNetnsContainerIDTakesPrecedence(t *testing.T) {
+	_, host := BuildDindContainer(DindContainerSpec{
+		Image:               "docker:dind@sha256:abc",
+		StorageDriver:       "overlay2",
+		NetnsContainerID:    "runner-id-1",
+		NetworkName:         "job-1-net",
+		SocketVolumeName:    "job-1-socket",
+		DindStateVolumeName: "job-1-dind-state",
+	})
+	if host.NetworkMode != ContainerNetworkMode("runner-id-1") {
+		t.Errorf("NetworkMode = %q, want %q: NetnsContainerID wins over NetworkName", host.NetworkMode, ContainerNetworkMode("runner-id-1"))
+	}
+}
+
+func TestBuildDindContainerWithoutPlacementLeavesNetworkModeUnset(t *testing.T) {
+	_, host := BuildDindContainer(DindContainerSpec{
+		Image:               "docker:dind@sha256:abc",
+		StorageDriver:       "overlay2",
+		SocketVolumeName:    "job-1-socket",
+		DindStateVolumeName: "job-1-dind-state",
+	})
+	if host.NetworkMode != "" {
+		t.Errorf("NetworkMode = %q, want empty when neither NetnsContainerID nor NetworkName is set", host.NetworkMode)
+	}
+}
+
+func TestDindSharesRunnerNetns(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{dindModePrivilegedSidecar, true},
+		{dindModeSysboxRunc, false},
+		{dindModeNone, false},
+		{"", false},
+		{"bogus", false},
+	}
+	for _, tc := range tests {
+		if got := DindSharesRunnerNetns(tc.mode); got != tc.want {
+			t.Errorf("DindSharesRunnerNetns(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestContainerNetworkMode(t *testing.T) {
+	got := ContainerNetworkMode("abc123")
+	if got != "container:abc123" || !got.IsContainer() || got.ConnectedContainer() != "abc123" {
+		t.Errorf("ContainerNetworkMode(abc123) = %q, want container:abc123", got)
+	}
 }
 
 func TestBuildDindContainerAppendsCallerEnvAfterTLSOff(t *testing.T) {

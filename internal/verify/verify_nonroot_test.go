@@ -30,6 +30,7 @@ package verify
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,12 @@ import (
 )
 
 const nrInstance = "nr-verify-01"
+
+// runnerBaseImageEnv optionally names an already-built runner image (for
+// example a released ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:... digest)
+// to layer the test wrapper on, instead of building runner-images/noble from
+// source. Either way the image carries the production entrypoint.
+const runnerBaseImageEnv = "GARM_VERIFY_RUNNER_BASE_IMAGE"
 
 func nrNet() string      { return nrInstance + "-net" }
 func nrDindName() string { return nrInstance + "-dind" }
@@ -81,10 +88,22 @@ func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 	t.Helper()
 
-	// 1. Build the REAL production runner image (real Dockerfile + entrypoint).
-	nobleTag := "garm-nr-noble-real:latest"
-	if out, err := dockerTry(append([]string{"build", "-t", nobleTag}, runnerImageBuildArgs(root, "noble")...)...); err != nil {
-		t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
+	// 1. Build the REAL production runner image (real Dockerfile + entrypoint),
+	//    or, when runnerBaseImageEnv names one, use that already-built runner
+	//    image (a released, digest-pinned ghcr.io image) as the base instead.
+	nobleTag := os.Getenv(runnerBaseImageEnv)
+	if nobleTag != "" {
+		if _, err := dockerTry("image", "inspect", nobleTag); err != nil {
+			if out, err := dockerTry("pull", nobleTag); err != nil {
+				t.Fatalf("pull %s=%s: %v\n%s", runnerBaseImageEnv, nobleTag, err, out)
+			}
+		}
+		t.Logf("[image] layering the test wrapper on %s=%s instead of building runner-images/noble", runnerBaseImageEnv, nobleTag)
+	} else {
+		nobleTag = "garm-nr-noble-real:latest"
+		if out, err := dockerTry(append([]string{"build", "-t", nobleTag}, runnerImageBuildArgs(root, "noble")...)...); err != nil {
+			t.Fatalf("build real runner-images/noble image: %v\n%s", err, out)
+		}
 	}
 
 	// 2. Layer a wrapper that runs ONLY the real ensure_docker_socket_group
@@ -320,6 +339,15 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Errorf("[W3] credential delivery marker missing under %s", spec.CredentialDir)
 	}
 	t.Logf("[W3] no host socket on runner/sidecar; no token/metadata in env; creds present on the tmpfs")
+
+	// =========================================================================
+	// Shared network namespace (ADR-001 amendment): as the NON-ROOT runner
+	// user, a port the inner daemon publishes is reachable on 127.0.0.1 and
+	// localhost — the testcontainers/compose case that failed with ECONNREFUSED
+	// while the sidecar had its own namespace.
+	// =========================================================================
+	assertDindSharesRunnerNetns(t, runnerName, nrDindName(), nrNet())
+	assertInnerPublishedPortReachable(t, runnerName, "runner", "nr-published-httpd")
 
 	// =========================================================================
 	// F4/F6 (part 1) — DeleteInstance reaps everything; repeat -> exit 30

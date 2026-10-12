@@ -33,11 +33,11 @@ import (
 	"github.com/cloudbase/garm-provider-common/params"
 )
 
-// dindImageDigest is a working, digest-pinned docker:dind reference (Docker
-// Engine 29.6.2 image), captured on the live daemon this WP was verified on.
+// dindImageDigest is a working, digest-pinned docker:dind reference (the
+// multi-arch index the real-job gate pins, Docker Engine 29.9.0 inside).
 // The shipped default dind_image is an M4 release concern (ADR-001 open
 // question); this is only the reference the live harness runs against.
-const dindImageDigest = "docker@sha256:bfec1f5159c63a81ca6fdedbd81404d2c0e16378ed0feec3bb3fbf3998847659"
+const dindImageDigest = "docker:dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470"
 
 const wp3Instance = "wp3-verify-01"
 
@@ -225,6 +225,9 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	if m := dockerOut(t, "inspect", wp3DindName(), "-f", "{{json .Mounts}}"); strings.Contains(m, "/var/run/docker.sock") {
 		t.Errorf("[topology] sidecar has a host docker.sock bind: %s", m)
 	}
+	// Shared network namespace (ADR-001 amendment): the sidecar joins the
+	// runner's namespace, and only the runner is attached to the job network.
+	assertDindSharesRunnerNetns(t, runnerID, wp3DindName(), wp3Net())
 
 	if !waitForDindReady(t, wp3DindName()) {
 		t.Fatalf("(W3-a) dind daemon never became ready")
@@ -291,6 +294,12 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	}
 
 	// =========================================================================
+	// (W3-g) a port the inner daemon publishes is reachable on the runner's
+	// 127.0.0.1 and localhost (shared network namespace, ADR-001 amendment)
+	// =========================================================================
+	assertInnerPublishedPortReachable(t, runnerID, "", "wp3-published-httpd")
+
+	// =========================================================================
 	// (W3-e) teardown removes runner->dind->volumes->network (network LAST, F4);
 	// repeat → exit 30
 	// =========================================================================
@@ -336,4 +345,113 @@ func infoField(line, key string) string {
 		}
 	}
 	return ""
+}
+
+// assertDindSharesRunnerNetns checks the privileged-sidecar network topology
+// (ADR-001, shared network namespace amendment) on the live daemon: the
+// sidecar's NetworkMode is container:<runner's full ID> and it has no network
+// attachment of its own, the runner is attached to exactly the job network,
+// and both containers really are in one network namespace (same
+// /proc/self/ns/net inode).
+func assertDindSharesRunnerNetns(t *testing.T, runner, dind, jobNet string) {
+	t.Helper()
+	runnerFullID := dockerOut(t, "inspect", runner, "-f", "{{.Id}}")
+	mode := dockerOut(t, "inspect", dind, "-f", "{{.HostConfig.NetworkMode}}")
+	if mode != "container:"+runnerFullID {
+		t.Errorf("[netns] sidecar NetworkMode=%q, want container:%s (the runner's namespace)", mode, runnerFullID)
+	} else {
+		t.Logf("[netns] sidecar NetworkMode=%s (joins the runner's namespace)", mode)
+	}
+	const netsFmt = "{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}"
+	if nets := lines(dockerOut(t, "inspect", dind, "-f", netsFmt)); len(nets) != 0 {
+		t.Errorf("[netns] sidecar has network attachments of its own: %v, want none", nets)
+	}
+	if nets := lines(dockerOut(t, "inspect", runner, "-f", netsFmt)); len(nets) != 1 || nets[0] != jobNet {
+		t.Errorf("[netns] runner networks=%v, want exactly [%s]", nets, jobNet)
+	} else {
+		t.Logf("[netns] runner is attached to exactly the job network %s", jobNet)
+	}
+	runnerNS := dockerOut(t, "exec", runner, "readlink", "/proc/self/ns/net")
+	dindNS := dockerOut(t, "exec", dind, "readlink", "/proc/self/ns/net")
+	if runnerNS == "" || runnerNS != dindNS {
+		t.Errorf("[netns] runner namespace %q != sidecar namespace %q, want one shared namespace", runnerNS, dindNS)
+	} else {
+		t.Logf("[netns] runner and sidecar share network namespace %s", runnerNS)
+	}
+}
+
+// publishedPortWait bounds how long the published-port probe retries while the
+// nested httpd comes up.
+const publishedPortWait = 30 * time.Second
+
+// assertInnerPublishedPortReachable starts a nested busybox httpd through the
+// runner's DOCKER_HOST with an ephemeral published port (`-p 80`, the shape
+// testcontainers uses), reads the host port back with `docker port`, and
+// fetches it from inside the runner via 127.0.0.1 and via localhost. With the
+// sidecar in its own namespace this fails with "connection refused" (the port
+// is bound in the sidecar's namespace); with the shared namespace it succeeds,
+// as on a GitHub-hosted runner. user, when non-empty, runs every command
+// inside the runner as that user (`docker exec -u`), as a job step would.
+func assertInnerPublishedPortReachable(t *testing.T, runner, user, name string) {
+	t.Helper()
+	const body = "garm-published-port-ok"
+	script := "mkdir -p /w && echo " + body + " > /w/index.html && exec httpd -f -p 80 -h /w"
+	if out, err := dockerTry(execIn(runner, user, "docker", "run", "-d", "--name", name, "-p", "80", "busybox:1.36", "sh", "-c", script)...); err != nil {
+		t.Errorf("(W3-g) could not start a nested httpd with a published port via the runner: %v\n%s", err, out)
+		return
+	}
+	mapping := dockerOut(t, execIn(runner, user, "docker", "port", name, "80/tcp")...)
+	port := publishedHostPort(mapping)
+	if port == "" {
+		t.Errorf("(W3-g) could not read the published host port from `docker port`: %q", mapping)
+		return
+	}
+	t.Logf("[W3-g] nested httpd published 80/tcp as %q", mapping)
+	for _, host := range []string{"127.0.0.1", "localhost"} {
+		url := "http://" + host + ":" + port + "/"
+		got, err := fetchFromContainer(runner, user, url, publishedPortWait)
+		if err != nil || got != body {
+			t.Errorf("(W3-g) runner GET %s = %q, %v; want %q (a port the inner daemon publishes must be reachable on the runner's %s)", url, got, err, body, host)
+			continue
+		}
+		t.Logf("[W3-g] runner GET %s -> %q", url, got)
+	}
+}
+
+// publishedHostPort returns the host port of the first `docker port` mapping
+// line ("0.0.0.0:32768" or "[::]:32768"), or "" when there is none.
+func publishedHostPort(mapping string) string {
+	ls := lines(mapping)
+	if len(ls) == 0 {
+		return ""
+	}
+	i := strings.LastIndex(ls[0], ":")
+	if i < 0 || i == len(ls[0])-1 {
+		return ""
+	}
+	return ls[0][i+1:]
+}
+
+// execIn returns the `docker exec` arguments that run args inside container,
+// as user when user is non-empty.
+func execIn(container, user string, args ...string) []string {
+	out := []string{"exec"}
+	if user != "" {
+		out = append(out, "-u", user)
+	}
+	return append(append(out, container), args...)
+}
+
+// fetchFromContainer GETs url with wget inside container (as user when
+// non-empty), retrying until it answers or wait elapses, and returns the
+// trimmed body.
+func fetchFromContainer(container, user, url string, wait time.Duration) (string, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		out, err := dockerTry(execIn(container, user, "wget", "-qO-", "-T", "3", url)...)
+		if err == nil || time.Now().After(deadline) {
+			return strings.TrimSpace(out), err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }

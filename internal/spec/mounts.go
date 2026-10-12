@@ -263,8 +263,11 @@ func BuildRunnerContainer(s RunnerContainerSpec) (*container.Config, *container.
 	host := &container.HostConfig{
 		Tmpfs:  CredentialTmpfsMap(),
 		Mounts: mounts,
-		// Runner only; the DinD sidecar keeps the daemon default. Jobs that
-		// bind or dial ::1 explicitly do not work (see RunnerIPv6Sysctl).
+		// Set on the runner only. A privileged-sidecar DinD sidecar joins the
+		// runner's network namespace, so the setting covers it too; a
+		// sysbox-runc sidecar keeps the daemon default in its own namespace.
+		// Jobs that bind or dial ::1 explicitly do not work (see
+		// RunnerIPv6Sysctl).
 		Sysctls: map[string]string{RunnerIPv6Sysctl: "1"},
 	}
 	if s.SocketVolumeName != "" {
@@ -365,13 +368,24 @@ type DindContainerSpec struct {
 	Privileged bool
 	Runtime    string
 
-	// NetworkName joins the DinD sidecar to the per-job network (ADR-001:
-	// the sidecar is on the SAME job network as the runner) as its sole
+	// NetnsContainerID, when non-empty, makes the sidecar join that
+	// container's network namespace (HostConfig.NetworkMode
+	// "container:<id>") instead of attaching to NetworkName; it takes
+	// precedence over NetworkName. The provider sets it to the runner's
+	// container ID in privileged-sidecar mode (DindSharesRunnerNetns), so the
+	// inner daemon's published ports land in the runner's namespace and are
+	// reachable on the runner's 127.0.0.1, as in an ARC pod (ADR-001, shared
+	// network namespace amendment). The runner must be running when the
+	// sidecar starts: the daemon refuses to join a stopped container's
+	// namespace.
+	NetnsContainerID string
+
+	// NetworkName joins the DinD sidecar to the per-job network as its sole
 	// attachment via HostConfig.NetworkMode, exactly like
-	// RunnerContainerSpec.NetworkName. WP3 always sets it —
-	// spec.JobNetworkName(instanceName) — so the runner reaches the daemon
-	// over the shared socket volume on a network isolated from every other
-	// allocation.
+	// RunnerContainerSpec.NetworkName — spec.JobNetworkName(instanceName), a
+	// network isolated from every other allocation. The provider uses it only
+	// in sysbox-runc mode, where the sidecar keeps its own network namespace
+	// (DindSharesRunnerNetns); it is ignored when NetnsContainerID is set.
 	NetworkName string
 
 	// SocketVolumeName backs the shared DinD socket mount at DindSocketDir

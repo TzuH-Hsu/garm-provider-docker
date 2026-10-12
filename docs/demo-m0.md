@@ -217,7 +217,12 @@ writes a file into `$GITHUB_WORKSPACE` and reads it back through
 workspace (the sidecar mounts the same workspace volume at
 `/actions-runner/_work`). The same step then has a nested container write
 `gate-nested.txt` into the workspace and reads it back from the runner, which
-proves the sidecar's workspace mount is writable end to end. Step 4 then also
+proves the sidecar's workspace mount is writable end to end. A last step
+starts a nested `busybox` httpd with an ephemeral published port (`-p 80`)
+and fetches it with `curl` at `127.0.0.1` and `localhost` (must print
+`published-ok`), which proves the sidecar shares the runner's network
+namespace (ADR-001, 2026-10-12 amendment), the way testcontainers and
+`docker compose` ports are used. Step 4 then also
 verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
 bind mounts on either container, `DOCKER_HOST`, labeled socket and
 `dind-state` volumes, and the flavor's memory limits).
@@ -404,8 +409,8 @@ the scale set's name (or the pool's tags with `--pool`), and a job that does
 `echo hello && env | sort | head` (plus a short `sleep` so the ephemeral
 runner stays up long enough for Step 4's checks — this runner is
 single-job ephemeral by design, `ADR-002`; the `--dind` variant adds
-`docker run --rm hello-world`, a `docker build` step and a shared-workspace
-step). Then polls
+`docker run --rm hello-world`, a `docker build` step, a shared-workspace
+step and a published-port step). Then polls
 `docker ps --filter label=garm.docker/managed=true --filter label=garm.docker/role=runner` and GARM's runner list
 (`garm-cli scaleset runner list <id>`, the id looked up by name, or
 `SCALESET_ID`) every few seconds until you've triggered the workflow and a
@@ -427,7 +432,9 @@ PASS/FAIL for each: ownership labels on the container, the labeled per-job
 network and named workspace volume, and that the runner is actually wired
 to them (attached to that network and not to the default `bridge`; the
 workspace volume mounted at `/actions-runner/_work`) (a); in the `--dind`
-variant the sidecar must be on the same network and both containers must
+variant the sidecar must join the runner's network namespace (no network of
+its own), a port published by the sidecar's daemon must be reachable from
+the runner at `127.0.0.1` and `localhost`, and both containers must
 mount the labeled socket volume at `/run`; no forbidden env var name,
 bind mount or `Privileged` flag in `docker inspect`, plus the sidecar
 checks above in the `--dind` variant (b) — values are never printed,
@@ -489,6 +496,7 @@ to reclaim them.
 | No job is ever picked up in scale-set mode | The workflow's `runs-on` does not exactly match the scale set name, the scale set is disabled, or GARM cannot reach GitHub (outbound HTTPS) | `garm-cli scaleset show <id>` (enabled? name?); compare `runs-on` with the name in the script's output; check GARM's logs for message-queue errors. |
 | No job is ever picked up in pool mode (`--pool`) | GitHub cannot deliver webhooks to GARM (e.g. GARM behind a NAT) | Use the default scale-set mode, or expose the webhook endpoint. |
 | `--dind` Step 4(b) reports the sidecar missing or the runner cannot reach its daemon | `allowed_dind_modes`/`extra_specs` not applied, the sidecar failed to start, or `docker:dind` could not be pulled | `docker ps -a --filter label=garm.docker/role=dind`; `docker logs <sidecar>`; confirm the scale set was created with the printed `--extra-specs`. |
+| `--dind` Step 4(b) reports the sidecar not in the runner's network namespace, or a published port not reachable at `127.0.0.1` | A provider older than the 2026-10-12 shared network namespace change (ADR-001), or a runner image without `curl` | Check the provider version; `docker inspect -f '{{.HostConfig.NetworkMode}}' <sidecar>` must print `container:<runner id>`. |
 | Runner container never appears after `garm-cli scaleset add` / `pool add` | The provider failed silently from GARM's point of view, or the pool/provider isn't wired up correctly | Check GARM's own log output (`docker logs garm` if run via Docker, `journalctl -u garm` if run via systemd) for lines mentioning this provider's executable or name — GARM logs a provider subprocess's stderr on failure. Confirm `garm-cli provider list` shows the provider and `garm-cli pool show <POOL_ID>` shows it `enabled`. This provider logs structured key=value lines (`internal/logging`); look for `level=ERROR` entries. |
 | Step 4(a)'s job-network or workspace-volume check fails | An older provider build predating M1's per-job network/named volume, or a config/topology bug | Confirm you are validating the intended `PROVIDER_VERSION`/build; check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` directly for what actually exists. |
 | Step 4(c) times out or reports missing credential files | The provider's fetch-first `docker exec`-streamed tar delivery didn't complete before the entrypoint's `GARM_CRED_WAIT_SECONDS` (120s default) expired, or the exec itself failed | Check the provider's own stderr (surfaced via GARM's logs, see above) for a `failed to deliver credentials` error; check `docker logs <runner>` for the entrypoint's `waiting up to ...s for the delivery marker` message and whether it timed out. A slow/overloaded Docker daemon or a metadata-service fetch that ran close to the 60s aggregate deadline are the two likely causes (`ADR-002`). |

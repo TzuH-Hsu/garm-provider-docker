@@ -163,8 +163,12 @@ Status: Accepted (2026-07-19)
 > is the one the daemon consults when writing `/etc/hosts`, and it also covers
 > `lo` and `eth0`, which already exist when the sysctl is applied (verified
 > live on Docker 29.9: `default` alone leaves the `::1` line in place). The
-> DinD sidecar is unchanged; it runs `dockerd`, not job code, and containers
-> it launches get their own network namespaces. There is no config knob. The
+> DinD sidecar sets no sysctl of its own; it runs `dockerd`, not job code, and
+> containers it launches get their own network namespaces. Since ADR-001's
+> shared network namespace amendment (2026-10-12) a `privileged-sidecar`
+> sidecar joins the runner's namespace, so the runner's setting covers it too;
+> `dockerd` runs, NATs and publishes ports there unchanged (IPv4). There is
+> no config knob. The
 > compatibility cost: a job that binds or dials `::1` explicitly (or a service
 > that needs IPv6 loopback) will not work in the runner container, which
 > already could not use IPv6 beyond loopback.

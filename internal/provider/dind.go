@@ -11,24 +11,33 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// startDindSidecar pulls the dind image if missing, then builds, creates, and
-// starts the DinD sidecar for this allocation (ADR-001), returning its
-// container ID. It is called ONLY in DinD modes (dindMode != "none").
+// startDindSidecar builds, creates, and starts the DinD sidecar for this
+// allocation (ADR-001), returning its container ID. It is called ONLY in DinD
+// modes (dindMode != "none"), after the runner container has started, and
+// expects the dind image to be present already (CreateInstance pulls it before
+// it creates the runner, so the pull never eats into the runner entrypoint's
+// Docker readiness wait).
 //
-// The sidecar joins the same per-job network as the runner, mounts the shared
-// socket volume at /run (where dockerd exposes its unix socket) and the
-// dind-state volume at /var/lib/docker, runs `dockerd --host=unix://...
-// --storage-driver=<config>` with TLS off, and carries this attempt's
-// create-nonce so the creation-guard rollback (nonce-keyed) reclaims it on any
-// later failure. Its Privileged/Runtime pair comes from
-// spec.DindRuntimeSelection — Privileged=true for privileged-sidecar — so
-// WP4's sysbox-runc support is a thin flip with no change here.
+// Its network placement depends on the mode (spec.DindSharesRunnerNetns). In
+// privileged-sidecar mode it joins the network namespace of runnerID, the
+// running runner container, so a port the inner daemon publishes is bound in
+// the runner's namespace and reachable on the runner's 127.0.0.1 (ADR-001,
+// shared network namespace amendment). In sysbox-runc mode it keeps its own
+// namespace on the per-job network.
+//
+// Either way it mounts the shared socket volume at /run (where dockerd exposes
+// its unix socket) and the dind-state volume at /var/lib/docker, runs
+// `dockerd --host=unix://... --storage-driver=<config>` with TLS off, and
+// carries this attempt's create-nonce so the creation-guard rollback
+// (nonce-keyed) reclaims it on any later failure. Its Privileged/Runtime pair
+// comes from spec.DindRuntimeSelection — Privileged=true for
+// privileged-sidecar.
 //
 // storageDriver and dindMemoryBytes are the extra_specs-resolved values
 // (resolved.StorageDriver / resolved.DindMemoryBytes): the pool's overrides
 // bounded against the operator's config (storage_driver enum, dind_memory
 // ceiling), or the config defaults when extra_specs sets neither.
-func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode, storageDriver string, dindMemoryBytes int64, createdAt time.Time) (string, error) {
+func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode, storageDriver string, dindMemoryBytes int64, createdAt time.Time, runnerID string) (string, error) {
 	instanceName := identity.InstanceName
 
 	privileged, runtime, err := spec.DindRuntimeSelection(dindMode)
@@ -36,32 +45,32 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		return "", fmt.Errorf("failed to derive DinD runtime for %q: %w", instanceName, err)
 	}
 
-	// dind_image is config-only (ADR-002: no flavor/extra_specs image channel
-	// for the sidecar) and validated digest-pinned + non-empty for any non-none
-	// mode at config load.
-	dindImage := p.cfg.DindImage
-	if err := p.ensureImage(ctx, dindImage); err != nil {
-		return "", err
-	}
-
 	labels := identity.DindContainerLabels(createdAt)
 	labels[spec.LabelCreateNonce] = nonce
 
-	cfg, hostCfg := spec.BuildDindContainer(spec.DindContainerSpec{
-		Image:               dindImage,
+	dindSpec := spec.DindContainerSpec{
+		// dind_image is config-only (ADR-002: no flavor/extra_specs image
+		// channel for the sidecar) and validated digest-pinned + non-empty for
+		// any non-none mode at config load.
+		Image:               p.cfg.DindImage,
 		Labels:              labels,
 		MemoryBytes:         dindMemoryBytes,
 		StorageDriver:       storageDriver,
 		Privileged:          privileged,
 		Runtime:             runtime,
-		NetworkName:         spec.JobNetworkName(instanceName),
 		SocketVolumeName:    spec.SocketVolumeName(instanceName, nonce),
 		DindStateVolumeName: spec.DindStateVolumeName(instanceName, nonce),
 		// F2: share the runner's workspace volume into the daemon at the same
 		// path, so nested `docker run -v "$PWD":/work` bind sources resolve to
 		// the real checked-out files rather than an empty daemon-side path.
 		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
-	})
+	}
+	if spec.DindSharesRunnerNetns(dindMode) {
+		dindSpec.NetnsContainerID = runnerID
+	} else {
+		dindSpec.NetworkName = spec.JobNetworkName(instanceName)
+	}
+	cfg, hostCfg := spec.BuildDindContainer(dindSpec)
 
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.DindContainerName(instanceName))
 	if err != nil {

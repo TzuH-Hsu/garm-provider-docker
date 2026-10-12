@@ -87,6 +87,14 @@ type FakeClient struct {
 	CreateErr               error
 	CreateErrLeaksContainer bool
 
+	// CreateErrContainerName, when non-empty, scopes CreateErr (and
+	// CreateErrLeaksContainer) to the ContainerCreate of the container with
+	// exactly this name; every other container creates normally. It lets a
+	// test fail one container of an allocation (the DinD sidecar, say)
+	// regardless of the order the provider creates them in. It has no
+	// effect while CreateErr is nil.
+	CreateErrContainerName string
+
 	// ExecExitCode is the exit code ExecStream reports (default 0). A
 	// non-zero value models a credential-delivery command that ran but
 	// failed, and suppresses the tmpfs write.
@@ -95,6 +103,11 @@ type FakeClient struct {
 	// StartErr, when non-nil, is returned by ContainerStart instead of
 	// starting — used to exercise the start-failure creation-guard path.
 	StartErr error
+
+	// StartErrContainerName, when non-empty, scopes StartErr to the
+	// ContainerStart of the container with exactly this name, like
+	// CreateErrContainerName. It has no effect while StartErr is nil.
+	StartErrContainerName string
 
 	// HostLacksIPv6 models a daemon host whose kernel has no IPv6 stack
 	// (booted with ipv6.disable=1, or built without IPv6): no container has
@@ -667,9 +680,14 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	createErr := f.CreateErr
+	if f.CreateErrContainerName != "" && containerName != f.CreateErrContainerName {
+		createErr = nil
+	}
+
 	// Clean create failure: nothing is recorded.
-	if f.CreateErr != nil && !f.CreateErrLeaksContainer {
-		return container.CreateResponse{}, f.CreateErr
+	if createErr != nil && !f.CreateErrLeaksContainer {
+		return container.CreateResponse{}, createErr
 	}
 	if f.IPv6SysctlFailsAtCreate {
 		if key := ipv6SysctlKey(hostConfig); key != "" {
@@ -682,7 +700,7 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 	// Docker-name uniqueness: the real daemon rejects a create whose name is
 	// already in use with a 409 Conflict (NEW-5). Model that here, unless an
 	// explicit CreateErr is already dictating this call's outcome.
-	if f.CreateErr == nil && containerName != "" && f.findByName(containerName) != nil {
+	if createErr == nil && containerName != "" && f.findByName(containerName) != nil {
 		return container.CreateResponse{}, conflictf("Conflict. The container name %q is already in use", "/"+containerName)
 	}
 
@@ -771,8 +789,8 @@ func (f *FakeClient) ContainerCreate(_ context.Context, cfg *container.Config, h
 
 	// Ambiguous create failure: the container was recorded, but the call
 	// still reports an error (ADR-004 F6).
-	if f.CreateErr != nil {
-		return container.CreateResponse{ID: id}, f.CreateErr
+	if createErr != nil {
+		return container.CreateResponse{ID: id}, createErr
 	}
 
 	return container.CreateResponse{ID: id}, nil
@@ -791,10 +809,10 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.StartErr != nil {
+	c := f.find(containerID)
+	if f.StartErr != nil && (f.StartErrContainerName == "" || (c != nil && c.name == f.StartErrContainerName)) {
 		return f.StartErr
 	}
-	c := f.find(containerID)
 	if c == nil {
 		return notFoundf("container %s not found", containerID)
 	}
@@ -807,6 +825,19 @@ func (f *FakeClient) ContainerStart(_ context.Context, containerID string, _ con
 	}
 	if isUserDefinedNetwork(c.networkMode) && f.findNetworkByName(c.networkMode) == nil && f.networks[c.networkMode] == nil {
 		return fmt.Errorf("failed to start container %s: network %s not found", containerID, c.networkMode)
+	}
+	// A "container:<ref>" network mode joins another container's network
+	// namespace. Like the real daemon (verified on Docker Engine 29.8.2), the
+	// create succeeds whatever <ref> is, but the start fails when <ref> does
+	// not exist or is not running.
+	if ref, ok := joinedNetnsOwner(c.networkMode); ok {
+		owner := f.find(ref)
+		if owner == nil {
+			return notFoundf("joining network namespace of container: No such container: %s", ref)
+		}
+		if owner.state != "running" {
+			return conflictf("cannot join network namespace of a non running container: container %s is %s", owner.name, owner.state)
+		}
 	}
 	for _, m := range c.mounts {
 		if m.Type == mount.TypeVolume && m.Source != "" {
@@ -1295,12 +1326,26 @@ func (f *FakeClient) RawRuntime(containerID string) string {
 // attachments are reported as endpoints and enforced by NetworkRemove's
 // active-endpoint check.
 func isUserDefinedNetwork(mode string) bool {
+	if _, ok := joinedNetnsOwner(mode); ok {
+		return false
+	}
 	switch mode {
 	case "", "bridge", "host", "none", "default", "container":
 		return false
 	default:
 		return true
 	}
+}
+
+// joinedNetnsOwner returns the container reference of a "container:<ref>"
+// network mode (the container whose network namespace is joined) and true, or
+// "" and false for any other mode.
+func joinedNetnsOwner(mode string) (string, bool) {
+	ref, ok := strings.CutPrefix(mode, "container:")
+	if !ok || ref == "" {
+		return "", false
+	}
+	return ref, true
 }
 
 func (c *fakeContainer) toContainerSummary() types.Container {
