@@ -18,11 +18,15 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"); the published `v0.2.3` release
-passes the current gate, for both runner images. `v0.2.2` passed the revision
-before `--runner-image` existed (28 and 50 PASS, script at efe5014), and
-`v0.2.1` an earlier one (26 and 48 PASS, script at fa4351c); `v0.2.1` fails the
-IPv6 checks added for `v0.2.2`. The runbook keeps `dind_mode=none` as its own
+work against GARM v0.2.x (see "Results"); the published `v0.2.4` release
+passes the current gate on the Ubuntu 26.04 runner image, for `none` and
+`--dind` (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
+before the shared network namespace and published-port checks, for both runner
+images (28 and 50 PASS, script at 92d6c85); `v0.2.2` the one before
+`--runner-image` existed (28 and 50 PASS, script at efe5014), and `v0.2.1` an
+earlier one (26 and 48 PASS, script at fa4351c); `v0.2.1` fails the IPv6 checks
+added for `v0.2.2`. The Ubuntu 24.04 image has not been gated with `v0.2.4`
+yet. The runbook keeps `dind_mode=none` as its own
 default (the smallest, most portable slice) and treats the DinD modes as
 out of scope for this particular gate (see "What this demo does not cover"
 below), but everything else it exercises is the CURRENT provider, not the
@@ -128,7 +132,7 @@ is specific to this provider and this demo.
 - **`release`** (default) — validates a **published release**, exactly as
   an operator would install it:
   1. Downloads the `garm-provider-docker_<version>_linux_<arch>` binary
-     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.3`)
+     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.4`)
      for this host's architecture, plus that release's `SHA256SUMS`.
   2. Verifies the downloaded binary against `SHA256SUMS` — **failing hard**
      (not warning) on any mismatch or missing entry — before it is ever
@@ -267,7 +271,7 @@ It does **not** exercise:
 
 ```sh
 export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
-scripts/demo-m0.sh                         # scale set, dind_mode=none, v0.2.3 release
+scripts/demo-m0.sh                         # scale set, dind_mode=none, v0.2.4 release
 scripts/demo-m0.sh --dind                  # same, plus the privileged-sidecar variant
 scripts/demo-m0.sh --pool                  # webhook-driven pool instead of a scale set
 ```
@@ -280,7 +284,7 @@ from this checkout".
 passing `--version` below `v0.2.1` with a scale-set target prints a warning
 (it does not block; older GARM or `--pool` may still work).
 
-This downloads and verifies the `v0.2.3` release (default), then runs every
+This downloads and verifies the `v0.2.4` release (default), then runs every
 step below in order, pausing for a confirmed manual action wherever one is
 needed (adding the `[[provider]]` section to GARM's config, creating the
 pool, confirming the GitHub UI). Pass `-y`/`--yes` to auto-confirm every
@@ -321,7 +325,7 @@ Checks `docker` and `garm-cli` are present and reachable/authenticated,
 then, depending on mode:
 
 - **release** (default): downloads the `PROVIDER_VERSION` (default
-  `v0.2.3`) binary asset for this host's architecture and its
+  `v0.2.4`) binary asset for this host's architecture and its
   `SHA256SUMS`, verifies the checksum (hard failure on mismatch), resolves
   `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s (`garm-runner-resolute` with
   `--runner-image resolute`) digest via `docker
@@ -531,9 +535,91 @@ re-running it:
 ## Results
 
 The gate has been run end to end against a live GARM with the published
+`v0.2.4` release binary, in two variants on the Ubuntu 26.04 image
+(`dind_mode=none` and `--dind`), on 2026-10-12, using `scripts/demo-m0.sh` at
+0cf2a76. `v0.2.4` changes one thing the gate cares about: in
+`privileged-sidecar` mode the sidecar now joins the runner's network namespace
+(ADR-001, 2026-10-12 amendment). The Ubuntu 24.04 image was not part of this
+run; its last recorded gate is the `v0.2.3` one below.
+
+**Environment**
+
+- GARM v0.2.1 (systemd service, API on loopback), scale-set dispatch (no
+  webhook); provider `interface_version` v0.1.0.
+- Docker Engine 29.9.0 on Ubuntu 26.04.1, amd64.
+- Provider: the `v0.2.4` release binary
+  (`garm-provider-docker_v0.2.4_linux_amd64`, sha256
+  `f02df425a00c9526f0b7ae6a5d3b19c288503a0e50ee40e08584ff7500e5bd5f`,
+  checked against the release's `SHA256SUMS`); `GetVersion` reports
+  `v0.2.4`. Release mode, `-y`.
+- Runner image, digest-pinned in the generated config (the `:v0.2.4` digest,
+  which `:latest` also pointed at; the release workflow rebuilt it, so it
+  differs from the `v0.2.3` one):
+  - `ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:1c48eb526328814ff4b76a2e4dbd50d1f77135cb04054578ab225fbf934d484a`
+- DinD image
+  `docker:dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470`
+  (unchanged).
+
+**Results**
+
+| Variant | `verify` | GitHub job | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `--dind` | 53 PASS, 0 FAIL | succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `none` | 28 PASS, 0 FAIL | succeeded | 2 PASS, 0 FAIL |
+
+- No WARN lines in either `verify`. `postjob` reports "no managed runner
+  container remains" and "no leftover job-scoped garm.docker/managed=true
+  containers, networks, or volumes"; the persistent cache volumes are reported
+  as informational.
+- The `none` count matches the `v0.2.3` run (28). The `--dind` count is 53
+  against 50: the two checks that the sidecar sits on the runner's per-job
+  network are gone, and five are new (see below).
+- Each variant was preflighted separately (`preflight --version v0.2.4
+  --runner-image resolute --dind`, then the same without `--dind` and with the
+  `none` scale set), and `verify` was started only after the runner logged
+  `Listening for Jobs` (GARM status `idle`). The sample workflows the script
+  prints were used (60 s and 30 s holds).
+
+What is new against the `v0.2.3` run (28 and 50 PASS, script at 92d6c85):
+
+- **Shared network namespace.** The sidecar's `NetworkMode` is
+  `container:<runner id>`, it has no network attachment of its own, and the
+  runner is the only container on the per-job network. In the live `--dind`
+  run `docker inspect` showed the sidecar `Privileged=true` with no sysctls and
+  the runner with `net.ipv6.conf.all.disable_ipv6=1` (the sysctl is applied
+  once, by the namespace owner); the runner's `/etc/hosts` still has only the
+  `127.0.0.1 localhost` line, no `::1`. `verify` reads the same network
+  namespace inode from both containers.
+- **Published ports reach the runner's localhost.** `verify` starts a nested
+  `busybox` httpd with an ephemeral published port through the runner's
+  `DOCKER_HOST` and fetches it from the runner at `127.0.0.1` and at
+  `localhost` (2 of the 5 new checks; the other 3 are the namespace checks
+  above). The workflow's new step does the same inside the job, and the job
+  log shows `127.0.0.1:<port> -> published-ok` and
+  `localhost:<port> -> published-ok`. The `v0.2.3` gate had no such check;
+  the `ECONNREFUSED` this fixes is described in the ADR-001 amendment.
+- **Runner status.** In both runs GARM's runner list showed `pending`,
+  `installing`, `idle` (3 s after `installing`), and GARM logged the job as
+  started 37 s (`--dind`) and 33 s (`none`) after `idle`. GARM's log has no
+  `invalid runner status transition` line over the run windows, and no WARN
+  or ERROR line for the gate's scale sets (see "Known upstream issue").
+- **Teardown.** GARM began deleting the instance within 2 s of logging the
+  job completed in both runs, and `postjob` found no leftover container,
+  sidecar, job network, job-scoped volume or socket and `dind-state` volume.
+- **Release plumbing.** The release carries the `linux/amd64` and
+  `linux/arm64` binaries and `SHA256SUMS`, and the release-triggered
+  "Container Images" run succeeded. `:latest` and `:v0.2.4` resolve to the same
+  digest for `garm-runner-noble` (`14599ec9...`), `garm-runner-resolute`
+  (`1c48eb52...`) and `garm-provider-docker` (`621d34ee...`).
+
+## Previous release: v0.2.3
+
+The gate had been run end to end against a live GARM with the published
 `v0.2.3` release binary, in three variants (Ubuntu 24.04 image with
 `dind_mode=none`, Ubuntu 26.04 image with `none`, and Ubuntu 26.04 image with
-`--dind`), on 2026-10-12, using `scripts/demo-m0.sh` at 92d6c85.
+`--dind`), on 2026-10-12, using `scripts/demo-m0.sh` at 92d6c85. That revision
+had neither the shared network namespace nor the published-port check, so this
+run says nothing about either.
 
 **Environment**
 
@@ -685,12 +771,16 @@ row `installing`), the watcher cannot be started, or GARM restarts while the
 watcher waits (see
 [`[status_report]`](config-reference.md#status_report-runner-status-reported-to-garm)).
 The gate runs above showed
-`idle` 15 to 35 s before `active` and no transition error in GARM's log, but
+`idle` 15 to 37 s before `active` and no transition error in GARM's log, but
 that ordering is not guaranteed. Upstream cloudbase/garm#817 removes the
 race and the stall entirely once it is in a release.
 
 ## Still unverified
 
+- The Ubuntu 24.04 runner image with `v0.2.4` (it was gated with `v0.2.3`;
+  `v0.2.4` rebuilt it).
+- Published ports on the runner's `localhost` under `sysbox-runc`, whose
+  sidecar keeps its own network namespace (ADR-001, 2026-10-12 amendment).
 - The non-JIT fallback path (`config.sh` writing credentials through the
   pre-created symlinks onto the tmpfs, `ADR-002`).
 - An arm64 host.

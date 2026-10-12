@@ -142,13 +142,16 @@ the same tag:
    published as a non-pre-release, or a published pre-release later changed
    to a full release.
 
-`v0.2.3` is the latest published release: its release binaries and
+`v0.2.4` is the latest published release: its release binaries and
 `SHA256SUMS` checksum file are downloadable from the
-[v0.2.3 release page](https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.3),
-and its container images are on GHCR as both `:v0.2.3` and `:latest`. It
-passed the end-to-end gate against GARM v0.2.1 with `dind_mode=none` on both
-runner images and with `privileged-sidecar` on the Ubuntu 26.04 image (see
-[`docs/demo-m0.md`](docs/demo-m0.md)); `v0.2.0` does not work with GARM v0.2.x.
+[v0.2.4 release page](https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.4),
+and its container images are on GHCR as both `:v0.2.4` and `:latest`. It
+passed the end-to-end gate against GARM v0.2.1 on the Ubuntu 26.04 runner
+image, with `dind_mode=none` and with `privileged-sidecar` (including a check
+that a port published by the sidecar's daemon is reachable on the runner's
+`127.0.0.1`); the Ubuntu 24.04 image was gated with `v0.2.3` and not re-run for
+`v0.2.4` (see [`docs/demo-m0.md`](docs/demo-m0.md)). `v0.2.0` does not work
+with GARM v0.2.x.
 (`v0.1.0`'s tag and `:v0.1.0` images still exist, but its GitHub Release
 draft has since been removed.) You can also build from source instead
 (see `go.mod`'s `go` directive for the required Go version):
@@ -406,9 +409,9 @@ skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 
 ## Status
 
-M0 through M4 are implemented and tested on this branch. `v0.2.3` is the
+M0 through M4 are implemented and tested on this branch. `v0.2.4` is the
 latest published release, with release binaries and container images
-(`:v0.2.3` and `:latest`) on GHCR; `v0.1.0`'s tag and `:v0.1.0` images
+(`:v0.2.4` and `:latest`) on GHCR; `v0.1.0`'s tag and `:v0.1.0` images
 still exist, though its GitHub Release draft has since been removed. No
 upstream pull request has been published yet. See
 [`docs/plan.md`](docs/plan.md) for the milestone breakdown and
