@@ -143,8 +143,8 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 // gap ADR-001 documents) rejects the sidecar's ContainerCreate. The provider
 // must surface a CLEAR, actionable error naming dind_mode and the missing
 // runtime rather than the raw daemon message, and the creation guard must
-// still roll back the network and volumes created before the sidecar —
-// zero leftovers of any kind.
+// still roll back the runner, network and volumes created before the
+// sidecar — zero leftovers of any kind.
 func TestCreateInstanceSysboxRuncRuntimeUnavailableCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -153,6 +153,7 @@ func TestCreateInstanceSysboxRuncRuntimeUnavailableCleansUp(t *testing.T) {
 	// The real daemon's observed rejection shape for an unregistered OCI
 	// runtime (see internal/provider/dind.go's runtimeUnavailableError).
 	fake.CreateErr = errors.New("Unknown runtime specified sysbox-runc")
+	fake.CreateErrContainerName = spec.DindContainerName("Test-Instance-01") // the sidecar is created after the runner
 
 	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err == nil {
@@ -183,6 +184,7 @@ func TestCreateInstanceSysboxRuncRuntimeUnavailableAtStartCleansUp(t *testing.T)
 
 	p, fake := newSysboxTestProvider(t)
 	fake.StartErr = errors.New("failed to start container: unknown runtime specified sysbox-runc")
+	fake.StartErrContainerName = spec.DindContainerName("Test-Instance-01") // the sidecar starts after the runner
 
 	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err == nil {
@@ -204,6 +206,7 @@ func TestCreateInstanceSysboxRuncOtherCreateFailureKeepsGenericMessage(t *testin
 
 	p, fake := newSysboxTestProvider(t)
 	fake.CreateErr = errors.New("transient daemon error")
+	fake.CreateErrContainerName = spec.DindContainerName("Test-Instance-01") // the sidecar is created after the runner
 
 	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err == nil {
@@ -227,6 +230,7 @@ func TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed(t *testing.T)
 
 	p, fake := newSysboxTestProvider(t)
 	fake.CreateErr = errors.New("failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: \"dockerd\": executable file not found in $PATH")
+	fake.CreateErrContainerName = spec.DindContainerName("Test-Instance-01") // the sidecar is created after the runner
 
 	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
 	if err == nil {

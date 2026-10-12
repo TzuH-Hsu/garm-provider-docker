@@ -99,6 +99,28 @@ func DindCommand(storageDriver string) []string {
 	}
 }
 
+// DindSharesRunnerNetns reports whether the DinD sidecar for dindMode joins
+// the runner container's network namespace instead of getting its own on the
+// job network (ADR-001, shared network namespace amendment).
+//
+// It is true for privileged-sidecar, which is what makes a port published by
+// the inner daemon (`docker run -p`, testcontainers, compose) reachable on the
+// runner's 127.0.0.1, as on a GitHub-hosted runner and in an ARC pod. It is
+// false for sysbox-runc: a sysbox container runs in its own user namespace,
+// and a network namespace created by the runner (owned by the host's initial
+// user namespace) grants the sidecar's root no CAP_NET_ADMIN, so its dockerd
+// could not create its bridge or NAT rules there. sysbox-runc keeps its own
+// namespace on the job network.
+func DindSharesRunnerNetns(dindMode string) bool {
+	return dindMode == dindModePrivilegedSidecar
+}
+
+// ContainerNetworkMode returns the HostConfig.NetworkMode that joins the
+// network namespace of the container with the given ID ("container:<id>").
+func ContainerNetworkMode(containerID string) container.NetworkMode {
+	return container.NetworkMode("container:" + containerID)
+}
+
 // SocketVolumeMount returns the shared DinD socket mount (the named socket
 // volume at DindSocketDir). Both the DinD sidecar and the runner mount this
 // SAME named volume at this SAME path — that shared mount, not a host socket
@@ -125,7 +147,8 @@ func DindStateMount(name string) mount.Mount {
 // the DinD sidecar (ADR-001), mirroring BuildRunnerContainer's pure-builder
 // shape: no Docker calls, so it is cheap to table-test, and it is the single
 // place the sidecar's dockerd command, TLS-off env, socket/dind-state mounts,
-// job-network attachment, and Privileged/Runtime pair are assembled.
+// network placement (the runner's namespace or the job network), and
+// Privileged/Runtime pair are assembled.
 //
 // The {Privileged, Runtime} pair MUST come from DindRuntimeSelection (via the
 // caller populating s.Privileged/s.Runtime) — privileged-sidecar is
@@ -172,9 +195,18 @@ func BuildDindContainer(s DindContainerSpec) (*container.Config, *container.Host
 		// "sysbox-runc" for sysbox-runc mode (WP4).
 		host.Runtime = s.Runtime
 	}
-	if s.NetworkName != "" {
-		// Same per-job network as the runner, as its sole attachment
-		// (ADR-001) — not the default bridge.
+	switch {
+	case s.NetnsContainerID != "":
+		// privileged-sidecar: join the runner's network namespace, so a port
+		// the inner daemon publishes is bound in the runner's namespace and
+		// reachable on the runner's 127.0.0.1 (ADR-001, shared network
+		// namespace amendment). The sidecar then has no network attachment of
+		// its own; it reaches the job network through the runner's.
+		host.NetworkMode = ContainerNetworkMode(s.NetnsContainerID)
+	case s.NetworkName != "":
+		// sysbox-runc: the sidecar's own namespace on the same per-job network
+		// as the runner, as its sole attachment (ADR-001) — not the default
+		// bridge.
 		host.NetworkMode = container.NetworkMode(s.NetworkName)
 	}
 	if s.MemoryBytes > 0 {

@@ -183,9 +183,24 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if !hasEnv(dind.Config.Env, "DOCKER_TLS_CERTDIR=") {
 		t.Errorf("sidecar env = %v, want DOCKER_TLS_CERTDIR= (TLS off)", dind.Config.Env)
 	}
-	// On the SAME job network as the runner.
-	if string(dind.HostConfig.NetworkMode) != spec.JobNetworkName(name) {
-		t.Errorf("sidecar NetworkMode = %q, want the job network", dind.HostConfig.NetworkMode)
+	// Joins the RUNNER's network namespace (shared netns amendment): no
+	// network attachment of its own, and no sysctl of its own.
+	runnerForNetns := inspectRunner(t, fake, name)
+	if dind.HostConfig.NetworkMode != spec.ContainerNetworkMode(runnerForNetns.ID) {
+		t.Errorf("sidecar NetworkMode = %q, want %q (the runner's network namespace)", dind.HostConfig.NetworkMode, spec.ContainerNetworkMode(runnerForNetns.ID))
+	}
+	if dind.NetworkSettings != nil && len(dind.NetworkSettings.Networks) != 0 {
+		t.Errorf("sidecar network attachments = %v, want none of its own", dind.NetworkSettings.Networks)
+	}
+	if !slices.ContainsFunc(fake.Created, func(c docker.CreatedContainer) bool {
+		return c.Name == spec.DindContainerName(name) && len(c.Sysctls) == 0
+	}) {
+		t.Error("sidecar was created with a sysctl; the runner owns the namespace and its sysctl")
+	}
+	// The runner is created before the sidecar: the daemon refuses to join
+	// the namespace of a container that is not running.
+	if got := createdNames(fake); !slices.Equal(got, []string{spec.RunnerContainerName(name), spec.DindContainerName(name)}) {
+		t.Errorf("container create order = %v, want [runner sidecar]", got)
 	}
 	// Socket at /run and dind-state at /var/lib/docker; no host docker.sock.
 	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
@@ -257,17 +272,25 @@ func TestCreateInstanceDinDDeliverFailureRollsBackBothContainers(t *testing.T) {
 }
 
 // TestCreateInstanceDinDSidecarStartFailureCleansUp exercises the dind-start
-// failure branch: the sidecar is started FIRST, so a ContainerStart failure
-// trips there, before the runner is ever built. The guard must leave nothing.
+// failure branch: the runner is created and started first (the sidecar joins
+// its network namespace), then the sidecar's ContainerStart fails. The guard
+// must remove the started runner, the created sidecar, the network and all
+// three volumes, and no credentials may be delivered.
 func TestCreateInstanceDinDSidecarStartFailureCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
 	p, fake := newDindTestProvider(t)
 	fake.StartErr = errors.New("start boom")
+	fake.StartErrContainerName = spec.DindContainerName("Test-Instance-01")
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on sidecar start, got nil")
+	} else if !strings.Contains(err.Error(), "failed to start DinD sidecar") {
+		t.Errorf("error = %q, want the sidecar start failure", err)
+	}
+	if got := createdNames(fake); !slices.Equal(got, []string{spec.RunnerContainerName("Test-Instance-01"), spec.DindContainerName("Test-Instance-01")}) {
+		t.Errorf("container create order = %v, want [runner sidecar]", got)
 	}
 	assertNoLeftovers(t, fake)
 	if len(fake.Execs) != 0 {
@@ -275,10 +298,40 @@ func TestCreateInstanceDinDSidecarStartFailureCleansUp(t *testing.T) {
 	}
 }
 
+// TestCreateInstanceDinDSidecarCannotJoinStoppedRunner pins the start-order
+// contract the shared network namespace depends on: the daemon refuses to start
+// a container that joins the namespace of a container that is not running. A
+// runner that exits between its own start and the sidecar's start therefore
+// fails the allocation cleanly, with nothing left behind.
+func TestCreateInstanceDinDSidecarCannotJoinStoppedRunner(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newDindTestProvider(t)
+	runnerName := spec.RunnerContainerName("Test-Instance-01")
+	fake.CreateHook = func() {
+		// Fires at the start of every ContainerCreate; the runner already
+		// exists and is running when the sidecar's create begins.
+		if c, err := fake.ContainerInspect(context.Background(), runnerName); err == nil && c.State != nil && c.State.Running {
+			_ = fake.ContainerStop(context.Background(), c.ID, container.StopOptions{})
+		}
+	}
+
+	_, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL))
+	if err == nil {
+		t.Fatal("expected CreateInstance to fail when the runner is not running at sidecar start, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot join network namespace of a non running container") {
+		t.Errorf("error = %q, want the daemon's refusal to join a stopped runner's namespace", err)
+	}
+	assertNoLeftovers(t, fake)
+}
+
 // TestCreateInstanceDinDImagePullFailureCleansUp exercises the dind-image-pull
-// failure branch inside startDindSidecar: the runner image is present (so its
-// pull is skipped), but the dind image pull fails. The guard must roll back the
-// network and all three volumes (no container was created yet).
+// failure branch: the runner image is present (so its pull is skipped), but the
+// dind image pull fails. The pull runs before the runner is created, so the
+// guard must roll back the network and all three volumes and no container may
+// have been created.
 func TestCreateInstanceDinDImagePullFailureCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -291,7 +344,7 @@ func TestCreateInstanceDinDImagePullFailureCleansUp(t *testing.T) {
 		t.Fatal("expected CreateInstance to fail on the dind image pull, got nil")
 	}
 	assertNoLeftovers(t, fake)
-	if n := listAll(t, p); n != 0 {
+	if n := len(fake.Created); n != 0 {
 		t.Errorf("a dind-pull failure created %d containers, want 0", n)
 	}
 }
@@ -300,8 +353,7 @@ func TestCreateInstanceDinDImagePullFailureCleansUp(t *testing.T) {
 // ambiguous dind-create branch: ContainerCreate errors but the daemon still
 // recorded the sidecar (ADR-004 F6). Since the leaked sidecar carries this
 // attempt's nonce, the nonce-keyed rollback must remove it along with the
-// network and volumes. In DinD mode the sidecar is the FIRST container created,
-// so CreateErr trips there.
+// already-running runner, the network and the volumes.
 func TestCreateInstanceDinDSidecarCreateAmbiguousLeakCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -309,39 +361,43 @@ func TestCreateInstanceDinDSidecarCreateAmbiguousLeakCleansUp(t *testing.T) {
 	p, fake := newDindTestProvider(t)
 	fake.CreateErr = errors.New("transient daemon error")
 	fake.CreateErrLeaksContainer = true
+	fake.CreateErrContainerName = spec.DindContainerName("Test-Instance-01")
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on the ambiguous sidecar create, got nil")
 	}
+	if got := createdNames(fake); !slices.Contains(got, spec.DindContainerName("Test-Instance-01")) {
+		t.Errorf("container creates = %v, want the leaked sidecar among them", got)
+	}
 	assertNoLeftovers(t, fake)
 }
 
-// TestCreateInstanceDinDRunnerCreateFailsAfterSidecarCleansUpSidecar exercises
-// the runner-create failure branch AFTER the sidecar is already up: a foreign
-// container occupies the runner's Docker name (409 on runner create), while the
-// sidecar's distinct name creates fine. The guard must reclaim the sidecar,
-// network, and volumes but never touch the foreign container.
-func TestCreateInstanceDinDRunnerCreateFailsAfterSidecarCleansUpSidecar(t *testing.T) {
+// TestCreateInstanceDinDRunnerCreateFailureNeverCreatesSidecar exercises the
+// runner-create failure branch: a foreign container occupies the runner's
+// Docker name (409 on runner create). The runner is created before the sidecar,
+// so no sidecar may ever be created; the guard must reclaim the network and
+// volumes but never touch the foreign container.
+func TestCreateInstanceDinDRunnerCreateFailureNeverCreatesSidecar(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
 
 	p, fake := newDindTestProvider(t)
-	// Foreign container occupies the runner name "test-instance-01"; the dind
-	// name "test-instance-01-dind" is free, so the sidecar starts, then the
-	// runner create hits a 409.
+	// Foreign container occupies the runner name "test-instance-01".
 	foreignID := seedRunner(t, fake, "Test-Instance-01", "p1", "different-controller", "running")
 
 	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err == nil {
 		t.Fatal("expected CreateInstance to fail on runner create (name conflict), got nil")
 	}
 
+	if slices.Contains(createdNames(fake), spec.DindContainerName("Test-Instance-01")) {
+		t.Error("a runner-create failure must not create the sidecar")
+	}
 	// Foreign container survives.
 	if _, err := fake.ContainerInspect(context.Background(), foreignID); err != nil {
 		t.Errorf("rollback removed the foreign container: %v", err)
 	}
-	// The sidecar, network, and all three volumes are rolled back.
 	if n := listAll(t, p); n != 1 {
-		t.Errorf("container count = %d, want 1 (only the foreign container; sidecar rolled back)", n)
+		t.Errorf("container count = %d, want 1 (only the foreign container)", n)
 	}
 	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
 	if len(nets) != 0 {
@@ -351,6 +407,54 @@ func TestCreateInstanceDinDRunnerCreateFailsAfterSidecarCleansUpSidecar(t *testi
 	if len(vols.Volumes) != 0 {
 		t.Errorf("rollback left %d volumes, want 0", len(vols.Volumes))
 	}
+}
+
+// TestCreateInstanceDinDSidecarJoinsRetriedRunner covers the IPv6 sysctl retry
+// in privileged-sidecar mode. The retry recreates the runner before the sidecar
+// exists, so the sidecar joins the namespace of the runner that actually
+// serves the job (the recreated one), the namespace owner is the only
+// container that ever carried the sysctl, and the sidecar carries none.
+func TestCreateInstanceDinDSidecarJoinsRetriedRunner(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	p, fake := newDindTestProvider(t)
+	fake.HostLacksIPv6 = true
+
+	if _, err := p.CreateInstance(context.Background(), jitBootstrap(srv.URL)); err != nil {
+		t.Fatalf("CreateInstance (DinD, host without IPv6) returned unexpected error: %v", err)
+	}
+	name := "Test-Instance-01"
+	runner := inspectRunner(t, fake, name)
+	dind, err := fake.ContainerInspect(context.Background(), spec.DindContainerName(name))
+	if err != nil {
+		t.Fatalf("DinD sidecar was not created: %v", err)
+	}
+	if dind.HostConfig.NetworkMode != spec.ContainerNetworkMode(runner.ID) {
+		t.Errorf("sidecar NetworkMode = %q, want %q (the recreated runner)", dind.HostConfig.NetworkMode, spec.ContainerNetworkMode(runner.ID))
+	}
+	if dind.State == nil || !dind.State.Running {
+		t.Error("DinD sidecar is not running after create")
+	}
+	want := []string{spec.RunnerContainerName(name), spec.RunnerContainerName(name), spec.DindContainerName(name)}
+	if got := createdNames(fake); !slices.Equal(got, want) {
+		t.Errorf("container create order = %v, want %v (runner, retried runner, then sidecar)", got, want)
+	}
+	for _, c := range fake.Created {
+		if c.Name == spec.DindContainerName(name) && len(c.Sysctls) != 0 {
+			t.Errorf("sidecar created with sysctls %v, want none", c.Sysctls)
+		}
+	}
+}
+
+// createdNames returns the names of every container the fake was asked to
+// create, in call order.
+func createdNames(fake *docker.FakeClient) []string {
+	out := make([]string, 0, len(fake.Created))
+	for _, c := range fake.Created {
+		out = append(out, c.Name)
+	}
+	return out
 }
 
 // TestCreateInstanceDinDDuplicateReturnsExit31 confirms duplicate detection
@@ -404,10 +508,29 @@ func TestDeleteInstanceDinDTearsDownFullTopology(t *testing.T) {
 		t.Fatalf("container count after create = %d, want 2 (runner + sidecar)", n)
 	}
 
+	runner := inspectRunner(t, fake, inst.Name)
+	dind, err := fake.ContainerInspect(context.Background(), spec.DindContainerName(inst.Name))
+	if err != nil {
+		t.Fatalf("DinD sidecar was not created: %v", err)
+	}
+	if dind.HostConfig.NetworkMode != spec.ContainerNetworkMode(runner.ID) {
+		t.Fatalf("sidecar NetworkMode = %q, want the runner's namespace", dind.HostConfig.NetworkMode)
+	}
+
 	if err := p.DeleteInstance(context.Background(), inst.Name); err != nil {
 		t.Fatalf("DeleteInstance returned unexpected error: %v", err)
 	}
 	assertNoLeftovers(t, fake)
+	// ADR-004 order is unchanged by the shared namespace: the runner (the
+	// namespace owner) goes first, then the sidecar that joined it, then the
+	// volumes, and the network last. The sidecar holds no endpoint on the
+	// network, so the network removal does not depend on it.
+	if len(fake.RemoveOrder) < 3 ||
+		fake.RemoveOrder[0] != "container:"+runner.ID ||
+		fake.RemoveOrder[1] != "container:"+dind.ID ||
+		!strings.HasPrefix(fake.RemoveOrder[len(fake.RemoveOrder)-1], "network:") {
+		t.Errorf("RemoveOrder = %v, want runner, sidecar, ..., network last", fake.RemoveOrder)
+	}
 
 	// Idempotent repeat → exit 30.
 	err = p.DeleteInstance(context.Background(), inst.Name)

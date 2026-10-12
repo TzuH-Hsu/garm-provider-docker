@@ -32,10 +32,16 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
     `Privileged=true`: a malicious job's own code can pivot from that
     privileged daemon to a host compromise. This is a real, direct residual
     risk, stated honestly rather than downplayed — see ADR-001's
-    "Residual risk" section.
+    "Residual risk" section. The sidecar shares the runner's network
+    namespace, as in an ARC pod, so a port a job publishes through it
+    (`docker run -p`, testcontainers, `docker compose`) is reachable on the
+    runner's `127.0.0.1`/`localhost`, as on a GitHub-hosted runner; the
+    runner and the inner containers share one port space.
   - `sysbox-runc` — reduced-privilege alternative (no `Privileged=true`) for
     hosts that have Sysbox installed; not realistically installable on
-    Synology DSM or Unraid today.
+    Synology DSM or Unraid today. Its sidecar keeps its own network
+    namespace, so published ports are reached at the sidecar's container
+    name (`<instance>-dind`), not on the runner's `localhost`.
 - **Persistent, repo-scoped caches.** Toolcache and pnpm-store volumes
   survive across jobs against the same repository, keyed by a normalized
   repo URL plus generation/pnpm-major salts. Cache volumes are **never

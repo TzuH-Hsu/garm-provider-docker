@@ -1407,6 +1407,26 @@ EOF
           back="$(cat "$GITHUB_WORKSPACE/gate-nested.txt")"
           echo "runner read back: ${back}"
           test "${back}" = nested
+      - name: a port published by the sidecar daemon is reachable on localhost
+        run: |
+          docker run -d --name gate-published -p 80 busybox:1.36 \
+            sh -c 'mkdir -p /w && echo published-ok > /w/index.html && exec httpd -f -p 80 -h /w'
+          mapping="$(docker port gate-published 80/tcp | head -n1)"
+          port="${mapping##*:}"
+          echo "published 80/tcp as ${mapping}"
+          for host in 127.0.0.1 localhost; do
+            out=""
+            for _ in $(seq 1 30); do
+              if out="$(curl -fsS --max-time 3 "http://${host}:${port}/")"; then
+                break
+              fi
+              out=""
+              sleep 1
+            done
+            echo "${host}:${port} -> ${out}"
+            test "${out}" = published-ok
+          done
+          docker rm -f gate-published
       - name: hold the runner briefly for scripts/demo-m0.sh verify
         run: sleep 60
 EOF
@@ -1795,6 +1815,74 @@ verify_no_host_mounts() {
   fi
 }
 
+# verify_dind_shared_netns checks that the DinD sidecar "$2" joins the network
+# namespace of the runner "$1" (ADR-001, shared network namespace amendment):
+# its NetworkMode is container:<runner's full ID>, it has no network
+# attachment of its own (the runner's per-job network attachment is checked
+# in verify_topology), and both containers report the same network namespace.
+verify_dind_shared_netns() {
+  local cid="$1" did="$2" runner_id mode runner_ns dind_ns
+  runner_id="$(docker inspect -f '{{.Id}}' "${cid}")"
+  mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "${did}")"
+  if [[ "${mode}" == "container:${runner_id}" ]]; then
+    ok "sidecar joins the runner's network namespace (NetworkMode=container:<runner id>)"
+  else
+    bad "sidecar NetworkMode is '${mode}', expected container:${runner_id} (the runner's network namespace)"
+  fi
+  if [[ -z "$(container_networks "${did}" | sed '/^$/d')" ]]; then
+    ok "sidecar has no network attachment of its own"
+  else
+    bad "sidecar is attached to networks of its own: $(container_networks "${did}" | tr '\n' ' ')"
+  fi
+  runner_ns="$(docker exec "${cid}" readlink /proc/self/ns/net 2>/dev/null)"
+  dind_ns="$(docker exec "${did}" readlink /proc/self/ns/net 2>/dev/null)"
+  if [[ -n "${runner_ns}" && "${runner_ns}" == "${dind_ns}" ]]; then
+    ok "runner and sidecar share one network namespace (${runner_ns})"
+  else
+    bad "runner network namespace '${runner_ns}' differs from the sidecar's '${dind_ns}'"
+  fi
+}
+
+# verify_published_port_on_localhost starts a nested busybox httpd through the
+# runner "$1"'s DOCKER_HOST with an ephemeral published port (-p 80, the shape
+# testcontainers uses), then fetches it from inside the runner via 127.0.0.1
+# and localhost. That works only when the sidecar shares the runner's network
+# namespace; with a separate namespace the port is bound in the sidecar's and
+# the runner gets "connection refused". The nested container is removed
+# afterwards.
+verify_published_port_on_localhost() {
+  local cid="$1" name="garm-verify-published-port" mapping port host out i
+  docker exec "${cid}" docker rm -f "${name}" >/dev/null 2>&1 || true
+  if ! docker exec "${cid}" docker run -d --quiet --name "${name}" -p 80 busybox:1.36 \
+      sh -c 'mkdir -p /w && echo published-ok > /w/index.html && exec httpd -f -p 80 -h /w' >/dev/null; then
+    bad "could not start a nested httpd with a published port through the runner's DOCKER_HOST"
+    return
+  fi
+  mapping="$(docker exec "${cid}" docker port "${name}" 80/tcp | head -n1)"
+  port="${mapping##*:}"
+  if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+    bad "could not read the published host port from 'docker port' ('${mapping}')"
+    docker exec "${cid}" docker rm -f "${name}" >/dev/null 2>&1 || true
+    return
+  fi
+  for host in 127.0.0.1 localhost; do
+    out=""
+    for i in $(seq 1 30); do
+      if out="$(docker exec "${cid}" curl -fsS --max-time 3 "http://${host}:${port}/" 2>/dev/null)"; then
+        break
+      fi
+      out=""
+      sleep 1
+    done
+    if [[ "${out}" == "published-ok" ]]; then
+      ok "a port published by the sidecar's daemon (${mapping}) is reachable from the runner at ${host}:${port}"
+    else
+      bad "a port published by the sidecar's daemon (${mapping}) is NOT reachable from the runner at ${host}:${port} after ${i}s (sidecar not in the runner's network namespace?)"
+    fi
+  done
+  docker exec "${cid}" docker rm -f "${name}" >/dev/null 2>&1 || true
+}
+
 # verify_dind_topology checks the privileged-sidecar allocation (ADR-001):
 # the role=dind sidecar container and its labels, Privileged=true (the one
 # deliberate exception, documented residual risk), no bind mounts, the
@@ -1909,18 +1997,10 @@ verify_dind_topology() {
     bad "sidecar does not mount the labeled dind-state volume '${state_vol}' at ${DIND_STATE_DIR}"
   fi
 
-  local net_name sock_vol
-  net_name="$(job_network_name "${instance}")"
-  if [[ -n "${net_name}" ]] && container_networks "${did}" | grep -qxF "${net_name}"; then
-    ok "sidecar is attached to the same labeled per-job network ${net_name}"
-  else
-    bad "sidecar is not attached to the labeled per-job network '${net_name}'"
-  fi
-  if [[ -n "${net_name}" ]] && container_networks_are_exactly "${did}" "${net_name}"; then
-    ok "sidecar's only network is the per-job network (not attached to the default 'bridge')"
-  else
-    bad "sidecar is attached to more than the per-job network (or to the default 'bridge'): $(container_networks "${did}" | tr '\n' ' ')"
-  fi
+  verify_dind_shared_netns "${cid}" "${did}"
+  verify_published_port_on_localhost "${cid}"
+
+  local sock_vol
   sock_vol="$(instance_volume_name "${instance}" socket)"
   if [[ -n "${sock_vol}" ]] && container_has_volume_mount "${cid}" "${sock_vol}" "${DIND_SOCKET_DIR}"; then
     ok "runner mounts the labeled socket volume ${sock_vol} at ${DIND_SOCKET_DIR}"

@@ -74,21 +74,25 @@ var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 //  4. fetch the credentials provider-side, before the container exists, so a
 //     slow fetch can never outlive the entrypoint's credential wait
 //  5. seed the image-digest-keyed externals cache (cache feature only)
-//  6. in DinD modes, pull the dind image and start the sidecar (privileged-
-//     sidecar or, WP4, sysbox-runc — the two differ only in Privileged/
-//     Runtime) on the job network FIRST, so the runner's entrypoint has a
-//     daemon to reach over the shared socket volume (its `until docker info`
-//     wait blocks on it)
+//  6. in DinD modes, pull the dind image if missing, before the runner exists,
+//     so the pull never eats into the runner entrypoint's Docker readiness wait
 //  7. create the runner container on the job network, with the workspace volume
 //     at the runner workdir, a credential tmpfs, the configured memory limit,
 //     and — in DinD modes — DOCKER_HOST plus the shared socket volume mount
 //  8. start it (if the daemon cannot apply the runner's IPv6 sysctl,
-//     recreate and start it once without the sysctl, with a warning), deliver the
-//     credentials by streaming an in-memory tar into a
+//     recreate and start it once without the sysctl, with a warning)
+//  9. in DinD modes, create and start the sidecar AFTER the runner: in
+//     privileged-sidecar mode it joins the runner's network namespace, which
+//     needs a running runner, so ports the inner daemon publishes are
+//     reachable on the runner's 127.0.0.1; in sysbox-runc mode it gets its own
+//     namespace on the job network (spec.DindSharesRunnerNetns). The runner's
+//     entrypoint waits for the daemon (`until docker info`) in parallel with
+//     the credential wait, so the sidecar starting a moment later is covered
+//  10. deliver the credentials by streaming an in-memory tar into a
 //     `docker exec`-run `tar -x` with an atomic .delivered marker, and verify
 //     BOTH the runner and (in DinD modes) the sidecar are running before
 //     reporting success
-//  9. report the runner "installing" to GARM's instance callback and, once the
+//  11. report the runner "installing" to GARM's instance callback and, once the
 //     runner logs "Listening for Jobs" (bounded wait), "idle" — best-effort,
 //     never failing the create ([status_report], ADR-002 amendment)
 //
@@ -318,21 +322,17 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// One timestamp for both containers' created-at labels this allocation.
 	createdAt := time.Now()
 
-	// 5. DinD sidecar (DinD modes only): pull the dind image, then create and
-	// start the privileged sidecar on the job network BEFORE the runner, so the
-	// runner's entrypoint (which blocks on `until docker info`) has a daemon to
-	// reach over the shared socket volume (ADR-001). The runner then gets
-	// DOCKER_HOST pointed at that socket and mounts the same socket volume as
+	// 5. DinD modes: pull the dind image now, before the runner exists, so the
+	// pull never eats into the runner entrypoint's Docker readiness wait. The
+	// sidecar itself starts after the runner (step 6b). The runner gets
+	// DOCKER_HOST pointed at the shared socket and mounts the socket volume as
 	// its SOLE channel to the daemon — never a host docker.sock, never TCP.
 	dockerHost := ""
 	socketVolumeName := ""
-	var dindID string
 	if dindEnabled {
-		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt)
-		if derr != nil {
-			return guarded(derr)
+		if err := p.ensureImage(ctx, p.cfg.DindImage); err != nil {
+			return guarded(err)
 		}
-		dindID = id
 		dockerHost = spec.DindDockerHost
 		socketVolumeName = spec.SocketVolumeName(instanceName, nonce)
 	}
@@ -401,6 +401,25 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	runnerID, err := p.createAndStartRunner(ctx, cfg, hostCfg, instanceName, plan)
 	if err != nil {
 		return guarded(err)
+	}
+
+	// 6b. DinD sidecar (DinD modes only), started AFTER the runner (ADR-001,
+	// shared network namespace amendment). In privileged-sidecar mode it joins
+	// the runner's network namespace, so ports the inner daemon publishes
+	// (`docker run -p`, testcontainers, compose) are reachable on the runner's
+	// 127.0.0.1 as on a GitHub-hosted runner or in an ARC pod; the daemon
+	// refuses to join a namespace whose owner is not running, hence the order.
+	// Any IPv6 sysctl retry has already happened above, so the sidecar joins
+	// the runner that will actually serve the job, and the sysctl is applied
+	// once, by the namespace owner. The runner's entrypoint waits for the
+	// daemon in parallel with its credential wait.
+	var dindID string
+	if dindEnabled {
+		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt, runnerID)
+		if derr != nil {
+			return guarded(derr)
+		}
+		dindID = id
 	}
 
 	// 7. Deliver the credentials into the running container's tmpfs by streaming
