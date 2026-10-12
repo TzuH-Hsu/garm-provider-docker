@@ -127,7 +127,9 @@ the same tag:
    attached to a draft GitHub Release.
 2. **Container images** — `ghcr.io/tzuh-hsu/garm-provider-docker` (a
    distribution vehicle for the binary — see below) and
-   `ghcr.io/tzuh-hsu/garm-runner-noble` (the runner image), both multi-arch
+   `ghcr.io/tzuh-hsu/garm-runner-noble` and
+   `ghcr.io/tzuh-hsu/garm-runner-resolute` (the Ubuntu 24.04 and 26.04
+   runner images), all multi-arch
    (`linux/amd64` + `linux/arm64`) with SBOM and provenance attestations,
    tagged `:<tag>`. The tag push does not move `:latest`: that happens only
    when the tag's GitHub Release becomes a full release — its draft
@@ -289,12 +291,34 @@ config) and
 [`internal/extraspecs/schema.json`](internal/extraspecs/schema.json)
 (`extra_specs`).
 
-## Runner image
+## Runner images
 
-Runner containers use `ghcr.io/tzuh-hsu/garm-runner-noble`: a
-`myoung34/github-runner` Ubuntu Noble base plus a custom, JIT-aware
-entrypoint. See [`runner-images/noble/README.md`](runner-images/noble/README.md)
-for the full entrypoint contract.
+Two runner images are published with every release. Both are a
+`myoung34/github-runner` base plus the same custom, JIT-aware entrypoint and
+the same added packages (headless-Chrome libraries, fonts, `pipx`,
+`clang-format`/`clang-tidy`, `cmake`, `ninja`); the runner user can install
+tools into `/usr/local/bin` and `/usr/local/lib`.
+
+| Image | Ubuntu | Toolchain | Use for |
+|---|---|---|---|
+| `ghcr.io/tzuh-hsu/garm-runner-noble` | 24.04 | GCC 13, LLVM 18, Python 3.12 | workflows on `ubuntu-24.04` |
+| `ghcr.io/tzuh-hsu/garm-runner-resolute` | 26.04 | GCC 15, LLVM 22, Python 3.14 | workflows on `ubuntu-latest` from 2026-10-19, or `ubuntu-26.04` |
+
+`runner_image` sets the default for every pool; a pool that needs the other
+release selects a flavor that overrides it:
+
+```toml
+runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>"
+
+[flavors.resolute]
+  runner_image = "ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:<digest>"
+```
+
+and the pool's `extra_specs` is `{"flavor": "resolute"}`. Pools on different
+Ubuntu releases never share a toolcache or pnpm store volume: those caches are
+keyed on the image's `garm.docker/os-release` label as well as the repository
+(ADR-003). See [`runner-images/README.md`](runner-images/README.md) for the
+full entrypoint contract and package list.
 
 Always pin `runner_image` (and `dind_image`, and any `[flavors.*].runner_image`
 override) by digest — `name@sha256:<64-hex>` — never a mutable tag.
@@ -304,6 +328,7 @@ with:
 
 ```sh
 docker buildx imagetools inspect ghcr.io/tzuh-hsu/garm-runner-noble:latest
+docker buildx imagetools inspect ghcr.io/tzuh-hsu/garm-runner-resolute:latest
 # or, without a local Docker daemon:
 skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 ```

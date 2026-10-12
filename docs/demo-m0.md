@@ -99,7 +99,8 @@ is specific to this provider and this demo.
      release mode is picky about.
    - **`--from-source` additionally needs a Go toolchain** (`go.mod` pins
      `go 1.25.0`) to build the provider binary, and builds the runner image
-     locally (`docker build runner-images/noble`).
+     locally (`docker build -f runner-images/noble/Dockerfile runner-images`,
+     or `resolute` with `--runner-image resolute`).
 5. This repository checked out locally, with `scripts/demo-m0.sh`
    executable (`chmod +x scripts/demo-m0.sh` if needed).
 6. **Provider paths readable by GARM's service user.** GARM executes the
@@ -130,7 +131,8 @@ is specific to this provider and this demo.
   2. Verifies the downloaded binary against `SHA256SUMS` — **failing hard**
      (not warning) on any mismatch or missing entry — before it is ever
      executed.
-  3. Resolves `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s current
+  3. Resolves `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s (or, with
+     `--runner-image resolute`, `garm-runner-resolute:<version>`'s) current
      digest via `docker buildx imagetools inspect` (no pull required) and
      writes the generated config's `runner_image` as
      `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>` — **digest-pin
@@ -143,10 +145,17 @@ is specific to this provider and this demo.
 - **`source`** (`--from-source`) — the original, M0-era local-dev flow:
   builds the provider binary from this checkout (`go build`, version
   stamped from `git describe`) and the runner image locally (`docker build
-  runner-images/noble`, tagged `garm-runner-noble:demo`), and sets
+  -f runner-images/noble/Dockerfile runner-images`, tagged
+  `garm-runner-noble:demo`), and sets
   `allow_unpinned_runner_image = true` in the generated config (required —
   a local mutable tag can never be digest-pinned). Use this when testing
   uncommitted provider or runner-image changes.
+
+Either mode gates the Ubuntu 24.04 runner image by default. `--runner-image
+resolute` (or `RUNNER_IMAGE_NAME=resolute`) gates the Ubuntu 26.04 image
+instead: `runner-images/resolute` in source mode, `garm-runner-resolute` in
+release mode (published from v0.2.3 on). Like the other modes it is remembered
+by preflight for the later steps.
 
 Either mode ends with a generated demo provider `config.toml` (path printed
 by the script) and a verified, runnable provider binary; everything after
@@ -312,7 +321,8 @@ then, depending on mode:
   `runner_image` pinned to that digest — digest-pin enforcement stays ON.
 - **`--from-source`**: builds the provider binary (`go build -ldflags
   version stamp`) and the runner image locally (`docker build -t <tag>
-  runner-images/noble`), and generates a `config.toml` with
+  -f runner-images/<name>/Dockerfile runner-images`), and generates a
+  `config.toml` with
   `allow_unpinned_runner_image = true` (required for the mutable local
   tag).
 

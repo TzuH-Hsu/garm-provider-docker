@@ -24,7 +24,7 @@ The design rationale behind every major decision below is recorded in `research.
 - `internal/config` — TOML loading, defaults, and validation (ADR-005), plus the `go:embed`-ed provider-config JSON Schema (`schema.json`, exposed via `JSONSchema()`).
 - `internal/extraspecs` — the `extra_specs` Go struct, its `go:embed`-ed draft-07 JSON Schema (`schema.json`), fail-closed `gojsonschema` validation, the reserved-env denylist, and `Resolve` against the config ceiling/flavor/memory machinery (ADR-005, M3-W1). The two JSON Schemas from ADR-005 are co-located with the structs they describe (config schema in `internal/config`, extra_specs schema here) rather than in a single `internal/schema` package, to keep each next to its struct and minimize drift.
 - `internal/version` — build-time version metadata injected via `-ldflags`.
-- `runner-images/noble/` — the `Dockerfile` and `entrypoint.sh` for the runner image (ADR-002).
+- `runner-images/` — the runner images (ADR-002): `noble/` (Ubuntu 24.04) and `resolute/` (Ubuntu 26.04, added for v0.2.3) each hold a `Dockerfile`, and `common/entrypoint.sh` is the entrypoint both share.
 - `docs/` — this plan, the ADRs, and `research.md`.
 - `.github/workflows/` — CI: build, lint, unit tests, integration harness (M3), and release automation (M4).
 

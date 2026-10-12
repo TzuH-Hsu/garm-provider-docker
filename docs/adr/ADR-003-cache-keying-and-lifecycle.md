@@ -1,6 +1,6 @@
 # ADR-003: Cache Keying and Lifecycle
 
-Status: Accepted (2026-07-19); amended 2026-07-22 (see Amendments below)
+Status: Accepted (2026-07-19); amended 2026-07-22, 2026-10-11 and 2026-10-12 (see Amendments below)
 
 ## Context
 
@@ -177,3 +177,29 @@ Each pnpm generation ignores the other's name, so a repository on pnpm 11 silent
 **Decision.** `spec.BuildRunnerEnv` emits both `npm_config_store_dir=<path>` and `pnpm_config_store_dir=<path>` whenever a persistent pnpm store volume is mounted (and neither otherwise), in JIT and non-JIT modes. `npm_config_store_dir` stays authoritative for the runner-image entrypoint's `prepare_cache_dirs` ownership prep; both names carry the same path. Both are provider-injected names, so an `extra_specs.extra_env` entry that collides with either is dropped in favor of the provider's value (ADR-005 H2).
 
 **Known cosmetic cost.** npm 11 prints `npm warn Unknown env config "store-dir". This will stop working in the next major version of npm.` on each npm/npx invocation while `npm_config_store_dir` is present; npm 10 is silent, and `pnpm_config_store_dir` never warns on either. Alternatives were tried against real binaries and rejected: `PNPM_STORE_DIR` is not read by pnpm 10 or 11; the hyphenated spelling `npm_config_store-dir` works for pnpm 10 but npm 11 warns on it identically; a pnpm-specific rc file under `$XDG_CONFIG_HOME/pnpm/rc` is read by pnpm 10 and is silent in npm 11 but needs a file written into the runner's config tree and, unlike an env var, a workspace `.npmrc` can override it, which is the property the M2-W1 decision chose the environment to avoid. Since pnpm 10 still has to work, `npm_config_store_dir` is kept and the npm 11 warning is documented as cosmetic; it can be dropped once pnpm 10 is out of support.
+
+## Amendment (2026-10-12) — toolcache and pnpm store volumes are keyed on the runner image's OS release
+
+With a second runner image (Ubuntu 26.04 next to 24.04, ADR-002 2026-10-12 Amendment), one repository can run pools on two Ubuntu releases on the same host. The keys above would hand both the same toolcache and pnpm store, and neither is portable across releases: `actions/setup-python` and `actions/setup-node` download builds made for one Ubuntu release into the toolcache (a Python built against 26.04's glibc does not start on 24.04), and pnpm's side-effects cache keeps built native addons keyed only by platform, architecture and Node major, so an addon linked against the newer glibc would be reused on the older one. The externals volume is already safe (keyed on the image digest) and diag logs are plain text, so only the toolcache and the pnpm store change.
+
+**Decision.** Both names gain an OS key between the repokey and the salt, and both label sets carry it as `garm.docker/os-release`:
+
+- toolcache: `garm-cache-toolcache-<repokey>-<oskey>-<gen>`
+- pnpm store: `garm-cache-pnpm-<repokey>-<oskey>-<pnpmMajor>`
+
+The OS key comes from the runner image itself (`spec.RunnerOSKey`), read with an image inspect after the image is pulled (so `CreateInstance` now pulls the runner image before it resolves the caches, rather than after the credential fetch):
+
+1. the image's `garm.docker/os-release` label when present. Both published images set it (`ubuntu-24.04`, `ubuntu-26.04`) and derived images inherit it, so an image rebuilt on the same release keeps its warm caches. A value outside `^[a-z0-9][a-z0-9._-]{0,63}$`, or one starting with `image-`, fails the allocation: the label is in this provider's namespace, so a malformed value is a broken image, not something to guess around;
+2. otherwise `image-` plus the first 32 hex characters of the image content ID. That is always correct, since two OS releases cannot share a content ID, but such caches start cold whenever the image is rebuilt, and the stranded volumes are only reported by the age rule; the provider logs the fallback at info level, and operators building images from other bases set the label to avoid it.
+
+Because the OS key and the salts may both contain `-`, two different (OS key, salt) pairs can in principle spell the same volume name (`a-b` + `c` and `a` + `b-c`). That cannot mix caches: the name's existing volume carries the other pair's labels, so adoption is refused on the `os-release` (or salt) mismatch and `EnsureCacheVolume` reconciles to a deterministic alternate name (the label-as-identity redesign above), keeping the two caches separate.
+
+Alternatives considered: keying on the image digest alone is correct but throws the toolcache away on every image release, which defeats the cache; reading `org.opencontainers.image.version` (the Ubuntu base sets `24.04`/`26.04`) relies on a label any intermediate image may overwrite with its own version, so an explicit label in this provider's namespace is used instead; running the image to read `/etc/os-release` would add a container start to every allocation.
+
+`garm.docker/os-release` joins the adoption identity keys (`cacheIdentityLabelKeys`), so a volume created for one release is never adopted for another even under a name collision. It is deliberately not added to the strict per-kind schema (`requiredCacheIdentityKeys`): toolcache and pnpm volumes created before this amendment have no OS label, and they must stay provably ours so the log-only GC reports them instead of treating them as foreign. The GC now flags such a volume as superseded once it is past the grace window ("created before toolcache/pnpm volumes were keyed on the OS release"), because no allocation resolves to its old name any more. Upgrading therefore costs each repository one cold toolcache and pnpm store; the old volumes are left in place, logged, for the operator's `docker volume prune`, as for any other superseded cache.
+
+The diag-logs volume keeps its per-repository key and is shared by a repository's pools on both releases. The externals volume is unchanged: one per image digest, so each image already has its own.
+
+Known limitation, unchanged by this amendment: the GC's externals supersession compares against the config-wide `runner_image` only, so the externals volume of an image selected through a flavor (for example the Ubuntu 26.04 image) is logged as superseded once past the grace window. Nothing is removed (the GC is log-only); if an operator prunes it between jobs, the next allocation re-seeds it.
+
+Tests: `internal/spec/osrelease_test.go` (key derivation, names, labels, adoption across releases, legacy validity), `internal/spec/gc_test.go` (pre-OS-key supersession), and `internal/provider/cache_osrelease_test.go` (one repository with a 24.04 pool and a 26.04 flavor pool gets two toolcache and two pnpm volumes, one shared diag volume, and each runner mounts its own release's toolcache; an unlabelled image keys on its content ID; a malformed label fails the create before any cache volume or runner exists).

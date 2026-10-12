@@ -173,6 +173,30 @@ authoritative schema with `GetConfigJSONSchema`. The keys most relevant to the
 (the default), the `[flavors.*]` map (the only image-varying channel), and
 `[extra_specs].allowed_env` (the `extra_env` allowlist).
 
+### Flavors
+
+A `[flavors.<name>]` entry overrides `runner_image`, `runner_memory` and/or
+`dind_memory` for the pools whose `extra_specs` select it by name. The usual
+case is running some pools on the Ubuntu 26.04 runner image while the default
+stays on Ubuntu 24.04 (see [`runner-images/README.md`](../runner-images/README.md)):
+
+```toml
+# Default for every pool: the Ubuntu 24.04 runner image.
+runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>"
+
+# Pools with extra_specs {"flavor": "resolute"} run the Ubuntu 26.04 image
+# (GCC 15, LLVM 22), the toolchain of ubuntu-latest from 2026-10-19.
+[flavors.resolute]
+  runner_image = "ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:<digest>"
+```
+
+A flavor's `runner_image` must be digest-pinned like the top-level one. Pools
+of one repository on the two images get separate toolcache and pnpm store
+volumes (keyed on the image's `garm.docker/os-release` label, ADR-003) and
+share its diagnostic-log volume.
+
+### `[extra_specs]` (the `extra_env` allowlist)
+
 The `extra_env` allowlist is an operator opt-in. It defaults to empty (a pool can
 set no extra env at all); add the names you trust a pool admin to set:
 
