@@ -165,3 +165,9 @@ storage_driver = "overlay2"
   runner_memory = "2GiB"
   dind_memory = "1GiB"
   runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble-small@sha256:cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+
+# Pools that need the Ubuntu 26.04 toolchain (GCC 15, LLVM 22; what
+# ubuntu-latest means from 2026-10-19) select this flavor. Their toolcache and
+# pnpm store are kept apart from the 24.04 pools' (ADR-003).
+[flavors.resolute]
+  runner_image = "ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"

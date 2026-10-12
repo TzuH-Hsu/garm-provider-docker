@@ -204,7 +204,10 @@ Status: Accepted (2026-07-19)
 > create on affected hosts only, and probing the host first would add a
 > Docker call to every allocation.
 
-> **Amendment (2026-10-11): what the base image carries.** Runner jobs have no
+> **Amendment (2026-10-11): what the base image carries.** (Corrected
+> 2026-10-12: the next sentence is wrong. Runner jobs do have passwordless
+> sudo through the base image's sudoers rule, and keep it; see the 2026-10-12
+> Amendment. The package policy below stands.) Runner jobs have no
 > passwordless sudo, so a job cannot install system packages, and the
 > `setup-*` actions only supply languages and toolchains. The policy is
 > therefore: the base image carries the commonly needed apt-level
@@ -218,7 +221,78 @@ Status: Accepted (2026-07-19)
 > open-file soft limit from Docker's 1024 to 65536 (clamped to the hard
 > limit, best effort, never fatal) before the privilege drop, as hosted
 > runners do. The package list and the reasoning behind each entry are in
-> `runner-images/noble/README.md`.
+> `runner-images/README.md` (moved there from `runner-images/noble/README.md`
+> by the 2026-10-12 Amendment).
+
+> **Amendment (2026-10-12): two base images, `/usr/local` writable, pipx and
+> LLVM tools.** GitHub moves `ubuntu-latest` to Ubuntu 26.04 on 2026-10-19,
+> and repositories written against it need that release's toolchain (GCC 15
+> as the default compiler, LLVM 22). The Decision's single Noble image
+> becomes two images built side by side, both published on every release and
+> both supported:
+>
+> - `runner-images/noble/` → `ghcr.io/tzuh-hsu/garm-runner-noble`, `FROM`
+>   `myoung34/github-runner:ubuntu-noble` (Ubuntu 24.04), unchanged in role;
+> - `runner-images/resolute/` → `ghcr.io/tzuh-hsu/garm-runner-resolute`,
+>   `FROM` `myoung34/github-runner:ubuntu-resolute` (Ubuntu 26.04), pinned by
+>   its multi-arch index digest exactly like Noble.
+>
+> Image selection stays config-only: `runner_image` is the default, and a
+> pool that needs the other release selects a `[flavors.*]` entry whose
+> `runner_image` points at it. The two images share one entrypoint,
+> `runner-images/common/entrypoint.sh`: it contains nothing release-specific,
+> and two copies would drift. Docker cannot `COPY` from outside the build
+> context (a symlink to `../noble/entrypoint.sh` is not followed out of it),
+> so the build context for both images is `runner-images/` and each
+> Dockerfile is selected with `-f`; named build contexts were rejected
+> because a plain `docker build` without the extra flag would then fail
+> obscurely. Each image carries a `garm.docker/os-release` label
+> (`ubuntu-24.04`, `ubuntu-26.04`) that the provider keys the toolcache and
+> pnpm store volumes on (ADR-003, 2026-10-12 Amendment).
+>
+> Both images also close gaps found by running real repositories' CI-tool
+> installers in them:
+>
+> - **`/usr/local/bin` and `/usr/local/lib` are owned by the runner user.**
+>   Hosted-runner CI scripts install pinned single-binary tools (and tool
+>   trees such as CMake) there and use `sudo` only when the directory is not
+>   writable; owning the directories lets them install without root (and
+>   keeps them working in a derived image without sudo). Only the two
+>   directories change owner, not the files the base ships in them. This
+>   leaks nothing between jobs: a runner container serves one job and its
+>   writable layer is discarded.
+> - **`pipx`**, because PEP 668 blocks `pip install --user` on both releases.
+> - **`clang-format` and `clang-tidy`** from the Ubuntu archive: LLVM 18 on
+>   Noble (its default, and the hosted ubuntu-24.04 default; newer LLVM
+>   exists there only in `noble-updates` or apt.llvm.org, and no third-party
+>   apt repository is added), LLVM 22 on Resolute (its archive's newest; the
+>   unversioned packages still point at 21). The unversioned names resolve to
+>   the installed release through `update-alternatives`, as on hosted
+>   images.
+> - **`cmake` and `ninja-build`**, which hosted images carry; about 50 MB.
+>
+> The LLVM libraries `clang-tidy` depends on are the main size cost, about
+> 300 MB per image (Noble grows from 3.66 GB to 4.15 GB unpacked on amd64).
+>
+> **Correction and decision: the runner user has passwordless sudo, and keeps
+> it.**
+> The 2026-10-11 Amendment above states that runner jobs have no passwordless
+> sudo. That is not what the images do: both `myoung34/github-runner` bases
+> (the Noble pin in use since v0.2.0 and the new Resolute pin) ship
+> `%sudo ALL=(ALL) NOPASSWD: ALL` in `/etc/sudoers` and add `runner` to the
+> `sudo` group, and the provider sets no `no-new-privileges` security option,
+> so after the entrypoint's `gosu runner` drop, `sudo -n id -u` prints `0`
+> (verified on both images). A job therefore can become root inside its own
+> container. Container isolation is unchanged: the container is unprivileged
+> in `none` mode, carries no host socket, and its credentials sit on a tmpfs
+> the job could already read as the runner user; a DinD job could already
+> reach a root-equivalent daemon. **Decision (owner, 2026-10-12): keep
+> passwordless sudo**, for parity with GitHub-hosted runners, where jobs have
+> it too. Operators who want to harden can build a derived image without the
+> sudoers rule; a provider option to set `no-new-privileges` (which also
+> blocks every other setuid binary) could be added later. Nothing in these
+> images depends on sudo: tool installs go to the runner-owned `/usr/local`,
+> and Python tools to `pipx`.
 
 ## Context
 
