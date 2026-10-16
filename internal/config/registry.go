@@ -73,6 +73,11 @@ func (c Config) validateInsecureRegistries() error {
 	for i, raw := range c.InsecureRegistries {
 		key, err := validateInsecureRegistry(raw)
 		if err != nil {
+			// Errors from validateInsecureRegistry never embed the value;
+			// the wrapper echoes it only when it cannot hold credentials.
+			if strings.ContainsAny(raw, "@%") {
+				return fmt.Errorf("%s[%d]: %w", insecureRegistriesKey, i, err)
+			}
 			return fmt.Errorf("%s[%d] %q: %w", insecureRegistriesKey, i, raw, err)
 		}
 		if _, dup := seen[key]; dup {
@@ -87,47 +92,52 @@ func (c Config) validateInsecureRegistries() error {
 // scheme and nothing else. The offending value is echoed back in the error
 // except where it could carry credentials.
 func validateRegistryMirror(raw string) error {
+	// Credentials first, before any other check can echo the value: a mirror
+	// URL with userinfo (user:token@host) must never reach an error string,
+	// whatever else is wrong with it. '%' is treated the same way, since it
+	// can percent-encode an '@'.
+	if strings.ContainsAny(raw, "@%") {
+		return errors.New("a mirror URL must not contain userinfo (user:password@) or percent-encoding; the value is not shown")
+	}
+	shown := strconv.Quote(raw)
+
 	if strings.TrimSpace(raw) != raw || raw == "" {
-		return fmt.Errorf("%q must not be empty or have leading or trailing whitespace", raw)
+		return fmt.Errorf("%s must not be empty or have leading or trailing whitespace", shown)
 	}
 	scheme, rest, ok := strings.Cut(raw, "://")
 	if !ok || scheme == "" {
-		return fmt.Errorf("%q must be an absolute URL with an http:// or https:// scheme", raw)
+		return fmt.Errorf("%s must be an absolute URL with an http:// or https:// scheme", shown)
 	}
 	// Lowercase only: dockerd's classic pull path checks the configured string
 	// for a literal "http://" / "https://" prefix and would otherwise prepend
 	// "https://" to an "HTTPS://..." mirror.
 	if scheme != "http" && scheme != "https" {
-		return fmt.Errorf("%q has unsupported scheme %q: must be lowercase http or https", raw, scheme)
-	}
-
-	authority := rest
-	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
-		authority = rest[:end]
-	}
-	if strings.Contains(authority, "@") {
-		// Never echo the value: it holds credentials.
-		return errors.New("userinfo (user:password@) is not allowed in a mirror URL")
+		return fmt.Errorf("%s has unsupported scheme %s: must be lowercase http or https", shown, strconv.Quote(scheme))
 	}
 	if strings.Contains(rest, "?") {
-		return fmt.Errorf("%q must not have a query", raw)
+		return fmt.Errorf("%s must not have a query", shown)
 	}
 	if strings.Contains(rest, "#") {
-		return fmt.Errorf("%q must not have a fragment", raw)
+		return fmt.Errorf("%s must not have a fragment", shown)
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("%q is not a valid URL: %w", raw, err)
+		// url.Error embeds the raw string; report only the underlying cause.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return fmt.Errorf("%s is not a valid URL: %w", shown, err)
 	}
 	if u.Hostname() == "" {
-		return fmt.Errorf("%q has no host", raw)
+		return fmt.Errorf("%s has no host", shown)
 	}
 	if u.Path != "" && u.Path != "/" {
-		return fmt.Errorf("%q must not have a path (only a bare origin is accepted)", raw)
+		return fmt.Errorf("%s must not have a path (only a bare origin is accepted)", shown)
 	}
 	if err := validateHostPort(u.Host); err != nil {
-		return fmt.Errorf("%q: %w", raw, err)
+		return fmt.Errorf("%s: %w", shown, err)
 	}
 	return nil
 }
@@ -135,6 +145,9 @@ func validateRegistryMirror(raw string) error {
 // validateInsecureRegistry accepts host[:port] or a CIDR, as dockerd does, and
 // returns the normalised duplicate-detection key.
 func validateInsecureRegistry(raw string) (string, error) {
+	if strings.ContainsAny(raw, "@%") {
+		return "", errors.New("must be host[:port] or a CIDR and must not contain userinfo ('@') or '%'; the value is not shown")
+	}
 	if strings.TrimSpace(raw) != raw || raw == "" {
 		return "", errors.New("must not be empty or have leading or trailing whitespace")
 	}
