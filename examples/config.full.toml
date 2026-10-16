@@ -3,10 +3,11 @@
 # Every configurable key, commented. Unless a key's own comment says
 # otherwise, the value below IS internal/config's real default (so this
 # file doubles as a reference for "what do I get if I never touch a key").
-# A few sections deliberately show a non-default, illustrative value
+# A few keys deliberately show a non-default, illustrative value
 # instead - [resources]'s runner_memory/dind_memory (default: empty,
-# meaning unlimited) and [extra_specs].allowed_env (default: empty) are the
-# two - and each such section's comment says so explicitly. Fields with no
+# meaning unlimited), registry_mirrors and insecure_registries (default:
+# empty) and [extra_specs].allowed_env (default: empty) - and each such
+# key's comment says so explicitly. Fields with no
 # default at all (runner_image, dind_image, [flavors.*]) are always
 # illustrative placeholders - replace them with your own before using this
 # file for real. See docs/config-reference.md for the full reference and
@@ -59,8 +60,9 @@ allowed_dind_modes = ["none"]
 # No default. REQUIRED only when the effective dind_mode != "none"; even
 # under "none" (as here), a value you DO set is still validated, so a typo
 # is caught at load time rather than only after you later enable DinD.
-# To use a registry mirror in the sidecar, build a custom image with a
-# daemon.json and pin that here: see docs/dind-image-pulls.md.
+# To use a registry mirror in the sidecar, set registry_mirrors below (see
+# docs/dind-image-pulls.md); do not also bake registry-mirrors into a custom
+# image's daemon.json, or dockerd refuses to start.
 dind_image = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
 
 # Dev-only escape hatch for dind_image, independent of
@@ -74,6 +76,25 @@ allow_unpinned_dind_image = false
 # ("vfs" is the slower, more compatible fallback - see the NAS notes in the
 # root README).
 storage_driver = "overlay2"
+
+# Docker Hub pull-through mirrors for the DinD sidecar's dockerd, emitted as
+# one --registry-mirror=<url> flag each. Each entry is a bare origin: an
+# http or https URL with a host and optional port, no path, query, fragment
+# or userinfo. Default: empty (no flag). dockerd uses a mirror only for
+# Docker Hub images and falls back to the upstream when the mirror is down.
+# Global and config-only: no flavor or extra_specs key can set it. The
+# value below is illustrative - point it at a mirror your Docker host and the
+# job networks can reach (see docs/dind-image-pulls.md).
+registry_mirrors = ["http://mirror.lan.example:5000"]
+
+# Registries the sidecar's dockerd may reach over plain HTTP or with an
+# untrusted certificate, emitted as one --insecure-registry=<entry> flag
+# each. host[:port] or a CIDR, never a URL. Default: empty (no flag). An
+# http:// mirror does NOT need an entry here (dockerd takes the scheme from
+# the mirror URL); use this for a mirror that serves HTTPS with a
+# certificate the sidecar does not trust, or for a private HTTP registry
+# that jobs pull from by name. Illustrative value below.
+insecure_registries = ["registry.lan.example:5001"]
 
 [resources]
   # Container memory limits. No cpu or pids limits, by design (ADR-005).

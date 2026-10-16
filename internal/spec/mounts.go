@@ -358,6 +358,13 @@ type DindContainerSpec struct {
 	// filesystems make in-container autodetection unreliable.
 	StorageDriver string
 
+	// RegistryMirrors and InsecureRegistries are the operator's registry
+	// settings for the sidecar daemon (config.Config.RegistryMirrors /
+	// InsecureRegistries). They are config-only — never populated from
+	// extra_specs — and are emitted as typed dockerd flags by DindCommand.
+	RegistryMirrors    []string
+	InsecureRegistries []string
+
 	// Privileged and Runtime are the two HostConfig fields ADR-001 says
 	// differ between privileged-sidecar and sysbox-runc mode ("Only two
 	// HostConfig fields differ on the DinD sidecar"). Both are derived from

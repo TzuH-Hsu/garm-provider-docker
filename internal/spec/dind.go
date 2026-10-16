@@ -90,13 +90,29 @@ const (
 // group — the runner user is made a member of that same GID, so a non-root
 // `docker` call from the runner can reach this socket. The docker:dind image's
 // entrypoint runs the DinD setup then execs this argv.
-func DindCommand(storageDriver string) []string {
-	return []string{
+//
+// registryMirrors and insecureRegistries are the operator's config-only
+// registry settings (config.Config.RegistryMirrors/InsecureRegistries, already
+// validated at load). They are appended AFTER the four fixed flags above, which
+// stay first and unchanged: one --registry-mirror=<url> per mirror, then one
+// --insecure-registry=<entry> per entry, in configured order. They are typed
+// flags rather than a daemon.json passthrough so the operator can never reach
+// options the provider owns (--host, --storage-driver, --group). A nil or empty
+// list adds nothing.
+func DindCommand(storageDriver string, registryMirrors, insecureRegistries []string) []string {
+	cmd := []string{
 		"dockerd",
 		"--host=" + DindDockerHost,
 		"--storage-driver=" + storageDriver,
 		"--group=" + DindSocketGID,
 	}
+	for _, m := range registryMirrors {
+		cmd = append(cmd, "--registry-mirror="+m)
+	}
+	for _, r := range insecureRegistries {
+		cmd = append(cmd, "--insecure-registry="+r)
+	}
+	return cmd
 }
 
 // DindSharesRunnerNetns reports whether the DinD sidecar for dindMode joins
@@ -168,7 +184,7 @@ func BuildDindContainer(s DindContainerSpec) (*container.Config, *container.Host
 		Image:  s.Image,
 		Env:    env,
 		Labels: s.Labels,
-		Cmd:    DindCommand(s.StorageDriver),
+		Cmd:    DindCommand(s.StorageDriver, s.RegistryMirrors, s.InsecureRegistries),
 	}
 
 	mounts := []mount.Mount{
