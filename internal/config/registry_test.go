@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -127,6 +128,69 @@ func TestConfigValidateInsecureRegistries(t *testing.T) {
 			assertValidation(t, cfg.Validate(), tt.wantErr)
 		})
 	}
+}
+
+// TestRegistryErrorsNeverEchoCredentials pins that an entry carrying a secret
+// never appears in any returned error, whichever other rule it also breaks
+// (wrong scheme, query, fragment, path, bad port, unparseable URL, duplicate)
+// and for both lists, direct or via Load.
+func TestRegistryErrorsNeverEchoCredentials(t *testing.T) {
+	const secret = "s3cr3t-t0ken"
+	mirrors := []string{
+		"https://user:" + secret + "@mirror.example",
+		"ftp://user:" + secret + "@mirror.example",
+		"user:" + secret + "@mirror.example:5000",
+		"https://user:" + secret + "@mirror.example/path",
+		"https://user:" + secret + "@mirror.example?x=1",
+		"https://user:" + secret + "@mirror.example#frag",
+		"https://user:" + secret + "@mirror.example:notaport",
+		"https://user:" + secret + "@[bad",
+		"https://us%40er:" + secret + "%40mirror.example",
+		" https://user:" + secret + "@mirror.example",
+	}
+	insecure := []string{
+		"user:" + secret + "@mirror.example:5000",
+		"http://user:" + secret + "@mirror.example",
+		"user:" + secret + "@10.0.0.0/8",
+		secret + "%40mirror.example",
+	}
+
+	check := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("Validate() succeeded, want an error")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error leaks the credential: %q", err)
+		}
+		if unwrapped := errors.Unwrap(err); unwrapped != nil && strings.Contains(unwrapped.Error(), secret) {
+			t.Errorf("wrapped error leaks the credential: %q", unwrapped)
+		}
+	}
+
+	for _, m := range mirrors {
+		cfg := validBaseConfig(registryTestRunnerImage, false)
+		cfg.RegistryMirrors = []string{m}
+		check(t, cfg.Validate())
+
+		// A duplicate must not echo it either (second entry is the secret one).
+		cfg.RegistryMirrors = []string{"https://mirror.example", m}
+		check(t, cfg.Validate())
+	}
+	for _, r := range insecure {
+		cfg := validBaseConfig(registryTestRunnerImage, false)
+		cfg.InsecureRegistries = []string{r}
+		check(t, cfg.Validate())
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := "runner_image = \"" + registryTestRunnerImage + "\"\n" +
+		"registry_mirrors = [\"ftp://user:" + secret + "@mirror.example\"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := Load(path)
+	check(t, err)
 }
 
 // TestRegistrySettingsValidatedInNoneMode pins that a malformed entry is
