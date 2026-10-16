@@ -43,6 +43,7 @@ is specific to this provider and this demo.
 - [Release mode vs. source mode](#release-mode-vs-source-mode)
 - [Scale set (default) vs. pool](#scale-set-default-vs-pool)
 - [The DinD variant](#the-dind-variant)
+  - [Registry mirror check (opt-in)](#registry-mirror-check-opt-in)
 - [What this demo proves](#what-this-demo-proves)
 - [What this demo does not cover](#what-this-demo-does-not-cover)
 - [Running the demo](#running-the-demo)
@@ -236,6 +237,65 @@ host; a malicious job could pivot to the host (ADR-001 "Residual risk").
 Use a disposable VM. The 6GiB + 4GiB flavor sizes are limits, not
 reservations, but size the VM accordingly.
 
+### Registry mirror check (opt-in)
+
+With `--dind`, setting `GATE_REGISTRY_MIRROR` adds a check of the sidecar's
+registry mirror (`registry_mirrors`, see [`dind-image-pulls.md`](dind-image-pulls.md)).
+Unset, which is the default, none of it runs and the gate is unchanged.
+
+```sh
+# The mirror is a Docker Hub pull-through cache your Docker host and the job
+# networks can reach (a distribution `registry` in proxy mode, per
+# dind-image-pulls.md). The log container is optional but recommended.
+export GATE_REGISTRY_MIRROR=http://mirror.lan.example:5000
+export GATE_MIRROR_LOG_CONTAINER=registry-mirror   # the mirror's container name on this host
+scripts/demo-m0.sh --dind preflight
+# ... pool, then once the job is running and the runner is idle:
+scripts/demo-m0.sh verify
+```
+
+What it changes and checks:
+
+- **Preflight** writes `registry_mirrors = ["<mirror>"]` into the generated
+  config (and `insecure_registries = ["<GATE_INSECURE_REGISTRY>"]` when that is
+  set), and refuses to continue if the provider build does not list
+  `registry_mirrors` in its config schema: a build without the key would load
+  the config, ignore the key, and run the sidecar with no mirror. A release that
+  predates the setting therefore fails here; use a release that includes it or
+  `--from-source`. The mirror and insecure registry are remembered with the
+  other modes (`gate-modes`), so later single steps need not repeat them.
+- **The workflow** gains a step, right after the first one, that fails the job
+  unless `docker info` in the job lists the mirror under Registry Mirrors
+  (dockerd prints it with a trailing `/`), and its final hold lasts 120 s
+  instead of 60 s to leave `verify` room for its extra pull.
+- **`verify`** adds, in the DinD part of check (b):
+  1. the sidecar's `dockerd` argv has `--registry-mirror=<mirror>`, and an
+     `--insecure-registry` flag only when `GATE_INSECURE_REGISTRY` is set. By
+     default the mirror is therefore exercised **without** an insecure entry,
+     which checks the claim that an `http://` mirror needs none. If that fails
+     on your Engine, set `GATE_INSECURE_REGISTRY` to the mirror's `host:port`
+     and report it;
+  2. `docker info` through the runner's `DOCKER_HOST` (the sidecar's daemon)
+     lists the mirror, and the insecure registry when one is set;
+  3. a pull of `GATE_MIRROR_PULL_IMAGE` (default `nginx:alpine-slim`, a small
+     Docker Hub official image the sample workflow never pulls) succeeds and is
+     observed at the mirror. The image is removed first so the pull is real.
+     With `GATE_MIRROR_LOG_CONTAINER` set, the mirror's access log
+     (`docker logs --since <just before the pull>`) must show requests under
+     `/v2/library/<image>/`; this is the authoritative check, and its absence
+     fails the gate. Without it, the mirror's `/v2/_catalog` (read from inside
+     the runner, the same network path dockerd uses) must list the repository
+     after the pull. That needs a distribution-based mirror, and if the
+     repository was already cached it only proves the mirror holds it; `verify`
+     says so, and if the catalog cannot be read it asks for the log container
+     instead.
+
+Run `verify` while the job holds (the same window as the other `verify`
+checks). The mirror must be reachable from the job network; with
+`[network].internal = true` it cannot be (that network has no route out at
+all). The check pulls one small image through the mirror and
+does nothing else to it.
+
 ## What this demo proves
 
 | # | Demo verification item | Maps to |
@@ -296,7 +356,8 @@ the full command list and every environment variable it accepts.
 
 **Modes are remembered between steps.** `preflight` (and `all`) record the
 effective `PROVIDER_SOURCE`, `PROVIDER_VERSION`, `GARM_TARGET`,
-`GATE_VARIANT` and `PROVIDER_INTERFACE_VERSION` in
+`GATE_VARIANT`, `PROVIDER_INTERFACE_VERSION`, `RUNNER_IMAGE_NAME` and, when
+set, `GATE_REGISTRY_MIRROR` / `GATE_INSECURE_REGISTRY` in
 `$PROVIDER_CONFIG_DIR/gate-modes` (mode 0600, plain `KEY=value` lines that
 are parsed, never sourced). A later single step run without a flag for a
 mode uses the saved value and logs `using saved <mode>=<value>`, so
@@ -429,7 +490,8 @@ Run it once the runner is `idle` (GARM's runner list, or `Listening for Jobs`
 in `docker logs`), not the moment its container appears: the entrypoint links
 the credential files into the install directory a few seconds after the
 container starts, and check (d) fails if it runs before that. The job's hold
-(30 s, or 60 s with `--dind`) leaves enough time for it.
+(30 s, 60 s with `--dind`, 120 s with `--dind` and `GATE_REGISTRY_MIRROR`)
+leaves enough time for it.
 
 Resolves the current managed runner container and checks, printing
 PASS/FAIL for each: ownership labels on the container, the labeled per-job

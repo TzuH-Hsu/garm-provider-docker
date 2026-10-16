@@ -67,6 +67,8 @@
 #               `docker run` and `docker build` inside the job. NOTE:
 #               privileged-sidecar runs a Privileged=true daemon on this
 #               host (ADR-001 "Residual risk") - use a disposable VM.
+#               With GATE_REGISTRY_MIRROR set (see below) it also checks the
+#               sidecar's registry mirror (opt-in; docs/demo-m0.md).
 #
 # Assumptions:
 #   - You are on a Linux Docker host (or macOS + Docker Desktop),
@@ -155,7 +157,35 @@
 #   DIND_IMAGE_SOURCE     Mutable reference whose digest is resolved and
 #                          pinned as dind_image in the dind variant.
 #                          Default: docker:dind
-#   PROVIDER_NAME         Name this provider is registered under in GARM's
+#   GATE_REGISTRY_MIRROR  Optional, dind variant only: a Docker Hub mirror the
+#                          generated config passes to the sidecar as
+#                          registry_mirrors, e.g. http://mirror.lan.example:5000
+#                          (a bare http(s) origin). When set, the sample
+#                          workflow gains a step asserting `docker info` lists
+#                          the mirror, and `verify` checks the sidecar's
+#                          dockerd flags, `docker info`, and that a pull of
+#                          GATE_MIRROR_PULL_IMAGE is observed at the mirror.
+#                          Needs a provider build that has registry_mirrors
+#                          (preflight checks the config schema). Remembered
+#                          with the other modes. Unset: no mirror check at all.
+#   GATE_INSECURE_REGISTRY
+#                          Optional, with GATE_REGISTRY_MIRROR: a host[:port]
+#                          passed as insecure_registries. Leave it unset for an
+#                          http:// mirror (dockerd needs no entry for one);
+#                          set it for an https mirror with an untrusted
+#                          certificate. Remembered with the other modes.
+#   GATE_MIRROR_LOG_CONTAINER
+#                          Optional: name of the mirror's container on this
+#                          host. `verify` then checks its access log
+#                          (docker logs --since just before the pull) for the
+#                          pulled repository, the authoritative proof that the
+#                          pull went through the mirror. Without it `verify`
+#                          reads the mirror's /v2/_catalog instead. Not
+#                          remembered; give it to the `verify` step.
+#   GATE_MIRROR_PULL_IMAGE
+#                          Docker Hub official image (name:tag) that `verify`
+#                          pulls through the mirror. Default: nginx:alpine-slim
+#   PROVIDER_NAME        Name this provider is registered under in GARM's
 #                          config.toml [[provider]] section.
 #                          Default: docker_demo
 #   PROVIDER_INTERFACE_VERSION
@@ -217,6 +247,8 @@ EXPL_PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-}"
 EXPL_GARM_TARGET="${GARM_TARGET:-}"
 EXPL_GATE_VARIANT="${GATE_VARIANT:-}"
 EXPL_RUNNER_IMAGE_NAME="${RUNNER_IMAGE_NAME:-}"
+EXPL_GATE_REGISTRY_MIRROR="${GATE_REGISTRY_MIRROR:-}"
+EXPL_GATE_INSECURE_REGISTRY="${GATE_INSECURE_REGISTRY:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.4}"
@@ -271,6 +303,27 @@ readonly DIND_FLAVOR_NAME=dind
 readonly DIND_RUNNER_MEMORY=6GiB
 readonly DIND_DIND_MEMORY=4GiB
 readonly DIND_EXTRA_SPECS='{"flavor":"dind","dind_mode":"privileged-sidecar"}'
+
+# Registry mirror check (opt-in, dind variant only; docs/demo-m0.md "Registry
+# mirror check"). GATE_REGISTRY_MIRROR is written to the generated config as
+# registry_mirrors (and GATE_INSECURE_REGISTRY, when set, as
+# insecure_registries); verify then checks the sidecar's dockerd flags, that
+# `docker info` in the job lists the mirror, and that a pull is observed at the
+# mirror. Both are remembered with the other modes. Unset (the default) skips
+# every one of those checks.
+GATE_REGISTRY_MIRROR="${GATE_REGISTRY_MIRROR:-}"
+GATE_INSECURE_REGISTRY="${GATE_INSECURE_REGISTRY:-}"
+# Per-step options (not remembered): the mirror's container name on this host
+# (enables the access-log check) and the Docker Hub official image the verify
+# step pulls through the mirror. The default is a small image whose repository
+# the sample workflow never pulls, so a cold mirror does not yet hold it.
+GATE_MIRROR_LOG_CONTAINER="${GATE_MIRROR_LOG_CONTAINER:-}"
+GATE_MIRROR_PULL_IMAGE="${GATE_MIRROR_PULL_IMAGE:-nginx:alpine-slim}"
+# Allowlists (no quote, space, $, ;, &, |, backslash or newline, so a value is
+# safe in the generated TOML/YAML and in a shell word): a bare http(s) origin
+# with an optional port, and a host[:port].
+readonly MIRROR_URL_RE='^https?://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?/?$'
+readonly INSECURE_HOST_RE='^(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?$'
 
 # --image/--flavor are REQUIRED by `garm-cli pool add` but are provider-
 # specific and, for THIS provider, purely informational: CreateInstance
@@ -385,6 +438,10 @@ validate_inputs() {
   [[ -z "${REPO}" ]] || require_format REPO "${REPO}" '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$' 128 "a repo ID or owner/name of letters, digits, '.', '_', '-' and one '/'"
   [[ -z "${SCALESET_NAME}" ]] || require_format SCALESET_NAME "${SCALESET_NAME}" "${name_re}" "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-', starting with a letter or digit"
   [[ -z "${SCALESET_ID}" ]] || require_format SCALESET_ID "${SCALESET_ID}" '^[A-Za-z0-9][A-Za-z0-9-]*$' 64 "an ID of letters, digits and '-'"
+  [[ -z "${GATE_REGISTRY_MIRROR}" ]] || require_format GATE_REGISTRY_MIRROR "${GATE_REGISTRY_MIRROR}" "${MIRROR_URL_RE}" 256 "a bare http(s) origin such as http://mirror.lan.example:5000, with no path, credentials or query"
+  [[ -z "${GATE_INSECURE_REGISTRY}" ]] || require_format GATE_INSECURE_REGISTRY "${GATE_INSECURE_REGISTRY}" "${INSECURE_HOST_RE}" 256 "a host[:port] such as mirror.lan.example:5000"
+  [[ -z "${GATE_MIRROR_LOG_CONTAINER}" ]] || require_format GATE_MIRROR_LOG_CONTAINER "${GATE_MIRROR_LOG_CONTAINER}" "${name_re}" "${MAX_NAME_LEN}" "a container name of letters, digits, '.', '_' and '-'"
+  require_format GATE_MIRROR_PULL_IMAGE "${GATE_MIRROR_PULL_IMAGE}" '^[a-z0-9][a-z0-9._-]*:[A-Za-z0-9][A-Za-z0-9._-]*$' 128 "a Docker Hub official image name:tag such as nginx:alpine-slim"
   require_format PROVIDER_BIN_DIR "${PROVIDER_BIN_DIR}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces; set PROVIDER_BIN_DIR explicitly if the checkout path contains other characters)"
   require_format PROVIDER_CONFIG_DIR "${PROVIDER_CONFIG_DIR}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces; set PROVIDER_CONFIG_DIR explicitly)"
   [[ "/${PROVIDER_BIN_DIR}/" != */../* && "/${PROVIDER_CONFIG_DIR}/" != */../* ]] \
@@ -459,6 +516,19 @@ validate_modes() {
   check_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR
 }
 
+# validate_registry_gate rejects a registry-mirror setting outside the dind
+# variant (the settings configure the sidecar's daemon, which only exists
+# there). It runs once the effective variant is known, i.e. after any saved
+# modes have been loaded.
+validate_registry_gate() {
+  if [[ -n "${GATE_REGISTRY_MIRROR}${GATE_INSECURE_REGISTRY}" && "${GATE_VARIANT}" != "dind" ]]; then
+    die "GATE_REGISTRY_MIRROR / GATE_INSECURE_REGISTRY configure the DinD sidecar's daemon; use the dind variant (--dind)"
+  fi
+  if [[ -n "${GATE_INSECURE_REGISTRY}" && -z "${GATE_REGISTRY_MIRROR}" ]]; then
+    die "GATE_INSECURE_REGISTRY is only used together with GATE_REGISTRY_MIRROR"
+  fi
+}
+
 # --- Saved modes -------------------------------------------------------------
 #
 # The selected modes are remembered in $PROVIDER_CONFIG_DIR/gate-modes so the
@@ -467,7 +537,7 @@ validate_modes() {
 # variant and interface version. Format: KEY=value lines, parsed WITHOUT
 # sourcing or eval, keys and values strictly allowlisted.
 
-readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME"
+readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME GATE_REGISTRY_MIRROR GATE_INSECURE_REGISTRY"
 
 modes_file() { printf '%s/gate-modes' "${PROVIDER_CONFIG_DIR}"; }
 
@@ -480,6 +550,9 @@ mode_value_valid() {
     GATE_VARIANT)               [[ "$2" =~ ^(none|dind)$ ]] ;;
     PROVIDER_INTERFACE_VERSION) [[ "$2" =~ ^v0\.1\.[01]$ ]] ;;
     RUNNER_IMAGE_NAME)          [[ "$2" =~ ^(noble|resolute)$ ]] ;;
+    # These two may be empty (the mirror check is opt-in).
+    GATE_REGISTRY_MIRROR)       (( ${#2} <= 256 )) && { [[ -z "$2" ]] || [[ "$2" =~ ${MIRROR_URL_RE} ]]; } ;;
+    GATE_INSECURE_REGISTRY)     (( ${#2} <= 256 )) && { [[ -z "$2" ]] || [[ "$2" =~ ${INSECURE_HOST_RE} ]]; } ;;
     *) return 1 ;;
   esac
 }
@@ -494,6 +567,8 @@ explicit_mode_value() {
     GATE_VARIANT)               printf '%s' "${EXPL_GATE_VARIANT}" ;;
     PROVIDER_INTERFACE_VERSION) printf '%s' "${EXPL_PROVIDER_INTERFACE_VERSION}" ;;
     RUNNER_IMAGE_NAME)          printf '%s' "${EXPL_RUNNER_IMAGE_NAME}" ;;
+    GATE_REGISTRY_MIRROR)       printf '%s' "${EXPL_GATE_REGISTRY_MIRROR}" ;;
+    GATE_INSECURE_REGISTRY)     printf '%s' "${EXPL_GATE_INSECURE_REGISTRY}" ;;
   esac
 }
 
@@ -1098,6 +1173,23 @@ EOF
 # host (ADR-001 "Residual risk") - disposable hosts only.
 allowed_dind_modes = ["none", "privileged-sidecar"]
 dind_image = "${dind_image}"
+EOF
+    if [[ -n "${GATE_REGISTRY_MIRROR}" ]]; then
+      # Registry mirror check (opt-in): the sidecar's dockerd gets these as
+      # --registry-mirror / --insecure-registry. Still top-level keys, so they
+      # must precede the flavor table below.
+      cat >> "${cfg_tmp}" <<EOF
+
+# Registry mirror check (GATE_REGISTRY_MIRROR): global, config-only.
+registry_mirrors = ["${GATE_REGISTRY_MIRROR}"]
+EOF
+      if [[ -n "${GATE_INSECURE_REGISTRY}" ]]; then
+        cat >> "${cfg_tmp}" <<EOF
+insecure_registries = ["${GATE_INSECURE_REGISTRY}"]
+EOF
+      fi
+    fi
+    cat >> "${cfg_tmp}" <<EOF
 
 [flavors.${DIND_FLAVOR_NAME}]
   runner_memory = "${DIND_RUNNER_MEMORY}"
@@ -1149,6 +1241,22 @@ smoke_test_binary() {
       die "the provider rejected the DinD extra_specs ${DIND_EXTRA_SPECS} (exit ${vrc}): ${err}"
     fi
     ok "provider accepts the DinD extra_specs ${DIND_EXTRA_SPECS} (ValidatePoolInfo)"
+  fi
+
+  if [[ -n "${GATE_REGISTRY_MIRROR}" ]]; then
+    # The loader ignores keys it does not know, so a provider build without
+    # the registry settings would load this config and silently run its
+    # sidecar with no mirror. The published config schema (GetConfigJSONSchema)
+    # names every key the build understands: require registry_mirrors there.
+    local schema src=0
+    schema="$(GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=GetConfigJSONSchema \
+        GARM_CONTROLLER_ID=demo-preflight \
+        GARM_PROVIDER_CONFIG_FILE="${STAGE_CFG}" \
+        "${STAGE_BIN}" 2>/dev/null </dev/null)" || src=$?
+    if [[ "${src}" -ne 0 ]] || ! grep -q '"registry_mirrors"' <<< "${schema}"; then
+      die "this provider build does not know registry_mirrors (GetConfigJSONSchema does not list it, exit ${src}); use a release that includes it (see --version) or --from-source"
+    fi
+    ok "provider build knows registry_mirrors (GetConfigJSONSchema)"
   fi
 }
 
@@ -1250,6 +1358,7 @@ step_preflight() {
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
   log "  Runner image    : ${runner_image}"
   [[ -z "${dind_image}" ]] || log "  DinD image      : ${dind_image}"
+  [[ -z "${GATE_REGISTRY_MIRROR}" ]] || log "  Registry mirror : ${GATE_REGISTRY_MIRROR}${GATE_INSECURE_REGISTRY:+ (insecure_registries: ${GATE_INSECURE_REGISTRY})}"
 }
 
 # --- Step 1: register the provider with GARM --------------------------------
@@ -1388,6 +1497,21 @@ jobs:
           env | sort | head
 EOF
   if [[ "${GATE_VARIANT}" == "dind" ]]; then
+    local hold_seconds=60
+    if [[ -n "${GATE_REGISTRY_MIRROR}" ]]; then
+      # The job's own daemon must list the configured mirror. The expected
+      # string is allowlisted (MIRROR_URL_RE), so it is safe inside the quotes;
+      # dockerd lists a mirror with a trailing slash. The longer hold leaves
+      # `verify` room for its extra pull and log checks.
+      hold_seconds=120
+      cat <<EOF
+      - name: the job's daemon lists the configured registry mirror
+        run: |
+          mirrors="\$(docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}')"
+          echo "Registry Mirrors: \${mirrors}"
+          printf '%s\n' "\${mirrors}" | grep -Fx '${GATE_REGISTRY_MIRROR%/}/'
+EOF
+    fi
     cat <<'EOF'
       - name: docker run inside the job (DinD sidecar)
         run: |
@@ -1429,8 +1553,10 @@ EOF
             test "${out}" = published-ok
           done
           docker rm -f gate-published
+EOF
+    cat <<EOF
       - name: hold the runner briefly for scripts/demo-m0.sh verify
-        run: sleep 60
+        run: sleep ${hold_seconds}
 EOF
   else
     cat <<'EOF'
@@ -2030,6 +2156,140 @@ verify_dind_topology() {
   fi
 }
 
+# mirror_catalog_has prints "present" or "absent" when the mirror's
+# GET /v2/_catalog (queried from inside the runner "$1", the same network path
+# the sidecar's dockerd uses) can be read, and "unavailable" otherwise (a
+# mirror that is not a distribution registry, an HTTP error, or no route).
+# "$2" is the repository to look for. The page size is raised to 1000, the
+# distribution maximum; a mirror holding more repositories than that is
+# paginated, and the access-log check below is the authoritative one.
+mirror_catalog_has() {
+  local cid="$1" repo="$2" body curl_opts=(-fsS --max-time 15)
+  # An https mirror with a certificate the sidecar does not trust is only
+  # usable through insecure_registries; curl then needs -k as well.
+  [[ -z "${GATE_INSECURE_REGISTRY}" ]] || curl_opts+=(-k)
+  if ! body="$(docker exec "${cid}" curl "${curl_opts[@]}" "${GATE_REGISTRY_MIRROR%/}/v2/_catalog?n=1000" 2>/dev/null)"; then
+    printf 'unavailable'
+    return
+  fi
+  if grep -qF "\"${repo}\"" <<< "${body}"; then
+    printf 'present'
+  else
+    printf 'absent'
+  fi
+}
+
+# verify_registry_mirror is the opt-in registry mirror check (GATE_REGISTRY_MIRROR,
+# dind variant). It does nothing when no mirror is configured. For the live
+# runner "$1" it checks that:
+#   1. the sidecar's dockerd was started with --registry-mirror=<mirror> and,
+#      only when GATE_INSECURE_REGISTRY is set, --insecure-registry=<entry>
+#      (so an http:// mirror is exercised WITHOUT an insecure-registries entry
+#      by default: dockerd takes the scheme from the mirror URL);
+#   2. `docker info` through the runner's DOCKER_HOST (the sidecar's daemon)
+#      lists the mirror under Registry Mirrors, with dockerd's trailing slash;
+#   3. a pull of GATE_MIRROR_PULL_IMAGE (a Docker Hub official image, removed
+#      first so the pull is real) succeeds, and is observed at the mirror: in
+#      the mirror's access log since just before the pull when
+#      GATE_MIRROR_LOG_CONTAINER names its container on this host (the
+#      authoritative check), else by the repository appearing in the mirror's
+#      /v2/_catalog (a distribution registry; a mirror that already held the
+#      repository cannot prove THIS pull used it, which is reported).
+verify_registry_mirror() {
+  local cid="$1"
+  [[ -n "${GATE_REGISTRY_MIRROR}" ]] || return 0
+
+  log "-- (b, continued) registry mirror (${GATE_REGISTRY_MIRROR}) --"
+  local instance did argv want_mirror
+  instance="$(label_value "${cid}" garm.docker/instance-name)"
+  did="$(docker ps -a --filter 'label=garm.docker/managed=true' \
+    --filter 'label=garm.docker/role=dind' \
+    --filter "label=garm.docker/instance-name=${instance}" -q | head -n1)"
+  if [[ -z "${did}" ]]; then
+    bad "no role=dind sidecar container found for instance ${instance}; cannot check its registry settings"
+    return
+  fi
+
+  # 1. dockerd flags.
+  argv="$(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "${did}")"
+  if grep -qFx -- "--registry-mirror=${GATE_REGISTRY_MIRROR}" <<< "${argv}"; then
+    ok "sidecar dockerd runs with --registry-mirror=${GATE_REGISTRY_MIRROR}"
+  else
+    bad "sidecar dockerd argv has no --registry-mirror=${GATE_REGISTRY_MIRROR} (provider build without the setting, or a stale config?)"
+  fi
+  if [[ -n "${GATE_INSECURE_REGISTRY}" ]]; then
+    if grep -qFx -- "--insecure-registry=${GATE_INSECURE_REGISTRY}" <<< "${argv}"; then
+      ok "sidecar dockerd runs with --insecure-registry=${GATE_INSECURE_REGISTRY}"
+    else
+      bad "sidecar dockerd argv has no --insecure-registry=${GATE_INSECURE_REGISTRY}"
+    fi
+  elif grep -q -- '--insecure-registry=' <<< "${argv}"; then
+    bad "sidecar dockerd has an --insecure-registry flag although GATE_INSECURE_REGISTRY is unset"
+  else
+    ok "sidecar dockerd has no --insecure-registry flag (the mirror is exercised without one)"
+  fi
+
+  # 2. docker info.
+  local mirrors
+  want_mirror="${GATE_REGISTRY_MIRROR%/}/"
+  mirrors="$(docker exec "${cid}" docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}' 2>/dev/null)"
+  if grep -qFx -- "${want_mirror}" <<< "${mirrors}"; then
+    ok "docker info in the job lists Registry Mirrors: ${want_mirror}"
+  else
+    bad "docker info in the job does not list ${want_mirror} under Registry Mirrors (got: ${mirrors:-none})"
+  fi
+  if [[ -n "${GATE_INSECURE_REGISTRY}" ]]; then
+    if docker exec "${cid}" docker info 2>/dev/null | grep -qF -- "${GATE_INSECURE_REGISTRY}"; then
+      ok "docker info in the job lists the insecure registry ${GATE_INSECURE_REGISTRY}"
+    else
+      bad "docker info in the job does not list the insecure registry ${GATE_INSECURE_REGISTRY}"
+    fi
+  fi
+
+  # 3. a pull observed at the mirror.
+  local image="${GATE_MIRROR_PULL_IMAGE}" repo before after since logged=""
+  repo="library/${image%%:*}"
+  before="$(mirror_catalog_has "${cid}" "${repo}")"
+  # The image is removed first (a leftover would make the pull a no-op), and the
+  # timestamp is taken just before the pull so the access-log window covers
+  # nothing earlier.
+  docker exec "${cid}" docker image rm -f "${image}" >/dev/null 2>&1 || true
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if docker exec "${cid}" docker pull --quiet "${image}" >/dev/null 2>&1; then
+    ok "pulled ${image} through the job's daemon"
+  else
+    bad "could not pull ${image} through the job's daemon (mirror unreachable and Docker Hub blocked?)"
+    return
+  fi
+  after="$(mirror_catalog_has "${cid}" "${repo}")"
+  log "mirror catalog for ${repo}: before the pull ${before}, after ${after}"
+
+  if [[ -n "${GATE_MIRROR_LOG_CONTAINER}" ]]; then
+    logged="$(docker logs --since "${since}" "${GATE_MIRROR_LOG_CONTAINER}" 2>&1 | grep -F "/v2/${repo}/" | head -n1)" || true
+    if [[ -n "${logged}" ]]; then
+      ok "the mirror's access log (${GATE_MIRROR_LOG_CONTAINER}) shows requests for ${repo} since ${since}"
+    else
+      bad "the mirror's access log (${GATE_MIRROR_LOG_CONTAINER}) shows no request for ${repo} since ${since}: the pull did not go through the mirror"
+    fi
+    return
+  fi
+  case "${after}" in
+    present)
+      if [[ "${before}" == "present" ]]; then
+        ok "the mirror's catalog lists ${repo} (it already did before this pull, so this proves the mirror holds it, not that this pull used it; set GATE_MIRROR_LOG_CONTAINER for the access-log check)"
+      else
+        ok "the mirror's catalog gained ${repo} with this pull"
+      fi
+      ;;
+    absent)
+      bad "the mirror's catalog does not list ${repo} after the pull: the pull did not go through the mirror"
+      ;;
+    *)
+      bad "could not observe the pull at the mirror: its /v2/_catalog is not readable from the runner. Set GATE_MIRROR_LOG_CONTAINER to the mirror's container name to check its access log instead"
+      ;;
+  esac
+}
+
 verify_no_credentials_in_inspect() {
   local cid="$1"
   log "-- (b) docker inspect: no credentials, no host docker.sock --"
@@ -2126,6 +2386,7 @@ step_verify() {
   verify_topology "${cid}"
   verify_no_credentials_in_inspect "${cid}"
   verify_dind_topology "${cid}"
+  verify_registry_mirror "${cid}"
   verify_tmpfs_delivery "${cid}"
   verify_symlink_compat "${cid}"
 
@@ -2289,6 +2550,11 @@ Flags:
                        that publishes it (resolute: v0.2.3 and later)
   -h, --help          Show this help
 
+Optional registry mirror check (with --dind): set GATE_REGISTRY_MIRROR to a
+Docker Hub mirror origin (e.g. http://mirror.lan.example:5000); see the
+GATE_* variables in this script's header and docs/demo-m0.md. Unset, no
+mirror check runs.
+
 The modes chosen for preflight (or all) are remembered, so later single steps
 (pool, watch, verify, ...) use them without repeating the flags; an explicit
 flag that conflicts with the remembered mode is an error (re-run preflight).
@@ -2344,6 +2610,7 @@ main() {
     preflight|all) ;; # these define the modes; step_preflight saves them on success
     *) load_saved_modes; validate_modes ;;
   esac
+  validate_registry_gate
   # In scale-set mode the scale set name is fixed up front, by preflight/all
   # (generating and saving one if needed) or by any command given an explicit
   # SCALESET_NAME, so every later step agrees from the start. Unlike the
