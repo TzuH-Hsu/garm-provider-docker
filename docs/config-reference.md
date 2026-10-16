@@ -85,7 +85,7 @@ they are rejected rather than silently ignored (ADR-005 amendment 2026-10-11).
 
 - **`allowed_dind_modes` ceiling (ADR-001 F7), fail-closed by default.** The operator's `allowed_dind_modes` is the final word on `dind_mode`, and it **defaults to `["none"]`**: DinD is unavailable on a host whose config never mentions it, so no pool's `extra_specs.dind_mode` can obtain a privileged sidecar by omission. To enable DinD you must widen the ceiling *and* set `dind_image`, e.g. `allowed_dind_modes = ["none", "privileged-sidecar"]` — read ADR-001's "Residual risk" section first. `dind_mode` itself must be a member of this list, so widening the ceiling is also what makes a non-`none` `dind_mode` load at all. No pool's `extra_specs.dind_mode` can escalate past it, full stop.
 - **A DinD mode with no `dind_image` is rejected before any Docker work.** Config load already requires `dind_image` when the *config's own* `dind_mode` is non-`none`, but that cannot see a pool's `extra_specs`. If a pool selects a DinD mode within a widened ceiling on a host that has no `dind_image` set, `CreateInstance` rejects it up front — before the orphan sweep, the claim network, the volumes, or the credential fetch — rather than failing at the sidecar image pull with a partial allocation to roll back.
-- **Registry mirrors for the sidecar.** The sidecar daemon has no config surface beyond `dind_image` and `storage_driver`, and every DinD job starts with an empty image store. To point the sidecar at a registry mirror today, ship a `daemon.json` in a custom digest-pinned `dind_image`; see [`dind-image-pulls.md`](dind-image-pulls.md), including the warning about options the provider already passes as `dockerd` flags.
+- **Registry mirrors for the sidecar are provider config only.** Every DinD job starts with an empty image store. The operator sets `registry_mirrors` and `insecure_registries` in the provider config (see [Registry mirrors for the sidecar](#registry-mirrors-for-the-sidecar)); no `extra_specs` key carries them, so a pool admin cannot redirect a sidecar's pulls.
 - **Memory is positive-only and reject-not-clamp (H1).** A `runner_memory`/`dind_memory` over the configured (or flavor-resolved) ceiling is rejected with a clear error; it is never silently reduced. A request at or below the ceiling is accepted; an unset ceiling (unlimited) accepts any finite request. A **zero** value in any representation (`"0"`, `"0GiB"`, `"0 B"`) is rejected — Docker treats a 0 memory limit as *unset* (unlimited), so accepting it would silently remove the operator's ceiling.
 - **`extra_env` is fail-closed via an operator ALLOWLIST (H2).** The operator lists the env NAMES a pool may set in `[extra_specs].allowed_env` (default **empty**). A name not on the allowlist is **rejected** — by default a pool can inject **no** extra environment at all.
 - **`extra_env` names must match a strict charset (H3):** `^[A-Za-z_][A-Za-z0-9_]*$`. A key containing `=`, whitespace, unicode, or a leading digit is rejected — this closes the bypass where `JIT_CONFIG_ENABLED=false` would be emitted as `JIT_CONFIG_ENABLED=false=<value>` and flip a reserved variable.
@@ -173,6 +173,65 @@ authoritative schema with `GetConfigJSONSchema`. The keys most relevant to the
 `[resources].runner_memory`/`dind_memory` (the memory ceilings), `storage_driver`
 (the default), the `[flavors.*]` map (the only image-varying channel), and
 `[extra_specs].allowed_env` (the `extra_env` allowlist).
+
+### Registry mirrors for the sidecar
+
+Two optional top-level keys, next to `dind_image` and `storage_driver`, configure
+the registry settings of every DinD sidecar's `dockerd`. They are emitted as
+typed flags appended after the fixed ones (`--host`, `--storage-driver`,
+`--group`), in the configured order: one `--registry-mirror=<url>` per mirror,
+then one `--insecure-registry=<entry>` per entry.
+
+```toml
+registry_mirrors    = ["http://mirror.lan.example:5000"]
+insecure_registries = ["registry.lan.example:5001"]
+```
+
+| Key | Entries | Default |
+|---|---|---|
+| `registry_mirrors` | A bare origin: `http://` or `https://`, a host, an optional port, and no path (a single trailing `/` is allowed), query, fragment or userinfo. | empty (no flag) |
+| `insecure_registries` | `host[:port]` (a DNS name, an IPv4 address, or an IPv6 address, bracketed when it carries a port) or a CIDR such as `192.168.0.0/16`. Never a URL. | empty (no flag) |
+
+- **Config only, global only.** They are not `extra_specs` keys (`extra_specs`
+  rejects them, as it rejects any key outside its allowlist) and not
+  `[flavors.<name>]` fields. A provider config describes one Docker host, and a
+  mirror is a property of that host's network, so a per-flavor override has no
+  use that the global setting does not cover.
+- **Validated at load**, whatever `dind_mode` is, so a typo fails at startup. A
+  malformed entry, or a duplicate (mirrors compare case-insensitively and
+  ignore one trailing `/`; CIDRs compare by their masked form), is rejected
+  with an error that names the key and the entry. The rules follow dockerd's
+  own registry configuration, a little stricter in four places: a mirror may
+  not have a path, an insecure registry may not carry a scheme, duplicates are
+  rejected instead of dropped, and ports are 1-65535.
+- **Docker Hub only.** dockerd consults `registry_mirrors` only for Docker Hub
+  images, tries the mirrors before Hub, and falls back to Hub when a mirror is
+  unreachable or does not have the image. Pulls from other registries are not
+  redirected; see [`dind-image-pulls.md`](dind-image-pulls.md).
+- **An `http://` mirror needs no `insecure_registries` entry.** dockerd takes
+  the scheme from the mirror URL, so a mirror configured as
+  `http://host:5000` is contacted over plain HTTP whether or not it is also
+  listed as insecure (checked in Moby's registry service for the Engine 29.x
+  line, `daemon/pkg/registry/service_v2.go` and `daemon/hosts.go`, release
+  `docker-v29.8.2`, for both the classic graph-driver and the containerd
+  image-store pull paths). An `insecure_registries` entry matters for an
+  `https://` mirror whose certificate the sidecar does not trust (it turns off
+  certificate verification for that host), and for non-mirror registries that
+  jobs pull from by name over plain HTTP.
+- **Logged.** When either list is non-empty, `CreateInstance` logs the
+  effective values at sidecar creation.
+- **Do not combine with a custom `dind_image` that sets the same options.** A
+  `daemon.json` in the image with `registry-mirrors` or `insecure-registries`
+  conflicts with these flags, and dockerd refuses to start ("the following
+  directives are specified both as a flag and in the configuration file"), so
+  every DinD job fails waiting for the daemon. Use either the config keys or
+  the image's `daemon.json`, not both. The custom-image route remains the way
+  to do this on provider versions without these keys.
+
+The keys appear in the machine-readable schema (`GetConfigJSONSchema`) and,
+with illustrative values, in `examples/config.full.toml`. The setup around the
+mirror itself (running a pull-through cache, reachability, TLS) is covered in
+[`dind-image-pulls.md`](dind-image-pulls.md).
 
 ### Flavors
 

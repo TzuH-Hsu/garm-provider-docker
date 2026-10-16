@@ -174,3 +174,20 @@ IPv6 inside nested networks is not supported in this mode. It was not supported 
 - *Unit tests* cover the spec builder (`NetnsContainerID` takes precedence over `NetworkName`, no sysctl on the sidecar) and the provider flow with the fake client. The flow tests check: create order (runner, then sidecar); sidecar `NetworkMode`; the IPv6 retry followed by the sidecar joining the recreated runner; refusal to join a stopped runner; rollback on every sidecar and runner failure; and teardown order. The fake now models the daemon's `container:` start rules.
 - *Live check `dockerverify`* (`TestVerifyM1WP3DindAllocation` and `TestVerifyM1NonRootDindAllocation`) checks the shared namespace. It also starts a nested `busybox` httpd with an ephemeral published port and fetches it from the runner at `127.0.0.1` and `localhost`. Against the previous topology the same check fails with "Connection refused".
 - *`scripts/demo-m0.sh verify`* runs the same checks. Its sample DinD workflow gains a published-port step.
+
+## Amendment (2026-10-17) — registry mirrors and insecure registries for the sidecar daemon
+
+The sidecar's `dockerd` argv was fixed (`--host`, `--storage-driver`, `--group`), so an operator had no way to make the per-job daemon pull through a registry mirror short of baking a `daemon.json` into a custom `dind_image` (issue #26, [`docs/dind-image-pulls.md`](../dind-image-pulls.md)). Two optional, operator-set settings now extend it:
+
+- `registry_mirrors` (a list of bare `http(s)://host[:port]` origins) is emitted as one `--registry-mirror=<url>` flag each.
+- `insecure_registries` (a list of `host[:port]` or CIDR entries) is emitted as one `--insecure-registry=<entry>` flag each.
+
+Both are appended after the three fixed flags, which stay first and unchanged. Both default to empty, which adds no flag.
+
+**Typed flags, not a `daemon.json` passthrough.** A free-form daemon configuration could set `hosts` (a TCP listener, breaking the no-TCP rule), `storage-driver` or `group`, which the provider owns, and dockerd refuses to start when an option is set both as a flag and in the file. Two typed lists cannot reach those options.
+
+**Trust tier.** Both settings are provider config only: the top-level keys sit next to `dind_image` and `storage_driver`, no `extra_specs` key carries them (the schema has `additionalProperties: false`), and they are not per-flavor either, because a provider config describes one Docker host and a mirror is a property of that host's network. A pool admin therefore cannot redirect a sidecar's pulls.
+
+**Isolation is unchanged.** The per-job `dind-state` volume is still created fresh and removed at teardown; a mirror only changes where a job's pulls are fetched from. dockerd consults mirrors only for Docker Hub names and falls back to the upstream when a mirror is unreachable. A mirror is trusted to the degree its operator is: a shared distribution registry in proxy mode refuses pushes, so no job can write into it. Entries are validated at config load (see `docs/config-reference.md`), and the effective values are logged at sidecar creation.
+
+**Combining with a custom image.** A custom `dind_image` whose `daemon.json` also sets `registry-mirrors` or `insecure-registries` conflicts with these flags, and dockerd refuses to start. Use one mechanism.
