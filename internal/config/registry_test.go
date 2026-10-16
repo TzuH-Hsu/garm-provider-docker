@@ -24,7 +24,8 @@ func TestConfigValidateRegistryMirrors(t *testing.T) {
 		{name: "trailing slash allowed", mirrors: []string{"https://mirror.gcr.io/"}},
 		{name: "IPv4 host and port", mirrors: []string{"http://10.0.0.5:5000"}},
 		{name: "bracketed IPv6 host and port", mirrors: []string{"http://[fd00::5]:5000"}},
-		{name: "uppercase scheme and host", mirrors: []string{"HTTPS://Mirror.Example"}},
+		{name: "mixed-case host", mirrors: []string{"https://Mirror.Example"}},
+		{name: "uppercase scheme", mirrors: []string{"HTTPS://mirror.example"}, wantErr: "scheme"},
 		{name: "several distinct mirrors", mirrors: []string{"https://mirror.gcr.io", "http://10.0.0.5:5000"}},
 
 		{name: "empty entry", mirrors: []string{""}, wantErr: "registry_mirrors"},
@@ -60,8 +61,8 @@ func TestConfigValidateRegistryMirrors(t *testing.T) {
 			wantErr: "duplicate",
 		},
 		{
-			name:    "duplicate differing only by case",
-			mirrors: []string{"https://mirror.gcr.io", "HTTPS://Mirror.GCR.io"},
+			name:    "duplicate differing only by host case",
+			mirrors: []string{"https://mirror.gcr.io", "https://Mirror.GCR.io"},
 			wantErr: "duplicate",
 		},
 	}

@@ -25,8 +25,9 @@ import (
 // dockerd is lenient, so that a mistake fails at load with a message instead of
 // being silently normalised or surfacing later as a sidecar that cannot start:
 //
-//   - a mirror must be a bare origin (scheme://host[:port][/]); dockerd also
-//     tolerates a path, which this provider does not allow;
+//   - a mirror must be a bare origin (scheme://host[:port][/]) with a
+//     lowercase scheme; dockerd also tolerates a path, which this provider does
+//     not allow, and mishandles an uppercase scheme;
 //   - an insecure registry must not carry a scheme; dockerd strips an http://
 //     or https:// prefix with a warning;
 //   - duplicates are rejected; dockerd drops them silently;
@@ -93,8 +94,11 @@ func validateRegistryMirror(raw string) error {
 	if !ok || scheme == "" {
 		return fmt.Errorf("%q must be an absolute URL with an http:// or https:// scheme", raw)
 	}
-	if s := strings.ToLower(scheme); s != "http" && s != "https" {
-		return fmt.Errorf("%q has unsupported scheme %q: must be http or https", raw, scheme)
+	// Lowercase only: dockerd's classic pull path checks the configured string
+	// for a literal "http://" / "https://" prefix and would otherwise prepend
+	// "https://" to an "HTTPS://..." mirror.
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("%q has unsupported scheme %q: must be lowercase http or https", raw, scheme)
 	}
 
 	authority := rest
