@@ -342,6 +342,15 @@ docker buildx imagetools inspect ghcr.io/tzuh-hsu/garm-runner-resolute:latest
 skopeo inspect docker://ghcr.io/tzuh-hsu/garm-runner-noble:latest
 ```
 
+## Image pulls in DinD jobs
+
+In the DinD modes every job starts with an empty image store, because each
+allocation has its own sidecar and its own `dind-state` volume (ADR-001), so
+every image a job pulls comes from the upstream registry every time. A
+pull-through cache shared by the whole deployment, wired in through a custom
+`dind_image`, removes the download latency and the Docker Hub rate-limit
+exposure. See [`docs/dind-image-pulls.md`](docs/dind-image-pulls.md).
+
 ## Security model
 
 - **The host's Docker socket is never mounted into a runner or DinD-sidecar

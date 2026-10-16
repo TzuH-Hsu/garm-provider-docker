@@ -59,6 +59,8 @@ allowed_dind_modes = ["none"]
 # No default. REQUIRED only when the effective dind_mode != "none"; even
 # under "none" (as here), a value you DO set is still validated, so a typo
 # is caught at load time rather than only after you later enable DinD.
+# To use a registry mirror in the sidecar, build a custom image with a
+# daemon.json and pin that here: see docs/dind-image-pulls.md.
 dind_image = "docker:dind@sha256:beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"
 
 # Dev-only escape hatch for dind_image, independent of
