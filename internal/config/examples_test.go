@@ -150,3 +150,30 @@ func TestExampleFullMatchesDocumentedDefaults(t *testing.T) {
 		t.Errorf("Cache = %+v, want the documented defaults %+v", cfg.Cache, wantCache)
 	}
 }
+
+// TestExampleFullShowsRegistrySettings pins the illustrative registry values
+// in config.full.toml (their defaults are empty, so they are deliberately NOT
+// part of the defaults test above): the example must keep exercising both keys
+// through the real loader, so a rename or a stricter validation rule cannot
+// leave it documenting a value the code rejects.
+func TestExampleFullShowsRegistrySettings(t *testing.T) {
+	cfg, err := Load("../../examples/config.full.toml")
+	if err != nil {
+		t.Fatalf("Load(full) returned unexpected error: %v", err)
+	}
+	if len(cfg.RegistryMirrors) == 0 {
+		t.Error("config.full.toml sets no registry_mirrors, want an illustrative value")
+	}
+	if len(cfg.InsecureRegistries) == 0 {
+		t.Error("config.full.toml sets no insecure_registries, want an illustrative value")
+	}
+
+	minimal, err := Load("../../examples/config.minimal.toml")
+	if err != nil {
+		t.Fatalf("Load(minimal) returned unexpected error: %v", err)
+	}
+	if len(minimal.RegistryMirrors) != 0 || len(minimal.InsecureRegistries) != 0 {
+		t.Errorf("config.minimal.toml sets registry settings %v / %v, want none (the defaults)",
+			minimal.RegistryMirrors, minimal.InsecureRegistries)
+	}
+}

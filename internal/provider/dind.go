@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -27,7 +28,8 @@ import (
 //
 // Either way it mounts the shared socket volume at /run (where dockerd exposes
 // its unix socket) and the dind-state volume at /var/lib/docker, runs
-// `dockerd --host=unix://... --storage-driver=<config>` with TLS off, and
+// `dockerd --host=unix://... --storage-driver=<config>` (plus the operator's
+// --registry-mirror / --insecure-registry flags, config-only) with TLS off, and
 // carries this attempt's create-nonce so the creation-guard rollback
 // (nonce-keyed) reclaims it on any later failure. Its Privileged/Runtime pair
 // comes from spec.DindRuntimeSelection — Privileged=true for
@@ -52,10 +54,14 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		// dind_image is config-only (ADR-002: no flavor/extra_specs image
 		// channel for the sidecar) and validated digest-pinned + non-empty for
 		// any non-none mode at config load.
-		Image:               p.cfg.DindImage,
-		Labels:              labels,
-		MemoryBytes:         dindMemoryBytes,
-		StorageDriver:       storageDriver,
+		Image:         p.cfg.DindImage,
+		Labels:        labels,
+		MemoryBytes:   dindMemoryBytes,
+		StorageDriver: storageDriver,
+		// Registry mirrors and insecure registries are config-only (never
+		// extra_specs): validated at load, emitted as typed dockerd flags.
+		RegistryMirrors:     p.cfg.RegistryMirrors,
+		InsecureRegistries:  p.cfg.InsecureRegistries,
 		Privileged:          privileged,
 		Runtime:             runtime,
 		SocketVolumeName:    spec.SocketVolumeName(instanceName, nonce),
@@ -71,6 +77,14 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		dindSpec.NetworkName = spec.JobNetworkName(instanceName)
 	}
 	cfg, hostCfg := spec.BuildDindContainer(dindSpec)
+
+	if len(p.cfg.RegistryMirrors) > 0 || len(p.cfg.InsecureRegistries) > 0 {
+		// Mirror URLs are validated to carry no userinfo, so they are safe to log.
+		slog.InfoContext(ctx, "CreateInstance: DinD sidecar registry settings",
+			"instance", instanceName,
+			"registry_mirrors", p.cfg.RegistryMirrors,
+			"insecure_registries", p.cfg.InsecureRegistries)
+	}
 
 	created, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, spec.DindContainerName(instanceName))
 	if err != nil {

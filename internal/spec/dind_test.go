@@ -9,7 +9,7 @@ import (
 )
 
 func TestDindCommand(t *testing.T) {
-	got := DindCommand("overlay2")
+	got := DindCommand("overlay2", nil, nil)
 	// F1: dockerd is launched with an explicit --group so the socket is
 	// group-owned by DindSocketGID (the runner user is made a member of it).
 	want := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + DindSocketGID}
@@ -17,7 +17,7 @@ func TestDindCommand(t *testing.T) {
 		t.Fatalf("DindCommand(overlay2) = %v, want %v", got, want)
 	}
 	// The storage driver is passed through verbatim (vfs fallback, ADR-001).
-	if got := DindCommand("vfs"); got[2] != "--storage-driver=vfs" {
+	if got := DindCommand("vfs", nil, nil); got[2] != "--storage-driver=vfs" {
 		t.Errorf("DindCommand(vfs) storage arg = %q, want --storage-driver=vfs", got[2])
 	}
 	// F1: the socket group is a fixed, provider-controlled GID, distinct from
@@ -29,6 +29,73 @@ func TestDindCommand(t *testing.T) {
 	// DindDockerHost is the exact socket the runner's DOCKER_HOST must match.
 	if DindDockerHost != "unix:///run/docker.sock" {
 		t.Errorf("DindDockerHost = %q, want unix:///run/docker.sock", DindDockerHost)
+	}
+}
+
+// TestDindCommandRegistryFlags covers the typed registry flags: one
+// --registry-mirror per mirror and one --insecure-registry per entry, in
+// configured order, always AFTER the fixed flags (host, storage driver,
+// group), which stay first and unchanged. Empty and nil lists add nothing.
+func TestDindCommandRegistryFlags(t *testing.T) {
+	fixed := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + DindSocketGID}
+
+	tests := []struct {
+		name      string
+		mirrors   []string
+		insecure  []string
+		wantExtra []string
+	}{
+		{name: "nil lists add nothing"},
+		{name: "empty lists add nothing", mirrors: []string{}, insecure: []string{}},
+		{
+			name:      "one mirror",
+			mirrors:   []string{"http://mirror.lan.example:5000"},
+			wantExtra: []string{"--registry-mirror=http://mirror.lan.example:5000"},
+		},
+		{
+			name:      "one insecure registry",
+			insecure:  []string{"mirror.lan.example:5000"},
+			wantExtra: []string{"--insecure-registry=mirror.lan.example:5000"},
+		},
+		{
+			name:     "many of each, mirrors first, order preserved",
+			mirrors:  []string{"https://mirror.gcr.io", "http://10.0.0.5:5000"},
+			insecure: []string{"10.0.0.5:5000", "192.168.0.0/16"},
+			wantExtra: []string{
+				"--registry-mirror=https://mirror.gcr.io",
+				"--registry-mirror=http://10.0.0.5:5000",
+				"--insecure-registry=10.0.0.5:5000",
+				"--insecure-registry=192.168.0.0/16",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DindCommand("overlay2", tt.mirrors, tt.insecure)
+			want := append(slices.Clone(fixed), tt.wantExtra...)
+			if !slices.Equal(got, want) {
+				t.Errorf("DindCommand = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuildDindContainerRegistryFlags(t *testing.T) {
+	cfg, _ := BuildDindContainer(DindContainerSpec{
+		Image:               "docker:dind@sha256:abc",
+		StorageDriver:       "overlay2",
+		SocketVolumeName:    "s",
+		DindStateVolumeName: "d",
+		RegistryMirrors:     []string{"http://mirror.lan.example:5000"},
+		InsecureRegistries:  []string{"mirror.lan.example:5000"},
+	})
+	want := []string{
+		"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + DindSocketGID,
+		"--registry-mirror=http://mirror.lan.example:5000",
+		"--insecure-registry=mirror.lan.example:5000",
+	}
+	if !slices.Equal([]string(cfg.Cmd), want) {
+		t.Errorf("Cmd = %v, want %v", cfg.Cmd, want)
 	}
 }
 
