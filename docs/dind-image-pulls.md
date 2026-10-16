@@ -58,8 +58,9 @@ services:
     image: registry:3  # pin by digest in a real deployment
     restart: unless-stopped
     ports:
-      # Publish on an address the job networks can reach (see "Reachability").
-      - "5000:5000"
+      # Bind to one address the Docker host and the job networks can reach,
+      # not 0.0.0.0 (see "Reachability" and the credentials note below).
+      - "<lan-ip>:5000:5000"
     volumes:
       - ./config.yml:/etc/distribution/config.yml:ro
       - mirror-data:/var/lib/registry
@@ -94,15 +95,22 @@ proxy:
   true` the TTL scheduler cannot clean up, and the cache only grows.
 - `proxy.ttl` defaults to `168h` (seven days). Size the volume for the set of
   images your jobs use, and set the TTL to taste.
-- Docker Hub credentials are optional. They raise the pull allowance (see the
-  numbers above) and let the mirror pull private images, but **they also make
-  every private image that account can read available through the mirror to
-  anyone who can reach it**. If you set `username`/`password`, put
-  authentication in front of the mirror, and treat the mirror's storage as
-  holding that account's private content. The registry keeps the credentials
-  in its configuration, so protect that file too. Use an access token with
-  read-only scope, not the account password. If you do not need private
-  images, leave the credentials out.
+- Docker Hub credentials are optional, and **leaving them out is the
+  recommended default**. They raise the pull allowance (see the numbers
+  above) and let the mirror pull private images, but **they also make every
+  private image that account can read available through the mirror to anyone
+  who can reach it**. Do not try to protect the mirror with HTTP
+  authentication: dockerd does not send credentials to a `registry-mirrors`
+  endpoint for Docker Hub image names (the long-standing, still open
+  [moby/moby#30880](https://github.com/moby/moby/issues/30880)), so a
+  password-protected mirror is skipped and every pull falls back to Docker
+  Hub. If you do set `username`/`password`, restrict access at the network
+  level instead: publish the mirror only on an address that the Docker host
+  and the job networks can reach, limit the host firewall to the Docker
+  address pools, and never expose it beyond the host or LAN segment. Treat
+  the mirror's storage as holding that account's private content, protect the
+  registry configuration file that holds the credentials, and use an access
+  token with read-only scope rather than the account password.
 
 ### How dockerd uses the mirror
 
@@ -226,8 +234,14 @@ mirror is plain HTTP, the sidecar needs it in `insecure-registries` too.
 
 ## What a mirror does not fix
 
-A mirror removes download latency and Docker Hub rate limits. It does not
-remove the per-job work of unpacking each image: layers are still extracted
+A mirror cuts download latency and reduces the number of pulls that reach
+Docker Hub, so it lowers your exposure to its rate limits. It does not
+eliminate them: a cold or expired entry, or several jobs requesting the same
+uncached image at once, still pulls from Docker Hub and counts against its
+limits, and the mirror remains subject to Docker's fair-use policy. Set Hub
+credentials on the mirror (with the caveats above) if you need a higher
+allowance. A mirror also does not remove the per-job work of unpacking each
+image: layers are still extracted
 into the job's fresh `dind-state` volume, so every job still writes each image
 in full to local disk. Large images stay slow to start even from a warm
 mirror. Avoiding that cost would need an image store that outlives a job,
