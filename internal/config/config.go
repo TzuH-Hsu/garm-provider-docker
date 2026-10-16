@@ -102,6 +102,25 @@ type Config struct {
 	// value is rejected.
 	StorageDriver string `toml:"storage_driver"`
 
+	// RegistryMirrors are Docker Hub pull-through mirrors for the DinD
+	// sidecar's dockerd, emitted as one --registry-mirror=<url> flag each
+	// (issue #26). Each entry is a bare origin: an http or https URL with a
+	// host, an optional port and no path, query, fragment or userinfo. Empty
+	// (the default) adds no flag. dockerd consults mirrors only for Docker Hub
+	// and falls back to the upstream when a mirror is unreachable.
+	//
+	// Config-only and global: it is not a Flavor field and no extra_specs key
+	// carries it — a mirror is a property of this Docker host's network, not of
+	// a pool. Validated at load whatever dind_mode is. See registry.go.
+	RegistryMirrors []string `toml:"registry_mirrors"`
+
+	// InsecureRegistries are registries the sidecar's dockerd may reach over
+	// plain HTTP or with an untrusted certificate, emitted as one
+	// --insecure-registry=<entry> flag each. Each entry is host[:port] or a
+	// CIDR, never a URL. Empty (the default) adds no flag. Same trust tier and
+	// scope as RegistryMirrors.
+	InsecureRegistries []string `toml:"insecure_registries"`
+
 	// Resources is the [resources] table: runner_memory/dind_memory
 	// limits. No cpu or pids limits, by design (ADR-005).
 	Resources Resources `toml:"resources"`
@@ -182,6 +201,12 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := c.validateStorageDriver(); err != nil {
+		return err
+	}
+	if err := c.validateRegistryMirrors(); err != nil {
+		return err
+	}
+	if err := c.validateInsecureRegistries(); err != nil {
 		return err
 	}
 	if err := c.Resources.validate(); err != nil {

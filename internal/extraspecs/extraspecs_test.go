@@ -77,6 +77,8 @@ func TestParseRejects(t *testing.T) {
 		{"unknown property (raw image ref, structurally absent)", `{"image": "evil/image:latest"}`},
 		{"unknown property docker_host", `{"docker_host": "tcp://evil:2375"}`},
 		{"unknown property privileged", `{"privileged": true}`},
+		{"registry_mirrors is config-only", `{"registry_mirrors": ["http://evil.example:5000"]}`},
+		{"insecure_registries is config-only", `{"insecure_registries": ["evil.example:5000"]}`},
 		{"dind_mode not in enum", `{"dind_mode": "rootless"}`},
 		{"storage_driver not in enum", `{"storage_driver": "btrfs"}`},
 		{"runner_memory bad shape", `{"runner_memory": "lots"}`},
