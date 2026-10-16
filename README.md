@@ -348,8 +348,9 @@ In the DinD modes every job starts with an empty image store, because each
 allocation has its own sidecar and its own `dind-state` volume (ADR-001), so
 every image a job pulls comes from the upstream registry every time. A
 pull-through cache shared by the whole deployment, wired in through a custom
-`dind_image`, removes the download latency and the Docker Hub rate-limit
-exposure. See [`docs/dind-image-pulls.md`](docs/dind-image-pulls.md).
+`dind_image`, cuts download latency and reduces both the number of upstream
+pulls and the exposure to Docker Hub rate limits. See
+[`docs/dind-image-pulls.md`](docs/dind-image-pulls.md).
 
 ## Security model
 
