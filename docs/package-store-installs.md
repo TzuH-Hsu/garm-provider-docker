@@ -110,11 +110,19 @@ pnpm's global virtual store keeps the linked package directories inside the
 store and leaves only symlinks in the workspace, which removes the copy on ext4
 as well: in the same measurements a warm install took about 1.0 s and wrote
 about 3 MiB. It is an experimental pnpm feature and is **not** enabled or
-recommended by the provider. The setting is `virtualStoreType: global` in pnpm
-11.23 and newer (`enableGlobalVirtualStore` before that, since 10.12.1); on
-11.28.6 the environment variable `pnpm_config_virtual_store_type=global` also
-works, which an operator can pass through `[extra_specs].allowed_env` and a
-pool's `extra_env`.
+recommended by the provider.
+
+It needs **pnpm 11 or newer**. The runners set `CI=true`, and pnpm 10 treats a
+detected CI environment as always turning the feature off, even when it is set
+explicitly, so on pnpm 10 the opt-in is silently ignored and installs keep
+copying. Respecting an explicit setting in CI was added in pnpm 11.0.0
+([pnpm/pnpm#10836](https://github.com/pnpm/pnpm/pull/10836)); it was measured
+here on 11.28.6 only. Do not set `CI=false` to work around this on pnpm 10,
+because other tools change behaviour with it. The setting is
+`virtualStoreType: global` from pnpm 11.23 (`enableGlobalVirtualStore` before
+that); on 11.28.6 the environment variable
+`pnpm_config_virtual_store_type=global` also works, which an operator can pass
+through `[extra_specs].allowed_env` and a pool's `extra_env`.
 
 Two reasons to be careful:
 
