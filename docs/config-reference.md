@@ -201,9 +201,10 @@ insecure_registries = ["registry.lan.example:5001"]
   malformed entry, or a duplicate (mirrors compare case-insensitively and
   ignore one trailing `/`; CIDRs compare by their masked form), is rejected
   with an error that names the key and the entry. The rules follow dockerd's
-  own registry configuration, a little stricter in four places: a mirror may
-  not have a path, an insecure registry may not carry a scheme, duplicates are
-  rejected instead of dropped, and ports are 1-65535.
+  own registry configuration, a little stricter in five places: a mirror may
+  not have a path, a mirror's scheme must be lowercase, an insecure registry
+  may not carry a scheme, duplicates are rejected instead of dropped, and
+  ports are 1-65535.
 - **Docker Hub only.** dockerd consults `registry_mirrors` only for Docker Hub
   images, tries the mirrors before Hub, and falls back to Hub when a mirror is
   unreachable or does not have the image. Pulls from other registries are not
