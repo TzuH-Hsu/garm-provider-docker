@@ -9,6 +9,7 @@ the job, so nothing is pulled.
 - [Why every DinD job starts with an empty image store](#why-every-dind-job-starts-with-an-empty-image-store)
 - [Recommended: a shared Docker Hub pull-through cache](#recommended-a-shared-docker-hub-pull-through-cache)
 - [Pointing the sidecar at the mirror](#pointing-the-sidecar-at-the-mirror)
+  (the `registry_mirrors` setting, and the custom-image alternative)
 - [Zero-infrastructure alternative: `mirror.gcr.io`](#zero-infrastructure-alternative-mirrorgcrio)
 - [Registries other than Docker Hub](#registries-other-than-docker-hub)
 - [What a mirror does not fix](#what-a-mirror-does-not-fix)
@@ -139,32 +140,76 @@ The sidecar's daemon reaches the mirror over the per-job bridge network:
 - A mirror is unreachable when `[network].internal = true`, because the job
   network then has no route out. With such a configuration the daemon cannot
   use a mirror (or the upstream registry).
-- If the mirror is plain HTTP, add it to `insecure-registries` in the same
-  `daemon.json` (see below). Docker defines an insecure registry as one that
-  uses plain HTTP or TLS with a CA the daemon does not trust. The
-  alternative is a TLS mirror whose CA the sidecar trusts, which means
-  baking the CA into the custom image.
+- A plain-HTTP mirror needs no `insecure_registries` entry: dockerd takes the
+  scheme from the mirror URL (see [Pointing the sidecar at the
+  mirror](#pointing-the-sidecar-at-the-mirror)). An insecure-registries entry
+  is for a TLS mirror whose certificate the sidecar does not trust. The
+  alternative is a TLS mirror whose CA the sidecar trusts, which means baking
+  the CA into a custom image.
 
 ## Pointing the sidecar at the mirror
 
-The provider does not yet have a setting for sidecar daemon options; a
-provider-level `registry_mirrors` setting is planned (tracked in
-[#26](https://github.com/TzuH-Hsu/garm-provider-docker/issues/26), with no
-release committed). Until then, `dind_image` accepts any digest-pinned image,
-and `dockerd` reads `/etc/docker/daemon.json` by default, so the mirror can be
-baked into a custom sidecar image.
+Set `registry_mirrors` in the provider config
+([#26](https://github.com/TzuH-Hsu/garm-provider-docker/issues/26)). It is a
+top-level key next to `dind_image` and `storage_driver`, and the provider
+passes each entry to the sidecar's `dockerd` as `--registry-mirror=<url>`:
+
+```toml
+registry_mirrors = ["http://mirror.lan.example:5000"]
+```
+
+- Each entry is a bare origin: `http://` or `https://`, a host, an optional
+  port, no path, query, fragment or userinfo. Anything else fails the config
+  load with a message naming the entry.
+- It is global and config-only. A pool's `extra_specs` cannot set or override
+  it, and it is not a per-flavor setting: a mirror belongs to the Docker
+  host's network, not to a pool. The provider reads its config on every
+  invocation, so each new sidecar picks up the current value; a sidecar that
+  already exists keeps the flags it was created with.
+- **An `http://` mirror does not need `insecure_registries`.** dockerd takes
+  the scheme from the mirror URL, so `http://mirror.lan.example:5000` is
+  contacted over plain HTTP by itself. This was checked in the Moby source for
+  the Engine 29.x line (release `docker-v29.8.2`): the mirror endpoint is built
+  from the URL as written (`daemon/pkg/registry/service_v2.go`), and the
+  containerd image-store pull path copies the URL's scheme into the registry
+  host (`daemon/hosts.go`); `insecure-registries` only switches off
+  certificate verification and enables an HTTP fallback for the hosts it
+  lists. Set `insecure_registries = ["mirror.lan.example:5000"]` only when the
+  mirror serves HTTPS with a certificate the sidecar does not trust, and for a
+  private HTTP registry that jobs pull from by name. Entries are `host[:port]`
+  or a CIDR, never a URL; each becomes `--insecure-registry=<entry>`.
+- The effective values are logged when each sidecar is created (`DinD sidecar
+  registry settings`). Duplicate and malformed entries fail the config load.
+
+To check the result, run `docker info` in a job and look for "Registry
+Mirrors" (and "Insecure Registries" if you set any). Mirrors are listed with
+a trailing `/`. The mirror's own access log shows whether pulls reach it; the
+real-job gate does both, see [`demo-m0.md`](demo-m0.md#registry-mirror-check-opt-in).
+
+> **Warning: do not combine these keys with a custom `dind_image` whose
+> `daemon.json` also sets `registry-mirrors` or `insecure-registries`.**
+> dockerd refuses to start when an option is set both as a flag and in the
+> configuration file ("the following directives are specified both as a flag
+> and in the configuration file"), so the sidecar would never become ready and
+> every DinD job would fail waiting for the daemon. Use the provider keys, or
+> the image's `daemon.json`, not both.
+
+### Alternative: a custom `dind_image` (older provider versions)
+
+On a provider version without `registry_mirrors`, the same result needs a
+custom sidecar image: `dind_image` accepts any digest-pinned image, and
+`dockerd` reads `/etc/docker/daemon.json` by default.
 
 `daemon.json`:
 
 ```json
 {
-  "registry-mirrors": ["http://mirror.lan.example:5000"],
-  "insecure-registries": ["mirror.lan.example:5000"]
+  "registry-mirrors": ["http://mirror.lan.example:5000"]
 }
 ```
 
-Drop the `insecure-registries` line if the mirror serves TLS with a
-certificate the sidecar trusts, and use an `https://` URL.
+Add an `"insecure-registries"` list only for the cases described above (an
+HTTPS mirror with an untrusted certificate, or a private HTTP registry).
 
 `Dockerfile`:
 
@@ -186,24 +231,23 @@ the base image.
 > option is set both as a flag and in the configuration file, regardless of
 > the values, so the sidecar would never become ready and every DinD job
 > would fail waiting for the daemon. Keep the file to `registry-mirrors` and
-> `insecure-registries`. Never add a TCP `hosts` entry in any case: the
-> ADR-001 rule that nothing listens on TCP is not configurable.
-
-To check the result, run `docker info` in a job and look for the
-"Registry Mirrors" (and "Insecure Registries") entries. The mirror's own
-access log shows whether pulls reach it.
+> `insecure-registries`, and drop those too once you move to the provider's
+> `registry_mirrors` / `insecure_registries` keys. Never add a TCP `hosts`
+> entry in any case: the ADR-001 rule that nothing listens on TCP is not
+> configurable.
 
 ## Zero-infrastructure alternative: `mirror.gcr.io`
 
 Google operates a public cache of popular Docker Hub images at
-`mirror.gcr.io`. It needs nothing to run: use the same custom-image recipe
-with
+`mirror.gcr.io`. It needs nothing to run: set
 
-```json
-{
-  "registry-mirrors": ["https://mirror.gcr.io"]
-}
+```toml
+registry_mirrors = ["https://mirror.gcr.io"]
 ```
+
+(or, on a provider version without that key, the equivalent
+`"registry-mirrors": ["https://mirror.gcr.io"]` in the custom image's
+`daemon.json`).
 
 It caches frequently requested public images only, and Google gives no
 guarantee that a given image stays cached (see
@@ -216,7 +260,7 @@ internet access from the job, so it is incompatible with
 
 ## Registries other than Docker Hub
 
-`registry-mirrors` applies **only to Docker Hub**. Pulls from `ghcr.io`,
+`registry_mirrors` (dockerd's `registry-mirrors`) applies **only to Docker Hub**. Pulls from `ghcr.io`,
 `quay.io`, `gcr.io` and other registries never go through it, and a
 distribution proxy instance mirrors exactly one upstream. Options:
 
@@ -229,8 +273,10 @@ distribution proxy instance mirrors exactly one upstream. Options:
 
 All of these are addressed by the mirror's own name, so jobs must reference
 images through it, for example `mirror.lan.example:5001/owner/image:tag`
-instead of `ghcr.io/owner/image:tag`. They are not transparent. If such a
-mirror is plain HTTP, the sidecar needs it in `insecure-registries` too.
+instead of `ghcr.io/owner/image:tag`. They are not transparent. Unlike a
+Docker Hub mirror, these are ordinary registries to dockerd, not entries in
+`registry_mirrors`: if one is plain HTTP, the sidecar needs it in
+`insecure_registries` (`mirror.lan.example:5001`).
 
 ## What a mirror does not fix
 
