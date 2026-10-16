@@ -66,7 +66,11 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   validation. Org/enterprise-shared caches are an explicit opt-in
   (`allow_org_shared`), off by default. NAS operators with limited storage
   should plan for this manual step. See
-  [ADR-003](docs/adr/ADR-003-cache-keying-and-lifecycle.md).
+  [ADR-003](docs/adr/ADR-003-cache-keying-and-lifecycle.md). The pnpm store
+  and the job workspace are separate volumes, so on a host whose Docker data
+  root is not on XFS (reflink) or btrfs, every `pnpm install` copies the whole
+  `node_modules` tree; see
+  [`docs/package-store-installs.md`](docs/package-store-installs.md).
 - **IPv4-only `localhost` in the runner.** The runner container is created
   with IPv6 disabled in its network namespace, so `::1` is never usable and
   `localhost` behaves as `127.0.0.1`, as on a VM host or a GitHub-hosted
@@ -403,7 +407,9 @@ pulls and the exposure to Docker Hub rate limits. See
   fallback) rather than relying on autodetection. Sysbox has no supported
   install path on DSM, so `sysbox-runc` is not available there —
   `privileged-sidecar` is the only working DinD mechanism if you need DinD
-  at all.
+  at all. btrfs can also make `pnpm install` cheap, because it supports
+  reflinks (kernel 5.18 or newer); see
+  [`docs/package-store-installs.md`](docs/package-store-installs.md).
 - **Unraid**: the same Sysbox-availability gap as DSM — `sysbox-runc` is not
   realistically installable; `privileged-sidecar` or `none` are the
   practical choices.
