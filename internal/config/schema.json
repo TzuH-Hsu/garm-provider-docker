@@ -108,14 +108,14 @@
     "registry_mirrors": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^[hH][tT][tT][pP][sS]?://[^/?#@\\s]+/?$" },
-      "description": "Docker Hub pull-through mirrors for the DinD sidecar's dockerd, emitted as one --registry-mirror=<url> flag each. Each entry is a bare origin: an http or https URL with a host and optional port, no path, query, fragment or userinfo. Defaults to empty (no flag). dockerd consults mirrors only for Docker Hub images and falls back to the upstream if a mirror is unreachable. Global and config-only: no flavor or extra_specs key carries it. The loader additionally rejects case-insensitive duplicates and invalid hosts or ports, which this pattern does not express."
+      "items": { "type": "string", "pattern": "^https?://[^\\s/?#@%]+/?$" },
+      "description": "Docker Hub pull-through mirrors for the DinD sidecar's dockerd, emitted as one --registry-mirror=<url> flag each. Each entry is a bare origin: a lowercase http or https URL with a host and optional port, no path (one trailing slash is allowed), query, fragment, userinfo ('@') or percent-encoding. Defaults to empty (no flag). dockerd consults mirrors only for Docker Hub images and falls back to the upstream if a mirror is unreachable. Global and config-only: no flavor or extra_specs key carries it. uniqueItems rejects exact duplicates; the loader additionally rejects duplicates that differ only by host case or a trailing slash, an empty host, and invalid hosts or ports (1-65535), which JSON Schema cannot express here."
     },
     "insecure_registries": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1, "pattern": "^[^\\s/]+$|^[^\\s/]+/[0-9]{1,3}$" },
-      "description": "Registries the sidecar's dockerd may reach over plain HTTP or with an untrusted certificate, emitted as one --insecure-registry=<entry> flag each. Each entry is host[:port] or a CIDR, never a URL. Defaults to empty (no flag). Global and config-only: no flavor or extra_specs key carries it. The loader additionally validates the host, port and CIDR and rejects case-insensitive duplicates."
+      "items": { "type": "string", "minLength": 1, "pattern": "^(?:[^\\s/@%-](?:[^\\s/@%]*[^\\s/@%-])?|[0-9A-Fa-f:.]+/[0-9]{1,3})$" },
+      "description": "Registries the sidecar's dockerd may reach over plain HTTP or with an untrusted certificate, emitted as one --insecure-registry=<entry> flag each. Each entry is host[:port] or a CIDR, never a URL: no scheme, path, whitespace, userinfo ('@') or percent-encoding, and no leading or trailing hyphen. Defaults to empty (no flag). Global and config-only: no flavor or extra_specs key carries it. uniqueItems rejects exact duplicates; the loader additionally validates the host, port (1-65535) and CIDR prefix length and rejects duplicates that differ only by case or by the unmasked form of a CIDR, which JSON Schema cannot express here."
     },
     "resources": {
       "type": "object",
