@@ -1,6 +1,8 @@
 package spec
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 	"time"
 
@@ -126,5 +128,40 @@ func BuildDiagPruneContainer(s DiagPruneContainerSpec) (*container.Config, *cont
 			Target: diagPruneMountDir,
 		}},
 	}
+	return cfg, host
+}
+
+// diagPruneStampPrefix and diagPruneStampHashLen shape DiagPruneStampName.
+const (
+	diagPruneStampPrefix  = "garm-diagprune-stamp-"
+	diagPruneStampHashLen = 16
+)
+
+// DiagPruneStampName returns the fixed container name of a controller's
+// diag-prune stamp (ADR-003 amendment 2026-10-26). The name is the claim:
+// Docker rejects a second container of the same name with a 409 Conflict, so
+// when several provider processes find the stamp expired, exactly one of them
+// creates the new stamp and prunes. The controller ID is hashed rather than
+// embedded, so the name is a legal container name whatever the ID's spelling,
+// and two controllers sharing one daemon each get their own stamp.
+func DiagPruneStampName(controllerID string) string {
+	sum := sha256.Sum256([]byte(controllerID))
+	return diagPruneStampPrefix + hex.EncodeToString(sum[:])[:diagPruneStampHashLen]
+}
+
+// BuildDiagPruneStampContainer assembles the config of the diag-prune stamp: a
+// container that is created and never started. Only its labels (the
+// created-at time of the last prune) matter. It mounts nothing, so it never
+// pins a volume against an operator's `docker volume prune`, and joins no
+// network. The entrypoint is overridden with `true` so that a manual
+// `docker start` of it does nothing.
+func BuildDiagPruneStampContainer(image string, labels map[string]string) (*container.Config, *container.HostConfig) {
+	cfg := &container.Config{
+		Image:      image,
+		Labels:     labels,
+		Entrypoint: strslice.StrSlice{"true"},
+		Cmd:        strslice.StrSlice{},
+	}
+	host := &container.HostConfig{NetworkMode: "none"}
 	return cfg, host
 }
