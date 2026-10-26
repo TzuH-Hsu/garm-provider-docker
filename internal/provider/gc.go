@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 
@@ -43,6 +45,16 @@ const (
 	// over one volume — fast; this is generous headroom).
 	diagPruneTimeout = 2 * time.Minute
 
+	// diagPruneInterval is the least time between two diag-prune rounds of one
+	// controller, across all provider processes (ADR-003 amendment 2026-10-26).
+	// The GC runs on every CreateInstance and ListInstances, which GARM calls
+	// often and once per pool or scale set, so without it every call started one
+	// prune helper per diag volume. Retention is measured in days (default 7,
+	// minimum 1), so pruning more often removes nothing a later prune would not:
+	// six hours keeps a file at most 6h past its window (under 4% of the default
+	// 7 days) while cutting the helpers to four rounds a day.
+	diagPruneInterval = 6 * time.Hour
+
 	// helperTerminalGrace and helperRunningMaxAge tune the leaked-helper reaper
 	// by container state (H5), so it never races a live peer's helper yet still
 	// eventually reclaims a genuinely stuck one:
@@ -76,7 +88,8 @@ const (
 //  3. prunes each diagnostic-logs volume to its retention window via a
 //     provider-run helper (the one remaining destructive cache action — it
 //     deletes FILES, strict-identity-gated; retention stays OUT of the untrusted
-//     runner, F14).
+//     runner, F14), at most once per diagPruneInterval per controller across
+//     provider processes (claimDiagPruneRound) — every other pass skips it.
 func (p *Provider) runCacheGC(ctx context.Context) {
 	p.reapLeakedHelpers(ctx)
 
@@ -171,7 +184,13 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 // controller's diagnostic-logs volumes (ADR-003 F14, provider-side). It needs an
 // image with `find`; it reuses the runner image but does NOT pull it — if the
 // image is not present locally this pass, the prune is skipped (best-effort) and
-// runs on a later pass once the image is present. Bounded per pass.
+// runs on a later pass once the image is present.
+//
+// A round runs at most once per diagPruneInterval per controller, across
+// provider processes: the pass first claims the controller's diag-prune stamp
+// (claimDiagPruneRound) and does nothing more when the claim fails. Bounded per
+// round; the volumes are visited in random order so that, past the cap, every
+// volume is still reached over successive rounds.
 func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 	refs, err := p.topo.ListDiagVolumes(ctx)
 	if err != nil {
@@ -185,14 +204,110 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 		slog.InfoContext(ctx, "cache GC: runner image not present; skipping diag prune this pass", "image", runnerImage)
 		return
 	}
-	for i, ref := range refs {
+	if !p.claimDiagPruneRound(ctx, runnerImage) {
+		return
+	}
+	order := slices.Clone(refs)
+	rand.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
+	for i, ref := range order {
 		if i >= cacheGCMaxDiagPrunes {
-			slog.InfoContext(ctx, "cache GC: hit the per-pass diag-prune cap; remaining diag volumes pruned on a later pass",
+			slog.InfoContext(ctx, "cache GC: hit the per-round diag-prune cap; remaining diag volumes pruned in a later round",
 				"cap", cacheGCMaxDiagPrunes)
 			break
 		}
 		p.pruneDiagVolume(ctx, runnerImage, ref)
 	}
+}
+
+// claimDiagPruneRound reports whether this pass may run a diag-prune round
+// (ADR-003 amendment 2026-10-26). The provider is a fresh process per GARM call
+// and has no state directory, so the time of the last round lives in Docker: a
+// never-started stamp container per controller (spec.DiagPruneStampName) whose
+// created-at label is when that round began.
+//
+//   - No stamp: create one and prune.
+//   - A stamp younger than diagPruneInterval: skip (throttled).
+//   - An expired stamp: remove it BY ID, create a new one and prune.
+//   - A stamp whose age is unknown (created-at missing or unparseable) or in the
+//     future: replace it WITHOUT pruning, so the next round comes one interval
+//     later. A bad stamp delays retention by one interval; it never causes a
+//     prune storm.
+//
+// The create is the atomic claim: Docker rejects a second container of the same
+// name with a 409 Conflict, so when several processes find the stamp missing or
+// expired, exactly one wins and the others skip. Removing the old stamp by its
+// ID (not its name) keeps a slow peer from deleting the winner's fresh stamp. A
+// container of the stamp's name that is not provably this controller's stamp is
+// never removed: the round is skipped and the squatter logged. Any daemon error
+// also skips the round (prune later); nothing here fails the caller.
+func (p *Provider) claimDiagPruneRound(ctx context.Context, image string) bool {
+	name := spec.DiagPruneStampName(p.controllerID)
+	existing, err := p.cli.ContainerInspect(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return p.createDiagPruneStamp(ctx, image, name)
+		}
+		slog.WarnContext(ctx, "cache GC: failed to inspect the diag-prune stamp; skipping diag prune this pass",
+			"resource", "container", "container_name", name, "error", err)
+		return false
+	}
+
+	var labels map[string]string
+	if existing.Config != nil {
+		labels = existing.Config.Labels
+	}
+	if !p.isOwnDiagPruneStamp(labels) || existing.ContainerJSONBase == nil || existing.ID == "" {
+		slog.WarnContext(ctx, "cache GC: a container named like the diag-prune stamp is not this controller's stamp; leaving it in place and skipping diag prune",
+			"resource", "container", "container_name", name)
+		return false
+	}
+
+	age, known := helperAge(time.Now(), labels[spec.LabelCreatedAt])
+	if known && age >= 0 && age < diagPruneInterval {
+		return false
+	}
+	if err := p.cli.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		slog.WarnContext(ctx, "cache GC: failed to replace the diag-prune stamp; skipping diag prune this pass",
+			"resource", "container", "container_name", name, "error", err)
+		return false
+	}
+	if !known || age < 0 {
+		if p.createDiagPruneStamp(ctx, image, name) {
+			slog.WarnContext(ctx, "cache GC: the diag-prune stamp had no usable time; reset it, the next diag prune runs one interval from now",
+				"resource", "container", "container_name", name, "interval", diagPruneInterval.String())
+		}
+		return false
+	}
+	return p.createDiagPruneStamp(ctx, image, name)
+}
+
+// createDiagPruneStamp creates the controller's diag-prune stamp and reports
+// whether this process now owns the round. A 409 Conflict means a concurrent
+// provider process created it first and owns the round.
+func (p *Provider) createDiagPruneStamp(ctx context.Context, image, name string) bool {
+	cfg, hostCfg := spec.BuildDiagPruneStampContainer(image, p.ownedHelperLabels(spec.RoleDiagPruneStamp))
+	if _, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, name); err != nil {
+		if !errdefs.IsConflict(err) {
+			slog.WarnContext(ctx, "cache GC: failed to create the diag-prune stamp; skipping diag prune this pass",
+				"resource", "container", "container_name", name, "error", err)
+		}
+		return false
+	}
+	return true
+}
+
+// isOwnDiagPruneStamp reports whether labels are those of this controller's
+// diag-prune stamp: managed, this controller-id, role=diag-prune-stamp, and no
+// instance-name (a stamp is never a job allocation).
+func (p *Provider) isOwnDiagPruneStamp(labels map[string]string) bool {
+	if labels[spec.LabelManaged] != "true" || labels[spec.LabelControllerID] != p.controllerID {
+		return false
+	}
+	if labels[spec.LabelRole] != spec.RoleDiagPruneStamp {
+		return false
+	}
+	_, hasInst := labels[spec.LabelInstanceName]
+	return !hasInst
 }
 
 // pruneDiagVolume runs one diagnostic-log prune helper to completion against a
@@ -362,10 +477,18 @@ func helperAge(now time.Time, createdAt string) (age time.Duration, known bool) 
 // reapLeakedHelpers find a crash-leaked helper and the created-at label lets it
 // age one by state without ever racing a live peer's in-flight helper.
 func (p *Provider) helperLabels() map[string]string {
+	return p.ownedHelperLabels(spec.RoleCacheHelper)
+}
+
+// ownedHelperLabels returns managed + controller-id + the given role + a
+// creation-time created-at, with no instance-name: the label set of every
+// provider-owned container that is not a job allocation (the cache helpers and
+// the diag-prune stamp).
+func (p *Provider) ownedHelperLabels(role string) map[string]string {
 	return map[string]string{
 		spec.LabelManaged:      "true",
 		spec.LabelControllerID: p.controllerID,
-		spec.LabelRole:         spec.RoleCacheHelper,
+		spec.LabelRole:         role,
 		spec.LabelCreatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}
 }

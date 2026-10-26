@@ -251,7 +251,10 @@ stale_cache_eviction_days = 30
 		"touch -t "+oldStamp+" /logs/old.log && touch /logs/recent.log && ls -la /logs"); err != nil {
 		t.Fatalf("(4) seed diag files: %v\n%s", err, out)
 	}
-	// Trigger the GC/prune pass again.
+	// Trigger the GC/prune pass again. The step (3) pass already ran this
+	// interval's diag-prune round, so expire the stamp first (ADR-003 amendment
+	// 2026-10-26).
+	expireDiagPruneStamp(t, controllerID, "(4)")
 	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
 		t.Fatalf("(4) ListInstances exit=%d, want 0", code)
 	}
@@ -289,6 +292,9 @@ stale_cache_eviction_days = 30
 		"touch -t "+oldStamp2+" /logs/old-incomplete.log && ls -la /logs"); err != nil {
 		t.Fatalf("(4b) seed incomplete diag file: %v\n%s", err, out)
 	}
+	// Expire the stamp so this pass runs a real prune round; a throttled pass
+	// would leave the file in place whatever the identity check decided.
+	expireDiagPruneStamp(t, controllerID, "(4b)")
 	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
 		t.Fatalf("(4b) ListInstances exit=%d, want 0", code)
 	}
@@ -298,6 +304,31 @@ stale_cache_eviction_days = 30
 		t.Errorf("(4b) the diag prune deleted a file in an INCOMPLETE-identity volume %q — strict validation must exclude it from the destructive prune (NEW-H2): %s", incompleteDiagVol, incompleteLs)
 	} else {
 		t.Logf("[4b] the incomplete-identity diag volume's aged file SURVIVED — strict validation excluded it from the destructive prune")
+	}
+
+	// =========================================================================
+	// (4c) the diag prune is throttled: a pass inside the interval prunes nothing
+	// =========================================================================
+	// The (4b) pass claimed this interval's round. Another aged file written into
+	// the complete diag volume now SURVIVES a further GC pass, and the stamp is
+	// the same container (ADR-003 amendment 2026-10-26).
+	stampName := spec.DiagPruneStampName(controllerID)
+	stampBefore := strings.TrimSpace(dockerOut(t, "inspect", "-f", "{{.Id}}", stampName))
+	if out, err := dockerTry("run", "--rm", "-v", diagVol+":/logs", "alpine:3.20", "sh", "-c",
+		"touch -t "+oldStamp+" /logs/old-throttled.log"); err != nil {
+		t.Fatalf("(4c) seed diag file: %v\n%s", err, out)
+	}
+	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
+		t.Fatalf("(4c) ListInstances exit=%d, want 0", code)
+	}
+	throttledLs := dockerOut(t, "run", "--rm", "-v", diagVol+":/logs", "alpine:3.20", "ls", "-A", "/logs")
+	if !strings.Contains(throttledLs, "old-throttled.log") {
+		t.Errorf("(4c) a GC pass inside the diag-prune interval pruned the diag volume: %s", throttledLs)
+	} else {
+		t.Logf("[4c] a GC pass inside the interval left the diag volume alone (throttled)")
+	}
+	if stampAfter := strings.TrimSpace(dockerOut(t, "inspect", "-f", "{{.Id}}", stampName)); stampAfter != stampBefore {
+		t.Errorf("(4c) a throttled pass replaced the diag-prune stamp (%s -> %s)", stampBefore, stampAfter)
 	}
 
 	// =========================================================================
@@ -387,4 +418,19 @@ func imageDigestHex(t *testing.T, image string) string {
 		t.Fatalf("image %q has no content ID", image)
 	}
 	return id
+}
+
+// expireDiagPruneStamp removes the controller's diag-prune stamp, standing in
+// for the throttle interval elapsing, so the next GC pass runs a prune round. An
+// earlier pass must have claimed a round, so a missing stamp is an error.
+func expireDiagPruneStamp(t *testing.T, controllerID, step string) {
+	t.Helper()
+	stamp := spec.DiagPruneStampName(controllerID)
+	if _, err := dockerTry("inspect", stamp); err != nil {
+		t.Errorf("%s no diag-prune stamp %q after an earlier GC pass ran a prune round: %v", step, stamp, err)
+		return
+	}
+	if out, err := dockerTry("rm", "-f", stamp); err != nil {
+		t.Fatalf("%s remove the diag-prune stamp %q: %v\n%s", step, stamp, err, out)
+	}
 }
