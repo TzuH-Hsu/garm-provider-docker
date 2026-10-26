@@ -50,6 +50,14 @@
 #               allow_unpinned_runner_image=true (required for a mutable
 #               local tag). For development against uncommitted changes.
 #
+# A third combination is a variant of release mode: a LOCAL provider binary
+# gated against the PUBLISHED runner image. Set LOCAL_PROVIDER_BIN and
+# LOCAL_PROVIDER_SHA256 (see below) and preflight stages that binary instead
+# of downloading the release asset, after checking it against the expected
+# sha256 (it is never run unverified). Everything else stays release mode, in
+# particular the digest-pinned runner_image. It is meant for a pre-tag gate
+# on a host where building the runner image is not acceptable.
+#
 # Two dispatch targets (see GARM_TARGET below):
 #   scaleset   (default) Creates a GARM SCALE SET: GARM long-polls GitHub's
 #               message queue for jobs, so NO inbound webhook is needed and
@@ -144,6 +152,25 @@
 #                          tag whose digest gets resolved). Ignored in
 #                          "source" mode.
 #                          Default: v0.2.4
+#   LOCAL_PROVIDER_BIN, LOCAL_PROVIDER_SHA256
+#                          Optional, "release" mode only, and only together:
+#                          the absolute path of a locally built provider
+#                          binary (executable, for this host's OS/arch) and
+#                          the lowercase hex sha256 you expect it to have.
+#                          Preflight copies the file into its private staging
+#                          directory, hashes the COPY and dies on any
+#                          mismatch (the binary is never run unverified), then
+#                          stages it instead of downloading the release asset
+#                          and its SHA256SUMS. PROVIDER_VERSION then only
+#                          selects the published runner image tag whose digest
+#                          is pinned (digest-pin enforcement stays ON); that
+#                          release need not publish a binary yet. Not allowed
+#                          with --from-source. The generated config and the
+#                          preflight summary say a local binary was used, and
+#                          the expected sha256 is remembered with the other
+#                          modes (the path is not). A result recorded from
+#                          such a run must name the commit the binary was
+#                          built from and its sha256 (docs/demo-m0.md).
 #   GARM_TARGET           "scaleset" (default) or "pool" - see above.
 #   GATE_VARIANT          "none" (default) or "dind" - see above.
 #   SCALESET_NAME         Scale set name (= the workflow's runs-on value).
@@ -249,9 +276,16 @@ EXPL_GATE_VARIANT="${GATE_VARIANT:-}"
 EXPL_RUNNER_IMAGE_NAME="${RUNNER_IMAGE_NAME:-}"
 EXPL_GATE_REGISTRY_MIRROR="${GATE_REGISTRY_MIRROR:-}"
 EXPL_GATE_INSECURE_REGISTRY="${GATE_INSECURE_REGISTRY:-}"
+EXPL_LOCAL_PROVIDER_SHA256="${LOCAL_PROVIDER_SHA256:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.4}"
+
+# "release" mode with a locally built binary (see the header): the path is used
+# by preflight only; the expected sha256 is a remembered mode so later steps
+# can still tell that a local binary is installed.
+LOCAL_PROVIDER_BIN="${LOCAL_PROVIDER_BIN:-}"
+LOCAL_PROVIDER_SHA256="${LOCAL_PROVIDER_SHA256:-}"
 
 PROVIDER_NAME="${PROVIDER_NAME:-docker_demo}"
 PROVIDER_INTERFACE_VERSION="${PROVIDER_INTERFACE_VERSION:-v0.1.0}"
@@ -323,6 +357,7 @@ GATE_MIRROR_PULL_IMAGE="${GATE_MIRROR_PULL_IMAGE:-nginx:alpine-slim}"
 # safe in the generated TOML/YAML and in a shell word): a bare http(s) origin
 # with an optional port, and a host[:port].
 readonly MIRROR_URL_RE='^https?://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?/?$'
+readonly SHA256_RE='^[0-9a-f]{64}$'
 readonly INSECURE_HOST_RE='^(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:[0-9]{1,5})?$'
 
 # --image/--flavor are REQUIRED by `garm-cli pool add` but are provider-
@@ -438,6 +473,8 @@ validate_inputs() {
   [[ -z "${REPO}" ]] || require_format REPO "${REPO}" '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$' 128 "a repo ID or owner/name of letters, digits, '.', '_', '-' and one '/'"
   [[ -z "${SCALESET_NAME}" ]] || require_format SCALESET_NAME "${SCALESET_NAME}" "${name_re}" "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-', starting with a letter or digit"
   [[ -z "${SCALESET_ID}" ]] || require_format SCALESET_ID "${SCALESET_ID}" '^[A-Za-z0-9][A-Za-z0-9-]*$' 64 "an ID of letters, digits and '-'"
+  [[ -z "${LOCAL_PROVIDER_SHA256}" ]] || require_format LOCAL_PROVIDER_SHA256 "${LOCAL_PROVIDER_SHA256}" "${SHA256_RE}" 64 "64 lowercase hex characters"
+  [[ -z "${LOCAL_PROVIDER_BIN}" ]] || require_format LOCAL_PROVIDER_BIN "${LOCAL_PROVIDER_BIN}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces)"
   [[ -z "${GATE_REGISTRY_MIRROR}" ]] || require_format GATE_REGISTRY_MIRROR "${GATE_REGISTRY_MIRROR}" "${MIRROR_URL_RE}" 256 "a bare http(s) origin such as http://mirror.lan.example:5000, with no path, credentials or query"
   [[ -z "${GATE_INSECURE_REGISTRY}" ]] || require_format GATE_INSECURE_REGISTRY "${GATE_INSECURE_REGISTRY}" "${INSECURE_HOST_RE}" 256 "a host[:port] such as mirror.lan.example:5000"
   [[ -z "${GATE_MIRROR_LOG_CONTAINER}" ]] || require_format GATE_MIRROR_LOG_CONTAINER "${GATE_MIRROR_LOG_CONTAINER}" "${name_re}" "${MAX_NAME_LEN}" "a container name of letters, digits, '.', '_' and '-'"
@@ -529,6 +566,25 @@ validate_registry_gate() {
   fi
 }
 
+# validate_local_provider checks the LOCAL_PROVIDER_BIN / LOCAL_PROVIDER_SHA256
+# pair. It runs for preflight and all only (the commands that obtain the
+# binary); later steps just use the remembered LOCAL_PROVIDER_SHA256. Neither
+# or both must be set, and a local binary belongs to release mode: with
+# --from-source the script builds its own binary.
+validate_local_provider() {
+  if [[ -z "${LOCAL_PROVIDER_BIN}" && -z "${LOCAL_PROVIDER_SHA256}" ]]; then
+    return 0
+  fi
+  [[ -n "${LOCAL_PROVIDER_BIN}" && -n "${LOCAL_PROVIDER_SHA256}" ]] \
+    || die "LOCAL_PROVIDER_BIN and LOCAL_PROVIDER_SHA256 must be set together (the binary is only used after its sha256 matches the expected value)"
+  [[ "${PROVIDER_SOURCE}" == "release" ]] \
+    || die "LOCAL_PROVIDER_BIN / LOCAL_PROVIDER_SHA256 select a local binary for the default release mode; --from-source builds its own binary, so unset them"
+  [[ "/${LOCAL_PROVIDER_BIN}/" != */../* ]] \
+    || die "LOCAL_PROVIDER_BIN must not contain '..' segments"
+  [[ -f "${LOCAL_PROVIDER_BIN}" && -r "${LOCAL_PROVIDER_BIN}" && -x "${LOCAL_PROVIDER_BIN}" ]] \
+    || die "LOCAL_PROVIDER_BIN (${LOCAL_PROVIDER_BIN}) must be an existing, readable, executable regular file"
+}
+
 # --- Saved modes -------------------------------------------------------------
 #
 # The selected modes are remembered in $PROVIDER_CONFIG_DIR/gate-modes so the
@@ -537,7 +593,7 @@ validate_registry_gate() {
 # variant and interface version. Format: KEY=value lines, parsed WITHOUT
 # sourcing or eval, keys and values strictly allowlisted.
 
-readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME GATE_REGISTRY_MIRROR GATE_INSECURE_REGISTRY"
+readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME GATE_REGISTRY_MIRROR GATE_INSECURE_REGISTRY LOCAL_PROVIDER_SHA256"
 
 modes_file() { printf '%s/gate-modes' "${PROVIDER_CONFIG_DIR}"; }
 
@@ -553,6 +609,8 @@ mode_value_valid() {
     # These two may be empty (the mirror check is opt-in).
     GATE_REGISTRY_MIRROR)       (( ${#2} <= 256 )) && { [[ -z "$2" ]] || [[ "$2" =~ ${MIRROR_URL_RE} ]]; } ;;
     GATE_INSECURE_REGISTRY)     (( ${#2} <= 256 )) && { [[ -z "$2" ]] || [[ "$2" =~ ${INSECURE_HOST_RE} ]]; } ;;
+    # May be empty (a local provider binary is opt-in).
+    LOCAL_PROVIDER_SHA256)      [[ -z "$2" ]] || [[ "$2" =~ ${SHA256_RE} ]] ;;
     *) return 1 ;;
   esac
 }
@@ -569,6 +627,7 @@ explicit_mode_value() {
     RUNNER_IMAGE_NAME)          printf '%s' "${EXPL_RUNNER_IMAGE_NAME}" ;;
     GATE_REGISTRY_MIRROR)       printf '%s' "${EXPL_GATE_REGISTRY_MIRROR}" ;;
     GATE_INSECURE_REGISTRY)     printf '%s' "${EXPL_GATE_INSECURE_REGISTRY}" ;;
+    LOCAL_PROVIDER_SHA256)      printf '%s' "${EXPL_LOCAL_PROVIDER_SHA256}" ;;
   esac
 }
 
@@ -1058,6 +1117,33 @@ download_provider_binary() {
   log "Staged verified binary: ${STAGE_BIN}"
 }
 
+# stage_local_provider_binary stages the locally built binary
+# LOCAL_PROVIDER_BIN instead of downloading a release asset. The file is first
+# copied into the private staging directory and the COPY is hashed, so the
+# bytes that are verified are the bytes that get staged (the original cannot be
+# swapped in between). Any mismatch is fatal: an unverified binary is never
+# staged, let alone executed. Release-only checks (a published SHA256SUMS,
+# the asset download) do not apply; the digest-pinned runner image is
+# resolved separately and still required.
+stage_local_provider_binary() {
+  warn_if_known_incompatible_version
+
+  local copy_path actual
+  copy_path="$(mktemp "${STAGE_BIN_DIR}/local.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
+  cp -- "${LOCAL_PROVIDER_BIN}" "${copy_path}" \
+    || { rm -f "${copy_path}"; die "could not copy ${LOCAL_PROVIDER_BIN} into the staging directory"; }
+  actual="$(compute_sha256 "${copy_path}")" || exit 1
+  if [[ "${actual}" != "${LOCAL_PROVIDER_SHA256}" ]]; then
+    rm -f "${copy_path}"
+    die "sha256 mismatch for ${LOCAL_PROVIDER_BIN}: expected ${LOCAL_PROVIDER_SHA256}, the file hashes to ${actual} - refusing to use an unverified binary"
+  fi
+  ok "local binary ${LOCAL_PROVIDER_BIN} matches the expected sha256 ${actual}"
+  warn "using a LOCAL provider binary, not the published ${PROVIDER_VERSION} release asset; a recorded result must name the commit it was built from and this sha256"
+
+  stage_provider_binary "${copy_path}"
+  log "Staged verified local binary: ${STAGE_BIN}"
+}
+
 # build_runner_image builds the runner image under a unique temporary tag. The
 # generated source-mode config references RUNNER_IMAGE_TAG itself (a mutable
 # tag; allow_unpinned_runner_image), so that tag must keep pointing at the
@@ -1131,11 +1217,17 @@ resolve_dind_image_digest() {
 generate_provider_config() {
   local runner_image="$1" dind_image="${2:-}"
   local cfg_tmp="${STAGE_CFG}"
+  local binary_note=""
+  if [[ -n "${LOCAL_PROVIDER_SHA256}" ]]; then
+    binary_note="# The provider binary is a LOCAL build (sha256 ${LOCAL_PROVIDER_SHA256}),
+# not the published ${PROVIDER_VERSION} release asset; only runner_image is published.
+"
+  fi
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
     cat > "${cfg_tmp}" <<EOF
 # Generated by scripts/demo-m0.sh (release mode, ${PROVIDER_VERSION}) -
-# gate config for garm-provider-docker. Every key besides runner_image
+${binary_note}# gate config for garm-provider-docker. Every key besides runner_image
 # falls back to its documented default (docs/config-reference.md):
 # dind_mode = "none", docker_host = "unix:///var/run/docker.sock", and so
 # on - see examples/config.minimal.toml, which this mirrors.
@@ -1322,8 +1414,12 @@ step_preflight() {
   local runner_image
   case "${PROVIDER_SOURCE}" in
     release)
-      require_linux_host_for_release_mode
-      download_provider_binary
+      if [[ -n "${LOCAL_PROVIDER_BIN}" ]]; then
+        stage_local_provider_binary
+      else
+        require_linux_host_for_release_mode
+        download_provider_binary
+      fi
       runner_image="$(resolve_runner_image_digest)" || exit 1
       ;;
     source)
@@ -1353,7 +1449,7 @@ step_preflight() {
   publish_staged_artifacts
 
   log "Preflight complete."
-  log "  Mode            : ${PROVIDER_SOURCE}"
+  log "  Mode            : ${PROVIDER_SOURCE}${LOCAL_PROVIDER_SHA256:+ (LOCAL provider binary, sha256 ${LOCAL_PROVIDER_SHA256})}"
   log "  Provider binary : ${PROVIDER_BIN}"
   log "  Provider config : ${PROVIDER_CONFIG_FILE}"
   log "  Runner image    : ${runner_image}"
@@ -1372,7 +1468,7 @@ step_config() {
 [[provider]]
   name = "${PROVIDER_NAME}"
   provider_type = "external"
-  description = "garm-provider-docker real-job gate (${PROVIDER_SOURCE} ${PROVIDER_VERSION})"
+  description = "garm-provider-docker real-job gate (${PROVIDER_SOURCE} ${PROVIDER_VERSION}${LOCAL_PROVIDER_SHA256:+, local binary})"
   disable_jit_config = false
   [provider.external]
     provider_executable = "${PROVIDER_BIN}"
@@ -2550,6 +2646,12 @@ Flags:
                        that publishes it (resolute: v0.2.3 and later)
   -h, --help          Show this help
 
+Optional local provider binary (release mode): set LOCAL_PROVIDER_BIN to the
+absolute path of a locally built binary and LOCAL_PROVIDER_SHA256 to its
+expected sha256. Preflight verifies it (hard failure on mismatch) and stages it
+instead of downloading the release asset; --version then only selects the
+published, digest-pinned runner image. Not allowed with --from-source.
+
 Optional registry mirror check (with --dind): set GATE_REGISTRY_MIRROR to a
 Docker Hub mirror origin (e.g. http://mirror.lan.example:5000); see the
 GATE_* variables in this script's header and docs/demo-m0.md. Unset, no
@@ -2607,7 +2709,9 @@ main() {
   init_arch
   validate_modes
   case "${COMMAND}" in
-    preflight|all) ;; # these define the modes; step_preflight saves them on success
+    preflight|all) # these define the modes; step_preflight saves them on success
+      validate_local_provider
+      ;;
     *) load_saved_modes; validate_modes ;;
   esac
   validate_registry_gate

@@ -103,7 +103,9 @@ is specific to this provider and this demo.
      you're on with `go build`. The **containers** this provider creates
      are always `linux` regardless of host OS (Docker Desktop's own VM
      handles that on macOS); it is only the provider binary's own OS that
-     release mode is picky about.
+     release mode is picky about. (A locally built binary supplied with
+     `LOCAL_PROVIDER_BIN` is not a release asset, so this restriction does
+     not apply to it; it must still match the host.)
    - **`--from-source` additionally needs a Go toolchain** (`go.mod` pins
      `go 1.25.0`) to build the provider binary, and builds the runner image
      locally (`docker build -f runner-images/noble/Dockerfile runner-images`,
@@ -128,7 +130,8 @@ is specific to this provider and this demo.
 ## Release mode vs. source mode
 
 `scripts/demo-m0.sh` has two modes, selected by `--from-source` (or the
-`PROVIDER_SOURCE` env var):
+`PROVIDER_SOURCE` env var), plus a variant of release mode for a locally
+built binary (see below):
 
 - **`release`** (default) — validates a **published release**, exactly as
   an operator would install it:
@@ -158,13 +161,51 @@ is specific to this provider and this demo.
   a local mutable tag can never be digest-pinned). Use this when testing
   uncommitted provider or runner-image changes.
 
+### Release mode with a locally built binary
+
+A pre-tag gate often needs the opposite split from `source`: a provider binary
+built from the commit under test, run against the **published** runner image,
+on a host where building images is not acceptable. Set both of these (they are
+only valid together, and not with `--from-source`):
+
+```sh
+export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker   # absolute path, executable
+export LOCAL_PROVIDER_SHA256=<64 lowercase hex characters>           # the sha256 you expect it to have
+scripts/demo-m0.sh --version vX.Y.Z preflight
+```
+
+Everything stays release mode except where the binary comes from:
+
+- Preflight copies the file into its private staging directory and hashes the
+  **copy**. A mismatch with `LOCAL_PROVIDER_SHA256` is a hard failure: an
+  unverified binary is never staged or executed. Compute the expected value
+  where you built the binary (`sha256sum garm-provider-docker`) so that it
+  does not come from the file being checked.
+- No release asset or `SHA256SUMS` is downloaded, and the release does not
+  have to be published yet. `--version` (or `PROVIDER_VERSION`) only selects
+  the tag of `ghcr.io/tzuh-hsu/garm-runner-<name>` whose digest is resolved
+  and pinned, so that image must already be published. Digest-pin enforcement
+  stays ON: `allow_unpinned_runner_image` is never set.
+- The binary must be built for the host's OS and architecture (the smoke test
+  runs it once against the generated config). Because it is not a release
+  asset, the Linux-only restriction of release mode does not apply.
+- The script says so wherever it matters: a warning when the binary is staged,
+  a "LOCAL provider binary" line in the preflight summary, a comment in the
+  generated `config.toml`, and `, local binary` in the `description` of the
+  `[[provider]]` snippet. The expected sha256 is remembered in `gate-modes`
+  (the path is not); a later `preflight` without these variables goes back to
+  downloading the release.
+
+A result from this mode proves the **commit and binary you built**, not the
+published release asset; see [Recording a result](#recording-a-result).
+
 Either mode gates the Ubuntu 24.04 runner image by default. `--runner-image
 resolute` (or `RUNNER_IMAGE_NAME=resolute`) gates the Ubuntu 26.04 image
 instead: `runner-images/resolute` in source mode, `garm-runner-resolute` in
 release mode (published from v0.2.3 on). Like the other modes it is remembered
 by preflight for the later steps.
 
-Either mode ends with a generated demo provider `config.toml` (path printed
+Every combination ends with a generated demo provider `config.toml` (path printed
 by the script) and a verified, runnable provider binary; everything after
 Step 0 (registration, pool, workflow, verification) is identical regardless
 of mode.
@@ -247,6 +288,8 @@ Unset, which is the default, none of it runs and the gate is unchanged.
 # The mirror is a Docker Hub pull-through cache your Docker host and the job
 # networks can reach (a distribution `registry` in proxy mode, per
 # dind-image-pulls.md). The log container is optional but recommended.
+# Use an address that is reachable from INSIDE the sidecar: the host's LAN IP
+# or a DNS name, never one in 172.17.0.0/16 (see the note below).
 export GATE_REGISTRY_MIRROR=http://mirror.lan.example:5000
 export GATE_MIRROR_LOG_CONTAINER=registry-mirror   # the mirror's container name on this host
 scripts/demo-m0.sh --dind preflight
@@ -272,9 +315,9 @@ What it changes and checks:
   1. the sidecar's `dockerd` argv has `--registry-mirror=<mirror>`, and an
      `--insecure-registry` flag only when `GATE_INSECURE_REGISTRY` is set. By
      default the mirror is therefore exercised **without** an insecure entry,
-     which checks the claim that an `http://` mirror needs none. If that fails
-     on your Engine, set `GATE_INSECURE_REGISTRY` to the mirror's `host:port`
-     and report it;
+     which checks the claim that an `http://` mirror needs none (confirmed on
+     Engine 29.9.2). If that fails on your Engine, set
+     `GATE_INSECURE_REGISTRY` to the mirror's `host:port` and report it;
   2. `docker info` through the runner's `DOCKER_HOST` (the sidecar's daemon)
      lists the mirror, and the insecure registry when one is set;
   3. a pull of `GATE_MIRROR_PULL_IMAGE` (default `nginx:alpine-slim`, a small
@@ -295,6 +338,23 @@ checks). The mirror must be reachable from the job network; with
 `[network].internal = true` it cannot be (that network has no route out at
 all). The check pulls one small image through the mirror and
 does nothing else to it.
+
+**Choosing the mirror address.** The sidecar shares the runner container's
+network namespace, and its nested `dockerd` creates its own `docker0` bridge
+there with the default range `172.17.0.0/16`. A mirror written as
+`http://172.17.0.1:5000` (the usual address of the *host's* `docker0`) therefore
+resolves to the nested bridge inside the sidecar, the dial gets `connection
+refused`, and `dockerd` silently falls back to Docker Hub. Nothing fails: the
+pull still succeeds, just not through the mirror. Use an address that is
+reachable from inside the sidecar, such as the host's LAN IP or a DNS name, and
+keep it out of `172.17.0.0/16`. The `docker info` step still passes with a
+wrong address (it only lists the configured mirror), so the pull check is the
+one that catches it: with `GATE_MIRROR_LOG_CONTAINER` set, `verify` fails
+because the mirror's access log shows no request for the pulled image. If the
+check fails, confirm the pull succeeded anyway and look at the mirror's access
+log before suspecting the provider. Overriding the nested bridge range (for
+example `--bip` or `default-address-pools` through a custom `dind_image`) is
+outside this gate.
 
 ## What this demo proves
 
@@ -357,7 +417,8 @@ the full command list and every environment variable it accepts.
 **Modes are remembered between steps.** `preflight` (and `all`) record the
 effective `PROVIDER_SOURCE`, `PROVIDER_VERSION`, `GARM_TARGET`,
 `GATE_VARIANT`, `PROVIDER_INTERFACE_VERSION`, `RUNNER_IMAGE_NAME` and, when
-set, `GATE_REGISTRY_MIRROR` / `GATE_INSECURE_REGISTRY` in
+set, `GATE_REGISTRY_MIRROR` / `GATE_INSECURE_REGISTRY` and the expected
+`LOCAL_PROVIDER_SHA256` in
 `$PROVIDER_CONFIG_DIR/gate-modes` (mode 0600, plain `KEY=value` lines that
 are parsed, never sourced). A later single step run without a flag for a
 mode uses the saved value and logs `using saved <mode>=<value>`, so
@@ -392,6 +453,10 @@ then, depending on mode:
   `--runner-image resolute`) digest via `docker
   buildx imagetools inspect`, and generates a provider `config.toml` with
   `runner_image` pinned to that digest — digest-pin enforcement stays ON.
+  With `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256` set, the download is
+  replaced by staging that local binary after its sha256 matches (see
+  [Release mode with a locally built binary](#release-mode-with-a-locally-built-binary));
+  the rest is unchanged.
 - **`--from-source`**: builds the provider binary (`go build -ldflags
   version stamp`) and the runner image locally (`docker build -t <tag>
   -f runner-images/<name>/Dockerfile runner-images`), and generates a
@@ -586,11 +651,17 @@ re-running it:
   printed.
 - **Host**: OS and architecture (`uname -sm`) and `docker version`'s
   `Server.Version`.
+- **The provider binary, when `LOCAL_PROVIDER_BIN` was used**: the git
+  commit it was built from (and whether the tree was clean) and its sha256,
+  as given in `LOCAL_PROVIDER_SHA256` and echoed by the preflight summary. A
+  result from a local binary says nothing about the published release asset
+  until the release's own `SHA256SUMS` entry is shown to equal that sha256
+  (or the release is gated again in plain release mode), so state which it is.
 - **Per-item PASS/FAIL**: the (a)–(e) results from Step 4's output (paste
   the script's own PASS/FAIL lines rather than summarizing from memory).
-- **Mode**: `release` or `--from-source`; dispatch target (scale set
-  or `--pool`); variant (`none` or `--dind`); and whether `-y`/`--yes`
-  was used.
+- **Mode**: `release`, `release` with a local binary, or `--from-source`;
+  dispatch target (scale set or `--pool`); variant (`none` or `--dind`); and
+  whether `-y`/`--yes` was used.
 - **Date** the run happened, since GARM, this provider, and the runner
   image can all move independently between runs.
 
