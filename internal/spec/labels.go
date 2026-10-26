@@ -145,6 +145,15 @@ const (
 	// controller-scoped rescue. Every normal path force-removes its helper in a
 	// defer, so a leak requires the process to die mid-run.
 	RoleCacheHelper = "cache-helper"
+
+	// RoleDiagPruneStamp marks the one never-started container per controller
+	// that records when the diagnostic-log prune last ran, so the opportunistic
+	// GC prunes at most once per interval across provider processes (ADR-003
+	// amendment 2026-10-26). Like a cache helper it carries managed=true +
+	// controller-id and NO instance-name, so the ADR-004 teardown/sweep
+	// predicate never matches it; it has its own role so the leaked-helper
+	// reaper leaves it alone.
+	RoleDiagPruneStamp = "diag-prune-stamp"
 )
 
 // Resource kind values for LabelResource. Networks and volumes only.

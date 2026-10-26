@@ -110,3 +110,48 @@ func TestDiagPruneRetentionInScript(t *testing.T) {
 		}
 	}
 }
+
+// TestDiagPruneStampName: the stamp name is deterministic per controller (it is
+// the cross-process claim), differs between controllers sharing a daemon, and is
+// a legal container name whatever the controller ID's spelling.
+func TestDiagPruneStampName(t *testing.T) {
+	a := DiagPruneStampName("controller-abc")
+	if a != DiagPruneStampName("controller-abc") {
+		t.Errorf("DiagPruneStampName is not deterministic: %q", a)
+	}
+	if b := DiagPruneStampName("controller-xyz"); a == b {
+		t.Errorf("two controllers share the stamp name %q", a)
+	}
+	for _, id := range []string{"controller-abc", "Ctrl With Spaces/and:colons", ""} {
+		name := DiagPruneStampName(id)
+		if !strings.HasPrefix(name, "garm-diagprune-stamp-") {
+			t.Errorf("DiagPruneStampName(%q) = %q, want the garm-diagprune-stamp- prefix", id, name)
+		}
+		if err := ValidateDerivedName("diag-prune stamp", name); err != nil {
+			t.Errorf("DiagPruneStampName(%q) = %q is not a legal name: %v", id, name, err)
+		}
+	}
+}
+
+// TestBuildDiagPruneStampContainer: the stamp mounts nothing (so it never pins a
+// volume against an operator's prune), joins no network, carries the given
+// labels, and does nothing if someone starts it.
+func TestBuildDiagPruneStampContainer(t *testing.T) {
+	labels := map[string]string{LabelRole: RoleDiagPruneStamp}
+	cfg, host := BuildDiagPruneStampContainer("runner@sha256:abc", labels)
+	if cfg.Image != "runner@sha256:abc" {
+		t.Errorf("Image = %q", cfg.Image)
+	}
+	if cfg.Labels[LabelRole] != RoleDiagPruneStamp {
+		t.Errorf("Labels = %v, want role=%s", cfg.Labels, RoleDiagPruneStamp)
+	}
+	if len(cfg.Entrypoint) != 1 || cfg.Entrypoint[0] != "true" || len(cfg.Cmd) != 0 {
+		t.Errorf("Entrypoint/Cmd = %v/%v, want [true]/[]", cfg.Entrypoint, cfg.Cmd)
+	}
+	if len(host.Mounts) != 0 || len(host.Binds) != 0 {
+		t.Errorf("stamp mounts %v / binds %v, want none", host.Mounts, host.Binds)
+	}
+	if !host.NetworkMode.IsNone() {
+		t.Errorf("NetworkMode = %q, want none", host.NetworkMode)
+	}
+}
