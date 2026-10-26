@@ -12,6 +12,7 @@ Docker's data root.
 - [Checking your host](#checking-your-host)
 - [If the host is ext4](#if-the-host-is-ext4)
 - [The global virtual store (opt-in, with a caveat)](#the-global-virtual-store-opt-in-with-a-caveat)
+- [The pnpm metadata cache](#the-pnpm-metadata-cache)
 - [Tools that are not affected](#tools-that-are-not-affected)
 
 ## What happens on every install
@@ -136,6 +137,93 @@ Two reasons to be careful:
 - **The symlinks in `node_modules` point into the store path.** A nested DinD
   container that bind-mounts the workspace does not see `/opt/pnpm-store`, so
   those links dangle there.
+
+## The pnpm metadata cache
+
+The store holds package contents. pnpm also keeps package **metadata** (the
+registry's per-package documents) under its `cache-dir`, which defaults to
+`$XDG_CACHE_HOME/pnpm` and so lives in the runner container's writable layer,
+gone with the runner. Without help, every job starts with an empty metadata
+cache.
+
+The provider therefore keeps it on the pnpm store volume. Whenever it mounts
+the store and sets the store-dir variables, it also sets `npm_config_cache_dir`
+(read by pnpm 10 and earlier) and `pnpm_config_cache_dir` (read by pnpm 11), to
+`<store mount>/metadata-cache`, `/opt/pnpm-store/metadata-cache` by default.
+Nothing is set for a cache-ineligible allocation or when the cache feature is
+off. There is no new volume: the metadata shares the store's repository scope,
+its lifecycle and its manual cleanup. A repository's own `.npmrc` cannot
+redirect it, for the same reason it cannot redirect the store.
+
+### Why it matters on pnpm 11
+
+pnpm 11 checks every entry of the lockfile against supply-chain policies before
+it installs anything, even with `--frozen-lockfile`. The default
+`minimumReleaseAge` of 1440 minutes (one day) is enough to trigger it, and the
+check reads each package's metadata. With an empty cache that is one registry
+request per package name, tens of megabytes in total.
+
+Lab measurements: `--frozen-lockfile`, warm store, a public monorepo with about
+1,300 lockfile entries (1,110 package names), Docker Desktop on a laptop, pnpm
+11.28.8 and 10.34.9, medians of five runs. Absolute seconds depend on the
+registry link and the disk; the request counts and ratios carry over better.
+
+| pnpm | Metadata cache | Install time | Received |
+|---|---|---|---|
+| 11 | empty (before this change) | 10.3 s | 72 MB |
+| 11 | persisted, lockfile not seen before | 3.9 s | 1.1 MB (all `304 Not Modified`) |
+| 11 | persisted, same lockfile verified by an earlier job | 1.6 s | none |
+| 10 | empty or persisted | 1.3 to 2.0 s | none |
+
+pnpm 11 records each lockfile that passed the check in
+`<cache-dir>/lockfile-verified.jsonl`, keyed by a hash of the lockfile
+contents, and skips the check for the same lockfile later; that is the 1.6 s
+row. For a changed lockfile the persisted documents turn the downloads into
+conditional requests, the 3.9 s row. A frozen install on pnpm 10 makes no
+registry request at all, so for it the cache changes nothing; it only helps
+commands that resolve (`pnpm add`, `pnpm update`, an install without a frozen
+lockfile). Writing the cache the first time cost nothing measurable.
+
+### Concurrency, staleness and size
+
+- **Concurrent runners.** Runners of one repository share the volume. In the
+  lab, 72 concurrent pnpm 11 installs on one volume produced no errors and no
+  corrupt files: pnpm writes a temporary file and renames it, and treats an
+  unreadable file as a cache miss.
+- **Staleness.** A persisted cache does not pin a job to an old resolution.
+  After a lockfile change a frozen install resolved exactly as with an empty
+  cache, and an entry whose version has moved on at the registry is re-fetched.
+  Older metadata is served only on request (`--prefer-offline`) or by design:
+  pnpm 11 uses a cache file younger than its release-age window (24 hours by
+  default) without asking the registry. A job running `pnpm add` can therefore
+  see a dist-tag up to a day behind.
+- **Size.** About 250 MiB per 1,100 package names in the lab, roughly half the
+  size of the store for that workload. It grows with the number of distinct
+  packages the repository has ever resolved, not with the number of jobs, since
+  each package's file is rewritten in place. A repository that sets
+  `trustPolicy=no-downgrade` makes pnpm cache the full documents, which was 669
+  MiB for the same lockfile. The provider never cleans inside a volume, so the
+  metadata is removed with the store volume (see the cache volume cleanup in the
+  README). `pnpm store prune` also removes it, which is harmless: it is
+  re-fetched on demand.
+- **Same-repository trust.** A job can write to this directory, as it can to
+  the store. In particular, a job can add a forged `lockfile-verified.jsonl`
+  record, which makes later jobs of the same repository skip pnpm 11's policy
+  check for that exact lockfile. The frozen install still checks every package
+  against the integrity hashes in the lockfile. This is the same-repository
+  boundary ADR-003 already accepts for the store; nothing crosses repositories,
+  and org-scoped pools get no persistent cache unless `allow_org_shared` is on.
+- **npm 11 warning.** Like `npm_config_store_dir`, `npm_config_cache_dir` makes
+  npm 11 print an `Unknown env config "cache-dir"` warning on each npm or npx
+  call. It is cosmetic and goes away when pnpm 10 support is dropped.
+
+### Why a sub-directory
+
+The cache directory is never the store mount itself. On pnpm 11, `pnpm store
+prune` deletes what it finds under `cache-dir`, and with `cache-dir` set to the
+store root it deleted the whole store in a lab run. In `metadata-cache/` it can
+only remove the metadata. The runner user creates the directory on first use
+inside the store mount it already owns.
 
 ## Tools that are not affected
 

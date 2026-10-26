@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"path"
 	"slices"
 	"strings"
 	"testing"
@@ -132,5 +133,70 @@ func TestBuildRunnerEnvNoCacheEnvWhenUnset(t *testing.T) {
 		if strings.HasPrefix(e, "npm_config_store_dir=") || strings.HasPrefix(e, "pnpm_config_store_dir=") {
 			t.Errorf("pnpm store envs must be absent when no pnpm store volume is mounted: %q", e)
 		}
+	}
+}
+
+// TestBuildRunnerEnvPnpmCacheDir: the metadata cache envs ride on the pnpm
+// store volume. They are emitted iff a persistent pnpm store is mounted, under
+// both spellings (pnpm <= 10 reads npm_config_cache_dir, pnpm >= 11 reads
+// pnpm_config_cache_dir), in JIT and non-JIT modes, and point at a
+// sub-directory of the store mount.
+func TestBuildRunnerEnvPnpmCacheDir(t *testing.T) {
+	const store = "/opt/pnpm-store"
+	const want = store + "/metadata-cache"
+	for _, jit := range []bool{true, false} {
+		env := BuildRunnerEnv(RunnerEnvOptions{
+			JITConfigEnabled: jit,
+			GitHubURL:        "https://github.com",
+			RunnerWorkDir:    RunnerWorkDir,
+			RunnerName:       "r",
+			Entity:           Entity{Scope: EntityRepo, Org: "o", Repo: "r"},
+			PnpmStoreDir:     store,
+		})
+		if !slices.Contains(env, "npm_config_cache_dir="+want) {
+			t.Errorf("jit=%v: env missing npm_config_cache_dir=%s (pnpm <= 10): %v", jit, want, env)
+		}
+		if !slices.Contains(env, "pnpm_config_cache_dir="+want) {
+			t.Errorf("jit=%v: env missing pnpm_config_cache_dir=%s (pnpm >= 11): %v", jit, want, env)
+		}
+	}
+}
+
+// TestBuildRunnerEnvNoPnpmCacheDirWithoutStore: no pnpm store volume, no cache
+// dir env. A cache-ineligible allocation (toolcache only) and a cache-disabled
+// one leave pnpm on its own default cache location.
+func TestBuildRunnerEnvNoPnpmCacheDirWithoutStore(t *testing.T) {
+	cases := map[string]RunnerEnvOptions{
+		"disabled":  {JITConfigEnabled: true, GitHubURL: "https://github.com", RunnerWorkDir: RunnerWorkDir},
+		"toolcache": {JITConfigEnabled: true, GitHubURL: "https://github.com", RunnerWorkDir: RunnerWorkDir, ToolCacheDir: "/opt/hostedtoolcache"},
+	}
+	for name, opts := range cases {
+		for _, e := range BuildRunnerEnv(opts) {
+			if strings.HasPrefix(e, "npm_config_cache_dir=") || strings.HasPrefix(e, "pnpm_config_cache_dir=") {
+				t.Errorf("%s: pnpm cache-dir env must be absent without a pnpm store volume: %q", name, e)
+			}
+		}
+	}
+}
+
+// TestPnpmMetadataCacheDirIsStrictlyBelowStoreRoot: the cache dir must never be
+// the store mount itself. pnpm 11's `pnpm store prune` removes what it finds
+// under cache-dir; with cache-dir at the store root it deleted the whole store
+// in a lab run. A sub-directory limits prune to the metadata.
+func TestPnpmMetadataCacheDirIsStrictlyBelowStoreRoot(t *testing.T) {
+	for _, store := range []string{"/opt/pnpm-store", "/data/pnpm", "/a"} {
+		got := PnpmMetadataCacheDir(store)
+		if got == store {
+			t.Errorf("PnpmMetadataCacheDir(%q) == store mount root", store)
+		}
+		if path.Dir(got) != store {
+			t.Errorf("PnpmMetadataCacheDir(%q) = %q, want a direct child of the store mount", store, got)
+		}
+		if !strings.HasPrefix(got, store+"/") {
+			t.Errorf("PnpmMetadataCacheDir(%q) = %q, not beneath the store mount", store, got)
+		}
+	}
+	if got := PnpmMetadataCacheDir(""); got != "" {
+		t.Errorf("PnpmMetadataCacheDir(empty) = %q, want empty (no store, no cache dir)", got)
 	}
 }

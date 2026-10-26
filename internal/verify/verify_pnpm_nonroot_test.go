@@ -157,6 +157,22 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		t.Errorf("runner is missing pnpm_config_store_dir=%s", h4StorePath)
 	}
 
+	// The metadata cache envs point at a SUB-directory of the store mount (never
+	// its root: `pnpm store prune` would otherwise be able to delete the store).
+	wantCacheDir := h4StorePath + "/" + spec.PnpmMetadataCacheSubdir
+	for _, name := range []string{spec.PnpmCacheDirEnvNpm, spec.PnpmCacheDirEnvPnpm} {
+		if !strings.Contains(containerEnvVerify(t, runner), name+"="+wantCacheDir+"\n") {
+			t.Errorf("runner is missing %s=%s", name, wantCacheDir)
+		}
+	}
+	// pnpm, running as the runner user inside the real runner image, resolves
+	// cache-dir to that sub-directory (the env is honored, not overridden).
+	if got := strings.TrimSpace(mustExecRunner(t, runner, "pnpm", "config", "get", "cache-dir")); got != wantCacheDir {
+		t.Errorf("[cache-dir] `pnpm config get cache-dir` = %q, want %q", got, wantCacheDir)
+	} else {
+		t.Logf("[cache-dir] `pnpm config get cache-dir` = %s", got)
+	}
+
 	// The store dir must be owned by the runner user (the H4 entrypoint chown ran
 	// on the fresh, root-owned volume before privileges were dropped).
 	owner := strings.TrimSpace(mustExecRunner(t, runner, "stat", "-c", "%U", h4StorePath))
@@ -190,6 +206,20 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		t.Errorf("[H4] the pnpm store %s is still empty after a successful install", h4StorePath)
 	} else {
 		t.Logf("[H4] provider pnpm store %s populated by the non-root install: %s", h4StorePath, strings.ReplaceAll(strings.TrimSpace(storeLs), "\n", " "))
+	}
+
+	// The install, run as the unprivileged runner, created the metadata cache
+	// sub-directory itself (the entrypoint only owns the store mount) and wrote
+	// package metadata into it; the sub-directory is runner-owned.
+	cacheOwner := strings.TrimSpace(mustExecRunner(t, runner, "stat", "-c", "%U", wantCacheDir))
+	if cacheOwner != "runner" {
+		t.Errorf("[cache-dir] %s is owned by %q, want runner", wantCacheDir, cacheOwner)
+	}
+	cacheLs := mustExecRunner(t, runner, "sh", "-c", "ls -A "+wantCacheDir)
+	if strings.TrimSpace(cacheLs) == "" {
+		t.Errorf("[cache-dir] metadata cache %s is empty after a successful install", wantCacheDir)
+	} else {
+		t.Logf("[cache-dir] metadata cache %s written by the non-root install: %s", wantCacheDir, strings.ReplaceAll(strings.TrimSpace(cacheLs), "\n", " "))
 	}
 
 	if _, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", h4Instance, nil); delCode != 0 {

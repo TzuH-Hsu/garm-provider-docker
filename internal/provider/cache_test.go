@@ -359,6 +359,13 @@ func TestCreateInstanceMountsRepoCaches(t *testing.T) {
 	if !envHas(c, "pnpm_config_store_dir=/opt/pnpm-store") {
 		t.Errorf("pnpm_config_store_dir not set: %v", c.Config.Env)
 	}
+	// The metadata cache lives in a sub-directory of the store mount, never at its root.
+	if !envHas(c, "npm_config_cache_dir=/opt/pnpm-store/metadata-cache") {
+		t.Errorf("npm_config_cache_dir not set: %v", c.Config.Env)
+	}
+	if !envHas(c, "pnpm_config_cache_dir=/opt/pnpm-store/metadata-cache") {
+		t.Errorf("pnpm_config_cache_dir not set: %v", c.Config.Env)
+	}
 }
 
 // TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete: two allocations for
@@ -479,6 +486,9 @@ func TestCreateInstanceOrgScopeWithholdsCaches(t *testing.T) {
 	if !envHas(c, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
 		t.Error("RUNNER_TOOL_CACHE should still be set (ephemeral toolcache) for a cache-ineligible pool")
 	}
+	if envHasPrefix(c, "npm_config_cache_dir=") || envHasPrefix(c, "pnpm_config_cache_dir=") {
+		t.Error("pnpm cache-dir envs must be absent when no persistent pnpm store is mounted")
+	}
 	if envHasPrefix(c, "npm_config_store_dir=") || envHasPrefix(c, "pnpm_config_store_dir=") {
 		t.Error("pnpm store envs must be absent when no persistent pnpm store is mounted")
 	}
@@ -521,6 +531,9 @@ func TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes(t *testing.T) {
 	c := inspectRunner(t, fake, "Test-Instance-01")
 	if envHasPrefix(c, "RUNNER_TOOL_CACHE=") {
 		t.Error("RUNNER_TOOL_CACHE must be absent when the cache feature is disabled")
+	}
+	if envHasPrefix(c, "npm_config_cache_dir=") || envHasPrefix(c, "pnpm_config_cache_dir=") {
+		t.Error("pnpm cache-dir envs must be absent when no persistent pnpm store is mounted")
 	}
 	if envHasPrefix(c, "npm_config_store_dir=") || envHasPrefix(c, "pnpm_config_store_dir=") {
 		t.Error("pnpm store envs must be absent when the cache feature is disabled")
