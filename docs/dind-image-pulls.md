@@ -135,6 +135,23 @@ The sidecar's daemon reaches the mirror over the per-job bridge network:
   gateway address is **not** a usable address: it is different for every
   job. Container DNS on the user-defined job network forwards to the host's
   resolvers, so a name your host resolves normally also resolves in the job.
+- **Keep the address out of the nested daemon's default bridge range,
+  `172.17.0.0/16`.** The sidecar shares the runner container's network
+  namespace, and its own `dockerd` creates a `docker0` bridge there with
+  `172.17.0.1/16`. A mirror written as `http://172.17.0.1:5000` (the host's
+  `docker0` gateway, a common choice when the mirror runs on the Docker host)
+  therefore resolves to the nested bridge inside the sidecar: the dial gets
+  `connect: connection refused`, and `dockerd` silently falls back to Docker
+  Hub. **No job fails**: `docker info` still lists the mirror and pulls still
+  succeed, they just do not go through it. The symptom is a mirror that stays
+  cold and an access log with no pull requests, so check the mirror's access
+  log, not only the job result. This was observed live with the
+  privileged-sidecar mode; the host's LAN IP (`http://<host-lan-ip>:5000`)
+  worked, with the pulls visible in the mirror's log. Use the host's LAN IP or
+  a DNS name. Moving the nested bridge elsewhere (`--bip` or
+  `default-address-pools` in a custom `dind_image`) is possible but outside what
+  the provider's `registry_mirrors` key covers, so prefer an address that never
+  needs it.
 - The host firewall must allow traffic from the job networks (the Docker
   address pools) to the mirror's port.
 - A mirror is unreachable when `[network].internal = true`, because the job
@@ -168,9 +185,11 @@ registry_mirrors = ["http://mirror.lan.example:5000"]
   already exists keeps the flags it was created with.
 - **An `http://` mirror does not need `insecure_registries`.** dockerd takes
   the scheme from the mirror URL, so `http://mirror.lan.example:5000` is
-  contacted over plain HTTP by itself. This was checked in the Moby source for
-  the Engine 29.x line (release `docker-v29.8.2`): the mirror endpoint is built
-  from the URL as written (`daemon/pkg/registry/service_v2.go`), and the
+  contacted over plain HTTP by itself. This was verified live on Engine 29.9.2
+  with no `insecure_registries` entry: an `http://` mirror served the pulls,
+  which showed up in the mirror's access log. It also matches the Moby source
+  for the Engine 29.x line (release `docker-v29.8.2`): the mirror endpoint is
+  built from the URL as written (`daemon/pkg/registry/service_v2.go`), and the
   containerd image-store pull path copies the URL's scheme into the registry
   host (`daemon/hosts.go`); `insecure-registries` only switches off
   certificate verification and enables an HTTP fallback for the hosts it
