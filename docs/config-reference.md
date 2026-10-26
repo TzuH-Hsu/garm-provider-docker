@@ -205,6 +205,14 @@ insecure_registries = ["registry.lan.example:5001"]
   not have a path, a mirror's scheme must be lowercase, an insecure registry
   may not carry a scheme, duplicates are rejected instead of dropped, and
   ports are 1-65535.
+- **Address the mirror from inside the sidecar.** Use the Docker host's LAN IP
+  or a DNS name, and not an address in `172.17.0.0/16` such as the host's
+  `docker0` gateway `172.17.0.1`: the sidecar's own `dockerd` owns a `docker0`
+  bridge with that range in the shared network namespace, so the address
+  reaches the nested bridge, the dial is refused, and dockerd falls back to
+  Docker Hub without any error (pulls succeed, but not through the mirror;
+  check the mirror's access log). See
+  [`dind-image-pulls.md`](dind-image-pulls.md#reachability).
 - **Docker Hub only.** dockerd consults `registry_mirrors` only for Docker Hub
   images, tries the mirrors before Hub, and falls back to Hub when a mirror is
   unreachable or does not have the image. Pulls from other registries are not
@@ -215,7 +223,8 @@ insecure_registries = ["registry.lan.example:5001"]
   listed as insecure (checked in Moby's registry service for the Engine 29.x
   line, `daemon/pkg/registry/service_v2.go` and `daemon/hosts.go`, release
   `docker-v29.8.2`, for both the classic graph-driver and the containerd
-  image-store pull paths). An `insecure_registries` entry matters for an
+  image-store pull paths, and verified live on Engine 29.9.2 without an
+  `insecure_registries` entry). An `insecure_registries` entry matters for an
   `https://` mirror whose certificate the sidecar does not trust (it turns off
   certificate verification for that host), and for non-mirror registries that
   jobs pull from by name over plain HTTP.
