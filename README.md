@@ -73,6 +73,10 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   root is not on XFS (reflink) or btrfs, every `pnpm install` copies the whole
   `node_modules` tree; see
   [`docs/package-store-installs.md`](docs/package-store-installs.md).
+  The same volume also keeps pnpm's package-metadata cache (in a
+  `metadata-cache` sub-directory), which saves several seconds per install on
+  pnpm 11; see the
+  [metadata cache section](docs/package-store-installs.md#the-pnpm-metadata-cache).
 - **IPv4-only `localhost` in the runner.** The runner container is created
   with IPv6 disabled in its network namespace, so `::1` is never usable and
   `localhost` behaves as `127.0.0.1`, as on a VM host or a GitHub-hosted

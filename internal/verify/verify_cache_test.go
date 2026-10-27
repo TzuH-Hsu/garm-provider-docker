@@ -149,6 +149,11 @@ allow_org_shared = false
 	if !strings.Contains(envA, "pnpm_config_store_dir=/opt/pnpm-store") {
 		t.Errorf("(c) job A missing pnpm_config_store_dir (read by pnpm >= 11)")
 	}
+	for _, e := range []string{"npm_config_cache_dir", "pnpm_config_cache_dir"} {
+		if !strings.Contains(envA, e+"=/opt/pnpm-store/metadata-cache\n") {
+			t.Errorf("(c) job A missing %s=/opt/pnpm-store/metadata-cache (sub-directory of the store mount)", e)
+		}
+	}
 
 	// (d) write a marker into the toolcache volume through job A's runner.
 	marker := "cachehit-" + randHex(t)
@@ -246,6 +251,9 @@ allow_org_shared = false
 	envOrg := containerEnv(t, runnerOrg)
 	if !strings.Contains(envOrg, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
 		t.Error("org-scoped runner should still get an ephemeral RUNNER_TOOL_CACHE")
+	}
+	if strings.Contains(envOrg, "npm_config_cache_dir=") || strings.Contains(envOrg, "pnpm_config_cache_dir=") {
+		t.Error("org-scoped runner must NOT get a pnpm cache-dir env (no persistent pnpm store)")
 	}
 	if strings.Contains(envOrg, "npm_config_store_dir=") || strings.Contains(envOrg, "pnpm_config_store_dir=") {
 		t.Error("org-scoped runner must NOT get npm_config_store_dir or pnpm_config_store_dir (no persistent pnpm store)")

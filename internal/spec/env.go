@@ -3,6 +3,7 @@ package spec
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -16,6 +17,37 @@ const (
 	PnpmStoreDirEnvNpm  = "npm_config_store_dir"
 	PnpmStoreDirEnvPnpm = "pnpm_config_store_dir"
 )
+
+// The environment variables that point pnpm at its metadata cache (packuments
+// and, on pnpm 11, the verified-lockfile record). Same split as the store dir:
+// pnpm <= 10 reads only npm_config_cache_dir, pnpm >= 11 only
+// pnpm_config_cache_dir, and either overrides XDG_CACHE_HOME. npm 11 prints an
+// "Unknown env config cache-dir" warning for the npm_config_ one, the same
+// cosmetic cost as store-dir (ADR-003, 2026-10-26 amendment).
+const (
+	PnpmCacheDirEnvNpm  = "npm_config_cache_dir"
+	PnpmCacheDirEnvPnpm = "pnpm_config_cache_dir"
+)
+
+// PnpmMetadataCacheSubdir is the directory, directly under the pnpm store
+// mount, that holds pnpm's metadata cache. It is deliberately NOT the mount
+// root: `pnpm store prune` removes what it finds under cache-dir, and on pnpm 11
+// with cache-dir equal to the store root it deleted the whole store in a lab
+// run. In a sub-directory, prune can only drop the metadata, which is
+// re-fetched on demand. The runner user creates it on first use inside the
+// runner-owned store mount, so no extra ownership prep is needed.
+const PnpmMetadataCacheSubdir = "metadata-cache"
+
+// PnpmMetadataCacheDir returns the metadata cache directory for a pnpm store
+// mounted at storeDir, or "" when storeDir is empty (no persistent store, so
+// pnpm keeps its own default cache location). The result is always strictly
+// beneath storeDir, never storeDir itself.
+func PnpmMetadataCacheDir(storeDir string) string {
+	if storeDir == "" {
+		return ""
+	}
+	return path.Join(storeDir, PnpmMetadataCacheSubdir)
+}
 
 // EntityScope identifies which GitHub entity level a bootstrap payload's
 // repo_url refers to.
@@ -146,7 +178,9 @@ type RunnerEnvOptions struct {
 	// the pnpm major boundary. Package content is reused across containers
 	// sharing the volume. Set ONLY when a persistent pnpm store volume is
 	// actually mounted, so a cache-ineligible allocation leaves pnpm on its own
-	// default store. Emitted in both modes.
+	// default store. Emitted in both modes. The same condition also emits
+	// npm_config_cache_dir and pnpm_config_cache_dir, pointing at the
+	// PnpmMetadataCacheSubdir sub-directory of this path.
 	PnpmStoreDir string
 
 	// Entity is the parsed repo/org/enterprise scope (ParseEntity),
@@ -212,6 +246,14 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 		env = append(env,
 			PnpmStoreDirEnvNpm+"="+opts.PnpmStoreDir,
 			PnpmStoreDirEnvPnpm+"="+opts.PnpmStoreDir,
+		)
+		// The metadata cache rides on the same volume, in a sub-directory (see
+		// PnpmMetadataCacheSubdir), so it exists under exactly the condition the
+		// store does and shares its repo scope and lifecycle.
+		cacheDir := PnpmMetadataCacheDir(opts.PnpmStoreDir)
+		env = append(env,
+			PnpmCacheDirEnvNpm+"="+cacheDir,
+			PnpmCacheDirEnvPnpm+"="+cacheDir,
 		)
 	}
 

@@ -137,7 +137,9 @@ insecure_registries = ["registry.lan.example:5001"]
 
   # Where the pnpm store volume mounts inside the runner
   # (exported as npm_config_store_dir for pnpm <= 10 and pnpm_config_store_dir
-  # for pnpm >= 11). Default: "/opt/pnpm-store".
+  # for pnpm >= 11). The same volume also holds pnpm's package-metadata cache in
+  # a "metadata-cache" sub-directory (npm_config_cache_dir / pnpm_config_cache_dir).
+  # Default: "/opt/pnpm-store".
   pnpm_store_path = "/opt/pnpm-store"
 
   # Opt-in for org/enterprise-keyed shared caches (ADR-003). Default:
