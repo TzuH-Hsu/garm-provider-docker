@@ -2525,8 +2525,16 @@ step_postjob() {
   # and are reported informationally. A volume that carries an instance-name is
   # job-scoped even if it also has cache=true (a labeling regression), so it is
   # NOT exempted and shows up as leftover. Everything else managed must be gone.
-  local leftover_c leftover_n leftover_v cache_v
-  leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}')"
+  #
+  # The diag-prune stamp (garm.docker/role=diag-prune-stamp, since v0.2.5) is a
+  # persistent, never-started container kept on purpose so the diagnostic-log
+  # prune runs at most once per interval. It is exempted by its role label, the
+  # same way the cache volumes are exempted by theirs; every other managed
+  # container, including every role=runner one, must still be gone.
+  local leftover_c leftover_n leftover_v cache_v stamp_c
+  stamp_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}')"
+  leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}' \
+    | { if [[ -n "${stamp_c}" ]]; then command grep -vxF -f <(printf '%s\n' "${stamp_c}") || true; else cat; fi; })"
   leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
   cache_v="$(persistent_cache_volumes)"
   leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}' \
@@ -2542,6 +2550,10 @@ step_postjob() {
   if [[ -n "${cache_v}" ]]; then
     log "info: persistent cache volumes (garm.docker/cache=true, no instance-name, kept by design):"
     printf '    %s\n' "${cache_v}"
+  fi
+  if [[ -n "${stamp_c}" ]]; then
+    log "info: diag-prune stamp container (garm.docker/role=diag-prune-stamp, never started, kept by design):"
+    printf '    %s\n' "${stamp_c}"
   fi
   log "Note: the per-job network and the named workspace volume both carry"
   log "garm.docker/managed=true (ADR-001/ADR-004), so DeleteInstance's"
