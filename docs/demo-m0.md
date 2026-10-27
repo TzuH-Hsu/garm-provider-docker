@@ -18,15 +18,17 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"); the published `v0.2.4` release
+work against GARM v0.2.x (see "Results"); the `v0.2.5` release asset
 passes the current gate on the Ubuntu 26.04 runner image, for `none` and
-`--dind` (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
+`--dind` with a registry mirror (28 and 58 PASS, script at e4a37fd).
+`v0.2.4` passed the revision before the registry mirror check, on the same
+image (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
 before the shared network namespace and published-port checks, for both runner
 images (28 and 50 PASS, script at 92d6c85); `v0.2.2` the one before
 `--runner-image` existed (28 and 50 PASS, script at efe5014), and `v0.2.1` an
 earlier one (26 and 48 PASS, script at fa4351c); `v0.2.1` fails the IPv6 checks
-added for `v0.2.2`. The Ubuntu 24.04 image has not been gated with `v0.2.4`
-yet. The runbook keeps `dind_mode=none` as its own
+added for `v0.2.2`. The Ubuntu 24.04 image has not been gated since `v0.2.3`.
+The runbook keeps `dind_mode=none` as its own
 default (the smallest, most portable slice) and treats the DinD modes as
 out of scope for this particular gate (see "What this demo does not cover"
 below), but everything else it exercises is the CURRENT provider, not the
@@ -592,7 +594,10 @@ reaper/polling cadence governs how quickly this happens, `docs/research.md`
 **network**, or volume. Only persistent cache volumes (`garm.docker/cache=true`
 and no `garm.docker/instance-name`) are excluded by label and listed
 informationally; a volume with an instance-name is job-scoped and counts as a
-leftover even if it also carries `cache=true`. The per-job network and the named workspace volume
+leftover even if it also carries `cache=true`. The diagnostic-log prune stamp
+(`garm.docker/role=diag-prune-stamp`, a never-started container kept on purpose
+since `v0.2.5`) is likewise excluded by label and listed; every other managed
+container, and every `role=runner` one, must be gone. The per-job network and the named workspace volume
 both carry `garm.docker/managed=true` (as of M1 — `ADR-001`/`ADR-004`), so
 `DeleteInstance`'s teardown removes both explicitly; a leftover one is a
 real failure this check catches. This is distinct from the persistent,
@@ -667,7 +672,62 @@ re-running it:
 
 ## Results
 
-The gate has been run end to end against a live GARM with the published
+The gate has been run end to end against a live GARM with the `v0.2.5` release
+binary, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
+`--dind` with a registry pull-through mirror), on 2026-10-27, using
+`scripts/demo-m0.sh` at e4a37fd. `v0.2.5` adds the persistent-cache and
+diagnostic-log changes (#30, #31); the registry mirror check is new to the
+gate since the `v0.2.4` run. The Ubuntu 24.04 image was not part of this run;
+its last recorded gate is the `v0.2.3` one below.
+
+**Environment**
+
+- GARM v0.2.1 (systemd service, API on loopback), scale-set dispatch (no
+  webhook); provider `interface_version` v0.1.0.
+- Docker Engine 29.9.2, amd64.
+- Provider: the `v0.2.5` release asset
+  (`garm-provider-docker_v0.2.5_linux_amd64`, sha256
+  `4fd40d5273826e46188291c45c556b3249926f1e77e737d0b7b136d4b8985380`, equal to
+  the entry in the release's `SHA256SUMS`); `GetVersion` reports `v0.2.5`. The
+  release was not yet published when the gate ran, and release mode cannot
+  fetch the asset of an unpublished release, so the unmodified asset was staged
+  with `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256` (see "Release mode with
+  a locally built binary"). Release mode otherwise, `-y`.
+- Runner image, digest-pinned in the generated config (the `:v0.2.5` digest):
+  - `ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:f9f20d3727653ff89afe75791a9bcfec965b11b13c0347f071ae2dcab802d2af`
+- DinD image
+  `docker:dind@sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977`.
+
+**Results**
+
+| Variant | `verify` | GitHub job | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `--dind` + registry mirror | 58 PASS, 0 FAIL | succeeded | 1 PASS, 1 FAIL (see below) |
+| Ubuntu 26.04, `none` | 28 PASS, 0 FAIL | succeeded | 1 PASS, 1 FAIL (see below) |
+
+- **Registry mirror.** The mirror was a Docker Hub pull-through cache reached
+  over plain `http` at the host's LAN address, with no `insecure_registries`
+  entry. Its access log showed the pulls, including the ones made inside the
+  job, so the sidecar did use it.
+- **`postjob`.** In both runs the one FAIL was the diagnostic-log prune stamp
+  (`role=diag-prune-stamp`, ADR-003 amendment 2026-10-26) being listed as a
+  leftover managed container. That is a false positive in the gate script, not
+  a leak: the stamp is a persistent, never-started container kept on purpose,
+  like the cache volumes. `postjob` now exempts it by that label and lists it
+  informationally; the check that no `role=runner` container remains is
+  unchanged. Apart from the stamp, no runner container, sidecar, job network,
+  job-scoped volume or socket and `dind-state` volume was left.
+- **Persistent pnpm cache (#30).** With the pnpm store mounted,
+  `npm_config_cache_dir` and `pnpm_config_cache_dir` were both
+  `<store mount>/metadata-cache`.
+- **Diagnostic-log prune throttle (#31).** The prune ran one round on the first
+  `CreateInstance` and created the stamp, in state `Created` and never started.
+  Later `CreateInstance` and `ListInstances` calls created no helper
+  containers.
+
+## Previous release: v0.2.4
+
+The gate had been run end to end against a live GARM with the published
 `v0.2.4` release binary, in two variants on the Ubuntu 26.04 image
 (`dind_mode=none` and `--dind`), on 2026-10-12, using `scripts/demo-m0.sh` at
 0cf2a76. `v0.2.4` changes one thing the gate cares about: in
@@ -745,7 +805,7 @@ What is new against the `v0.2.3` run (28 and 50 PASS, script at 92d6c85):
   digest for `garm-runner-noble` (`14599ec9...`), `garm-runner-resolute`
   (`1c48eb52...`) and `garm-provider-docker` (`621d34ee...`).
 
-## Previous release: v0.2.3
+## Earlier release: v0.2.3
 
 The gate had been run end to end against a live GARM with the published
 `v0.2.3` release binary, in three variants (Ubuntu 24.04 image with
@@ -910,8 +970,8 @@ race and the stall entirely once it is in a release.
 
 ## Still unverified
 
-- The Ubuntu 24.04 runner image with `v0.2.4` (it was gated with `v0.2.3`;
-  `v0.2.4` rebuilt it).
+- The Ubuntu 24.04 runner image with `v0.2.4` or `v0.2.5` (it was gated with
+  `v0.2.3`; both releases rebuilt it).
 - Published ports on the runner's `localhost` under `sysbox-runc`, whose
   sidecar keeps its own network namespace (ADR-001, 2026-10-12 amendment).
 - The non-JIT fallback path (`config.sh` writing credentials through the
