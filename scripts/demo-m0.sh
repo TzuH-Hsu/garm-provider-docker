@@ -16,8 +16,9 @@
 # per-job topology (job network, named workspace volume, DinD modes,
 # persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
 # failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
-# a published release that passes this gate (v0.2.4 does, on the Ubuntu 26.04
-# runner image with both variants; v0.2.3 passed the revision before the
+# a published release that passes this gate (v0.2.5 does, on the Ubuntu 26.04
+# runner image with both variants; v0.2.4 passed the revision before the
+# registry mirror check; v0.2.3 passed the revision before the
 # shared-network-namespace and published-port checks; v0.2.2 passed the
 # revision before --runner-image was added; v0.2.1 passed an earlier revision
 # but fails the IPv6 checks added for v0.2.2; for an unpublished release use
@@ -123,7 +124,7 @@
 #   --version vX.Y.Z
 #                   Release to validate in the default "release" mode
 #                   (equivalent to PROVIDER_VERSION=vX.Y.Z). Ignored with
-#                   --from-source. Default: v0.2.4
+#                   --from-source. Default: v0.2.5
 #   --pool          Dispatch via a webhook-driven pool instead of a scale set
 #                   (equivalent to GARM_TARGET=pool)
 #   --dind          Run the DinD variant (privileged-sidecar) instead of
@@ -151,7 +152,7 @@
 #                          ghcr.io/tzuh-hsu/garm-runner-<RUNNER_IMAGE_NAME>
 #                          tag whose digest gets resolved). Ignored in
 #                          "source" mode.
-#                          Default: v0.2.4
+#                          Default: v0.2.5
 #   LOCAL_PROVIDER_BIN, LOCAL_PROVIDER_SHA256
 #                          Optional, "release" mode only, and only together:
 #                          the absolute path of a locally built provider
@@ -279,7 +280,7 @@ EXPL_GATE_INSECURE_REGISTRY="${GATE_INSECURE_REGISTRY:-}"
 EXPL_LOCAL_PROVIDER_SHA256="${LOCAL_PROVIDER_SHA256:-}"
 
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
-PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.4}"
+PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.5}"
 
 # "release" mode with a locally built binary (see the header): the path is used
 # by preflight only; the expected sha256 is a remembered mode so later steps
@@ -2646,7 +2647,7 @@ Flags:
                        instead of downloading/pinning a published release
                        (equivalent to PROVIDER_SOURCE=source)
   --version vX.Y.Z    Release to validate in the default "release" mode
-                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.4
+                       (equivalent to PROVIDER_VERSION=vX.Y.Z). Default: v0.2.5
   --pool              Dispatch via a webhook-driven pool instead of the default
                        scale set (equivalent to GARM_TARGET=pool). Needs GitHub
                        to be able to reach GARM's webhook endpoint.
@@ -2686,7 +2687,7 @@ while [[ $# -gt 0 ]]; do
     -y|--yes) ASSUME_YES=1; shift ;;
     --from-source) PROVIDER_SOURCE="source"; EXPL_PROVIDER_SOURCE="source"; shift ;;
     --version)
-      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.4"
+      [[ $# -ge 2 ]] || die "--version requires an argument, e.g. --version v0.2.5"
       PROVIDER_VERSION="$2"
       EXPL_PROVIDER_VERSION="$2"
       shift 2
