@@ -187,27 +187,29 @@ compatibility-fix release exists); see the checklist's end-to-end item.
    other provider has been inserted between CloudStack and GCP (or that the
    table hasn't been restructured again). As of 2026-09-26 it still has
    exactly the 10 rows listed in (a).
-2. **Re-verify the release facts.** As of 2026-10-12: `v0.2.4` is published
+2. **Re-verify the release facts.** As of 2026-10-28: `v0.2.5` is published
    (`draft: false`, `prerelease: false`, the latest release) at
-   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.4,
+   https://github.com/TzuH-Hsu/garm-provider-docker/releases/tag/v0.2.5,
    with `linux/amd64` and `linux/arm64` binaries and a `SHA256SUMS` file;
    `ghcr.io/tzuh-hsu/garm-provider-docker`,
    `ghcr.io/tzuh-hsu/garm-runner-noble` and
-   `ghcr.io/tzuh-hsu/garm-runner-resolute` are all tagged `:v0.2.4` and
+   `ghcr.io/tzuh-hsu/garm-runner-resolute` are all tagged `:v0.2.5` and
    `:latest` on GHCR. Re-run the equivalent `gh release view` / package
    API checks at submission time in case a newer tag has since shipped.
-3. **End-to-end validation - state this plainly.** The `v0.2.4` release
+3. **End-to-end validation - state this plainly.** The `v0.2.5` release
    binary passed a live run against GARM v0.2.1 (scale sets, provider
    interface v0.1.0) on the Ubuntu 26.04 runner image, for `dind_mode=none`
-   and for `privileged-sidecar`, on 2026-10-12 (the Ubuntu 24.04 image was
-   gated with `v0.2.3` and not re-run for `v0.2.4`); the recorded
+   and for `privileged-sidecar`, on 2026-10-27. The gate ran the unmodified
+   release asset (its sha256 equals the release's `SHA256SUMS`), staged
+   before the release was published. The Ubuntu 24.04 image was gated with
+   `v0.2.3` and not re-run since. The recorded
    results are in the "Results" and "Still unverified" sections of
    `docs/demo-m0.md`. `v0.2.0` does not work on
    GARM v0.2.x (`CreateInstance` rejects GARM's injected
    `runner_install_template`; `GetInstance`/`DeleteInstance` fail with
-   "missing pool ID"), so name `v0.2.4` as the release, never `v0.2.0`.
+   "missing pool ID"), so name `v0.2.5` as the release, never `v0.2.0`.
    Before submitting:
-   1. Re-check that `v0.2.4` is still the latest release; if a newer tag
+   1. Re-check that `v0.2.5` is still the latest release; if a newer tag
       shipped, re-run the gate (`docs/demo-m0.md`) against that release
       binary, not a branch build.
    2. Mention the runner-status stall only if it is relevant (root cause in
@@ -226,14 +228,14 @@ compatibility-fix release exists); see the checklist's end-to-end item.
       returns. The gate saw the `pending`, `installing`, `idle`,
       `active` sequence with no such error, but that ordering is not
       guaranteed. Do not describe it as fixed.
-   3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.4`,
+   3. Fill in the placeholders in the PR body (`<RELEASE>` = `v0.2.5`,
       `<GARM_VERSION>` = `v0.2.1`). Do not claim compatibility with
       "GARM" generically, and do not imply production usage (the way the
       CloudStack PR's "thousands of builds" line does); the gate is a
       limited verification, not production evidence. Still unverified: the
       non-JIT path, an arm64 host, and pool/webhook mode.
 4. **This repo's own `README.md` "Status" section** states the current
-   `v0.2.4` release facts, so the linked repository does not contradict
+   `v0.2.5` release facts, so the linked repository does not contradict
    this PR's own claims. Re-check it against the release at submission
    time.
 5. **Submission commands** (instructions only — not executed as part of
