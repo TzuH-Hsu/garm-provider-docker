@@ -415,7 +415,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// daemon in parallel with its credential wait.
 	var dindID string
 	if dindEnabled {
-		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt, runnerID)
+		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt, runnerID, plan.externalsVolume)
 		if derr != nil {
 			return guarded(derr)
 		}

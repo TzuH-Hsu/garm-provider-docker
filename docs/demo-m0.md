@@ -268,10 +268,21 @@ starts a nested `busybox` httpd with an ephemeral published port (`-p 80`)
 and fetches it with `curl` at `127.0.0.1` and `localhost` (must print
 `published-ok`), which proves the sidecar shares the runner's network
 namespace (ADR-001, 2026-10-12 amendment), the way testcontainers and
-`docker compose` ports are used. Step 4 then also
+`docker compose` ports are used. The workflow also has a second job,
+`container-job`, which `needs` the first one (so the gate's single runner is
+free, and `verify` keeps its window on the first job). It runs in
+`container: debian:trixie-slim`, starts with `actions/checkout` and then reads
+the checked-out workflow file back with a `run:` step. This is the acceptance
+test for container jobs (ADR-001, 2026-10-29 amendment): the runner binds
+`/actions-runner/externals` into the job container as `/__e`, the sidecar's
+daemon resolves that source in its own filesystem, and `actions/checkout`, a
+JavaScript action, only starts if the sidecar holds the runner's externals. It
+needs the externals cache, which is on by default. Step 4 then also
 verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
 bind mounts on either container, `DOCKER_HOST`, labeled socket and
-`dind-state` volumes, and the flavor's memory limits).
+`dind-state` volumes, the sidecar's mount set (socket, `dind-state`, workspace
+and, with the cache on, the runner's externals volume read-only), and the
+flavor's memory limits).
 
 **Caveat:** `privileged-sidecar` runs a `Privileged=true` daemon on the
 host; a malicious job could pivot to the host (ADR-001 "Residual risk").

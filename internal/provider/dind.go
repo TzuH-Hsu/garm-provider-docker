@@ -26,6 +26,12 @@ import (
 // shared network namespace amendment). In sysbox-runc mode it keeps its own
 // namespace on the per-job network.
 //
+// externalsVolume is the shared externals volume the runner mounts (empty when
+// the externals cache is disabled); the sidecar mounts it read-only at the same
+// path so a job container's /__e bind resolves to the real externals. The
+// runner container, created before the sidecar, already references the volume,
+// which keeps it pinned and was revalidated before it started.
+//
 // Either way it mounts the shared socket volume at /run (where dockerd exposes
 // its unix socket) and the dind-state volume at /var/lib/docker, runs
 // `dockerd --host=unix://... --storage-driver=<config>` (plus the operator's
@@ -39,7 +45,7 @@ import (
 // (resolved.StorageDriver / resolved.DindMemoryBytes): the pool's overrides
 // bounded against the operator's config (storage_driver enum, dind_memory
 // ceiling), or the config defaults when extra_specs sets neither.
-func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode, storageDriver string, dindMemoryBytes int64, createdAt time.Time, runnerID string) (string, error) {
+func (p *Provider) startDindSidecar(ctx context.Context, identity spec.AllocationIdentity, nonce, dindMode, storageDriver string, dindMemoryBytes int64, createdAt time.Time, runnerID, externalsVolume string) (string, error) {
 	instanceName := identity.InstanceName
 
 	privileged, runtime, err := spec.DindRuntimeSelection(dindMode)
@@ -70,6 +76,8 @@ func (p *Provider) startDindSidecar(ctx context.Context, identity spec.Allocatio
 		// path, so nested `docker run -v "$PWD":/work` bind sources resolve to
 		// the real checked-out files rather than an empty daemon-side path.
 		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
+		// Same reason for the externals a container job binds as /__e.
+		ExternalsVolumeName: externalsVolume,
 	}
 	if spec.DindSharesRunnerNetns(dindMode) {
 		dindSpec.NetnsContainerID = runnerID

@@ -416,6 +416,20 @@ type DindContainerSpec struct {
 	// real checked-out workspace rather than an empty new path. WP3 always
 	// sets it in DinD modes.
 	WorkspaceVolumeName string
+
+	// ExternalsVolumeName, when set, mounts the shared externals volume into the
+	// sidecar READ-ONLY at RunnerExternalsDir — the SAME volume and path the
+	// runner mounts it at. A job container (`jobs.<id>.container:`) has the
+	// runner ask the daemon to bind /actions-runner/externals into it at /__e
+	// (the Node runtimes the JS actions run on), and the daemon resolves that
+	// bind source in ITS OWN filesystem, exactly like the workspace above;
+	// without this mount /__e is an empty directory and the first JS action
+	// (actions/checkout) fails. Read-only for the same reason as on the runner
+	// (ADR-003 red-line F4): the volume is shared across repositories. Empty
+	// when the externals cache is disabled — the runner then uses its image's
+	// own externals, which the sidecar does not have (see ADR-001's 2026-10-29
+	// amendment).
+	ExternalsVolumeName string
 }
 
 // DindRuntimeSelection derives the HostConfig.Privileged/HostConfig.Runtime

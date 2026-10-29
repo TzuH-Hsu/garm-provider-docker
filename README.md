@@ -363,6 +363,19 @@ download latency and reduces both the number of upstream pulls and the
 exposure to Docker Hub rate limits. See
 [`docs/dind-image-pulls.md`](docs/dind-image-pulls.md).
 
+## Container jobs in DinD modes
+
+A job with `container:` runs its steps in a container the runner creates
+through the sidecar's daemon, and the daemon resolves the paths the runner
+binds into it (`/__w` and `/__e`) in the sidecar's own filesystem. The sidecar
+therefore mounts the runner's workspace volume and, read-only, the shared
+externals volume at the runner's paths, so JavaScript actions such as
+`actions/checkout` find their Node runtime in the job container. The externals
+volume is part of the cache (`[cache].enabled`, on by default): with the cache
+disabled the sidecar has no externals to share, and JavaScript actions cannot
+run in a container job (plain `run:` steps still work). See ADR-001's
+2026-10-29 amendment.
+
 ## Security model
 
 - **The host's Docker socket is never mounted into a runner or DinD-sidecar

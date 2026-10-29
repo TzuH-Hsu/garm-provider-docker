@@ -1,6 +1,6 @@
 # ADR-001: Docker-in-Docker (DinD) Strategy
 
-Status: Accepted (2026-07-19); amended 2026-07-21, 2026-07-26 and 2026-10-12 (see Amendments below)
+Status: Accepted (2026-07-19); amended 2026-07-21, 2026-07-26, 2026-10-12, 2026-10-17 and 2026-10-29 (see Amendments below)
 
 ## Context
 
@@ -21,7 +21,7 @@ Per-allocation resources, created on `CreateInstance` and destroyed on `DeleteIn
 - Job network (a labeled bridge network) — all modes.
 - Runner container — all modes.
 - DinD sidecar container, job-scoped socket volume, and a dedicated `dind-state` volume mounted at `/var/lib/docker` — DinD modes only (`privileged-sidecar`, `sysbox-runc`).
-- Workspace volume — all modes.
+- Workspace volume — all modes. In DinD modes the sidecar mounts it at the runner's workspace path too, and, when the externals cache is enabled, mounts the shared externals volume read-only at the runner's externals path (corrected 2026-10-29 — see the container jobs Amendment below), so that bind sources the runner hands the daemon resolve to the runner's own files.
 
 **`privileged-sidecar` wiring** (the default DinD *mechanism* when DinD is enabled; not enabled by default — `dind_mode` defaults to `none`, see the Amendment below): the DinD sidecar runs `dockerd --host=unix:///run/docker.sock --storage-driver=overlay2` with `DOCKER_TLS_CERTDIR=""` — TLS is disabled because the daemon socket is exposed only over the shared volume, never over TCP. This mirrors ARC's own `gha-runner-scale-set` DinD values file. The runner container mounts the same socket volume **at `/run`** (corrected 2026-07-21 — see the DinD socket path Amendment below; originally this ADR specified `/var/run`) and sets `DOCKER_HOST=unix:///run/docker.sock`; the entrypoint polls for daemon readiness (`until docker info; do sleep …; done`, budget roughly 120 seconds) before proceeding. The sidecar joins the runner's network namespace (`HostConfig.NetworkMode = container:<runner ID>`, added 2026-10-12 — see the shared network namespace Amendment below; originally the sidecar had its own namespace on the job network), so ports the inner daemon publishes are reachable on the runner's `127.0.0.1`, as in an ARC pod; the runner is therefore started first and the sidecar right after it.
 
@@ -191,3 +191,17 @@ Both are appended after the three fixed flags, which stay first and unchanged. B
 **Isolation is unchanged.** The per-job `dind-state` volume is still created fresh and removed at teardown; a mirror only changes where a job's pulls are fetched from. dockerd consults mirrors only for Docker Hub names and falls back to the upstream when a mirror is unreachable. A mirror is trusted to the degree its operator is: a shared distribution registry in proxy mode refuses pushes, so no job can write into it. Entries are validated at config load (see `docs/config-reference.md`), and the effective values are logged at sidecar creation.
 
 **Combining with a custom image.** A custom `dind_image` whose `daemon.json` also sets `registry-mirrors` or `insecure-registries` conflicts with these flags, and dockerd refuses to start. Use one mechanism.
+
+## Amendment (2026-10-29) — the sidecar mounts the runner's externals so container jobs can run JavaScript actions
+
+A workflow job with `container:` runs its steps inside a container the runner creates through the sidecar's daemon. To do that the runner asks the daemon to bind-mount two of its own paths into the job container: `/actions-runner/_work` as `/__w`, and `/actions-runner/externals` as `/__e` (read-only). The daemon resolves a bind source in **its own** filesystem, which is the sidecar's, not the runner's. The sidecar already shared the workspace volume at the runner's workspace path (the F2 mount, for the same reason with a nested `docker run -v "$PWD":/work`), so `/__w` worked. It did not share the externals, so `/__e` was an empty directory in every job container, and the first JavaScript action (`actions/checkout`, for one) failed because the Node runtime it runs on was not there.
+
+**Decision.** When the externals cache is enabled, the sidecar mounts the same digest-keyed externals volume the runner uses, **read-only**, at the same path (`spec.RunnerExternalsDir`). `DindContainerSpec.ExternalsVolumeName` carries it, set from the same cache plan the runner's mount comes from, in both DinD modes (`sysbox-runc` builds the same sidecar spec). Read-only is as load-bearing here as on the runner (ADR-003, red-line F4): the volume is shared across repositories, and a read-write mount would let a job poison the Node runtimes other repositories execute. The sidecar's mount is read-only as well, and the runner binds it into the job container as `:ro`.
+
+**Lifecycle and ordering.** Nothing new is created or removed. The externals volume is the existing shared cache volume: ensured and seeded before the runner is created, and revalidated after the runner is created and before it starts. The sidecar is created after the runner, so the runner already pins the volume by then. The provider never deletes a cache volume, so teardown (ADR-004) is unchanged: it removes the sidecar with the other job-scoped resources and leaves the cache volume in place.
+
+**Externals cache disabled.** With `[cache].enabled = false` there is no externals volume: the runner uses the externals baked into its image, which the stock `docker:dind` sidecar does not have. The sidecar then gets no externals mount and a job container's `/__e` stays empty, so JavaScript actions cannot run in a container job. Plain `run:` steps in the container are unaffected. The cache is on by default, and container jobs that use JavaScript actions require it. The provider does not try to substitute an ephemeral copy: that would mean seeding about 380 MB per job into a job-scoped volume, which is the cost the shared cache exists to avoid.
+
+**Trade-offs.** The sidecar's mount set grows by one: socket, `dind-state`, workspace, and (cache enabled) externals, and still no other cache volume (toolcache, pnpm store, diagnostics). The gate's `verify` checks exactly that set and that the sidecar's externals mount is the runner's volume, read-only. The gate workflow gains a container job whose first step is `actions/checkout`, followed by a step that reads a checked-out file; it is the acceptance test for this amendment.
+
+*Unit tests* cover the spec builder (the read-only externals mount at `RunnerExternalsDir` when the volume is set, absent when not, in both modes) and the provider flow with the fake client (the same volume on runner and sidecar, read-only, with the cache on; no mount on either with it off; no sidecar without DinD).
