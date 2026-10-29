@@ -179,6 +179,68 @@ func TestBuildDindContainerPrivilegedSidecar(t *testing.T) {
 	}
 }
 
+// TestBuildDindContainerExternalsMount covers the shared externals volume a
+// container job's /__e bind needs in the daemon's filesystem: the sidecar
+// mounts it READ-ONLY at RunnerExternalsDir when ExternalsVolumeName is set,
+// and adds nothing when it is not (externals cache disabled), in either mode.
+func TestBuildDindContainerExternalsMount(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		externals  string
+		wantMounts int
+	}{
+		{name: "privileged-sidecar with externals", mode: dindModePrivilegedSidecar, externals: "garm-cache-externals-abc", wantMounts: 4},
+		{name: "sysbox-runc with externals", mode: dindModeSysboxRunc, externals: "garm-cache-externals-abc", wantMounts: 4},
+		{name: "privileged-sidecar without externals", mode: dindModePrivilegedSidecar, wantMounts: 3},
+		{name: "sysbox-runc without externals", mode: dindModeSysboxRunc, wantMounts: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			priv, runtime, err := DindRuntimeSelection(tc.mode)
+			if err != nil {
+				t.Fatalf("DindRuntimeSelection returned unexpected error: %v", err)
+			}
+			_, host := BuildDindContainer(DindContainerSpec{
+				Image:               "docker:dind@sha256:abc",
+				StorageDriver:       "overlay2",
+				Privileged:          priv,
+				Runtime:             runtime,
+				SocketVolumeName:    "job-1-socket",
+				DindStateVolumeName: "job-1-dind-state",
+				WorkspaceVolumeName: "job-1-workspace",
+				ExternalsVolumeName: tc.externals,
+			})
+
+			if len(host.Mounts) != tc.wantMounts {
+				t.Errorf("Mounts = %d, want %d: %+v", len(host.Mounts), tc.wantMounts, host.Mounts)
+			}
+			var found *mount.Mount
+			for i := range host.Mounts {
+				if host.Mounts[i].Target == RunnerExternalsDir {
+					found = &host.Mounts[i]
+				}
+			}
+			if tc.externals == "" {
+				if found != nil {
+					t.Errorf("unexpected mount at %s: %+v", RunnerExternalsDir, *found)
+				}
+				return
+			}
+			if found == nil {
+				t.Fatalf("no mount at %s in %+v", RunnerExternalsDir, host.Mounts)
+			}
+			// Exactly the runner's mount: the same named volume, read-only.
+			if want := ExternalsROMount(tc.externals); *found != want {
+				t.Errorf("externals mount = %+v, want %+v", *found, want)
+			}
+			if !found.ReadOnly {
+				t.Error("externals mount is read-write; the shared volume must stay read-only (ADR-003 F4)")
+			}
+		})
+	}
+}
+
 func TestBuildDindContainerSysboxRuncFlipsOnlyTwoFields(t *testing.T) {
 	// WP4 preview: the sysbox-runc mode is a thin flip of {Privileged,Runtime}
 	// via DindRuntimeSelection; everything else about the built container is

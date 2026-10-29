@@ -201,6 +201,14 @@ func BuildDindContainer(s DindContainerSpec) (*container.Config, *container.Host
 		// runner's workspace and the daemon's view of it the same files.
 		mounts = append(mounts, NamedWorkspaceMount(s.WorkspaceVolumeName))
 	}
+	if s.ExternalsVolumeName != "" {
+		// A job container's `/__e` is a bind of the runner's externals dir, and
+		// the daemon resolves that source in its own filesystem (the same
+		// reason as the workspace above). Mount the runner's shared externals
+		// volume at the same path, read-only as on the runner (ADR-003 F4), so
+		// the JS actions in a job container find their Node runtime.
+		mounts = append(mounts, ExternalsROMount(s.ExternalsVolumeName))
+	}
 
 	host := &container.HostConfig{
 		Privileged: s.Privileged,

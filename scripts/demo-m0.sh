@@ -1654,6 +1654,23 @@ EOF
     cat <<EOF
       - name: hold the runner briefly for scripts/demo-m0.sh verify
         run: sleep ${hold_seconds}
+  # A container job: the runner has the sidecar daemon bind /actions-runner/_work
+  # as /__w and /actions-runner/externals as /__e into the job container, and the
+  # daemon resolves both in its own filesystem. actions/checkout is a JS action,
+  # so it only starts if /__e holds the runner's Node runtimes. It needs the demo
+  # job so the single runner this gate allows is free (and so 'verify' keeps its
+  # window on the first one).
+  container-job:
+    needs: demo
+    runs-on: ${runs_on}
+    container: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: read a file checked out into the job container
+        run: |
+          test -s .github/workflows/garm-m0-demo.yml
+          grep -Fx 'name: garm-m0-demo' .github/workflows/garm-m0-demo.yml
+          grep -q 'Debian' /etc/os-release
 EOF
   else
     cat <<'EOF'
@@ -2040,6 +2057,49 @@ verify_no_host_mounts() {
   fi
 }
 
+# verify_sidecar_mount_set checks the DinD sidecar "$2" mounts exactly the
+# socket, dind-state and workspace volumes, plus - when the runner "$1" has the
+# shared externals volume (the externals cache is on, the default) - that same
+# volume READ-ONLY at RUNNER_EXTERNALS_DIR. A job container (`container:`) has
+# the runner ask the daemon to bind the externals dir into it as /__e, and the
+# daemon resolves that source in the sidecar's own filesystem, so the sidecar
+# needs the volume too (ADR-001, 2026-10-29 amendment). With the cache disabled
+# the runner has no externals volume and the sidecar gets none; JS actions in a
+# job container then cannot work. No other cache volume is ever shared into the
+# sidecar.
+verify_sidecar_mount_set() {
+  local cid="$1" did="$2" want have runner_ext_vol sidecar_ext_vol sidecar_ext_rw
+  want="${RUNNER_WORKDIR}
+${DIND_SOCKET_DIR}
+${DIND_STATE_DIR}"
+  runner_ext_vol="$(docker inspect -f '{{range .Mounts}}{{.Destination}}|{{.Name}}{{println}}{{end}}' "${cid}" \
+    | awk -F'|' -v d="${RUNNER_EXTERNALS_DIR}" '$1 == d { print $2; exit }')"
+  if [[ -n "${runner_ext_vol}" ]]; then
+    want="${want}
+${RUNNER_EXTERNALS_DIR}"
+  fi
+  want="$(printf '%s\n' "${want}" | sort)"
+  have="$(container_mount_dests "${did}")"
+  if [[ "${have}" == "${want}" ]]; then
+    if [[ -n "${runner_ext_vol}" ]]; then
+      ok "sidecar has exactly the socket, dind-state, workspace and shared externals mounts (no other cache volumes)"
+    else
+      ok "sidecar has exactly the socket, dind-state and workspace mounts (no cache volumes)"
+    fi
+  else
+    bad "sidecar mount destinations are not exactly {$(printf '%s' "${want}" | tr '\n' ' ')}: $(printf '%s' "${have}" | tr '\n' ' ')"
+  fi
+  [[ -n "${runner_ext_vol}" ]] || return 0
+  sidecar_ext_vol="$(docker inspect -f '{{range .Mounts}}{{.Destination}}|{{.Name}}{{println}}{{end}}' "${did}" \
+    | awk -F'|' -v d="${RUNNER_EXTERNALS_DIR}" '$1 == d { print $2; exit }')"
+  sidecar_ext_rw="$(container_mount_rw "${did}" "${RUNNER_EXTERNALS_DIR}")"
+  if [[ "${sidecar_ext_vol}" == "${runner_ext_vol}" && "${sidecar_ext_rw}" == "false" ]]; then
+    ok "sidecar mounts the runner's externals volume ${runner_ext_vol} read-only at ${RUNNER_EXTERNALS_DIR} (a container job's /__e bind resolves to it)"
+  else
+    bad "sidecar externals mount at ${RUNNER_EXTERNALS_DIR} is volume '${sidecar_ext_vol}' (rw=${sidecar_ext_rw}), expected the runner's '${runner_ext_vol}' read-only"
+  fi
+}
+
 # verify_dind_shared_netns checks that the DinD sidecar "$2" joins the network
 # namespace of the runner "$1" (ADR-001, shared network namespace amendment):
 # its NetworkMode is container:<runner's full ID>, it has no network
@@ -2196,11 +2256,7 @@ verify_dind_topology() {
   fi
   verify_workspace_mount_rw "${did}" "sidecar"
 
-  if [[ "$(container_mount_dests "${did}" | tr '\n' ' ')" == "${RUNNER_WORKDIR} ${DIND_SOCKET_DIR} ${DIND_STATE_DIR} " ]]; then
-    ok "sidecar has exactly the socket, dind-state and workspace mounts (no cache volumes)"
-  else
-    bad "sidecar mount destinations are not exactly {${RUNNER_WORKDIR}, ${DIND_SOCKET_DIR}, ${DIND_STATE_DIR}}: $(container_mount_dests "${did}" | tr '\n' ' ')"
-  fi
+  verify_sidecar_mount_set "${cid}" "${did}"
   if docker inspect -f '{{range .HostConfig.GroupAdd}}{{.}}{{println}}{{end}}' "${cid}" | grep -qx "${DIND_SOCKET_GID}"; then
     ok "runner has supplementary group ${DIND_SOCKET_GID} (the dockerd socket group)"
   else
