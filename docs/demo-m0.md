@@ -18,9 +18,11 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"); the `v0.2.5` release asset
-passes the current gate on the Ubuntu 26.04 runner image, for `none` and
-`--dind` with a registry mirror (28 and 58 PASS, script at e4a37fd).
+work against GARM v0.2.x (see "Results"). `main` at 1b9320c, which adds the
+container-job acceptance test, passes the current gate on the Ubuntu 26.04
+runner image, for `none` and `--dind` with a registry mirror (28 and 59 PASS);
+it is not a release yet. The `v0.2.5` release asset passed the revision before
+the container job (28 and 58 PASS, script at e4a37fd).
 `v0.2.4` passed the revision before the registry mirror check, on the same
 image (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
 before the shared network namespace and published-port checks, for both runner
@@ -683,6 +685,57 @@ re-running it:
 
 ## Results
 
+The gate has been run end to end against a live GARM with a build of `main` at
+1b9320c, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
+`--dind` with a registry pull-through mirror), on 2026-11-01, using
+`scripts/demo-m0.sh` at the same commit. That commit adds the DinD sidecar's
+read-only mount of the runner's externals volume (#36), and the gate's sample
+workflow gained the `container-job` that depends on it. It is the first gate
+run with a container job, so unlike the `v0.2.5` record below it covers
+unreleased code; the next release will carry it. The Ubuntu 24.04 image was
+not part of this run; its last recorded gate is the `v0.2.3` one below.
+
+**Environment**
+
+- GARM v0.2.1 (scale-set dispatch, no webhook); provider `interface_version`
+  v0.1.0.
+- Docker Engine 29.x, amd64.
+- Provider: a local build of `main` at 1b9320c, whose `GetVersion` reports
+  `v0.2.5-4-g1b9320c`, passed with `LOCAL_PROVIDER_BIN` (see "Release mode with
+  a locally built binary"). No published release asset was run, so this says
+  nothing about one until the release that carries the change is gated.
+- Runner image, digest-pinned in the generated config (the `v0.2.5` digest,
+  which this change does not rebuild):
+  - `ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:f9f20d3727653ff89afe75791a9bcfec965b11b13c0347f071ae2dcab802d2af`
+- DinD image `docker:dind` 29.x, digest-pinned by the preflight.
+- A Docker Hub pull-through mirror (`registry:3` in proxy mode) at a LAN
+  address reachable from the sidecar, with no `insecure_registries` entry.
+
+**Results**
+
+| Variant | `verify` | GitHub jobs | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `--dind` + registry mirror | 59 PASS, 0 FAIL | `demo` and `container-job` succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `none` | 28 PASS, 0 FAIL | succeeded | 2 PASS, 0 FAIL |
+
+- **Container job.** In the `--dind` run `container-job`, which runs in
+  `container: debian:trixie-slim` and starts with `actions/checkout@v4`,
+  succeeded. `verify` grew from 58 to 59 checks: the sidecar mount-set check now
+  expects the runner's externals volume, and a new check asserts that it is
+  mounted read-only at the runner's externals path. The `debian:trixie-slim`
+  image has no `git`, so `actions/checkout` used its REST archive fallback
+  instead of a clone. The run therefore proves that a JavaScript action starts
+  from `/__e` in the job container, which is what the mount is for, and not that
+  a git clone works there.
+- **Registry mirror.** The mirror's access log showed the pulls, including the
+  one for the job container's `debian` image, so the sidecar used it for
+  container-job images too.
+- **`postjob`.** Both runs passed both checks. The diagnostic-log prune stamp
+  is exempted by its `role=diag-prune-stamp` label, as of the `v0.2.5` record
+  below, and listed informationally.
+
+## Previous release: v0.2.5
+
 The gate has been run end to end against a live GARM with the `v0.2.5` release
 binary, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
 `--dind` with a registry pull-through mirror), on 2026-10-27, using
@@ -736,7 +789,7 @@ its last recorded gate is the `v0.2.3` one below.
   Later `CreateInstance` and `ListInstances` calls created no helper
   containers.
 
-## Previous release: v0.2.4
+## Earlier release: v0.2.4
 
 The gate had been run end to end against a live GARM with the published
 `v0.2.4` release binary, in two variants on the Ubuntu 26.04 image
