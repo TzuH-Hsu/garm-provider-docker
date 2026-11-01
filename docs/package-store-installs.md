@@ -13,6 +13,7 @@ Docker's data root.
 - [If the host is ext4](#if-the-host-is-ext4)
 - [The global virtual store (opt-in, with a caveat)](#the-global-virtual-store-opt-in-with-a-caveat)
 - [The pnpm metadata cache](#the-pnpm-metadata-cache)
+- [pnpm switching its own version (pnpm 11 before 11.22)](#pnpm-switching-its-own-version-pnpm-11-before-1122)
 - [Tools that are not affected](#tools-that-are-not-affected)
 
 ## What happens on every install
@@ -138,6 +139,10 @@ Two reasons to be careful:
   container that bind-mounts the workspace does not see `/opt/pnpm-store`, so
   those links dangle there.
 
+pnpm 11 also keeps its own version switches in the same `links` directory,
+whatever this setting says; see
+[pnpm switching its own version](#pnpm-switching-its-own-version-pnpm-11-before-1122).
+
 ## The pnpm metadata cache
 
 The store holds package contents. pnpm also keeps package **metadata** (the
@@ -224,6 +229,109 @@ prune` deletes what it finds under `cache-dir`, and with `cache-dir` set to the
 store root it deleted the whole store in a lab run. In `metadata-cache/` it can
 only remove the metadata. The runner user creates the directory on first use
 inside the store mount it already owns.
+
+## pnpm switching its own version (pnpm 11 before 11.22)
+
+pnpm 11 can install another pnpm version by itself: `pnpm self-update`, and
+the automatic switch to a version pinned in `packageManager` or
+`devEngines.packageManager`. `pnpm/action-setup` relies on it. It installs a
+bootstrap pnpm 11 and runs `pnpm self-update <version>` to reach the version
+the workflow asks for. The bootstrap is the standalone `@pnpm/exe` build when
+the workflow sets `standalone: true` or when the `node` on `PATH` is older than
+22.13. The Ubuntu 24.04 runner image ships Node 18, so the standalone build is
+what a job gets there unless `actions/setup-node` installs a newer Node first.
+
+pnpm puts the version it switches to in its global virtual store, the `links`
+directory of the store (`<store>/v11/links`), and records the job's install
+under `<store>/v11/projects`. Both paths are derived from `store-dir`, and
+pnpm 11 has no setting that moves them; setting
+`pnpm_config_global_virtual_store_dir` or `pnpm_config_virtual_store_dir` was
+tried and changes nothing. With the persistent store, the switched pnpm
+therefore lands on the repository's pnpm volume and is reused by later jobs.
+
+### What goes wrong before pnpm 11.22.0
+
+This was reproduced with `pnpm self-update`, the path `pnpm/action-setup`
+takes; the automatic `packageManager` switch was not tested. The first job
+against a store works. In a later job, a bootstrap pnpm older than 11.22.0
+reuses the stored `@pnpm/exe` entry and writes the package's empty
+placeholder over its `pnpm` binary. That file is a hardlink to the
+platform package's binary (`@pnpm/linux-x64` or `@pnpm/linux-arm64`), which is
+itself a hardlink to the content-addressable part of the store (`v11/files`).
+The write empties all three. From then on every job of the repository gets a
+0-byte `pnpm`:
+
+- `pnpm --version` prints nothing and exits 0;
+- `actions/setup-node` with `cache: pnpm` fails at `pnpm store path --silent`
+  with "Could not get pnpm cache folder path".
+
+A newer pnpm does not repair a store in this state: it trusts the emptied file
+in `v11/files` and links it again.
+
+Lab results, two consecutive jobs on one fresh store volume, switching to pnpm
+10.16.1 with the provider's store environment (linux/amd64 runner image and
+linux/arm64):
+
+| Bootstrap `@pnpm/exe` | Second job |
+|---|---|
+| 11.5.0, 11.15.0, 11.19.0, 11.20.0, 11.21.0 | 0-byte `pnpm` |
+| 11.22.0, 11.25.0, 11.28.10 | works |
+| any version, after an older one emptied the file | 0-byte `pnpm` |
+
+`pnpm/action-setup` v6.0.10 bootstraps 11.19.0. v6.1.0 bootstraps 11.25.0.
+
+Each switch also leaves a symlink in `<store>/v11/projects` that points into the
+finished job's home directory. These are a few bytes each, dangle in every
+later job, and do not break installs.
+
+### What to do
+
+- **Repositories:** use `pnpm/action-setup` v6.1.0 or newer, or any setup whose
+  bootstrap pnpm is 11.22.0 or newer. A repository that has to stay on an older
+  setup can keep the switch off the persistent store by pointing the store at
+  a job-local directory for that step only:
+
+  ```yaml
+  - name: Set up pnpm
+    uses: pnpm/action-setup@<sha>
+    env:
+      npm_config_store_dir: ${{ runner.temp }}/pnpm-bootstrap-store
+      pnpm_config_store_dir: ${{ runner.temp }}/pnpm-bootstrap-store
+  ```
+
+  Later steps still use the persistent store. `cache: pnpm` on
+  `actions/setup-node` is not needed when the provider persists the store.
+- **The provider** sets no extra variable for this: no pnpm 11 setting
+  separates the switch from the store, and the store itself has to stay on the
+  volume. See ADR-003, amendment of 2026-11-02.
+- **Operators:** check for stores that are already damaged. The listing below
+  is read-only. Replace `<your-controller-id>` as for the cache purge in the
+  README:
+
+  ```sh
+  for v in $(docker volume ls -q \
+      --filter label=garm.docker/cache-kind=pnpm \
+      --filter label=garm.docker/controller-id=<your-controller-id>); do
+    hits=$(docker run --rm -v "$v":/store:ro alpine:3.20 \
+      find /store/v11/links/@pnpm -path '*/node_modules/@pnpm/*/pnpm' \
+        -type f -size 0 2>/dev/null)
+    [ -n "$hits" ] && printf '%s\n%s\n\n' "$v" "$hits"
+  done
+  ```
+
+  A damaged store lists entries such as
+  `/store/v11/links/@pnpm/exe/<version>/<hash>/node_modules/@pnpm/exe/pnpm`
+  and the matching `@pnpm/linux-x64` (or `linux-arm64`) entry. Remove such a
+  volume while none of the repository's runners is up:
+
+  ```sh
+  docker volume rm <volume>
+  ```
+
+  Docker refuses to remove a volume that a container still uses. The next job
+  of the repository starts with an empty store and fills it again. Removing
+  only the `links` entries is not enough, because the emptied file in
+  `v11/files` stays and pnpm links it again.
 
 ## Tools that are not affected
 
