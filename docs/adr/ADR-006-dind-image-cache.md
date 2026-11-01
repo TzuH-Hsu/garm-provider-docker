@@ -1,6 +1,6 @@
 # ADR-006: Cross-job Image Cache for DinD Runners
 
-Status: Proposed (2026-11-02). Nothing in this ADR changes behaviour until it is accepted and implemented. If accepted, the implementation amends ADR-001 (the `dind-state` volume stops being strictly per job for opted-in pools), ADR-003 (a new cache kind), ADR-004 (a new job-scoped container role and a teardown ordering rule) and ADR-005 (a new config table and `extra_specs` key).
+Status: Accepted (2026-11-02) as the design; implementation is gated on the phase 0 measurement (see "Decisions" below). Nothing in this ADR changes behaviour until it is implemented. The implementation amends ADR-001 (the `dind-state` volume stops being strictly per job for opted-in pools), ADR-003 (a new cache kind), ADR-004 (a new job-scoped container role and a teardown ordering rule) and ADR-005 (a new config table and `extra_specs` key).
 
 ## Context
 
@@ -50,7 +50,7 @@ These facts were checked against the Docker documentation and the Moby source fo
 | (d) tarballs | yes, for listed images | no | no | none | rejected |
 | (e) mirror | yes (LAN) | no | no | none | in place |
 
-## Decision (proposed)
+## Decision
 
 Adopt option (a) as an opt-in, two-step feature: off by default, enabled by the operator as a ceiling and by a pool's `extra_specs`, for `privileged-sidecar` allocations of repository-scoped pools only. Everything else keeps today's per-job `dind-state` volume. An allocation that cannot lease a slot falls back to a per-job volume; the cache never fails a create on its own.
 
@@ -229,16 +229,18 @@ What changes, for an opted-in pool only: a job can see what earlier jobs of the 
 
 Rollback is a config change: set the pool's `dind_cache` to `false` or the ceiling to off, and the next allocations use per-job volumes. Slot volumes stay until an operator prunes them.
 
-## Open questions for the owner
+## Decisions (2026-11-02)
 
-1. **Keying:** per repository and pool (proposed), or per repository across all its pools?
-2. **Default retention:** `"pulled"` (proposed) or `"all"`? And should a pool be able to choose its own retention within the operator's ceiling, or is it operator-only?
-3. **Scrub placement:** a quarantine daemon per lease (proposed, a few seconds per create), or inside the job's sidecar before credentials are delivered (faster, with the restart-policy window above)?
-4. **Engine updates:** wipe on any engine `major.minor` change (proposed), or keep the data root on upgrades and wipe only on a downgrade?
-5. **Organization and enterprise pools:** excluded (proposed), or allowed under `allow_org_shared`?
-6. **Defaults:** `slots_per_pool = 1`, `max_size_gib = 20`, `min_free_gib = 10`, `max_idle_days = 14`, `scrub_timeout_seconds = 300`. Do these fit the reference deployment's disk?
-7. **Go/no-go:** which phase 0 result justifies implementing? For example, image extraction making up more than half of a DinD job's writes.
-8. **`sysbox-runc`:** out of scope until it can be verified (proposed)?
+The questions raised with the proposal were settled as follows.
+
+1. **Keying:** per repository and pool.
+2. **Retention:** `"pulled"` by default, and retention is operator-only; a pool cannot widen it. Keeping locally built images or build cache would carry one pull request's build output into the next job.
+3. **Scrub placement:** a no-network quarantine daemon per lease, accepting a few seconds per create, so that restart-policy containers left by a previous job never start in the new runner's network namespace.
+4. **Engine updates:** wipe the slot on any engine `major.minor` change.
+5. **Organization and enterprise pools:** excluded.
+6. **Defaults:** `slots_per_pool = 1`, `max_size_gib = 20`, `min_free_gib = 10`, `max_idle_days = 14`, `scrub_timeout_seconds = 300`.
+7. **Go/no-go:** implement only if phase 0 shows that image pulls and extraction account for more than half of the bytes a DinD job writes. The measurement compares bytes written, not durations, because a constrained or degraded disk distorts timings.
+8. **`sysbox-runc`:** out of scope until it can be verified.
 
 ## References
 
