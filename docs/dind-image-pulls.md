@@ -13,6 +13,7 @@ the job, so nothing is pulled.
 - [Zero-infrastructure alternative: `mirror.gcr.io`](#zero-infrastructure-alternative-mirrorgcrio)
 - [Registries other than Docker Hub](#registries-other-than-docker-hub)
 - [What a mirror does not fix](#what-a-mirror-does-not-fix)
+- [Measuring what a job writes: the teardown log line](#measuring-what-a-job-writes-the-teardown-log-line)
 - [Job-side advice](#job-side-advice)
 
 ## Why every DinD job starts with an empty image store
@@ -311,6 +312,76 @@ into the job's fresh `dind-state` volume, so every job still writes each image
 in full to local disk. Large images stay slow to start even from a warm
 mirror. Avoiding that cost would need an image store that outlives a job,
 which the per-job design of ADR-001 deliberately does not provide.
+
+## Measuring what a job writes: the teardown log line
+
+To judge how much of a job's disk writing is image pulls and extraction (the
+question [ADR-006](adr/ADR-006-dind-image-cache.md) gates on), `DeleteInstance`
+logs one line per DinD allocation just before it stops the sidecar and
+removes its `dind-state` volume. It is log-only and best-effort: it shares a
+four-second budget, never changes what is removed, and on any error it logs the
+reason and teardown continues. It is emitted by `DeleteInstance` only, not by
+the orphan sweep or `RemoveAllInstances`, and never in `dind_mode = "none"`.
+
+```text
+level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... repo=acme/widgets dind_mode=privileged-sidecar since_create_s=412 written_bytes=3187671040 storage_driver=overlay2 image_store=classic images=4 image_bytes=1974321152
+```
+
+(All values in examples are synthetic. A `containerd` store line also carries
+`content_bytes=<n>`.)
+
+| Field | Meaning |
+|---|---|
+| `instance`, `pool` | The GARM instance name and pool ID. |
+| `repo` | `org/repo` (or `org`, or `enterprises/name`) the runner registered against, read from the runner's environment. Omitted when the runner is already gone. |
+| `dind_mode` | `privileged-sidecar` or `sysbox-runc`. |
+| `since_create_s` | Seconds from allocation create to this line: startup, the job, and the wait for GARM's delete. |
+| `written_bytes` | Bytes the sidecar wrote to block devices over its life: the sum of the `write` entries of `blkio_stats.io_service_bytes_recursive` from a one-shot stats sample (`write` on cgroup v2, `Write` on v1; `Total`, `Sync` and `Async` are not summed). The counter is recursive, so it covers nested containers, builds, volumes and `dockerd`'s own metadata, not only pulls. |
+| `storage_driver`, `image_store` | The sidecar daemon's driver, and `classic` (a graph driver such as `overlay2`) or `containerd` (the containerd image store). The provider always passes `--storage-driver`, so sidecars normally report `classic`; `containerd` appears only if a custom `dind_image` enables the containerd snapshotter itself. |
+| `images`, `image_bytes` | Distinct images the sidecar daemon holds at teardown, and the sum of their `docker image inspect` `Size`: the unpacked, uncompressed size. |
+| `content_bytes` | `containerd` image store only: the on-disk size (`du -sk`) of the containerd content store, the compressed blobs pulls wrote. |
+| `probe_error` | The image probe failed; `images`, `image_bytes` and the rest are omitted but `written_bytes` is still logged. |
+
+A sample that fails altogether is logged as `level=WARN msg="teardown: DinD
+sidecar IO unavailable" ... stats_error=...` (for example when the cgroup has no
+io controller). A sidecar that has already exited is skipped with a debug line,
+since its counters are gone.
+
+**Computing the ratio.** The question is what share of `written_bytes` comes
+from pulling and extracting images. Estimate the bytes the pulls wrote as
+`image_bytes + content_bytes` (containerd store: unpacked snapshots plus
+compressed blobs) or `image_bytes` alone (classic store, where the compressed
+download is also written to a temporary file but is not measured). Aggregate
+over many jobs as a ratio of sums, not a mean of per-job ratios:
+
+```sh
+grep 'teardown: DinD sidecar IO"' provider.log | awk '/image_bytes=/ {
+  delete v; for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+  w += v["written_bytes"]; p += v["image_bytes"] + v["content_bytes"]; n++ }
+  END { printf "jobs=%d written=%d pull_estimate=%d share=%.2f\n", n, w, p, p / w }'
+```
+
+**Known biases.** Treat the result as an estimate with a direction, not an exact
+figure:
+
+- `image_bytes` counts a layer shared by several images once per image, and
+  counts images the job built as if they were pulled. Both overstate the pull
+  share. Lines with `images=1` are free of the sharing effect.
+- Images the job removed (`docker rmi`, `docker system prune`) before teardown,
+  intermediate build layers and build cache are not in `image_bytes`, and are
+  in `written_bytes`. This understates the pull share.
+- `image_bytes` is a size, not a write count. On the classic store the
+  compressed download is also written once and is not measured, which
+  understates the pull share; on the containerd store `content_bytes` covers it.
+- `written_bytes` counts only bytes that reached the block device. Pages still
+  dirty in the page cache when the sample is taken are missed, which lowers the
+  denominator and can push the ratio above 1. In a local run with freshly
+  started sidecars that had only pulled two images, `written_bytes` came out
+  20 to 25 percent below the unpacked plus compressed size of those images,
+  on both image stores.
+- `content_bytes` rounds up to filesystem blocks, and `written_bytes` includes
+  writes to any device the sidecar's cgroup used, not only the one holding
+  `dind-state`.
 
 ## Job-side advice
 
