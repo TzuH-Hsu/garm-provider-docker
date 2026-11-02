@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/docker/docker/api/types"
@@ -61,13 +62,64 @@ var _ Client = (*mobyClient)(nil)
 // connection — is delegated to streamExec so it is testable without a Docker
 // daemon.
 func (m *mobyClient) ExecStream(ctx context.Context, containerID string, cmd []string, stdin io.Reader) (int, error) {
-	execResp, err := m.Client.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+	return m.runExec(ctx, containerID, container.ExecOptions{
 		User:         credentialExecUser,
 		Cmd:          cmd,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-	})
+	}, stdin, io.Discard)
+}
+
+// execOutputLimit caps what ExecOutput keeps of an exec's output. The only
+// caller prints a few dozen bytes per image, so the cap is far above any real
+// answer; it bounds memory against a runaway command.
+const execOutputLimit = 256 << 10
+
+// ExecOutput implements the output-capturing exec documented on the Client
+// interface: the same create/attach/drain/inspect sequence as ExecStream, with
+// no stdin, the container's default user, and stdout+stderr collected into a
+// capped buffer instead of discarded.
+func (m *mobyClient) ExecOutput(ctx context.Context, containerID string, cmd []string) (string, int, error) {
+	buf := &cappedBuffer{limit: execOutputLimit}
+	code, err := m.runExec(ctx, containerID, container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	}, nil, buf)
+	if err != nil {
+		return "", 0, err
+	}
+	if buf.overflowed {
+		return "", 0, fmt.Errorf("exec output from container %s exceeded %d bytes", containerID, execOutputLimit)
+	}
+	return buf.b.String(), code, nil
+}
+
+// cappedBuffer collects up to limit bytes and records, rather than errors on,
+// any excess, so the exec output pump never blocks or fails mid-stream.
+type cappedBuffer struct {
+	b          strings.Builder
+	limit      int
+	overflowed bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := c.limit - c.b.Len(); n > room {
+		c.overflowed = true
+		p = p[:room]
+	}
+	c.b.Write(p)
+	return n, nil
+}
+
+// runExec creates an exec with opts, attaches, pumps stdin (if any) and writes
+// the exec's output to stdout, and returns the exit code from ExecInspect. The
+// actual stream pumping — including honoring ctx cancellation by force-closing
+// the hijacked connection — is delegated to streamExecTo.
+func (m *mobyClient) runExec(ctx context.Context, containerID string, opts container.ExecOptions, stdin io.Reader, stdout io.Writer) (int, error) {
+	execResp, err := m.Client.ContainerExecCreate(ctx, containerID, opts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create exec in container %s: %w", containerID, err)
 	}
@@ -77,9 +129,9 @@ func (m *mobyClient) ExecStream(ctx context.Context, containerID string, cmd []s
 		return 0, fmt.Errorf("failed to attach to exec in container %s: %w", containerID, err)
 	}
 
-	// streamExec owns closing the hijacked connection (on success, error, or
+	// streamExecTo owns closing the hijacked connection (on success, error, or
 	// cancellation), so there is no separate defer att.Close() here.
-	if err := streamExec(ctx, containerID, sdkHijack{att: att}, stdin); err != nil {
+	if err := streamExecTo(ctx, containerID, sdkHijack{att: att}, stdin, stdout); err != nil {
 		return 0, err
 	}
 
@@ -138,6 +190,12 @@ func (s sdkHijack) Close()                      { s.att.Close() }
 // provides. This is documentation of an existing invariant every current
 // caller already satisfies, not a behavior change.
 func streamExec(ctx context.Context, containerID string, conn execConn, stdin io.Reader) error {
+	return streamExecTo(ctx, containerID, conn, stdin, io.Discard)
+}
+
+// streamExecTo is streamExec with the exec's demultiplexed output (stdout and
+// stderr, interleaved) written to stdout instead of discarded.
+func streamExecTo(ctx context.Context, containerID string, conn execConn, stdin io.Reader, stdout io.Writer) error {
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(conn.Close) }
 	defer closeConn()
@@ -174,15 +232,15 @@ func streamExec(ctx context.Context, containerID string, conn execConn, stdin io
 
 	// StdCopy blocks until the exec closes its streams (i.e. the process
 	// exits) or the connection is force-closed; the credential-delivery tar
-	// produces no stdout worth keeping.
-	_, copyErr := stdcopy.StdCopy(io.Discard, io.Discard, conn.output())
+	// produces no stdout worth keeping, so ExecStream passes io.Discard.
+	_, copyErr := stdcopy.StdCopy(stdout, stdout, conn.output())
 	werr := <-copyDone
 
 	// A cancellation is what unblocked the pumps above (via the force-close),
 	// so surface ctx.Err() rather than the resulting "use of closed
 	// connection" noise from StdCopy / the stdin copy.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("credential delivery exec in container %s canceled: %w", containerID, ctxErr)
+		return fmt.Errorf("exec in container %s canceled: %w", containerID, ctxErr)
 	}
 	if copyErr != nil {
 		return fmt.Errorf("failed to read exec output from container %s: %w", containerID, copyErr)

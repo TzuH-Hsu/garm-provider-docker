@@ -319,6 +319,35 @@ func TestDindSharesRunnerNetns(t *testing.T) {
 	}
 }
 
+// TestDindModeOf proves DindModeOf inverts DinD's runtime selection, including
+// the inspected default runtime ("runc") a privileged sidecar reports.
+func TestDindModeOf(t *testing.T) {
+	for _, mode := range []string{dindModePrivilegedSidecar, dindModeSysboxRunc} {
+		priv, runtime, err := DindRuntimeSelection(mode)
+		if err != nil {
+			t.Fatalf("DindRuntimeSelection(%q): %v", mode, err)
+		}
+		if got := DindModeOf(priv, runtime); got != mode {
+			t.Errorf("DindModeOf(%v, %q) = %q, want %q", priv, runtime, got, mode)
+		}
+	}
+	tests := []struct {
+		name       string
+		privileged bool
+		runtime    string
+		want       string
+	}{
+		{"privileged with the inspected default runtime", true, "runc", dindModePrivilegedSidecar},
+		{"unprivileged default runtime", false, "runc", DindModeUnknown},
+		{"nothing set", false, "", DindModeUnknown},
+	}
+	for _, tc := range tests {
+		if got := DindModeOf(tc.privileged, tc.runtime); got != tc.want {
+			t.Errorf("%s: DindModeOf(%v, %q) = %q, want %q", tc.name, tc.privileged, tc.runtime, got, tc.want)
+		}
+	}
+}
+
 func TestContainerNetworkMode(t *testing.T) {
 	got := ContainerNetworkMode("abc123")
 	if got != "container:abc123" || !got.IsContainer() || got.ConnectedContainer() != "abc123" {

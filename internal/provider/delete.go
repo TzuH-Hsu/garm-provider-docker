@@ -23,6 +23,10 @@ import (
 // teardown; if the runner container is already gone but a network, volume, or
 // lingering DinD sidecar remains (a crashed/partial allocation), the label
 // fallback still finds and sweeps the leftovers (ADR-004 F6).
+//
+// For a DinD allocation the teardown also logs one best-effort line with the
+// sidecar's block-device writes and image footprint before the sidecar stops
+// (ADR-006 rollout step 0); it never affects the result.
 func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error {
 	instanceName, found, err := p.resolveInstanceName(ctx, instanceID)
 	if err != nil {
@@ -33,7 +37,7 @@ func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error 
 		return notFoundError(instanceID)
 	}
 
-	torn, err := p.topo.TeardownAllocation(ctx, instanceName)
+	torn, err := p.topo.TeardownAllocationReportingIO(ctx, instanceName)
 	if err != nil {
 		return fmt.Errorf("failed to delete instance %q: %w", instanceID, err)
 	}

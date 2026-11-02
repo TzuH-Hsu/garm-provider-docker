@@ -164,6 +164,16 @@ type FakeClient struct {
 	// command.
 	Execs []ExecRecord
 
+	// OutputExecs records every ExecOutput call, in order. ExecOutputText and
+	// ExecOutputExit are what the fake reports for each (stdout, exit code);
+	// ExecOutputErr, when non-nil, is returned instead. StatsErr, when non-nil,
+	// is returned by ContainerStatsOneShot. See fake_dindio.go.
+	OutputExecs    []ExecRecord
+	ExecOutputText string
+	ExecOutputExit int
+	ExecOutputErr  error
+	StatsErr       error
+
 	// Created records the SHAPE of every ContainerCreate call, in order, and
 	// PERSISTS even after the container is removed — unlike the live containers
 	// map, which drops a removed container. It is how a test asserts the shape of
@@ -363,6 +373,10 @@ type fakeContainer struct {
 	// processes is the command lines ContainerTop reports while the container
 	// runs (SetProcesses).
 	processes []string
+
+	// statsBody is the JSON ContainerStatsOneShot returns for this container
+	// (SetStats); empty models a daemon sample with no blkio counters.
+	statsBody string
 }
 
 // fakeNetwork models an in-memory Docker network.
