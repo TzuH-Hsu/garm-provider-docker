@@ -131,6 +131,26 @@ func DindSharesRunnerNetns(dindMode string) bool {
 	return dindMode == dindModePrivilegedSidecar
 }
 
+// DindModeUnknown is what DindModeOf returns for a {Privileged, Runtime} pair
+// that is neither DinD mode's.
+const DindModeUnknown = "unknown"
+
+// DindModeOf recovers the dind_mode a sidecar was created for from its inspected
+// HostConfig, the inverse of DindRuntimeSelection. The inspected runtime of a
+// privileged-sidecar is the daemon's default ("runc"), not the empty create
+// request, so any runtime other than sysbox's is accepted when Privileged is
+// set. Teardown logging uses it because the mode is not a label on the sidecar.
+func DindModeOf(privileged bool, runtime string) string {
+	switch {
+	case runtime == dindRuntimeSysbox:
+		return dindModeSysboxRunc
+	case privileged:
+		return dindModePrivilegedSidecar
+	default:
+		return DindModeUnknown
+	}
+}
+
 // ContainerNetworkMode returns the HostConfig.NetworkMode that joins the
 // network namespace of the container with the given ID ("container:<id>").
 func ContainerNetworkMode(containerID string) container.NetworkMode {

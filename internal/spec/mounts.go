@@ -331,6 +331,9 @@ const (
 	dindModeNone              = "none"
 	dindModePrivilegedSidecar = "privileged-sidecar"
 	dindModeSysboxRunc        = "sysbox-runc"
+
+	// dindRuntimeSysbox is the OCI runtime name sysbox-runc mode selects.
+	dindRuntimeSysbox = "sysbox-runc"
 )
 
 // DindContainerSpec bundles the inputs a future WP2/WP3 orchestration layer
@@ -450,7 +453,7 @@ func DindRuntimeSelection(dindMode string) (privileged bool, runtime string, err
 	case dindModePrivilegedSidecar:
 		return true, "", nil
 	case dindModeSysboxRunc:
-		return false, "sysbox-runc", nil
+		return false, dindRuntimeSysbox, nil
 	case dindModeNone:
 		return false, "", fmt.Errorf("dind runtime selection does not apply to dind_mode %q: no DinD sidecar exists in that mode", dindModeNone)
 	default:

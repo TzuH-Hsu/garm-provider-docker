@@ -55,7 +55,18 @@ func filtersForNonce(controllerID, nonce string) filters.Args {
 // them, and spec.MatchesPredicate re-asserts the "NOT cache=true" conjunct
 // defense-in-depth.
 func (m *Manager) TeardownAllocation(ctx context.Context, instanceName string) (found bool, err error) {
-	return m.teardownGeneration(ctx, m.instanceScopedFilter(instanceName))
+	return m.teardownGeneration(ctx, m.instanceScopedFilter(instanceName), false)
+}
+
+// TeardownAllocationReportingIO is TeardownAllocation that also logs, for a
+// DinD allocation, one line with the sidecar's cumulative block-device writes
+// and the images its daemon holds, taken just before the sidecar is stopped
+// (ADR-006 rollout step 0). DeleteInstance uses it; the orphan sweep does not,
+// since it runs inside other instances' creates and must not slow them. The
+// report is best-effort and bounded by dindIOReportTimeout: it never changes
+// what is removed, and a failure in it is logged, not returned.
+func (m *Manager) TeardownAllocationReportingIO(ctx context.Context, instanceName string) (found bool, err error) {
+	return m.teardownGeneration(ctx, m.instanceScopedFilter(instanceName), true)
 }
 
 // TeardownAll removes EVERY managed, job-scoped resource for this controller —
@@ -129,12 +140,12 @@ func (m *Manager) Rollback(ctx context.Context, instanceName, nonce string) erro
 // It backs TeardownAllocation (DeleteInstance and the orphan sweep) only —
 // TeardownAll (the RemoveAllInstances rescue path) deliberately does NOT go
 // through this generation-scoped helper; see TeardownAll's doc for why.
-func (m *Manager) teardownGeneration(ctx context.Context, f filters.Args) (bool, error) {
+func (m *Manager) teardownGeneration(ctx context.Context, f filters.Args, reportDindIO bool) (bool, error) {
 	captured, err := m.claimNoncesByInstance(ctx, f)
 	if err != nil {
 		return false, err
 	}
-	scope := &teardownScope{m: m, mode: teardownModeGeneration, captured: captured}
+	scope := &teardownScope{m: m, mode: teardownModeGeneration, captured: captured, reportDindIO: reportDindIO}
 	return m.runTeardown(ctx, f, scope)
 }
 
@@ -198,6 +209,7 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 		found bool
 		errs  []error
 	)
+	dindIO := m.newDindIOReporter(ctx, list, scope)
 	for _, c := range list {
 		ok, err := scope.mayRemove(ctx, c.Labels)
 		if err != nil {
@@ -208,6 +220,8 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 			continue
 		}
 		found = true
+		// Log the sidecar's IO before it stops: stopping destroys its counters.
+		dindIO.report(ctx, c)
 		// Best-effort graceful stop first (ADR-004 ordering); the forced
 		// remove below reaps a still-running container regardless.
 		_ = m.cli.ContainerStop(ctx, c.ID, container.StopOptions{})
@@ -326,6 +340,10 @@ type teardownScope struct {
 	// resource is removable only when its instance's captured nonce equals the
 	// resource's create-nonce.
 	captured map[string]string
+
+	// reportDindIO asks removeContainers to log a DinD sidecar's IO before
+	// stopping it (dindio.go). Set only by TeardownAllocationReportingIO.
+	reportDindIO bool
 }
 
 // mayRemove reports whether a teardown may remove a resource with these labels,

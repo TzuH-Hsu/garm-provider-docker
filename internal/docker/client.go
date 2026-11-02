@@ -103,6 +103,22 @@ type Client interface {
 	// This is why CopyToContainer was removed from this interface entirely.
 	ExecStream(ctx context.Context, containerID string, cmd []string, stdin io.Reader) (exitCode int, err error)
 
+	// ExecOutput runs cmd inside a running container as the container's
+	// default user, with no stdin, and returns what it wrote to stdout and
+	// stderr (interleaved, capped at execOutputLimit bytes) and its exit code.
+	// A non-zero exit code is reported in exitCode, not as an error; err is
+	// reserved for transport failures, an output overflow, and ctx
+	// cancellation. The teardown DinD IO report uses it to ask the sidecar's
+	// own daemon what it holds before the sidecar and its dind-state volume are
+	// removed.
+	ExecOutput(ctx context.Context, containerID string, cmd []string) (output string, exitCode int, err error)
+
+	// ContainerStatsOneShot returns a single stats sample for a running
+	// container without waiting to prime the CPU counters (`one-shot=1`). The
+	// caller must Close the returned reader. The teardown DinD IO report reads
+	// the sidecar's cumulative blkio counters from it.
+	ContainerStatsOneShot(ctx context.Context, containerID string) (container.StatsResponseReader, error)
+
 	// ContainerLogs streams a container's log output. For a container created
 	// WITHOUT a TTY — every container this provider creates — the stream is
 	// the daemon's multiplexed stdout/stderr framing and must be demultiplexed
