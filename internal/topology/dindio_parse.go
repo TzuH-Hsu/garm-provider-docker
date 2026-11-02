@@ -57,7 +57,11 @@ func parseBlkioWriteBytes(r io.Reader) (uint64, error) {
 // shared socket path and reads only metadata: image sizes come from `docker
 // image inspect`, never from walking the data root, which is slow on the
 // disks this feature is meant to measure. It exits non-zero when the daemon
-// does not answer. The content directory is only meaningful for the
+// does not answer or the image list or inspect fails: each step's status is
+// checked on its own, never through a pipeline, because a pipeline reports
+// only its last command's status and would turn a failed list into a
+// successful "no images" answer. The one deliberate exception is the content
+// size, which is optional and simply omitted when `du` fails. The content directory is only meaningful for the
 // containerd image store (a classic store also has a containerd directory,
 // but for runtime state only), so it is read only then.
 const imageProbeScript = `export DOCKER_HOST=unix:///run/docker.sock
@@ -70,7 +74,8 @@ case "$info" in
   [ -z "$kib" ] || echo "content_kib $kib" ;;
 *) echo "store classic" ;;
 esac
-ids=$(docker image ls -q --no-trunc | sort -u) || exit 4
+ids=$(docker image ls -q --no-trunc) || exit 4
+ids=$(printf '%s\n' "$ids" | sort -u) || exit 5
 [ -z "$ids" ] || docker image inspect --format 'image {{.ID}} {{.Size}}' $ids`
 
 // imageProbe is what imageProbeScript reports about the sidecar's daemon.

@@ -129,6 +129,37 @@ func TestTeardownReportsDindIO(t *testing.T) {
 	}
 }
 
+// TestReportBudgetStartsWhenReportStarts proves time spent between creating the
+// reporter and reporting (in a teardown: stopping and removing the slower runner
+// first) does not count against the sidecar measurement's budget.
+func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	list, err := fake.ContainerList(context.Background(), container.ListOptions{All: true})
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	scope := &teardownScope{m: m, mode: teardownModeAll, reportDindIO: true}
+	r := m.newDindIOReporter(context.Background(), list, scope)
+	if r == nil {
+		t.Fatal("expected a reporter for an allocation with a sidecar")
+	}
+
+	// A budget far shorter than the simulated runner shutdown: were it counted
+	// from the reporter's creation, it would be spent before the report began.
+	r.budget = 200 * time.Millisecond
+	time.Sleep(400 * time.Millisecond)
+
+	for _, c := range list {
+		if c.ID == sidecar {
+			r.report(context.Background(), c)
+		}
+	}
+	if !strings.Contains(logs.String(), "written_bytes=123456") || !strings.Contains(logs.String(), "repo=acme/widgets") {
+		t.Errorf("the IO line was not emitted after a slow runner shutdown:\n%s", logs.String())
+	}
+}
+
 func TestTeardownReportsContainerdContentBytes(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, _ := seedDindAllocation(t, "gha-1")

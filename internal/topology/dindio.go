@@ -12,21 +12,27 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// dindIOReportTimeout bounds the whole DinD IO report for one teardown: the
-// runner inspect, the sidecar inspect, the stats sample and the image probe
-// share it. The report is a measurement aid (ADR-006 rollout step 0), so when
-// a stalled disk makes the daemon slow it gives up rather than hold up
-// the teardown.
+// dindIOReportTimeout bounds one sidecar's DinD IO report: the sidecar
+// inspect, the stats sample and the image probe share it. The report is a
+// measurement aid (ADR-006 rollout step 0), so when a stalled disk makes the
+// daemon slow it gives up rather than hold up the teardown. The budget starts
+// when the report starts, not when the teardown does, so the time the runner
+// takes to stop does not eat into it.
 const dindIOReportTimeout = 4 * time.Second
+
+// dindIORepoTimeout bounds the early lookup of the runner's repository, a
+// single local inspect made before the runner is stopped.
+const dindIORepoTimeout = time.Second
 
 // dindIOReporter logs one line per DinD sidecar about to be torn down: how
 // much the sidecar wrote to block devices over its life, and what its daemon
 // holds, so an operator can compare the two (ADR-006, phase 0). It is
 // best-effort and log-only; nothing it does can fail or change a teardown.
 type dindIOReporter struct {
-	m        *Manager
-	deadline time.Time
-	repo     string
+	m *Manager
+	// budget is the time one report may take, counted from when it starts.
+	budget time.Duration
+	repo   string
 }
 
 // newDindIOReporter returns a reporter for a teardown of list, or nil when no
@@ -38,7 +44,7 @@ func (m *Manager) newDindIOReporter(ctx context.Context, list []types.Container,
 	if !scope.reportDindIO || !hasRole(list, spec.RoleDind) {
 		return nil
 	}
-	r := &dindIOReporter{m: m, deadline: time.Now().Add(dindIOReportTimeout)}
+	r := &dindIOReporter{m: m, budget: dindIOReportTimeout}
 	r.repo = r.runnerRepo(ctx, list)
 	return r
 }
@@ -60,7 +66,7 @@ func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container)
 		if c.Labels[spec.LabelRole] != spec.RoleRunner {
 			continue
 		}
-		ctx, cancel := context.WithDeadline(ctx, r.deadline)
+		ctx, cancel := context.WithTimeout(ctx, dindIORepoTimeout)
 		defer cancel()
 		info, err := r.m.cli.ContainerInspect(ctx, c.ID)
 		if err != nil || info.Config == nil {
@@ -79,7 +85,7 @@ func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 	if r == nil || c.Labels[spec.LabelRole] != spec.RoleDind {
 		return
 	}
-	ctx, cancel := context.WithDeadline(ctx, r.deadline)
+	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
 
 	attrs, err := r.identity(ctx, c)
