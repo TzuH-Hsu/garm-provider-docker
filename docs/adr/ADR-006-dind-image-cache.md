@@ -221,6 +221,7 @@ What changes, for an opted-in pool only: a job can see what earlier jobs of the 
 ## Rollout
 
 0. **Measure first** (as #26 recommended). Before any slot code, ship the teardown block-IO log line, and collect per-job sidecar writes and pull durations on the reference deployment for about a week. Decide with those numbers whether the extraction writes justify the feature.
+   *Shipped:* `DeleteInstance` logs one `teardown: DinD sidecar IO` line per DinD allocation; how to read it, compute the ratio and its known biases are in [`docs/dind-image-pulls.md`](../dind-image-pulls.md#measuring-what-a-job-writes-the-teardown-log-line).
 1. Implement behind both opt-ins, `privileged-sidecar` only, with unit tests and the live harness on a development daemon, never the production host.
 2. Run the real-job gate with `--dind-cache` on a non-production host.
 3. Release in a minor version, with the ADR-001, ADR-003, ADR-004 and ADR-005 amendments, `docs/config-reference.md`, and a section in `docs/dind-image-pulls.md` ("What a mirror does not fix" points to it).
