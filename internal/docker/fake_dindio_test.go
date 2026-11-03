@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
@@ -43,6 +44,51 @@ func TestFakeContainerStatsOneShot(t *testing.T) {
 	f.SetState(id, "exited", false)
 	if _, err := f.ContainerStatsOneShot(ctx, id); !errdefs.IsConflict(err) {
 		t.Fatalf("stopped container err = %v, want Conflict", err)
+	}
+}
+
+// TestFakeStatsOfJoinedNetns pins the daemon behavior the DinD IO report must
+// work around: a container in another container's network namespace gets an
+// empty sample once that container is removed, and an error while it is
+// stopped, although the joined container itself still runs.
+func TestFakeStatsOfJoinedNetns(t *testing.T) {
+	f := NewFakeClient()
+	ctx := context.Background()
+	owner := runningFakeContainer(t, f)
+	created, err := f.ContainerCreate(ctx, &container.Config{Image: "img"},
+		&container.HostConfig{NetworkMode: container.NetworkMode("container:" + owner)}, nil, nil, "c2")
+	if err != nil {
+		t.Fatalf("ContainerCreate: %v", err)
+	}
+	joined := created.ID
+	f.SetState(joined, "running", false)
+	f.SetStats(joined, `{"blkio_stats":{}}`)
+
+	read := func() (string, error) {
+		r, err := f.ContainerStatsOneShot(ctx, joined)
+		if err != nil {
+			return "", err
+		}
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		return string(body), err
+	}
+
+	if body, err := read(); err != nil || body != `{"blkio_stats":{}}` {
+		t.Fatalf("owner running: (%q, %v), want the set sample", body, err)
+	}
+	if err := f.ContainerStop(ctx, owner, container.StopOptions{}); err != nil {
+		t.Fatalf("ContainerStop: %v", err)
+	}
+	if _, err := read(); !errdefs.IsInvalidParameter(err) {
+		t.Fatalf("owner stopped: err = %v, want InvalidParameter", err)
+	}
+	if err := f.ContainerRemove(ctx, owner, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("ContainerRemove: %v", err)
+	}
+	body, err := read()
+	if err != nil || strings.Contains(body, "blkio_stats") || !strings.Contains(body, joined) {
+		t.Fatalf("owner removed: (%q, %v), want an empty sample naming the container", body, err)
 	}
 }
 

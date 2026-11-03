@@ -15,13 +15,13 @@ import (
 // dindIOReportTimeout bounds one sidecar's DinD IO report: the sidecar
 // inspect, the stats sample and the image probe share it. The report is a
 // measurement aid (ADR-006 rollout step 0), so when a stalled disk makes the
-// daemon slow it gives up rather than hold up the teardown. The budget starts
-// when the report starts, not when the teardown does, so the time the runner
-// takes to stop does not eat into it.
+// daemon slow it gives up rather than hold up the teardown. Each report has
+// its own budget, counted from when it starts, so the runner lookup before it
+// and an earlier sidecar's report do not eat into it.
 const dindIOReportTimeout = 4 * time.Second
 
-// dindIORepoTimeout bounds the early lookup of the runner's repository, a
-// single local inspect made before the runner is stopped.
+// dindIORepoTimeout bounds the lookup of the runner's repository, a single
+// local inspect made before any container is stopped.
 const dindIORepoTimeout = time.Second
 
 // dindIOReporter logs one line per DinD sidecar about to be torn down: how
@@ -38,8 +38,8 @@ type dindIOReporter struct {
 // newDindIOReporter returns a reporter for a teardown of list, or nil when no
 // report applies: the scope does not ask for one (only DeleteInstance does) or
 // the allocation has no DinD sidecar, so a non-DinD teardown does no extra
-// Docker calls. The runner's repository is read here, while the runner still
-// exists: the runner is removed before the sidecar (ADR-004).
+// Docker calls. The runner's repository is read here, before any container is
+// stopped.
 func (m *Manager) newDindIOReporter(ctx context.Context, list []types.Container, scope *teardownScope) *dindIOReporter {
 	if !scope.reportDindIO || !hasRole(list, spec.RoleDind) {
 		return nil
@@ -77,14 +77,33 @@ func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container)
 	return ""
 }
 
-// report logs the IO line for c if it is a DinD sidecar. It is a no-op on a
-// nil reporter and on any other container, so removeContainers can call it
-// unconditionally. It must run before the sidecar is stopped: stopping tears
-// down its cgroup, and with it the counters read here.
-func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
-	if r == nil || c.Labels[spec.LabelRole] != spec.RoleDind {
+// reportAll logs the IO line for every DinD sidecar in list that scope lets
+// the teardown remove. It is a no-op on a nil reporter. removeContainers calls
+// it before it stops or removes any container of the allocation, not just
+// before the sidecar: a privileged sidecar shares the runner's network
+// namespace, and once the runner is removed the daemon answers the sidecar's
+// stats request with an empty sample, although the sidecar still runs and its
+// cgroup still holds the counters. A removal check that fails is left to the
+// removal loop to report.
+func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, scope *teardownScope) {
+	if r == nil {
 		return
 	}
+	for _, c := range list {
+		if c.Labels[spec.LabelRole] != spec.RoleDind {
+			continue
+		}
+		if ok, err := scope.mayRemove(ctx, c.Labels); err != nil || !ok {
+			continue
+		}
+		r.report(ctx, c)
+	}
+}
+
+// report logs the IO line for the DinD sidecar c. The image probe runs whether
+// or not the stats sample succeeds, so a line without written_bytes still
+// records what the sidecar's daemon holds.
+func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
 
@@ -93,14 +112,15 @@ func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 		slog.DebugContext(ctx, "teardown: DinD sidecar IO not reported", "instance", c.Labels[spec.LabelInstanceName], "reason", err.Error())
 		return
 	}
-	written, err := r.writtenBytes(ctx, c.ID)
-	if err != nil {
-		slog.WarnContext(ctx, "teardown: DinD sidecar IO unavailable", append(attrs, "stats_error", err.Error())...)
+	written, statsErr := r.writtenBytes(ctx, c.ID)
+	probe := r.probeAttrs(ctx, c.ID)
+	if statsErr != nil {
+		attrs = append(attrs, "stats_error", statsErr.Error())
+		slog.WarnContext(ctx, "teardown: DinD sidecar IO unavailable", append(attrs, probe...)...)
 		return
 	}
 	attrs = append(attrs, "written_bytes", written)
-	attrs = append(attrs, r.probeAttrs(ctx, c.ID)...)
-	slog.InfoContext(ctx, "teardown: DinD sidecar IO", attrs...)
+	slog.InfoContext(ctx, "teardown: DinD sidecar IO", append(attrs, probe...)...)
 }
 
 // identity builds the log attributes that name the allocation. It errors when
@@ -138,7 +158,7 @@ func (r *dindIOReporter) writtenBytes(ctx context.Context, id string) (uint64, e
 
 // probeAttrs asks the sidecar's daemon what images it holds and returns them as
 // log attributes. A failed probe is not fatal to the line: it is reported as
-// probe_error, so the written_bytes figure is still logged.
+// probe_error, so the rest of the line is still logged.
 func (r *dindIOReporter) probeAttrs(ctx context.Context, id string) []any {
 	out, code, err := r.m.cli.ExecOutput(ctx, id, []string{"sh", "-c", imageProbeScript})
 	if err == nil && code != 0 {
