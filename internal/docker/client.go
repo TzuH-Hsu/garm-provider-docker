@@ -108,15 +108,16 @@ type Client interface {
 	// stderr (interleaved, capped at execOutputLimit bytes) and its exit code.
 	// A non-zero exit code is reported in exitCode, not as an error; err is
 	// reserved for transport failures, an output overflow, and ctx
-	// cancellation. The teardown DinD IO report uses it to ask the sidecar's
-	// own daemon what it holds before the sidecar and its dind-state volume are
-	// removed.
+	// cancellation. The teardown DinD IO report uses it to read the sidecar's
+	// cgroup io.stat and ask the sidecar's own daemon what it holds before the
+	// sidecar and its dind-state volume are removed.
 	ExecOutput(ctx context.Context, containerID string, cmd []string) (output string, exitCode int, err error)
 
 	// ContainerStatsOneShot returns a single stats sample for a running
 	// container without waiting to prime the CPU counters (`one-shot=1`). The
-	// caller must Close the returned reader. The teardown DinD IO report reads
-	// the sidecar's cumulative blkio counters from it.
+	// caller must Close the returned reader. The teardown DinD IO report falls
+	// back to the sidecar's cumulative blkio counters from it when the
+	// sidecar's io.stat is not readable.
 	ContainerStatsOneShot(ctx context.Context, containerID string) (container.StatsResponseReader, error)
 
 	// ContainerLogs streams a container's log output. For a container created

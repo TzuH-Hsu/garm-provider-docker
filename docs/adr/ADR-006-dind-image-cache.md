@@ -185,7 +185,7 @@ What changes, for an opted-in pool only: a job can see what earlier jobs of the 
 
 - One log line per DinD create: `dind_state=slot|ephemeral`, the fallback reason, the slot (repokey, pool key, index), scrub duration, usage before and after, actions (`wipe:engine-change|daemon-failure|low-free-space|idle`, `prune:build-cache|images`) and free space.
 - Sidecar labels `garm.docker/dind-state=slot|ephemeral` and `garm.docker/dind-slot=<volume>`, so `docker ps` shows which sidecars use a slot.
-- At teardown, before the sidecar stops, one log line with its cumulative block IO from a one-shot stats call. This is also the before-and-after measurement for the rollout.
+- At teardown, before the sidecar stops, one log line with its cumulative block IO, read from the sidecar's cgroup `io.stat` (a one-shot stats call is the fallback where `io.stat` is not readable). This is also the before-and-after measurement for the rollout.
 - The GC round logs idle wipes and slots over their cap.
 - Operators list slots with `docker volume ls --filter label=garm.docker/cache-kind=dind-state`. `docker system df -v` reports their sizes but walks every volume on the host, so it should not run routinely on a slow disk.
 

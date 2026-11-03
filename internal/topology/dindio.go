@@ -13,7 +13,8 @@ import (
 )
 
 // dindIOReportTimeout bounds one sidecar's DinD IO report: the sidecar
-// inspect, the stats sample and the image probe share it. The report is a
+// inspect, the probe exec (io.stat and image probe) and, only when io.stat is
+// not readable, the stats sample share it. The report is a
 // measurement aid (ADR-006 rollout step 0), so when a stalled disk makes the
 // daemon slow it gives up rather than hold up the teardown. Each report has
 // its own budget, counted from when it starts, so the runner lookup before it
@@ -80,11 +81,10 @@ func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container)
 // reportAll logs the IO line for every DinD sidecar in list that scope lets
 // the teardown remove. It is a no-op on a nil reporter. removeContainers calls
 // it before it stops or removes any container of the allocation, not just
-// before the sidecar: a privileged sidecar shares the runner's network
-// namespace, and once the runner is removed the daemon answers the sidecar's
-// stats request with an empty sample, although the sidecar still runs and its
-// cgroup still holds the counters. A removal check that fails is left to the
-// removal loop to report.
+// before the sidecar. The io.stat read does not depend on the runner, but the
+// stats fallback does when the sidecar shares the runner's network namespace
+// (see writtenAttrs), so the runner is left as it is until every report is
+// done. A removal check that fails is left to the removal loop to report.
 func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, scope *teardownScope) {
 	if r == nil {
 		return
@@ -100,9 +100,11 @@ func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, 
 	}
 }
 
-// report logs the IO line for the DinD sidecar c. The image probe runs whether
-// or not the stats sample succeeds, so a line without written_bytes still
-// records what the sidecar's daemon holds.
+// report logs the IO line for the DinD sidecar c. One exec in the sidecar
+// reads its cgroup io.stat and asks its daemon what images it holds; the
+// written bytes come from io.stat, or from a stats sample when io.stat is not
+// readable. The image fields are logged whether or not the written bytes are
+// known, so a WARN line still records what the sidecar's daemon holds.
 func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
@@ -112,15 +114,15 @@ func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 		slog.DebugContext(ctx, "teardown: DinD sidecar IO not reported", "instance", c.Labels[spec.LabelInstanceName], "reason", err.Error())
 		return
 	}
-	written, statsErr := r.writtenBytes(ctx, c.ID)
-	probe := r.probeAttrs(ctx, c.ID)
-	if statsErr != nil {
-		attrs = append(attrs, "stats_error", statsErr.Error())
-		slog.WarnContext(ctx, "teardown: DinD sidecar IO unavailable", append(attrs, probe...)...)
+	out, code, execErr := r.m.cli.ExecOutput(ctx, c.ID, []string{"sh", "-c", sidecarProbeScript})
+	written, ok := r.writtenAttrs(ctx, c.ID, out, execErr)
+	attrs = append(attrs, written...)
+	attrs = append(attrs, probeAttrs(out, code, execErr)...)
+	if !ok {
+		slog.WarnContext(ctx, "teardown: DinD sidecar IO unavailable", attrs...)
 		return
 	}
-	attrs = append(attrs, "written_bytes", written)
-	slog.InfoContext(ctx, "teardown: DinD sidecar IO", append(attrs, probe...)...)
+	slog.InfoContext(ctx, "teardown: DinD sidecar IO", attrs...)
 }
 
 // identity builds the log attributes that name the allocation. It errors when
@@ -145,9 +147,41 @@ func (r *dindIOReporter) identity(ctx context.Context, c types.Container) ([]any
 	return attrs, nil
 }
 
-// writtenBytes takes one one-shot stats sample of the sidecar and returns its
-// cumulative block-device write bytes.
-func (r *dindIOReporter) writtenBytes(ctx context.Context, id string) (uint64, error) {
+// writtenAttrs returns the log attributes for the bytes the sidecar wrote, and
+// whether they could be read at all.
+//
+// The primary source is the sidecar's cgroup io.stat, read by the probe exec
+// (out, execErr). The stats endpoint cannot serve a privileged sidecar at
+// teardown: the sidecar joins the runner's network namespace, the daemon adds
+// network stats to a sample through that namespace's owner, and an ephemeral
+// runner has usually exited on its own when its job ended, before the delete
+// arrives. With the owner stopped the stats request fails; with it removed
+// the sample comes back without counters. The stats sample stays the fallback
+// for when io.stat is not readable (a cgroup v1 host, a runtime that
+// virtualises cgroupfs), where the sidecar normally owns its network namespace.
+func (r *dindIOReporter) writtenAttrs(ctx context.Context, id, out string, execErr error) ([]any, bool) {
+	var ioErr error
+	if execErr != nil {
+		ioErr = fmt.Errorf("failed to run probe: %w", execErr)
+	} else if st, err := parseIOStat(out); err != nil {
+		ioErr = err
+	} else {
+		attrs := []any{"written_bytes", st.Written, "written_source", "io.stat"}
+		if len(st.Devices) > 0 {
+			attrs = append(attrs, "written_by_device", st.byDevice())
+		}
+		return attrs, true
+	}
+	written, statsErr := r.statsWrittenBytes(ctx, id)
+	if statsErr != nil {
+		return []any{"io_stat_error", ioErr.Error(), "stats_error", statsErr.Error()}, false
+	}
+	return []any{"written_bytes", written, "written_source", "stats", "io_stat_error", ioErr.Error()}, true
+}
+
+// statsWrittenBytes takes one one-shot stats sample of the sidecar and returns
+// its cumulative block-device write bytes.
+func (r *dindIOReporter) statsWrittenBytes(ctx context.Context, id string) (uint64, error) {
 	stats, err := r.m.cli.ContainerStatsOneShot(ctx, id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read stats: %w", err)
@@ -156,11 +190,10 @@ func (r *dindIOReporter) writtenBytes(ctx context.Context, id string) (uint64, e
 	return parseBlkioWriteBytes(stats.Body)
 }
 
-// probeAttrs asks the sidecar's daemon what images it holds and returns them as
-// log attributes. A failed probe is not fatal to the line: it is reported as
+// probeAttrs turns the image probe's part of the probe exec's result into log
+// attributes. A failed probe is not fatal to the line: it is reported as
 // probe_error, so the rest of the line is still logged.
-func (r *dindIOReporter) probeAttrs(ctx context.Context, id string) []any {
-	out, code, err := r.m.cli.ExecOutput(ctx, id, []string{"sh", "-c", imageProbeScript})
+func probeAttrs(out string, code int, err error) []any {
 	if err == nil && code != 0 {
 		err = fmt.Errorf("probe exited with code %d", code)
 	}
