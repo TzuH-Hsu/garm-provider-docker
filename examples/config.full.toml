@@ -165,6 +165,13 @@ insecure_registries = ["registry.lan.example:5001"]
   # see docs/config-reference.md for the full reserved set.
   allowed_env = ["MY_CI_FLAG", "TZ"]
 
+# [logging]
+#   # Optional persistent log file, appended to in addition to stderr (GARM keeps
+#   # a provider's stderr only when a call fails). Absolute path; the directory
+#   # must exist. Default: unset (stderr only). Needed to collect the
+#   # "teardown: DinD sidecar IO" line. See docs/config-reference.md.
+#   file = "/var/log/garm-provider-docker/provider.log"
+
 [status_report]
   # Provider-side runner status reporting to GARM's instance callback. After
   # delivering credentials the provider reports the runner "installing" and
