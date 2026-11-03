@@ -318,11 +318,17 @@ which the per-job design of ADR-001 deliberately does not provide.
 To judge how much of a job's disk writing is image pulls and extraction (the
 question [ADR-006](adr/ADR-006-dind-image-cache.md) gates on), `DeleteInstance`
 logs one line per DinD allocation before it stops any of the allocation's
-containers, the runner included. A privileged sidecar shares the runner's
-network namespace, and once the runner is removed the daemon returns an empty
-stats sample for the sidecar, so the sample is taken first. It is log-only and
-best-effort: it shares a four-second budget, never changes what is removed, and
-on any error it logs the reason and teardown continues. It is emitted by
+containers, the runner included. One `docker exec` in the sidecar reads the
+sidecar's own cgroup v2 `io.stat` and asks the sidecar's daemon what images it
+holds. The written bytes come from `io.stat`, not from the Docker stats
+endpoint: a privileged sidecar shares the runner's network namespace, the
+ephemeral runner has usually exited by itself when its job ended, before the
+delete arrives, and the daemon cannot build a stats sample for a container
+whose network namespace owner is stopped or gone. The stats sample is used only
+as a fallback when `io.stat` is not readable (a cgroup v1 host, or a runtime
+that virtualises cgroupfs). The line is log-only and best-effort: it shares a
+four-second budget, never changes what is removed, and on any error it logs the
+reason and teardown continues. It is emitted by
 `DeleteInstance` only, not by the orphan sweep or `RemoveAllInstances`, and
 never in `dind_mode = "none"`.
 
@@ -333,7 +339,7 @@ is discarded. Set `file` in the [`[logging]` table](config-reference.md#logging-
 `grep` below reads that file.
 
 ```text
-level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... repo=acme/widgets dind_mode=privileged-sidecar since_create_s=412 written_bytes=3187671040 storage_driver=overlay2 image_store=classic images=4 image_bytes=1974321152
+level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... repo=acme/widgets dind_mode=privileged-sidecar since_create_s=412 written_bytes=3187671040 written_source=io.stat written_by_device="8:0=3187671040" storage_driver=overlay2 image_store=classic images=4 image_bytes=1974321152
 ```
 
 (All values in examples are synthetic. A `containerd` store line also carries
@@ -345,15 +351,19 @@ level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... r
 | `repo` | `org/repo` (or `org`, or `enterprises/name`) the runner registered against, read from the runner's environment. Omitted when the runner is already gone. |
 | `dind_mode` | `privileged-sidecar` or `sysbox-runc`. |
 | `since_create_s` | Seconds from allocation create to this line: startup, the job, and the wait for GARM's delete. |
-| `written_bytes` | Bytes the sidecar wrote to block devices over its life: the sum of the `write` entries of `blkio_stats.io_service_bytes_recursive` from a one-shot stats sample (`write` on cgroup v2, `Write` on v1; `Total`, `Sync` and `Async` are not summed). The counter is recursive, so it covers nested containers, builds, volumes and `dockerd`'s own metadata, not only pulls. |
+| `written_bytes` | Bytes the sidecar wrote to block devices over its life. From `io.stat`, it is the sum of `wbytes` over every device listed. From the stats fallback, it is the sum of the `write` entries of `blkio_stats.io_service_bytes_recursive` in a one-shot sample (`write` on cgroup v2, `Write` on v1; `Total`, `Sync` and `Async` are not summed). Either counter is recursive, so it covers nested containers, builds, volumes and `dockerd`'s own metadata, not only pulls. A present `io.stat` with no devices is logged as `written_bytes=0`. |
+| `written_source` | `io.stat` or `stats`: where `written_bytes` came from. |
+| `written_by_device` | `io.stat` only: `wbytes` per device as `major:minor=bytes`, comma separated. Devices are not filtered, so a swap device such as zram is included in `written_bytes`; its major number is assigned at boot, so subtract it here when it matters. |
+| `io_stat_error` | Why `io.stat` could not be used, when the line fell back to the stats sample or has no `written_bytes`. |
 | `storage_driver`, `image_store` | The sidecar daemon's driver, and `classic` (a graph driver such as `overlay2`) or `containerd` (the containerd image store). The provider always passes `--storage-driver`, so sidecars normally report `classic`; `containerd` appears only if a custom `dind_image` enables the containerd snapshotter itself. |
 | `images`, `image_bytes` | Distinct images the sidecar daemon holds at teardown, and the sum of their `docker image inspect` `Size`: the unpacked, uncompressed size. |
 | `content_bytes` | `containerd` image store only: the on-disk size (`du -sk`) of the containerd content store, the compressed blobs pulls wrote. |
 | `probe_error` | The image probe failed; `storage_driver`, `images`, `image_bytes` and the other image fields are omitted, and the rest of the line is still logged. |
 
-A sample that fails altogether is logged as `level=WARN msg="teardown: DinD
-sidecar IO unavailable" ... stats_error=...` (for example when the cgroup has no
-io controller). The image probe still runs, so the WARN line carries the image
+When neither `io.stat` nor the stats sample yields a counter, the line is
+logged as `level=WARN msg="teardown: DinD sidecar IO unavailable" ...
+io_stat_error=... stats_error=...` (for example when the cgroup has no io
+controller). The image probe still runs, so the WARN line carries the image
 fields or `probe_error`, but no `written_bytes`. A sidecar that has already
 exited is skipped with a debug line, since its counters are gone.
 

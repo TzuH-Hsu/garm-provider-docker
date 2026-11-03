@@ -17,10 +17,20 @@ import (
 
 const (
 	ioTestNonce = "n1"
+	// ioTestStats is the stats endpoint's sample, the fallback source. Its
+	// total differs from ioTestIOStat's so a line shows which one it used.
 	ioTestStats = `{"blkio_stats":{"io_service_bytes_recursive":[` +
-		`{"major":8,"minor":0,"op":"read","value":5},{"major":8,"minor":0,"op":"write","value":123456}]}}`
-	ioTestProbe = "driver overlay2\nstore classic\nimage sha256:aa 1000\nimage sha256:bb 2500\n"
-	ioLogMsg    = "teardown: DinD sidecar IO"
+		`{"major":8,"minor":0,"op":"read","value":5},{"major":8,"minor":0,"op":"write","value":654321}]}}`
+	// ioTestIOStat is what the probe exec prints for a readable io.stat: a
+	// disk and a zram swap device, 123456 bytes written in all.
+	ioTestIOStat = "io_stat\n" +
+		"io 8:0 rbytes=5 wbytes=123000 rios=1 wios=2 dbytes=0 dios=0\n" +
+		"io 251:0 rbytes=0 wbytes=456 rios=0 wios=1 dbytes=0 dios=0\n"
+	ioTestImages = "driver overlay2\nstore classic\nimage sha256:aa 1000\nimage sha256:bb 2500\n"
+	ioTestProbe  = ioTestIOStat + ioTestImages
+	// ioTestNoIOStat is the probe output on a host where io.stat is missing.
+	ioTestNoIOStat = "io_stat_missing\n" + ioTestImages
+	ioLogMsg       = "teardown: DinD sidecar IO"
 )
 
 var ioTestCreatedAt = time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
@@ -98,14 +108,13 @@ func assertAllocationGone(t *testing.T, fake *docker.FakeClient) {
 	}
 }
 
-// TestTeardownReportsDindIO also pins the ordering the counters depend on:
-// the fake, like the daemon, refuses stats and exec on a stopped container and
-// returns an empty sample for a sidecar whose network namespace owner (the
-// runner) is gone, so a complete line proves the sample was taken before any
-// container of the allocation stopped.
+// TestTeardownReportsDindIO pins the primary path: the written bytes come from
+// the sidecar's io.stat, read in the same exec as the image probe, and the
+// stats endpoint is not consulted.
 func TestTeardownReportsDindIO(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, _ := seedDindAllocation(t, "gha-1")
+	fake.StatsErr = errors.New("stats must not be called")
 
 	found, err := m.TeardownAllocationReportingIO(context.Background(), "gha-1")
 	if err != nil || !found {
@@ -119,18 +128,74 @@ func TestTeardownReportsDindIO(t *testing.T) {
 	}
 	for _, want := range []string{
 		"level=INFO", "instance=gha-1", "pool=pool-1", "repo=acme/widgets", "dind_mode=privileged-sidecar",
-		"since_create_s=95", "written_bytes=123456", "storage_driver=overlay2", "image_store=classic",
+		"since_create_s=95", "written_bytes=123456", "written_source=io.stat",
+		`written_by_device="8:0=123000,251:0=456"`, "storage_driver=overlay2", "image_store=classic",
 		"images=2", "image_bytes=3500",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("IO line missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "content_bytes") || strings.Contains(out, "probe_error") {
-		t.Errorf("classic-store success line should carry neither content_bytes nor probe_error:\n%s", out)
+	for _, bad := range []string{"content_bytes", "probe_error", "stats_error", "io_stat_error"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("classic-store io.stat line must not carry %s:\n%s", bad, out)
+		}
 	}
-	if len(fake.OutputExecs) != 1 || fake.OutputExecs[0].Cmd[0] != "sh" {
-		t.Errorf("OutputExecs = %+v, want one sh -c probe", fake.OutputExecs)
+	if len(fake.OutputExecs) != 1 || fake.OutputExecs[0].Cmd[2] != sidecarProbeScript {
+		t.Errorf("OutputExecs = %+v, want one sh -c sidecar probe", fake.OutputExecs)
+	}
+}
+
+// TestTeardownReportsDindIOAfterRunnerExited is the regression for the live
+// failure: the ephemeral runner exits on its own when its job ends, before
+// the delete arrives, so the stats request for the privileged sidecar (which
+// shares the runner's network namespace) fails with "id is empty". io.stat
+// does not depend on the runner, so the line still carries written_bytes.
+func TestTeardownReportsDindIOAfterRunnerExited(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	runner, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("gha-1"))
+	if err != nil {
+		t.Fatalf("ContainerInspect runner: %v", err)
+	}
+	fake.SetState(runner.ID, "exited", false)
+
+	// Guard: the fake really models the daemon's failure for this placement.
+	if _, err := fake.ContainerStatsOneShot(context.Background(), sidecar); err == nil || !strings.Contains(err.Error(), "id is empty") {
+		t.Fatalf("stats of the sidecar with its netns owner stopped: err = %v, want id is empty", err)
+	}
+
+	if _, err := m.TeardownAllocationReportingIO(context.Background(), "gha-1"); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{"level=INFO", "written_bytes=123456", "written_source=io.stat", "images=2", "repo=acme/widgets"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("IO line missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "IO unavailable") {
+		t.Errorf("line must not take the WARN path:\n%s", out)
+	}
+}
+
+// TestTeardownReportsZeroIOStat proves an io.stat that is present but empty
+// (no device saw IO) is a valid zero, not an absence.
+func TestTeardownReportsZeroIOStat(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, _ := seedDindAllocation(t, "gha-1")
+	fake.ExecOutputText = "io_stat\n" + ioTestImages
+	fake.StatsErr = errors.New("stats must not be called")
+
+	if _, err := m.TeardownAllocationReportingIO(context.Background(), "gha-1"); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "written_bytes=0 written_source=io.stat") {
+		t.Errorf("want an INFO line with written_bytes=0 from io.stat:\n%s", out)
+	}
+	if strings.Contains(out, "written_by_device") || strings.Contains(out, "stats_error") {
+		t.Errorf("an empty io.stat has no devices and needs no fallback:\n%s", out)
 	}
 }
 
@@ -165,14 +230,15 @@ func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
 	}
 }
 
-// TestTeardownSamplesDindIOBeforeRunnerRemoval is the regression for a sample
-// taken after the runner was removed: the privileged sidecar shares the
-// runner's network namespace, and the daemon then returns an empty sample. The
-// report must come first, while the stop/remove order stays runner, then
-// sidecar (ADR-004).
+// TestTeardownSamplesDindIOBeforeRunnerRemoval pins the ordering the stats
+// fallback depends on: the privileged sidecar shares the runner's network
+// namespace, and once the teardown stops or removes the runner the daemon
+// cannot sample the sidecar. The report must come first, while the stop/remove
+// order stays runner, then sidecar (ADR-004).
 func TestTeardownSamplesDindIOBeforeRunnerRemoval(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	fake.ExecOutputText = ioTestNoIOStat
 	runner := spec.RunnerContainerName("gha-1")
 	info, err := fake.ContainerInspect(context.Background(), runner)
 	if err != nil {
@@ -183,8 +249,8 @@ func TestTeardownSamplesDindIOBeforeRunnerRemoval(t *testing.T) {
 		t.Fatalf("teardown: %v", err)
 	}
 	out := logs.String()
-	if strings.Contains(out, "IO unavailable") || !strings.Contains(out, "written_bytes=123456") {
-		t.Errorf("the sample was not taken before the runner was removed:\n%s", out)
+	if strings.Contains(out, "IO unavailable") || !strings.Contains(out, "written_bytes=654321 written_source=stats") {
+		t.Errorf("the stats sample was not taken before the runner was removed:\n%s", out)
 	}
 	var containers []string
 	for _, r := range fake.RemoveOrder {
@@ -273,17 +339,50 @@ func TestTeardownSurvivesReportFailures(t *testing.T) {
 		wantNone string
 	}{
 		{
-			name:    "stats call fails",
-			tweak:   func(f *docker.FakeClient, _ string) { f.StatsErr = errors.New("daemon busy") },
-			wantLog: []string{"level=WARN", "DinD sidecar IO unavailable", "stats_error", "daemon busy", "images=2"},
+			name:  "io.stat missing falls back to the stats sample",
+			tweak: func(f *docker.FakeClient, _ string) { f.ExecOutputText = ioTestNoIOStat },
+			wantLog: []string{"level=INFO", "written_bytes=654321", "written_source=stats",
+				"io_stat_error", "not readable", "images=2"},
 		},
 		{
-			name:    "stats sample has no blkio counters still runs the probe",
-			tweak:   func(f *docker.FakeClient, s string) { f.SetStats(s, `{}`) },
+			name: "io.stat missing and stats call fails",
+			tweak: func(f *docker.FakeClient, _ string) {
+				f.ExecOutputText = ioTestNoIOStat
+				f.StatsErr = errors.New("daemon busy")
+			},
+			wantLog:  []string{"level=WARN", "DinD sidecar IO unavailable", "io_stat_error", "stats_error", "daemon busy", "images=2"},
+			wantNone: "written_bytes",
+		},
+		{
+			name: "io.stat missing and stats sample has no blkio counters still logs the probe",
+			tweak: func(f *docker.FakeClient, s string) {
+				f.ExecOutputText = ioTestNoIOStat
+				f.SetStats(s, `{}`)
+			},
 			wantLog: []string{"level=WARN", "stats_error", "no blkio write counters", "storage_driver=overlay2", "images=2", "image_bytes=3500"},
 		},
 		{
-			name: "stats and probe both fail",
+			name: "io.stat missing and stats body is not JSON",
+			tweak: func(f *docker.FakeClient, s string) {
+				f.ExecOutputText = ioTestNoIOStat
+				f.SetStats(s, `oops`)
+			},
+			wantLog: []string{"level=WARN", "stats_error", "failed to decode stats sample"},
+		},
+		{
+			name: "malformed io.stat falls back to the stats sample",
+			tweak: func(f *docker.FakeClient, _ string) {
+				f.ExecOutputText = "io_stat\nio 8:0 wbytes=lots\n" + ioTestImages
+			},
+			wantLog: []string{"level=INFO", "written_bytes=654321", "written_source=stats", "malformed io.stat line"},
+		},
+		{
+			name:    "probe transport error falls back to the stats sample",
+			tweak:   func(f *docker.FakeClient, _ string) { f.ExecOutputErr = errors.New("exec refused") },
+			wantLog: []string{"level=INFO", "written_bytes=654321", "written_source=stats", "io_stat_error", "probe_error", "exec refused"},
+		},
+		{
+			name: "exec and stats both fail",
 			tweak: func(f *docker.FakeClient, _ string) {
 				f.StatsErr = errors.New("daemon busy")
 				f.ExecOutputErr = errors.New("exec refused")
@@ -292,23 +391,15 @@ func TestTeardownSurvivesReportFailures(t *testing.T) {
 			wantNone: "written_bytes",
 		},
 		{
-			name:    "stats body is not JSON",
-			tweak:   func(f *docker.FakeClient, s string) { f.SetStats(s, `oops`) },
-			wantLog: []string{"level=WARN", "stats_error", "failed to decode stats sample"},
-		},
-		{
-			name:    "probe transport error keeps the written bytes",
-			tweak:   func(f *docker.FakeClient, _ string) { f.ExecOutputErr = errors.New("exec refused") },
-			wantLog: []string{"level=INFO", "written_bytes=123456", "probe_error", "exec refused"},
-		},
-		{
-			name:    "probe exits non-zero",
+			name:    "image probe exits non-zero keeps the io.stat bytes",
 			tweak:   func(f *docker.FakeClient, _ string) { f.ExecOutputExit = 3 },
-			wantLog: []string{"level=INFO", "written_bytes=123456", "probe exited with code 3"},
+			wantLog: []string{"level=INFO", "written_bytes=123456", "written_source=io.stat", "probe exited with code 3"},
 		},
 		{
-			name:    "probe prints garbage",
-			tweak:   func(f *docker.FakeClient, _ string) { f.ExecOutputText = "driver overlay2\nimage sha256:aa huge\n" },
+			name: "image probe prints garbage",
+			tweak: func(f *docker.FakeClient, _ string) {
+				f.ExecOutputText = ioTestIOStat + "driver overlay2\nimage sha256:aa huge\n"
+			},
 			wantLog: []string{"level=INFO", "written_bytes=123456", "malformed probe line"},
 		},
 		{

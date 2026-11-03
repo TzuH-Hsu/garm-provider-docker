@@ -52,6 +52,134 @@ func parseBlkioWriteBytes(r io.Reader) (uint64, error) {
 	return total, nil
 }
 
+// ioStatPath is the sidecar's own cgroup v2 io.stat as seen from inside it.
+// On a cgroup v2 host Docker gives the sidecar a private cgroup namespace (the
+// daemon default there, and one the DinD entrypoint relies on when it moves its
+// processes into an init/ child), so /sys/fs/cgroup is the sidecar's cgroup.
+// io.stat is recursive: it covers the entrypoint's init/ child and the nested
+// daemon's docker/ subtree, so every container the job ran is counted.
+const ioStatPath = "/sys/fs/cgroup/io.stat"
+
+// ioStatScript prints the sidecar's cgroup io.stat for parseIOStat: an
+// "io_stat" marker, then each line of the file prefixed with "io ". A file
+// that is there but empty (no device saw IO yet) prints the marker alone; a
+// file that is missing or unreadable (a cgroup v1 host, no io controller on
+// the cgroup, a runtime that virtualises cgroupfs) prints "io_stat_missing".
+// It never exits, so the image probe after it still runs.
+const ioStatScript = `if [ -e ` + ioStatPath + ` ] && io=$(sed 's/^/io /' ` + ioStatPath + ` 2>/dev/null); then
+  echo io_stat
+  [ -z "$io" ] || printf '%s\n' "$io"
+else
+  echo io_stat_missing
+fi`
+
+// sidecarProbeScript is the one exec the teardown report runs in a sidecar:
+// io.stat first (a plain file read, before the docker calls that may stall),
+// then the image probe. Its exit status is the image probe's.
+const sidecarProbeScript = ioStatScript + "\n" + imageProbeScript
+
+// errNoIOStat means the sidecar's cgroup io.stat could not be read at all, as
+// opposed to a file with no write counters, which is a valid zero.
+var errNoIOStat = errors.New("cgroup io.stat not readable in the sidecar")
+
+// deviceWrites is one device's line of io.stat: "major:minor" and its wbytes.
+type deviceWrites struct {
+	Device string
+	Bytes  uint64
+}
+
+// ioStat is what ioStatScript reports.
+type ioStat struct {
+	// Written is the sum of wbytes over every device in io.stat. Devices are
+	// not filtered: a swap device (zram, for example) also shows up, but its
+	// major number is assigned at boot, so excluding it would be guesswork.
+	// Summing every device also keeps the meaning of the stats endpoint
+	// fallback, which sums every device too. Devices lists the per-device
+	// figures so an operator can subtract a swap device.
+	Written uint64
+	Devices []deviceWrites
+}
+
+// byDevice formats Devices as "8:0=123,251:0=4".
+func (s ioStat) byDevice() string {
+	parts := make([]string, 0, len(s.Devices))
+	for _, d := range s.Devices {
+		parts = append(parts, d.Device+"="+strconv.FormatUint(d.Bytes, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseIOStat reads the io.stat records in the output of sidecarProbeScript
+// and ignores every other line, so it works whatever the image probe printed
+// or however it failed. It returns errNoIOStat when the script found no
+// readable io.stat, and an error for a malformed line rather than a silently
+// wrong number.
+func parseIOStat(out string) (ioStat, error) {
+	var (
+		st      ioStat
+		present bool
+	)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "io_stat":
+			present = true
+		case "io":
+			d, err := parseIOStatLine(fields[1:])
+			if err != nil {
+				return ioStat{}, fmt.Errorf("malformed io.stat line %q: %w", line, err)
+			}
+			st.Devices = append(st.Devices, d)
+			st.Written += d.Bytes
+		}
+	}
+	if !present {
+		return ioStat{}, errNoIOStat
+	}
+	return st, nil
+}
+
+// parseIOStatLine parses one io.stat line, "MAJ:MIN rbytes=.. wbytes=.. ...",
+// already split into fields. Keys other than wbytes are ignored (the kernel
+// adds some when other io controllers are configured); a missing wbytes is an
+// error.
+func parseIOStatLine(fields []string) (deviceWrites, error) {
+	if len(fields) == 0 {
+		return deviceWrites{}, errors.New("no device")
+	}
+	major, minor, ok := strings.Cut(fields[0], ":")
+	if !ok || !isDecimal(major) || !isDecimal(minor) {
+		return deviceWrites{}, fmt.Errorf("device %q is not MAJ:MIN", fields[0])
+	}
+	for _, kv := range fields[1:] {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k != "wbytes" {
+			continue
+		}
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return deviceWrites{}, fmt.Errorf("bad wbytes: %w", err)
+		}
+		return deviceWrites{Device: fields[0], Bytes: n}, nil
+	}
+	return deviceWrites{}, errors.New("no wbytes")
+}
+
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // imageProbeScript runs inside the sidecar and prints one record per line,
 // parsed by parseImageProbe. It talks to the sidecar's own daemon over the
 // shared socket path and reads only metadata: image sizes come from `docker

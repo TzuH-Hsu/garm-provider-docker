@@ -78,6 +78,73 @@ func TestParseBlkioWriteBytes(t *testing.T) {
 	}
 }
 
+func TestParseIOStat(t *testing.T) {
+	tests := []struct {
+		name       string
+		out        string
+		want       uint64
+		wantDevice string
+		wantErr    error
+		errSub     string
+	}{
+		{
+			name: "wbytes summed over every device, swap included",
+			out: "io_stat\n" +
+				"io 8:0 rbytes=1024 wbytes=5539061760 rios=10 wios=200 dbytes=0 dios=0\n" +
+				"io 251:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n",
+			want:       5539069952,
+			wantDevice: "8:0=5539061760,251:0=8192",
+		},
+		{
+			name:       "extra keys from other io controllers are ignored",
+			out:        "io_stat\nio 259:0 rbytes=1 wbytes=77 rios=1 wios=1 dbytes=0 dios=0 cost.vrate=100.00 cost.usage=5\n",
+			want:       77,
+			wantDevice: "259:0=77",
+		},
+		{
+			name: "a present but empty io.stat is a valid zero",
+			out:  "io_stat\n",
+			want: 0,
+		},
+		{
+			name:       "image probe lines and stray stderr are ignored",
+			out:        "io_stat\nio 8:0 rbytes=0 wbytes=9 rios=0 wios=1 dbytes=0 dios=0\ndriver overlay2\nimage sha256:aa 5\nCannot connect\n",
+			want:       9,
+			wantDevice: "8:0=9",
+		},
+		{name: "missing io.stat reports absence", out: "io_stat_missing\ndriver overlay2\n", wantErr: errNoIOStat},
+		{name: "no marker at all reports absence", out: "driver overlay2\n", wantErr: errNoIOStat},
+		{name: "empty output reports absence", out: "", wantErr: errNoIOStat},
+		{name: "non-numeric wbytes", out: "io_stat\nio 8:0 rbytes=1 wbytes=lots\n", errSub: "bad wbytes"},
+		{name: "negative wbytes", out: "io_stat\nio 8:0 wbytes=-1\n", errSub: "bad wbytes"},
+		{name: "line without wbytes", out: "io_stat\nio 8:0 rbytes=1 rios=1\n", errSub: "no wbytes"},
+		{name: "device that is not MAJ:MIN", out: "io_stat\nio sda wbytes=1\n", errSub: "not MAJ:MIN"},
+		{name: "device with a non-numeric minor", out: "io_stat\nio 8:x wbytes=1\n", errSub: "not MAJ:MIN"},
+		{name: "record with no device", out: "io_stat\nio\n", errSub: "no device"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseIOStat(tc.out)
+			switch {
+			case tc.wantErr != nil:
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+			case tc.errSub != "":
+				if err == nil || !strings.Contains(err.Error(), tc.errSub) || !strings.Contains(err.Error(), "malformed io.stat line") {
+					t.Fatalf("err = %v, want a malformed line error containing %q", err, tc.errSub)
+				}
+			case err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			default:
+				if got.Written != tc.want || got.byDevice() != tc.wantDevice {
+					t.Fatalf("io.stat = (%d, %q), want (%d, %q)", got.Written, got.byDevice(), tc.want, tc.wantDevice)
+				}
+			}
+		})
+	}
+}
+
 func TestParseImageProbe(t *testing.T) {
 	tests := []struct {
 		name   string
