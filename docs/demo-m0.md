@@ -110,6 +110,14 @@ is specific to this provider and this demo.
      release mode is picky about. (A locally built binary supplied with
      `LOCAL_PROVIDER_BIN` is not a release asset, so this restriction does
      not apply to it; it must still match the host.)
+   - **The Docker host may be shared.** The gate can run on a host that also
+     runs other GARM scale sets or pools, including production ones: `verify`
+     and `postjob` only inspect the container, network and volumes whose
+     `garm.docker/instance-name` is this gate's runner (see Step 4). Keep the
+     gate scale set at `--max-runners 1` (the printed command does) so exactly
+     one runner matches; with several, set `GATE_INSTANCE`. The gate still
+     creates real containers and, in the `--dind` variant, a privileged
+     sidecar, so a production host remains a deliberate choice.
    - **`--from-source` additionally needs a Go toolchain** (`go.mod` pins
      `go 1.25.0`) to build the provider binary, and builds the runner image
      locally (`docker build -f runner-images/noble/Dockerfile runner-images`,
@@ -559,10 +567,12 @@ step and a published-port step). Then polls
 `docker ps --filter label=garm.docker/managed=true --filter label=garm.docker/role=runner` and GARM's runner list
 (`garm-cli scaleset runner list <id>`, the id looked up by name, or
 `SCALESET_ID`) every few seconds until you've triggered the workflow and a
-runner appears (Ctrl+C to move on early). Always select the runner by
-`garm.docker/role=runner`, never by `garm.docker/managed=true` alone: the
-provider also starts short-lived cache-seeding helper containers
-(`garm-seed-*`) that carry `managed=true`.
+runner appears (Ctrl+C to move on early). The `docker ps` listing is
+informational and host-wide (it shows every managed runner on the host,
+including other scale sets'); `verify` and `postjob` scope to this gate's own
+instance. Always select the runner by `garm.docker/role=runner`, never by
+`garm.docker/managed=true` alone: the provider also starts short-lived
+cache-seeding helper containers (`garm-seed-*`) that carry `managed=true`.
 
 ### Step 4(a-d) — verify
 
@@ -573,8 +583,22 @@ container starts, and check (d) fails if it runs before that. The job's hold
 (30 s, 60 s with `--dind`, 120 s with `--dind` and `GATE_REGISTRY_MIRROR`)
 leaves enough time for it.
 
-Resolves the current managed runner container and checks, printing
-PASS/FAIL for each: ownership labels on the container, the labeled per-job
+Identifies the gate's own runner and checks it. The runner is selected by its
+`garm.docker/instance-name` label, the GARM instance name, and never by
+recency: the instance names come from GARM's runner list for the gate's own
+scale set (`garm-cli scaleset runner list <id>`, the id looked up by name or
+given as `SCALESET_ID`) or, with `--pool`, for the pool (`POOL_ID`) or the
+repo. Set `GATE_INSTANCE` to the runner's instance name to skip the GARM
+lookup. Exactly one runner container must match; zero matches, several
+matches, or a GARM list that cannot be read is a FAIL, and `verify` never
+falls back to "the newest runner". This is what lets the gate run on a Docker
+host that also runs other GARM scale sets and pools (for example a production
+host): their runners carry the same `managed=true`/`role=runner` labels but a
+different instance name, so they are never inspected. `verify` remembers the
+instance it checked in `$PROVIDER_CONFIG_DIR/gate-instance` so `postjob`
+inspects the same one; `watch` clears it when a new run starts.
+
+It prints PASS/FAIL for each check: ownership labels on the container, the labeled per-job
 network and named workspace volume, and that the runner is actually wired
 to them (attached to that network and not to the default `bridge`; the
 workspace volume mounted at `/actions-runner/_work`) (a); in the `--dind`
@@ -604,7 +628,12 @@ cannot check this itself), then polls for the runner container to
 disappear (bounded by `POST_JOB_WAIT_SECONDS`, default 300s — GARM's own
 reaper/polling cadence governs how quickly this happens, `docs/research.md`
 §1.F) and checks for any leftover `garm.docker/managed=true` container,
-**network**, or volume. Only persistent cache volumes (`garm.docker/cache=true`
+**network**, or volume. All of this is scoped to the gate's own
+`garm.docker/instance-name` (the one `verify` remembered, or `GATE_INSTANCE`),
+so other scale sets' runners and resources on a shared host are neither waited
+for nor reported. With no instance known (`verify` was not run and
+`GATE_INSTANCE` is unset) `postjob` fails rather than checking the whole host.
+Only persistent cache volumes (`garm.docker/cache=true`
 and no `garm.docker/instance-name`) are excluded by label and listed
 informationally; a volume with an instance-name is job-scoped and counts as a
 leftover even if it also carries `cache=true`. The diagnostic-log prune stamp

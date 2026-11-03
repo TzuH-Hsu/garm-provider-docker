@@ -182,6 +182,21 @@
 #   SCALESET_ID           GARM's scale set ID, for `scaleset runner list` and
 #                          cleanup. Looked up by name from `garm-cli scaleset
 #                          list` when unset.
+#   POOL_ID               Pool mode only: GARM's pool ID, to narrow the runner
+#                          lookup of `verify` to that pool (`garm-cli runner
+#                          list <id>`) instead of the whole repo.
+#   GATE_INSTANCE         The GARM instance name (= the runner container's
+#                          garm.docker/instance-name label) of THIS gate's
+#                          runner. `verify` normally reads it from GARM's
+#                          runner list for the gate's scale set or pool; set
+#                          this to skip that lookup (e.g. when GARM's list is
+#                          not reachable from here). `verify` remembers the
+#                          instance it checked in the config dir so `postjob`
+#                          inspects the same one. Every container, network and
+#                          volume check is scoped to this one instance, so the
+#                          gate can share a Docker host with other GARM scale
+#                          sets and pools. There is no "newest runner"
+#                          fallback: zero or several matches is a failure.
 #   DIND_IMAGE_SOURCE     Mutable reference whose digest is resolved and
 #                          pinned as dind_image in the dind variant.
 #                          Default: docker:dind
@@ -325,6 +340,8 @@ GARM_TARGET="${GARM_TARGET:-scaleset}"
 GATE_VARIANT="${GATE_VARIANT:-none}"
 SCALESET_NAME="${SCALESET_NAME:-}"
 SCALESET_ID="${SCALESET_ID:-}"
+POOL_ID="${POOL_ID:-}"
+GATE_INSTANCE="${GATE_INSTANCE:-}"
 
 # DinD variant only. dind_image must be digest-pinned like runner_image
 # (internal/config/dind.go's validateDindMode), so a mutable reference is
@@ -474,6 +491,8 @@ validate_inputs() {
   [[ -z "${REPO}" ]] || require_format REPO "${REPO}" '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$' 128 "a repo ID or owner/name of letters, digits, '.', '_', '-' and one '/'"
   [[ -z "${SCALESET_NAME}" ]] || require_format SCALESET_NAME "${SCALESET_NAME}" "${name_re}" "${MAX_NAME_LEN}" "letters, digits, '.', '_' and '-', starting with a letter or digit"
   [[ -z "${SCALESET_ID}" ]] || require_format SCALESET_ID "${SCALESET_ID}" '^[A-Za-z0-9][A-Za-z0-9-]*$' 64 "an ID of letters, digits and '-'"
+  [[ -z "${POOL_ID}" ]] || require_format POOL_ID "${POOL_ID}" '^[A-Za-z0-9][A-Za-z0-9-]*$' 64 "an ID of letters, digits and '-'"
+  [[ -z "${GATE_INSTANCE}" ]] || require_format GATE_INSTANCE "${GATE_INSTANCE}" "${name_re}" "${MAX_NAME_LEN}" "an instance name of letters, digits, '.', '_' and '-', starting with a letter or digit"
   [[ -z "${LOCAL_PROVIDER_SHA256}" ]] || require_format LOCAL_PROVIDER_SHA256 "${LOCAL_PROVIDER_SHA256}" "${SHA256_RE}" 64 "64 lowercase hex characters"
   [[ -z "${LOCAL_PROVIDER_BIN}" ]] || require_format LOCAL_PROVIDER_BIN "${LOCAL_PROVIDER_BIN}" "${path_re}" 200 "an absolute path of letters, digits and '._/+@-' (no spaces)"
   [[ -z "${GATE_REGISTRY_MIRROR}" ]] || require_format GATE_REGISTRY_MIRROR "${GATE_REGISTRY_MIRROR}" "${MIRROR_URL_RE}" 256 "a bare http(s) origin such as http://mirror.lan.example:5000, with no path, credentials or query"
@@ -1705,6 +1724,10 @@ step_watch() {
     resolve_scaleset_name
   fi
 
+  # A new job run starts here: drop the instance an earlier `verify`
+  # remembered so a later `postjob` cannot silently check a previous run.
+  forget_gate_instance
+
   log "Copy the following into <your-test-repo>/.github/workflows/garm-m0-demo.yml,"
   log "commit/push it, then trigger it (Actions tab > Run workflow, or"
   log "'gh workflow run garm-m0-demo.yml' if you use the gh CLI):"
@@ -1712,7 +1735,7 @@ step_watch() {
   sample_workflow_yaml
   echo
 
-  log "Watching docker ps (managed runner containers) + GARM's runner list, every ${WATCH_INTERVAL_SECONDS}s"
+  log "Watching docker ps (ALL managed runner containers on this host; informational only, verify/postjob scope to this gate's own instance) + GARM's runner list, every ${WATCH_INTERVAL_SECONDS}s"
   log "(Ctrl+C to stop early and move on to Step 4; stops on its own after ${WATCH_MAX_ITERATIONS} iterations, 0 = unbounded)."
 
   trap 'log "stopping watch (Ctrl+C)"; trap - INT; return 0' INT
@@ -1733,9 +1756,124 @@ step_watch() {
 
 # --- Step 4(a-d): verify -----------------------------------------------------
 
+# gate_instance_file is where `verify` remembers the instance it checked, so a
+# later `postjob` (a separate invocation) inspects the same one. Only the
+# instance NAME is stored, never a container ID: by postjob the container is
+# supposed to be gone.
+gate_instance_file() { printf '%s/gate-instance' "${PROVIDER_CONFIG_DIR}"; }
+
+forget_gate_instance() {
+  rm -f "$(gate_instance_file)"
+}
+
+remember_gate_instance() {
+  ensure_private_dir "${PROVIDER_CONFIG_DIR}" PROVIDER_CONFIG_DIR 0755
+  write_file_atomic "$(gate_instance_file)" 0600 <<< "$1"
+}
+
+# load_gate_instance prints the instance name `postjob` must scope to:
+# GATE_INSTANCE, else the one `verify` remembered. It prints nothing (and
+# returns 1) when neither exists; the caller must fail, never widen the scope.
+load_gate_instance() {
+  local f saved
+  if [[ -n "${GATE_INSTANCE}" ]]; then
+    printf '%s\n' "${GATE_INSTANCE}"
+    return 0
+  fi
+  f="$(gate_instance_file)"
+  [[ -s "${f}" ]] || return 1
+  path_is_owned_regular "${f}" \
+    || die "${f} must be a regular file owned by you (not a symlink). Remove it and re-run verify."
+  saved="$(head -c 256 "${f}")"
+  saved="${saved%%$'\n'*}"
+  if (( ${#saved} > MAX_NAME_LEN )) || ! [[ "${saved}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "the saved instance name in ${f} is invalid. Remove the file and re-run verify."
+  fi
+  printf '%s\n' "${saved}"
+}
+
+# garm_runner_names prints the instance names GARM lists for this gate's own
+# scale set (scale-set mode) or pool/repo (pool mode), one per line. The names
+# come from the "Name" column of garm-cli's table. Returns 1 with a message on
+# stderr when GARM cannot be queried; prints nothing when it lists no runner.
+garm_runner_names() {
+  local listing
+  if [[ "${GARM_TARGET}" == "scaleset" ]]; then
+    resolve_scaleset_name
+    if [[ -z "${SCALESET_ID}" ]]; then
+      require_repo
+      lookup_scaleset_id
+    fi
+    if [[ -z "${SCALESET_ID}" ]]; then
+      warn "scale set '${SCALESET_NAME}' not found in 'garm-cli scaleset list --repo ${REPO}' (set SCALESET_ID, or GATE_INSTANCE)"
+      return 1
+    fi
+    listing="$(garm-cli scaleset runner list "${SCALESET_ID}" 2>&1)" \
+      || { warn "garm-cli scaleset runner list ${SCALESET_ID} failed: ${listing}"; return 1; }
+  elif [[ -n "${POOL_ID}" ]]; then
+    listing="$(garm-cli runner list "${POOL_ID}" 2>&1)" \
+      || { warn "garm-cli runner list ${POOL_ID} failed: ${listing}"; return 1; }
+  else
+    require_repo
+    listing="$(garm-cli runner list --repo "${REPO}" 2>&1)" \
+      || { warn "garm-cli runner list --repo ${REPO} failed: ${listing}"; return 1; }
+  fi
+  printf '%s\n' "${listing}" | awk -F'|' '
+    /\|/ {
+      if (!col) {
+        for (i = 1; i <= NF; i++) {
+          f = $i; gsub(/^[ \t]+|[ \t]+$/, "", f)
+          if (tolower(f) == "name") { col = i; break }
+        }
+        next
+      }
+      f = $col; gsub(/^[ \t]+|[ \t]+$/, "", f)
+      if (f != "") print f
+    }'
+}
+
+# resolve_runner_container selects THE runner container of this gate and sets
+# RUNNER_CID and RUNNER_INSTANCE. It selects by the garm.docker/instance-name
+# label, never by recency: the Docker host may also run other GARM scale sets
+# and pools whose runners carry the same managed/role labels. The instance
+# names come from GATE_INSTANCE or GARM's runner list for the gate's own scale
+# set/pool. Exactly one runner container must match; zero or several is a
+# failure (reported with bad) and returns 1.
 resolve_runner_container() {
-  docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' \
-    --format '{{.CreatedAt}}\t{{.ID}}' | sort -r | head -n1 | cut -f2
+  RUNNER_CID=""
+  RUNNER_INSTANCE=""
+  local names name id found_cid="" found_instance="" count=0 ids
+  if [[ -n "${GATE_INSTANCE}" ]]; then
+    names="${GATE_INSTANCE}"
+  else
+    names="$(garm_runner_names)" \
+      || { bad "could not read this gate's runner list from GARM, so the gate's own runner cannot be identified (set GATE_INSTANCE to the runner's instance name to bypass the lookup)"; return 1; }
+  fi
+  if [[ -z "${names}" ]]; then
+    bad "GARM lists no runner for this gate's scale set/pool - has it created one yet? (Step 3)"
+    return 1
+  fi
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    ids="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' \
+      --filter "label=garm.docker/instance-name=${name}" -q)"
+    while IFS= read -r id; do
+      [[ -n "${id}" ]] || continue
+      count=$(( count + 1 ))
+      found_cid="${id}"
+      found_instance="${name}"
+    done <<< "${ids}"
+  done <<< "${names}"
+  if (( count == 0 )); then
+    bad "no runner container carries garm.docker/instance-name matching this gate's runner(s): $(printf '%s' "${names}" | tr '\n' ' ') (the container may not exist yet, or may already be gone)"
+    return 1
+  fi
+  if (( count > 1 )); then
+    bad "${count} runner containers match this gate's runner(s) ($(printf '%s' "${names}" | tr '\n' ' ')); refusing to guess. Set GATE_INSTANCE to the one to check (the gate is meant to run with max-runners 1)"
+    return 1
+  fi
+  RUNNER_CID="${found_cid}"
+  RUNNER_INSTANCE="${found_instance}"
 }
 
 label_value() {
@@ -2001,7 +2139,7 @@ verify_topology() {
   verify_ipv6_disabled "${cid}" "runner container"
 
   local cache_vols scoped_cache
-  scoped_cache="$(job_scoped_cache_volumes)"
+  scoped_cache="$(job_scoped_cache_volumes "$(label_value "${cid}" garm.docker/instance-name)")"
   if [[ -n "${scoped_cache}" ]]; then
     bad "job-scoped volume(s) also carry garm.docker/cache=true (teardown would skip them, so they would leak): $(printf '%s' "${scoped_cache}" | tr '\n' ' ')"
   else
@@ -2018,11 +2156,15 @@ verify_topology() {
 # the job-scoped workspace/socket/dind-state volumes carry an instance-name and
 # must be torn down. A job-scoped volume that also gained cache=true would be
 # skipped by teardown (MatchesPredicate rejects cache=true), i.e. leak.
+# With an instance name as "$1" only that instance's volumes are considered
+# (the gate's own check); without one, every instance on the host is.
 job_scoped_cache_volumes() {
+  local instance_filter='label=garm.docker/instance-name'
+  [[ -z "${1:-}" ]] || instance_filter="label=garm.docker/instance-name=$1"
   docker volume ls \
     --filter 'label=garm.docker/managed=true' \
     --filter 'label=garm.docker/cache=true' \
-    --filter 'label=garm.docker/instance-name' \
+    --filter "${instance_filter}" \
     --format '{{.Name}}'
 }
 
@@ -2525,12 +2667,10 @@ step_verify() {
   log "=== Step 4 (a-d): verification against the live runner container ==="
   VERIFY_FAILED=0
 
-  local cid
-  cid="$(resolve_runner_container)"
-  if [[ -z "${cid}" ]]; then
-    bad "no managed runner container found (labels garm.docker/managed=true,garm.docker/role=runner) - has the pool created one yet? (Step 3)"
-    return 1
-  fi
+  resolve_runner_container || return 1
+  local cid="${RUNNER_CID}"
+  remember_gate_instance "${RUNNER_INSTANCE}"
+  log "Gate runner instance: ${RUNNER_INSTANCE} (selected by garm.docker/instance-name; remembered for postjob)"
   local cname
   cname="$(docker inspect -f '{{.Name}}' "${cid}" 2>/dev/null | sed 's#^/##')"
   log "Checking container: ${cid} (${cname})"
@@ -2563,18 +2703,31 @@ step_postjob() {
   log "token, so it cannot check this for you."
   confirm "Confirmed the runner is gone from GitHub?"
 
+  # Every check below is scoped to the gate's own instance, so runners and
+  # resources of other scale sets/pools on this host are neither waited for nor
+  # reported. The instance is the one `verify` checked (or GATE_INSTANCE); with
+  # neither there is nothing to scope to, and widening to the whole host is
+  # exactly what this gate must not do.
+  local inst
+  inst="$(load_gate_instance)" || {
+    bad "no gate runner instance is known: run 'verify' first (it remembers the instance it checked) or set GATE_INSTANCE to the runner's instance name"
+    return 1
+  }
+  log "Checking teardown of gate runner instance: ${inst}"
+  local -a inst_filter=(--filter "label=garm.docker/instance-name=${inst}")
+
   log "Waiting up to ${POST_JOB_WAIT_SECONDS}s for GARM's DeleteInstance to remove the managed runner container..."
   local waited=0
-  while docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' -q | grep -q .; do
+  while docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' "${inst_filter[@]}" -q | grep -q .; do
     if (( waited >= POST_JOB_WAIT_SECONDS )); then
-      bad "a managed runner container is still present after ${POST_JOB_WAIT_SECONDS}s"
+      bad "the managed runner container of ${inst} is still present after ${POST_JOB_WAIT_SECONDS}s"
       break
     fi
     sleep 5
     waited=$(( waited + 5 ))
   done
-  if ! docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' -q | grep -q .; then
-    ok "no managed runner container remains"
+  if ! docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=runner' "${inst_filter[@]}" -q | grep -q .; then
+    ok "no managed runner container remains for ${inst}"
   fi
 
   # Persistent cache volumes (garm.docker/cache=true and NO instance-name,
@@ -2590,16 +2743,16 @@ step_postjob() {
   # container, including every role=runner one, must still be gone.
   local leftover_c leftover_n leftover_v cache_v stamp_c
   stamp_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}')"
-  leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}' \
+  leftover_c="$(docker ps -a --filter 'label=garm.docker/managed=true' "${inst_filter[@]}" --format '{{.Names}}' \
     | { if [[ -n "${stamp_c}" ]]; then command grep -vxF -f <(printf '%s\n' "${stamp_c}") || true; else cat; fi; })"
-  leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
+  leftover_n="$(docker network ls --filter 'label=garm.docker/managed=true' "${inst_filter[@]}" --format '{{.Name}}')"
   cache_v="$(persistent_cache_volumes)"
-  leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}' \
+  leftover_v="$(docker volume ls --filter 'label=garm.docker/managed=true' "${inst_filter[@]}" --format '{{.Name}}' \
     | { if [[ -n "${cache_v}" ]]; then command grep -vxF -f <(printf '%s\n' "${cache_v}") || true; else cat; fi; })"
   if [[ -z "${leftover_c}" && -z "${leftover_n}" && -z "${leftover_v}" ]]; then
-    ok "no leftover job-scoped garm.docker/managed=true containers, networks, or volumes"
+    ok "no leftover job-scoped garm.docker/managed=true containers, networks, or volumes for ${inst}"
   else
-    bad "leftover managed resources found"
+    bad "leftover managed resources found for ${inst}"
     [[ -n "${leftover_c}" ]] && printf '    containers: %s\n' "${leftover_c}"
     [[ -n "${leftover_n}" ]] && printf '    networks: %s\n' "${leftover_n}"
     [[ -n "${leftover_v}" ]] && printf '    volumes: %s\n' "${leftover_v}"
