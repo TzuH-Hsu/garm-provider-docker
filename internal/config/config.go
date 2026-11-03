@@ -151,6 +151,10 @@ type Config struct {
 	// reporting to GARM's instance callback, on by default. See
 	// status_report.go.
 	StatusReport StatusReport `toml:"status_report"`
+
+	// Logging is the [logging] table: an optional persistent log file next to
+	// stderr, unset by default. See logging.go.
+	Logging Logging `toml:"logging"`
 }
 
 // Load reads the TOML config file at path, applies defaults, and validates

@@ -398,3 +398,82 @@ plain http only to a loopback host; no userinfo; `ca-cert-bundle` honored), and
 no redirect is followed. The runner container is unchanged: it never sees the
 instance token or the callback URL, and `docker inspect` shows neither. This
 key is config-only; `extra_specs` cannot change it.
+
+### `[logging]` (persistent log file)
+
+The provider logs to stderr, and GARM keeps a provider's stderr only when the
+call fails. A successful call's log lines are therefore lost, including the ones
+that explain what happened after the fact: orphan-sweep teardowns, a
+`DeleteInstance` that found nothing to delete, `CreateInstance` progress and the
+`teardown: DinD sidecar IO` line. Set `file` to also append every line to a
+file:
+
+```toml
+[logging]
+# Absolute path. Unset (the default) means stderr only, exactly as before.
+file = "/var/log/garm-provider-docker/provider.log"
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `file` | string | unset | Absolute path; the directory must already exist and be writable by the user GARM runs the provider as |
+
+How it behaves:
+
+- **Same lines as stderr.** The file gets the same slog text format, the same
+  level (`GARM_PROVIDER_DOCKER_LOG_LEVEL`, default `info`) and the same
+  redaction as stderr; stderr keeps receiving every line too. Each line starts
+  with a `time=` field.
+- **Opened per call.** The provider is exec'd once per GARM call, so it opens the
+  file with `O_APPEND|O_CREATE` once the config has loaded and closes it at the
+  end of the call. A new file is created with mode `0640` (narrowed further by
+  the umask). An existing file keeps its mode and owner.
+- **Never fails a call.** If the file cannot be opened (missing directory, no
+  permission, a relative path), the provider logs one warning on stderr and
+  carries on with stderr only. If a write fails mid-call, it logs one warning,
+  stops writing to the file for the rest of that call, and carries on.
+- **Early lines are stderr only.** The path lives in this config file, so it is
+  known only after the config has loaded. The `starting garm-provider-docker`
+  line and any failure to read GARM's environment or to load the config are
+  logged before that point and go to stderr only. Every line after the config
+  loads, including `command completed`, goes to both.
+- **The status watcher is not covered.** The detached watcher (see
+  `[status_report]`) never loads this config and keeps its output on
+  `/dev/null`; its results appear in GARM's instance events instead.
+- **Concurrent calls.** GARM may run several provider processes at once. Each
+  record is written with a single `write(2)` on an `O_APPEND` descriptor, which
+  local Linux filesystems apply atomically, so lines from different processes do
+  not interleave or split, whatever their length. Do not point `file` at a
+  network filesystem (NFS does not give `O_APPEND` that guarantee).
+- **Contents.** The file holds instance names, pool IDs and repository names, as
+  stderr does. No credential is ever logged (see `internal/logging`). Keep its
+  directory readable only by the people who should see them.
+
+**Rotation.** The provider never rotates or prunes the file; use logrotate.
+Rotate with `copytruncate`: the file is copied and then emptied in place, so a
+provider process that has it open keeps writing to the live path.
+
+```text
+/var/log/garm-provider-docker/provider.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+`copytruncate` can lose lines written between the copy and the truncate, a
+window of milliseconds. Rename-based rotation (without `copytruncate`) is also
+safe, because every call reopens the path, but a call in flight during the
+rename finishes its lines in the rotated file.
+
+**Reading the DinD teardown line.** `teardown: DinD sidecar IO` is logged at
+info, so it reaches stderr on every successful `DeleteInstance` and is then
+discarded by GARM. It is available for the analysis in
+[dind-image-pulls.md](dind-image-pulls.md#measuring-what-a-job-writes-the-teardown-log-line)
+only when `[logging] file` is set.
+
+This key is config-only; `extra_specs` cannot change it.

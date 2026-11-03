@@ -60,6 +60,17 @@ func run() int {
 		return 1
 	}
 
+	// The optional [logging] file can only be attached now, because its path
+	// lives in the config: everything logged above (the start line, an
+	// execution-environment or config-load failure) went to stderr only.
+	// NewWithFile never fails the call; an unusable path costs one stderr
+	// warning and leaves stderr logging as it was.
+	if cfg.Logging.File != "" {
+		logger, closer := logging.NewWithFile(cfg.Logging.File)
+		defer closer.Close()
+		slog.SetDefault(logger)
+	}
+
 	cli, err := docker.NewMobyClient(cfg.DockerHost)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to create docker client", "command", command, "error", err)

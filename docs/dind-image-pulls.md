@@ -323,6 +323,12 @@ four-second budget, never changes what is removed, and on any error it logs the
 reason and teardown continues. It is emitted by `DeleteInstance` only, not by
 the orphan sweep or `RemoveAllInstances`, and never in `dind_mode = "none"`.
 
+**The line needs `[logging] file`.** The provider logs to stderr, and GARM keeps
+a provider's stderr only when the call fails, so on a successful delete this line
+is discarded. Set `file` in the [`[logging]` table](config-reference.md#logging-persistent-log-file)
+(for example `/var/log/garm-provider-docker/provider.log`) to collect it; the
+`grep` below reads that file.
+
 ```text
 level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... repo=acme/widgets dind_mode=privileged-sidecar since_create_s=412 written_bytes=3187671040 storage_driver=overlay2 image_store=classic images=4 image_bytes=1974321152
 ```
@@ -355,7 +361,7 @@ download is also written to a temporary file but is not measured). Aggregate
 over many jobs as a ratio of sums, not a mean of per-job ratios:
 
 ```sh
-grep 'teardown: DinD sidecar IO"' provider.log | awk '/image_bytes=/ {
+grep 'teardown: DinD sidecar IO"' /var/log/garm-provider-docker/provider.log | awk '/image_bytes=/ {
   delete v; for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
   w += v["written_bytes"]; p += v["image_bytes"] + v["content_bytes"]; n++ }
   END { printf "jobs=%d written=%d pull_estimate=%d share=%.2f\n", n, w, p, p / w }'
