@@ -646,9 +646,10 @@ the whole host.
 Only persistent cache volumes (`garm.docker/cache=true`
 and no `garm.docker/instance-name`) are excluded by label and listed
 informationally; a volume with an instance-name is job-scoped and counts as a
-leftover even if it also carries `cache=true`. The diagnostic-log prune stamp
-(`garm.docker/role=diag-prune-stamp`, a never-started container kept on purpose
-since `v0.2.5`) is likewise excluded by label and listed; every other managed
+leftover even if it also carries `cache=true`. The throttle stamps
+(`garm.docker/role=diag-prune-stamp` since `v0.2.5`, and `role=throttle-stamp`
+for the orphan sweep and the cache GC: never-started containers kept on purpose)
+are likewise excluded by label and listed; every other managed
 container, and every `role=runner` one, must be gone. The per-job network and the named workspace volume
 both carry `garm.docker/managed=true` (as of M1 — `ADR-001`/`ADR-004`), so
 `DeleteInstance`'s teardown removes both explicitly; a leftover one is a

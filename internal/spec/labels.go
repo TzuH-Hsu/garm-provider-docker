@@ -154,6 +154,13 @@ const (
 	// predicate never matches it; it has its own role so the leaked-helper
 	// reaper leaves it alone.
 	RoleDiagPruneStamp = "diag-prune-stamp"
+
+	// RoleThrottleStamp marks the never-started per-controller containers that
+	// record when the orphan sweep and the cache GC last ran, so ListInstances
+	// runs each at most once per interval across provider processes. Same label
+	// shape and exclusions as RoleDiagPruneStamp; the stamp's name says which
+	// pass it throttles (ThrottleStampName).
+	RoleThrottleStamp = "throttle-stamp"
 )
 
 // Resource kind values for LabelResource. Networks and volumes only.

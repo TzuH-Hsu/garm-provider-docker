@@ -89,7 +89,7 @@ const (
 //     provider-run helper (the one remaining destructive cache action — it
 //     deletes FILES, strict-identity-gated; retention stays OUT of the untrusted
 //     runner, F14), at most once per diagPruneInterval per controller across
-//     provider processes (claimDiagPruneRound) — every other pass skips it.
+//     provider processes (claimStamp) — every other pass skips it.
 func (p *Provider) runCacheGC(ctx context.Context) {
 	p.reapLeakedHelpers(ctx)
 
@@ -188,7 +188,7 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 //
 // A round runs at most once per diagPruneInterval per controller, across
 // provider processes: the pass first claims the controller's diag-prune stamp
-// (claimDiagPruneRound) and does nothing more when the claim fails. Bounded per
+// (claimStamp) and does nothing more when the claim fails. Bounded per
 // round; the volumes are visited in random order so that, past the cap, every
 // volume is still reached over successive rounds.
 func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
@@ -204,7 +204,7 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 		slog.InfoContext(ctx, "cache GC: runner image not present; skipping diag prune this pass", "image", runnerImage)
 		return
 	}
-	if !p.claimDiagPruneRound(ctx, runnerImage) {
+	if !p.claimStamp(ctx, p.diagPruneStamp(), runnerImage) {
 		return
 	}
 	order := slices.Clone(refs)
@@ -217,97 +217,6 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 		}
 		p.pruneDiagVolume(ctx, runnerImage, ref)
 	}
-}
-
-// claimDiagPruneRound reports whether this pass may run a diag-prune round
-// (ADR-003 amendment 2026-10-26). The provider is a fresh process per GARM call
-// and has no state directory, so the time of the last round lives in Docker: a
-// never-started stamp container per controller (spec.DiagPruneStampName) whose
-// created-at label is when that round began.
-//
-//   - No stamp: create one and prune.
-//   - A stamp younger than diagPruneInterval: skip (throttled).
-//   - An expired stamp: remove it BY ID, create a new one and prune.
-//   - A stamp whose age is unknown (created-at missing or unparseable) or in the
-//     future: replace it WITHOUT pruning, so the next round comes one interval
-//     later. A bad stamp delays retention by one interval; it never causes a
-//     prune storm.
-//
-// The create is the atomic claim: Docker rejects a second container of the same
-// name with a 409 Conflict, so when several processes find the stamp missing or
-// expired, exactly one wins and the others skip. Removing the old stamp by its
-// ID (not its name) keeps a slow peer from deleting the winner's fresh stamp. A
-// container of the stamp's name that is not provably this controller's stamp is
-// never removed: the round is skipped and the squatter logged. Any daemon error
-// also skips the round (prune later); nothing here fails the caller.
-func (p *Provider) claimDiagPruneRound(ctx context.Context, image string) bool {
-	name := spec.DiagPruneStampName(p.controllerID)
-	existing, err := p.cli.ContainerInspect(ctx, name)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return p.createDiagPruneStamp(ctx, image, name)
-		}
-		slog.WarnContext(ctx, "cache GC: failed to inspect the diag-prune stamp; skipping diag prune this pass",
-			"resource", "container", "container_name", name, "error", err)
-		return false
-	}
-
-	var labels map[string]string
-	if existing.Config != nil {
-		labels = existing.Config.Labels
-	}
-	if !p.isOwnDiagPruneStamp(labels) || existing.ContainerJSONBase == nil || existing.ID == "" {
-		slog.WarnContext(ctx, "cache GC: a container named like the diag-prune stamp is not this controller's stamp; leaving it in place and skipping diag prune",
-			"resource", "container", "container_name", name)
-		return false
-	}
-
-	age, known := helperAge(time.Now(), labels[spec.LabelCreatedAt])
-	if known && age >= 0 && age < diagPruneInterval {
-		return false
-	}
-	if err := p.cli.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-		slog.WarnContext(ctx, "cache GC: failed to replace the diag-prune stamp; skipping diag prune this pass",
-			"resource", "container", "container_name", name, "error", err)
-		return false
-	}
-	if !known || age < 0 {
-		if p.createDiagPruneStamp(ctx, image, name) {
-			slog.WarnContext(ctx, "cache GC: the diag-prune stamp had no usable time; reset it, the next diag prune runs one interval from now",
-				"resource", "container", "container_name", name, "interval", diagPruneInterval.String())
-		}
-		return false
-	}
-	return p.createDiagPruneStamp(ctx, image, name)
-}
-
-// createDiagPruneStamp creates the controller's diag-prune stamp and reports
-// whether this process now owns the round. A 409 Conflict means a concurrent
-// provider process created it first and owns the round.
-func (p *Provider) createDiagPruneStamp(ctx context.Context, image, name string) bool {
-	cfg, hostCfg := spec.BuildDiagPruneStampContainer(image, p.ownedHelperLabels(spec.RoleDiagPruneStamp))
-	if _, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, name); err != nil {
-		if !errdefs.IsConflict(err) {
-			slog.WarnContext(ctx, "cache GC: failed to create the diag-prune stamp; skipping diag prune this pass",
-				"resource", "container", "container_name", name, "error", err)
-		}
-		return false
-	}
-	return true
-}
-
-// isOwnDiagPruneStamp reports whether labels are those of this controller's
-// diag-prune stamp: managed, this controller-id, role=diag-prune-stamp, and no
-// instance-name (a stamp is never a job allocation).
-func (p *Provider) isOwnDiagPruneStamp(labels map[string]string) bool {
-	if labels[spec.LabelManaged] != "true" || labels[spec.LabelControllerID] != p.controllerID {
-		return false
-	}
-	if labels[spec.LabelRole] != spec.RoleDiagPruneStamp {
-		return false
-	}
-	_, hasInst := labels[spec.LabelInstanceName]
-	return !hasInst
 }
 
 // pruneDiagVolume runs one diagnostic-log prune helper to completion against a

@@ -35,6 +35,8 @@ import (
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
+
+	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
 const (
@@ -625,7 +627,15 @@ func controllerResourceCount(t *testing.T, controllerID string) int {
 		}
 		return len(strings.Split(out, "\n"))
 	}
-	c := count(dockerOut(t, "ps", "-aq", "--filter", label))
+	// The throttle stamps (never-started containers kept on purpose so the sweep,
+	// the GC and the diag prune run at most once per interval) are not allocation
+	// resources and do not count.
+	c := 0
+	for _, role := range lines(dockerOut(t, "ps", "-a", "--filter", label, "--format", `{{.Label "garm.docker/role"}}`)) {
+		if role != spec.RoleThrottleStamp && role != spec.RoleDiagPruneStamp {
+			c++
+		}
+	}
 	n := count(dockerOut(t, "network", "ls", "-q", "--filter", label))
 	v := count(dockerOut(t, "volume", "ls", "-q", "--filter", label))
 	return c + n + v

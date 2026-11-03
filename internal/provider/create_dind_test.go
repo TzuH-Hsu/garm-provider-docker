@@ -344,7 +344,13 @@ func TestCreateInstanceDinDImagePullFailureCleansUp(t *testing.T) {
 		t.Fatal("expected CreateInstance to fail on the dind image pull, got nil")
 	}
 	assertNoLeftovers(t, fake)
-	if n := len(fake.Created); n != 0 {
+	n := 0
+	for _, c := range fake.Created {
+		if c.Labels[spec.LabelRole] != spec.RoleThrottleStamp {
+			n++
+		}
+	}
+	if n != 0 {
 		t.Errorf("a dind-pull failure created %d containers, want 0", n)
 	}
 }

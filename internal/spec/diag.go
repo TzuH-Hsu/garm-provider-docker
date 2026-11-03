@@ -149,13 +149,34 @@ func DiagPruneStampName(controllerID string) string {
 	return diagPruneStampPrefix + hex.EncodeToString(sum[:])[:diagPruneStampHashLen]
 }
 
-// BuildDiagPruneStampContainer assembles the config of the diag-prune stamp: a
+// ThrottleStamp names the pass a throttle stamp rate-limits, so each pass of a
+// controller has its own stamp container.
+type ThrottleStamp string
+
+const (
+	// StampOrphanSweep throttles ListInstances' controller-wide orphan sweep.
+	StampOrphanSweep ThrottleStamp = "sweep"
+	// StampCacheGC throttles the cache GC pass that ListInstances and
+	// CreateInstance run.
+	StampCacheGC ThrottleStamp = "cachegc"
+)
+
+// ThrottleStampName returns the fixed container name of a controller's stamp for
+// the given pass. It is built like DiagPruneStampName (the name is the claim; the
+// controller ID is hashed), with the pass in the prefix.
+func ThrottleStampName(controllerID string, pass ThrottleStamp) string {
+	sum := sha256.Sum256([]byte(controllerID))
+	return "garm-" + string(pass) + "-stamp-" + hex.EncodeToString(sum[:])[:diagPruneStampHashLen]
+}
+
+// BuildStampContainer assembles the config of a throttle stamp (the diag-prune
+// stamp included): a
 // container that is created and never started. Only its labels (the
 // created-at time of the last prune) matter. It mounts nothing, so it never
 // pins a volume against an operator's `docker volume prune`, and joins no
 // network. The entrypoint is overridden with `true` so that a manual
 // `docker start` of it does nothing.
-func BuildDiagPruneStampContainer(image string, labels map[string]string) (*container.Config, *container.HostConfig) {
+func BuildStampContainer(image string, labels map[string]string) (*container.Config, *container.HostConfig) {
 	cfg := &container.Config{
 		Image:      image,
 		Labels:     labels,

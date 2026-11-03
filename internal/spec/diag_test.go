@@ -133,12 +133,12 @@ func TestDiagPruneStampName(t *testing.T) {
 	}
 }
 
-// TestBuildDiagPruneStampContainer: the stamp mounts nothing (so it never pins a
+// TestBuildStampContainer: the stamp mounts nothing (so it never pins a
 // volume against an operator's prune), joins no network, carries the given
 // labels, and does nothing if someone starts it.
-func TestBuildDiagPruneStampContainer(t *testing.T) {
+func TestBuildStampContainer(t *testing.T) {
 	labels := map[string]string{LabelRole: RoleDiagPruneStamp}
-	cfg, host := BuildDiagPruneStampContainer("runner@sha256:abc", labels)
+	cfg, host := BuildStampContainer("runner@sha256:abc", labels)
 	if cfg.Image != "runner@sha256:abc" {
 		t.Errorf("Image = %q", cfg.Image)
 	}
@@ -153,5 +153,29 @@ func TestBuildDiagPruneStampContainer(t *testing.T) {
 	}
 	if !host.NetworkMode.IsNone() {
 		t.Errorf("NetworkMode = %q, want none", host.NetworkMode)
+	}
+}
+
+// TestThrottleStampName: each pass of a controller has its own deterministic,
+// legal stamp name, distinct from the other passes' and the diag-prune stamp's,
+// and from another controller's.
+func TestThrottleStampName(t *testing.T) {
+	sweep := ThrottleStampName("controller-abc", StampOrphanSweep)
+	gc := ThrottleStampName("controller-abc", StampCacheGC)
+	if sweep != ThrottleStampName("controller-abc", StampOrphanSweep) {
+		t.Errorf("ThrottleStampName is not deterministic: %q", sweep)
+	}
+	for _, other := range []string{gc, DiagPruneStampName("controller-abc"), ThrottleStampName("controller-xyz", StampOrphanSweep)} {
+		if sweep == other {
+			t.Errorf("stamp name %q collides with %q", sweep, other)
+		}
+	}
+	if !strings.HasPrefix(sweep, "garm-sweep-stamp-") || !strings.HasPrefix(gc, "garm-cachegc-stamp-") {
+		t.Errorf("names = %q, %q, want the garm-<pass>-stamp- prefixes", sweep, gc)
+	}
+	for _, name := range []string{sweep, gc, ThrottleStampName("weird id/with:chars", StampCacheGC)} {
+		if err := ValidateDerivedName("throttle stamp", name); err != nil {
+			t.Errorf("stamp name %q is not a legal name: %v", name, err)
+		}
 	}
 }
