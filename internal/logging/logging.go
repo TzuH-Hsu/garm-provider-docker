@@ -24,7 +24,10 @@
 // credential contents — the GARM instance-token, JIT config file bytes, or
 // any metadata bearer value. See Redact and the package doc on why this is
 // enforced structurally (no logger ever receives those values in the first
-// place) rather than by scrubbing after the fact.
+// place) rather than by scrubbing after the fact. The one exception is text
+// the provider did not produce — a runner container's own output, which the
+// orphan sweep logs a tail of — and that goes through SafeLogLines, which
+// withholds every line that might carry a credential.
 package logging
 
 import (

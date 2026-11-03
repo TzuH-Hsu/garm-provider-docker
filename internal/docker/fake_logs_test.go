@@ -224,3 +224,39 @@ func TestFakeContainerTop(t *testing.T) {
 		t.Errorf("ContainerTop of a missing container error = %v, want NotFound", err)
 	}
 }
+
+// TestFakeContainerLogsTail pins the Tail option: "N" returns only the last N
+// lines, counted across both streams, and "all" or "" returns every line.
+func TestFakeContainerLogsTail(t *testing.T) {
+	f := NewFakeClient()
+	id := startFakeContainer(t, f, "runner", false)
+	for _, l := range []string{"one", "two", "three", "four"} {
+		f.AppendLog(id, LogStdout, l)
+	}
+	f.AppendLog(id, LogStderr, "five")
+
+	cases := []struct {
+		tail string
+		want string
+	}{
+		{"2", "four\nfive\n"},
+		{"0", ""},
+		{"10", "one\ntwo\nthree\nfour\nfive\n"},
+		{"all", "one\ntwo\nthree\nfour\nfive\n"},
+		{"", "one\ntwo\nthree\nfour\nfive\n"},
+	}
+	for _, tc := range cases {
+		rc, err := f.ContainerLogs(context.Background(), id, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: tc.tail})
+		if err != nil {
+			t.Fatalf("Tail %q: ContainerLogs: %v", tc.tail, err)
+		}
+		var out bytes.Buffer
+		if _, err := stdcopy.StdCopy(&out, &out, rc); err != nil {
+			t.Fatalf("Tail %q: StdCopy: %v", tc.tail, err)
+		}
+		_ = rc.Close()
+		if out.String() != tc.want {
+			t.Errorf("Tail %q: got %q, want %q", tc.tail, out.String(), tc.want)
+		}
+	}
+}

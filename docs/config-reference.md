@@ -403,10 +403,10 @@ key is config-only; `extra_specs` cannot change it.
 
 The provider logs to stderr, and GARM keeps a provider's stderr only when the
 call fails. A successful call's log lines are therefore lost, including the ones
-that explain what happened after the fact: orphan-sweep teardowns, a
-`DeleteInstance` that found nothing to delete, `CreateInstance` progress and the
-`teardown: DinD sidecar IO` line. Set `file` to also append every line to a
-file:
+that explain what happened after the fact: orphan-sweep teardowns, the
+`orphan sweep: runner exited on its own` line, a `DeleteInstance` that found
+nothing to delete, `CreateInstance` progress and the `teardown: DinD sidecar IO`
+line. Set `file` to also append every line to a file:
 
 ```toml
 [logging]
@@ -475,5 +475,28 @@ info, so it reaches stderr on every successful `DeleteInstance` and is then
 discarded by GARM. It is available for the analysis in
 [dind-image-pulls.md](dind-image-pulls.md#measuring-what-a-job-writes-the-teardown-log-line)
 only when `[logging] file` is set.
+
+**Reading the exited-runner line.** When a runner container exits on its own and
+GARM has not deleted it within the exited-runner grace (about two minutes from
+its `State.FinishedAt`), the next orphan sweep (run by `ListInstances` and at the
+start of `CreateInstance`) tears the allocation down. Just before it does, it
+logs one `orphan sweep: runner exited on its own` line with `instance`, `pool`,
+the runner's `state`, `exit_code`, `finished_at` and `oom_killed`, the same
+fields prefixed `dind_` when the DinD sidecar has stopped too (`dind_state`
+alone while it still runs), and `log_tail`: the runner's last 20 lines of
+stdout and stderr. This is the record of why a runner that took a job died
+before running it, so it is worth keeping with `file`.
+
+The tail is the runner's own output, so it is screened before it is logged: any
+line that might carry a credential (a token, JIT config or `.credentials`
+content, an authorization header, a metadata or callback URL, a URL with
+userinfo or a query string, key material, or a long base64 or hex value) is
+replaced whole by `[line withheld: it may carry a credential]`, and
+`log_tail_withheld` counts them. Each line is cut to 240 bytes, and at most
+64 KiB is read (`log_tail_truncated=true` when that cut the tail short). The
+report has a two-second budget. If the logs cannot be read (for example the
+`none` log driver), the line is logged at `warn` with `log_tail_error` instead
+of the tail, and the sweep carries on. A `DeleteInstance` teardown never logs
+this line.
 
 This key is config-only; `extra_specs` cannot change it.
