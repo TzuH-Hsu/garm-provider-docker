@@ -317,11 +317,14 @@ which the per-job design of ADR-001 deliberately does not provide.
 
 To judge how much of a job's disk writing is image pulls and extraction (the
 question [ADR-006](adr/ADR-006-dind-image-cache.md) gates on), `DeleteInstance`
-logs one line per DinD allocation just before it stops the sidecar and
-removes its `dind-state` volume. It is log-only and best-effort: it shares a
-four-second budget, never changes what is removed, and on any error it logs the
-reason and teardown continues. It is emitted by `DeleteInstance` only, not by
-the orphan sweep or `RemoveAllInstances`, and never in `dind_mode = "none"`.
+logs one line per DinD allocation before it stops any of the allocation's
+containers, the runner included. A privileged sidecar shares the runner's
+network namespace, and once the runner is removed the daemon returns an empty
+stats sample for the sidecar, so the sample is taken first. It is log-only and
+best-effort: it shares a four-second budget, never changes what is removed, and
+on any error it logs the reason and teardown continues. It is emitted by
+`DeleteInstance` only, not by the orphan sweep or `RemoveAllInstances`, and
+never in `dind_mode = "none"`.
 
 **The line needs `[logging] file`.** The provider logs to stderr, and GARM keeps
 a provider's stderr only when the call fails, so on a successful delete this line
@@ -346,12 +349,13 @@ level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... r
 | `storage_driver`, `image_store` | The sidecar daemon's driver, and `classic` (a graph driver such as `overlay2`) or `containerd` (the containerd image store). The provider always passes `--storage-driver`, so sidecars normally report `classic`; `containerd` appears only if a custom `dind_image` enables the containerd snapshotter itself. |
 | `images`, `image_bytes` | Distinct images the sidecar daemon holds at teardown, and the sum of their `docker image inspect` `Size`: the unpacked, uncompressed size. |
 | `content_bytes` | `containerd` image store only: the on-disk size (`du -sk`) of the containerd content store, the compressed blobs pulls wrote. |
-| `probe_error` | The image probe failed; `images`, `image_bytes` and the rest are omitted but `written_bytes` is still logged. |
+| `probe_error` | The image probe failed; `storage_driver`, `images`, `image_bytes` and the other image fields are omitted, and the rest of the line is still logged. |
 
 A sample that fails altogether is logged as `level=WARN msg="teardown: DinD
 sidecar IO unavailable" ... stats_error=...` (for example when the cgroup has no
-io controller). A sidecar that has already exited is skipped with a debug line,
-since its counters are gone.
+io controller). The image probe still runs, so the WARN line carries the image
+fields or `probe_error`, but no `written_bytes`. A sidecar that has already
+exited is skipped with a debug line, since its counters are gone.
 
 **Computing the ratio.** The question is what share of `written_bytes` comes
 from pulling and extracting images. Estimate the bytes the pulls wrote as

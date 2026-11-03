@@ -209,7 +209,8 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 		found bool
 		errs  []error
 	)
-	dindIO := m.newDindIOReporter(ctx, list, scope)
+	// Log every DinD sidecar's IO before any container stops (dindio.go).
+	m.newDindIOReporter(ctx, list, scope).reportAll(ctx, list, scope)
 	for _, c := range list {
 		ok, err := scope.mayRemove(ctx, c.Labels)
 		if err != nil {
@@ -220,8 +221,6 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 			continue
 		}
 		found = true
-		// Log the sidecar's IO before it stops: stopping destroys its counters.
-		dindIO.report(ctx, c)
 		// Best-effort graceful stop first (ADR-004 ordering); the forced
 		// remove below reaps a still-running container regardless.
 		_ = m.cli.ContainerStop(ctx, c.ID, container.StopOptions{})
@@ -341,8 +340,9 @@ type teardownScope struct {
 	// resource's create-nonce.
 	captured map[string]string
 
-	// reportDindIO asks removeContainers to log a DinD sidecar's IO before
-	// stopping it (dindio.go). Set only by TeardownAllocationReportingIO.
+	// reportDindIO asks removeContainers to log each DinD sidecar's IO before
+	// it stops any container (dindio.go). Set only by
+	// TeardownAllocationReportingIO.
 	reportDindIO bool
 }
 

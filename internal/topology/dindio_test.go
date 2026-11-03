@@ -38,8 +38,8 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 }
 
 // seedRunnerWithEnv seeds a running runner whose environment names its
-// repository, attached to name's job network.
-func seedRunnerWithEnv(t *testing.T, fake *docker.FakeClient, name string, env []string) {
+// repository, attached to name's job network, and returns its ID.
+func seedRunnerWithEnv(t *testing.T, fake *docker.FakeClient, name string, env []string) string {
 	t.Helper()
 	labels := identityFor(name).ContainerLabels(spec.RoleRunner, ioTestCreatedAt)
 	labels[spec.LabelCreateNonce] = ioTestNonce
@@ -49,16 +49,17 @@ func seedRunnerWithEnv(t *testing.T, fake *docker.FakeClient, name string, env [
 		t.Fatalf("seed runner ContainerCreate: %v", err)
 	}
 	fake.SetState(resp.ID, "running", false)
+	return resp.ID
 }
 
-// seedSidecar seeds a DinD sidecar with the given HostConfig runtime pair and
-// state, returning its ID.
-func seedSidecar(t *testing.T, fake *docker.FakeClient, name string, privileged bool, runtime, state string) string {
+// seedSidecar seeds a DinD sidecar with the given HostConfig (its runtime pair
+// and network placement) and state, returning its ID.
+func seedSidecar(t *testing.T, fake *docker.FakeClient, name string, host *container.HostConfig, state string) string {
 	t.Helper()
 	labels := identityFor(name).DindContainerLabels(ioTestCreatedAt)
 	labels[spec.LabelCreateNonce] = ioTestNonce
 	resp, err := fake.ContainerCreate(context.Background(), &container.Config{Labels: labels},
-		&container.HostConfig{Privileged: privileged, Runtime: runtime}, nil, nil, spec.DindContainerName(name))
+		host, nil, nil, spec.DindContainerName(name))
 	if err != nil {
 		t.Fatalf("seed sidecar ContainerCreate: %v", err)
 	}
@@ -67,16 +68,18 @@ func seedSidecar(t *testing.T, fake *docker.FakeClient, name string, privileged 
 }
 
 // seedDindAllocation seeds a full privileged-sidecar allocation (claim network,
-// dind-state volume, runner, running sidecar with stats and probe output) and
-// returns the Manager with a fixed clock 95s after creation.
+// dind-state volume, runner, running sidecar in the runner's network namespace
+// with stats and probe output) and returns the Manager with a fixed clock 95s
+// after creation.
 func seedDindAllocation(t *testing.T, name string) (*Manager, *docker.FakeClient, string) {
 	t.Helper()
 	m, fake := newManager(t)
 	m.now = func() time.Time { return ioTestCreatedAt.Add(95 * time.Second) }
 	seedNetworkFor(t, fake, testControllerID, name, ioTestCreatedAt, ioTestNonce)
 	seedDindStateVolumeFor(t, fake, testControllerID, name, ioTestCreatedAt, ioTestNonce)
-	seedRunnerWithEnv(t, fake, name, []string{"PATH=/bin", "RUNNER_ORG=acme", "RUNNER_REPO=widgets"})
-	sidecar := seedSidecar(t, fake, name, true, "", "running")
+	runner := seedRunnerWithEnv(t, fake, name, []string{"PATH=/bin", "RUNNER_ORG=acme", "RUNNER_REPO=widgets"})
+	sidecar := seedSidecar(t, fake, name,
+		&container.HostConfig{Privileged: true, NetworkMode: spec.ContainerNetworkMode(runner)}, "running")
 	fake.SetStats(sidecar, ioTestStats)
 	fake.ExecOutputText = ioTestProbe
 	return m, fake, sidecar
@@ -96,8 +99,10 @@ func assertAllocationGone(t *testing.T, fake *docker.FakeClient) {
 }
 
 // TestTeardownReportsDindIO also pins the ordering the counters depend on:
-// the fake, like the daemon, refuses stats and exec on a stopped container, so
-// a complete line proves the sample was taken before the sidecar stopped.
+// the fake, like the daemon, refuses stats and exec on a stopped container and
+// returns an empty sample for a sidecar whose network namespace owner (the
+// runner) is gone, so a complete line proves the sample was taken before any
+// container of the allocation stopped.
 func TestTeardownReportsDindIO(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, _ := seedDindAllocation(t, "gha-1")
@@ -130,8 +135,8 @@ func TestTeardownReportsDindIO(t *testing.T) {
 }
 
 // TestReportBudgetStartsWhenReportStarts proves time spent between creating the
-// reporter and reporting (in a teardown: stopping and removing the slower runner
-// first) does not count against the sidecar measurement's budget.
+// reporter and reporting (in a teardown: the runner lookup, or an earlier
+// sidecar's report) does not count against the sidecar measurement's budget.
 func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, sidecar := seedDindAllocation(t, "gha-1")
@@ -145,8 +150,8 @@ func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
 		t.Fatal("expected a reporter for an allocation with a sidecar")
 	}
 
-	// A budget far shorter than the simulated runner shutdown: were it counted
-	// from the reporter's creation, it would be spent before the report began.
+	// A budget far shorter than the simulated delay: were it counted from the
+	// reporter's creation, it would be spent before the report began.
 	r.budget = 200 * time.Millisecond
 	time.Sleep(400 * time.Millisecond)
 
@@ -156,7 +161,40 @@ func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
 		}
 	}
 	if !strings.Contains(logs.String(), "written_bytes=123456") || !strings.Contains(logs.String(), "repo=acme/widgets") {
-		t.Errorf("the IO line was not emitted after a slow runner shutdown:\n%s", logs.String())
+		t.Errorf("the IO line was not emitted after a delay:\n%s", logs.String())
+	}
+}
+
+// TestTeardownSamplesDindIOBeforeRunnerRemoval is the regression for a sample
+// taken after the runner was removed: the privileged sidecar shares the
+// runner's network namespace, and the daemon then returns an empty sample. The
+// report must come first, while the stop/remove order stays runner, then
+// sidecar (ADR-004).
+func TestTeardownSamplesDindIOBeforeRunnerRemoval(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	runner := spec.RunnerContainerName("gha-1")
+	info, err := fake.ContainerInspect(context.Background(), runner)
+	if err != nil {
+		t.Fatalf("ContainerInspect runner: %v", err)
+	}
+
+	if _, err := m.TeardownAllocationReportingIO(context.Background(), "gha-1"); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	out := logs.String()
+	if strings.Contains(out, "IO unavailable") || !strings.Contains(out, "written_bytes=123456") {
+		t.Errorf("the sample was not taken before the runner was removed:\n%s", out)
+	}
+	var containers []string
+	for _, r := range fake.RemoveOrder {
+		if strings.HasPrefix(r, "container:") {
+			containers = append(containers, r)
+		}
+	}
+	want := []string{"container:" + info.ID, "container:" + sidecar}
+	if strings.Join(containers, ",") != strings.Join(want, ",") {
+		t.Errorf("container remove order = %v, want %v (runner before sidecar)", containers, want)
 	}
 }
 
@@ -179,7 +217,7 @@ func TestTeardownReportsSysboxMode(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake := newManager(t)
 	seedNetworkFor(t, fake, testControllerID, "gha-2", ioTestCreatedAt, ioTestNonce)
-	sidecar := seedSidecar(t, fake, "gha-2", false, "sysbox-runc", "running")
+	sidecar := seedSidecar(t, fake, "gha-2", &container.HostConfig{Runtime: "sysbox-runc"}, "running")
 	fake.SetStats(sidecar, ioTestStats)
 	fake.ExecOutputText = ioTestProbe
 
@@ -237,12 +275,21 @@ func TestTeardownSurvivesReportFailures(t *testing.T) {
 		{
 			name:    "stats call fails",
 			tweak:   func(f *docker.FakeClient, _ string) { f.StatsErr = errors.New("daemon busy") },
-			wantLog: []string{"level=WARN", "DinD sidecar IO unavailable", "stats_error", "daemon busy"},
+			wantLog: []string{"level=WARN", "DinD sidecar IO unavailable", "stats_error", "daemon busy", "images=2"},
 		},
 		{
-			name:    "stats sample has no blkio counters",
+			name:    "stats sample has no blkio counters still runs the probe",
 			tweak:   func(f *docker.FakeClient, s string) { f.SetStats(s, `{}`) },
-			wantLog: []string{"level=WARN", "stats_error", "no blkio write counters"},
+			wantLog: []string{"level=WARN", "stats_error", "no blkio write counters", "storage_driver=overlay2", "images=2", "image_bytes=3500"},
+		},
+		{
+			name: "stats and probe both fail",
+			tweak: func(f *docker.FakeClient, _ string) {
+				f.StatsErr = errors.New("daemon busy")
+				f.ExecOutputErr = errors.New("exec refused")
+			},
+			wantLog:  []string{"level=WARN", "stats_error", "daemon busy", "probe_error", "exec refused"},
+			wantNone: "written_bytes",
 		},
 		{
 			name:    "stats body is not JSON",
