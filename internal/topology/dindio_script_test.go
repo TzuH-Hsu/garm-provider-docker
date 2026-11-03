@@ -112,63 +112,40 @@ func TestProbeScriptFailuresAreNotMasked(t *testing.T) {
 	}
 }
 
-// sidecarScriptWithIOStat returns sidecarProbeScript reading io.stat from
-// path instead of the sidecar's cgroup.
-func sidecarScriptWithIOStat(path string) string {
-	return strings.ReplaceAll(sidecarProbeScript, ioStatPath, path)
+// ioStatScriptAt returns ioStatScript reading io.stat from path instead of the
+// sidecar's cgroup.
+func ioStatScriptAt(path string) string {
+	return strings.ReplaceAll(ioStatScript, ioStatPath, path)
 }
 
-// TestSidecarScriptReadsIOStat runs the full probe script against a stand-in
-// io.stat file and checks that parseIOStat and parseImageProbe both read
-// their parts of the one output.
-func TestSidecarScriptReadsIOStat(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "io.stat")
+// TestIOStatScriptStates runs the io.stat script under sh against stand-in
+// files: a full file is read across devices, an empty one is a valid zero, and
+// a missing one is an absence. The script always exits 0.
+func TestIOStatScriptStates(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "full")
 	content := "8:0 rbytes=1 wbytes=500 rios=1 wios=1 dbytes=0 dios=0\n251:0 rbytes=0 wbytes=20 rios=0 wios=1 dbytes=0 dios=0\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
 		t.Fatalf("write io.stat: %v", err)
 	}
-	out, code := runScript(t, sidecarScriptWithIOStat(path), "STUB_IDS=sha256:aa\n")
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (output %q)", code, out)
-	}
-	st, err := parseIOStat(out)
-	if err != nil || st.Written != 520 || st.byDevice() != "8:0=500,251:0=20" {
-		t.Fatalf("io.stat = %+v, err = %v, want 520 over two devices (output %q)", st, err, out)
-	}
-	if p, err := parseImageProbe(out); err != nil || p.Images != 2 {
-		t.Fatalf("probe = %+v, err = %v (output %q)", p, err, out)
-	}
-}
-
-// TestSidecarScriptIOStatStates keeps a present but empty io.stat (a valid
-// zero) apart from a missing one, and proves the io.stat records survive a
-// failing image probe.
-func TestSidecarScriptIOStatStates(t *testing.T) {
-	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty")
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatalf("write empty io.stat: %v", err)
 	}
-	full := filepath.Join(dir, "full")
-	if err := os.WriteFile(full, []byte("8:0 rbytes=0 wbytes=7 rios=0 wios=1 dbytes=0 dios=0\n"), 0o600); err != nil {
-		t.Fatalf("write io.stat: %v", err)
+
+	out, code := runScript(t, ioStatScriptAt(full))
+	st, err := parseIOStat(out)
+	if code != 0 || err != nil || st.Written != 520 || st.byDevice() != "8:0=500,251:0=20" {
+		t.Errorf("full io.stat: %+v, code %d, err = %v, want 520 over two devices (output %q)", st, code, err, out)
 	}
 
-	out, _ := runScript(t, sidecarScriptWithIOStat(empty), "STUB_IDS=")
-	if st, err := parseIOStat(out); err != nil || st.Written != 0 || len(st.Devices) != 0 {
-		t.Errorf("empty io.stat: %+v, err = %v, want a zero with no devices (output %q)", st, err, out)
+	out, code = runScript(t, ioStatScriptAt(empty))
+	if st, err := parseIOStat(out); code != 0 || err != nil || st.Written != 0 || len(st.Devices) != 0 {
+		t.Errorf("empty io.stat: %+v, code %d, err = %v, want a zero with no devices (output %q)", st, code, err, out)
 	}
 
-	out, _ = runScript(t, sidecarScriptWithIOStat(filepath.Join(dir, "missing")), "STUB_IDS=")
-	if _, err := parseIOStat(out); !errors.Is(err, errNoIOStat) {
-		t.Errorf("missing io.stat: err = %v, want errNoIOStat (output %q)", err, out)
-	}
-
-	out, code := runScript(t, sidecarScriptWithIOStat(full), "STUB_INFO_FAIL=1")
-	if code != 3 {
-		t.Errorf("exit code = %d, want the image probe's 3 (output %q)", code, out)
-	}
-	if st, err := parseIOStat(out); err != nil || st.Written != 7 {
-		t.Errorf("io.stat with a failed image probe: %+v, err = %v, want 7 (output %q)", st, err, out)
+	out, code = runScript(t, ioStatScriptAt(filepath.Join(dir, "missing")))
+	if _, err := parseIOStat(out); code != 0 || !errors.Is(err, errNoIOStat) {
+		t.Errorf("missing io.stat: code %d, err = %v, want errNoIOStat (output %q)", code, err, out)
 	}
 }

@@ -65,18 +65,14 @@ const ioStatPath = "/sys/fs/cgroup/io.stat"
 // that is there but empty (no device saw IO yet) prints the marker alone; a
 // file that is missing or unreadable (a cgroup v1 host, no io controller on
 // the cgroup, a runtime that virtualises cgroupfs) prints "io_stat_missing".
-// It never exits, so the image probe after it still runs.
+// It runs in an exec of its own, apart from the image probe, and only reads a
+// file, so it never waits on the sidecar's daemon.
 const ioStatScript = `if [ -e ` + ioStatPath + ` ] && io=$(sed 's/^/io /' ` + ioStatPath + ` 2>/dev/null); then
   echo io_stat
   [ -z "$io" ] || printf '%s\n' "$io"
 else
   echo io_stat_missing
 fi`
-
-// sidecarProbeScript is the one exec the teardown report runs in a sidecar:
-// io.stat first (a plain file read, before the docker calls that may stall),
-// then the image probe. Its exit status is the image probe's.
-const sidecarProbeScript = ioStatScript + "\n" + imageProbeScript
 
 // errNoIOStat means the sidecar's cgroup io.stat could not be read at all, as
 // opposed to a file with no write counters, which is a valid zero.
@@ -109,9 +105,8 @@ func (s ioStat) byDevice() string {
 	return strings.Join(parts, ",")
 }
 
-// parseIOStat reads the io.stat records in the output of sidecarProbeScript
-// and ignores every other line, so it works whatever the image probe printed
-// or however it failed. It returns errNoIOStat when the script found no
+// parseIOStat reads the io.stat records in the output of ioStatScript and
+// ignores every other line (stray stderr, for example). It returns errNoIOStat when the script found no
 // readable io.stat, and an error for a malformed line rather than a silently
 // wrong number.
 func parseIOStat(out string) (ioStat, error) {

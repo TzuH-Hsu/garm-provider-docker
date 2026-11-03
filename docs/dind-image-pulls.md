@@ -318,17 +318,21 @@ which the per-job design of ADR-001 deliberately does not provide.
 To judge how much of a job's disk writing is image pulls and extraction (the
 question [ADR-006](adr/ADR-006-dind-image-cache.md) gates on), `DeleteInstance`
 logs one line per DinD allocation before it stops any of the allocation's
-containers, the runner included. One `docker exec` in the sidecar reads the
-sidecar's own cgroup v2 `io.stat` and asks the sidecar's daemon what images it
-holds. The written bytes come from `io.stat`, not from the Docker stats
-endpoint: a privileged sidecar shares the runner's network namespace, the
-ephemeral runner has usually exited by itself when its job ended, before the
-delete arrives, and the daemon cannot build a stats sample for a container
-whose network namespace owner is stopped or gone. The stats sample is used only
-as a fallback when `io.stat` is not readable (a cgroup v1 host, or a runtime
-that virtualises cgroupfs). The line is log-only and best-effort: it shares a
-four-second budget, never changes what is removed, and on any error it logs the
-reason and teardown continues. It is emitted by
+containers, the runner included. A short `docker exec` in the sidecar first
+reads the sidecar's own cgroup v2 `io.stat`, with a one-second budget of its
+own. A second exec then asks the sidecar's daemon what images it holds, with
+what is left of the report's budget, so a probe that stalls on a slow disk
+costs only the image fields, never the written bytes. The written bytes come
+from `io.stat`, not from the Docker stats endpoint: a privileged sidecar shares
+the runner's network namespace, the ephemeral runner has usually exited by
+itself when its job ended, before the delete arrives, and the daemon cannot
+build a stats sample for a container whose network namespace owner is stopped
+or gone. The stats sample is used only as a fallback when `io.stat` is not
+readable (a cgroup v1 host, or a runtime that virtualises cgroupfs); it also
+has a one-second budget and is taken before the image probe. The line is
+log-only and best-effort: all of it fits in a four-second budget, it never
+changes what is removed, and on any error it logs the reason and teardown
+continues. It is emitted by
 `DeleteInstance` only, not by the orphan sweep or `RemoveAllInstances`, and
 never in `dind_mode = "none"`.
 
