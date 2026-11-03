@@ -182,9 +182,12 @@
 #   SCALESET_ID           GARM's scale set ID, for `scaleset runner list` and
 #                          cleanup. Looked up by name from `garm-cli scaleset
 #                          list` when unset.
-#   POOL_ID               Pool mode only: GARM's pool ID, to narrow the runner
-#                          lookup of `verify` to that pool (`garm-cli runner
-#                          list <id>`) instead of the whole repo.
+#   POOL_ID               Pool mode only, REQUIRED for `verify` and `watch`
+#                          unless GATE_INSTANCE is set: GARM's pool ID
+#                          (`garm-cli pool list --repo ...`). The gate's
+#                          runners are looked up in that pool
+#                          (`garm-cli runner list <id>`); the repo's other
+#                          pools are never treated as the gate's own.
 #   GATE_INSTANCE         The GARM instance name (= the runner container's
 #                          garm.docker/instance-name label) of THIS gate's
 #                          runner; several names may be given, separated by
@@ -1861,13 +1864,16 @@ garm_runner_names() {
     fi
     listing="$(garm-cli scaleset runner list "${SCALESET_ID}" 2>&1)" \
       || { warn "garm-cli scaleset runner list ${SCALESET_ID} failed: ${listing}"; return 1; }
-  elif [[ -n "${POOL_ID}" ]]; then
+  else
+    # Pool mode: membership of the repo is not ownership of the runner, since
+    # other pools of the same repo may be running jobs. Only the gate's own
+    # pool is listed, so its ID must be given.
+    if [[ -z "${POOL_ID}" ]]; then
+      warn "pool mode cannot tell this gate's runner from other pools' runners of the repo: set POOL_ID to the gate pool's ID (garm-cli pool list --repo <repo>), or GATE_INSTANCE to the runner's instance name"
+      return 1
+    fi
     listing="$(garm-cli runner list "${POOL_ID}" 2>&1)" \
       || { warn "garm-cli runner list ${POOL_ID} failed: ${listing}"; return 1; }
-  else
-    require_repo
-    listing="$(garm-cli runner list --repo "${REPO}" 2>&1)" \
-      || { warn "garm-cli runner list --repo ${REPO} failed: ${listing}"; return 1; }
   fi
   printf '%s\n' "${listing}" | awk -F'|' '
     /\|/ {

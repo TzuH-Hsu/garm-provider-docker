@@ -587,9 +587,11 @@ Identifies the gate's own runner and checks it. The runner is selected by its
 `garm.docker/instance-name` label, the GARM instance name, and never by
 recency: the instance names come from GARM's runner list for the gate's own
 scale set (`garm-cli scaleset runner list <id>`, the id looked up by name or
-given as `SCALESET_ID`) or, with `--pool`, for the pool (`POOL_ID`) or the
-repo. Set `GATE_INSTANCE` to the runner's instance name to skip the GARM
-lookup. Exactly one runner container must match; zero matches, several
+given as `SCALESET_ID`) or, with `--pool`, for the gate's pool
+(`garm-cli runner list <POOL_ID>`). With `--pool`, `POOL_ID` (from `garm-cli
+pool list --repo <repo>`) or `GATE_INSTANCE` is required: other pools of the
+same repo are never assumed to be the gate's. Set `GATE_INSTANCE` to the
+runner's instance name to skip the GARM lookup. Exactly one runner container must match; zero matches, several
 matches, or a GARM list that cannot be read is a FAIL, and `verify` never
 falls back to "the newest runner". This is what lets the gate run on a Docker
 host that also runs other GARM scale sets and pools (for example a production
