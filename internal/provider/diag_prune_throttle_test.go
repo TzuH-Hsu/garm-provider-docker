@@ -94,7 +94,7 @@ func TestDiagPruneFirstRoundPrunesAndStamps(t *testing.T) {
 		t.Fatalf("first round ran %d prune helpers, want 3 (one per diag volume)", got)
 	}
 	_, labels, state := inspectStamp(t, fake, p.controllerID)
-	if !p.isOwnDiagPruneStamp(labels) {
+	if !p.isOwnStamp(labels, spec.RoleDiagPruneStamp) {
 		t.Errorf("stamp labels %v are not this controller's stamp", labels)
 	}
 	if state != "created" {

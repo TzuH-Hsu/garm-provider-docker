@@ -2803,13 +2803,16 @@ step_postjob() {
   # job-scoped even if it also has cache=true (a labeling regression), so it is
   # NOT exempted and shows up as leftover. Everything else managed must be gone.
   #
-  # The diag-prune stamp (garm.docker/role=diag-prune-stamp, since v0.2.5) is a
-  # persistent, never-started container kept on purpose so the diagnostic-log
-  # prune runs at most once per interval. It is exempted by its role label, the
-  # same way the cache volumes are exempted by theirs; every other managed
-  # container, including every role=runner one, must still be gone.
+  # The diag-prune stamp (garm.docker/role=diag-prune-stamp, since v0.2.5) and
+  # the sweep and cache-GC stamps (garm.docker/role=throttle-stamp) are
+  # persistent, never-started containers kept on purpose so the diagnostic-log
+  # prune, the orphan sweep and the cache GC run at most once per interval.
+  # They are exempted by their role labels, the same way the cache volumes are
+  # exempted by theirs; every other managed container, including every
+  # role=runner one, must still be gone.
   local leftover_c leftover_n leftover_v cache_v stamp_c
-  stamp_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}')"
+  stamp_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}'
+    docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=throttle-stamp' --format '{{.Names}}')"
   leftover_c="$(per_instance_docker "${insts}" ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}' \
     | { if [[ -n "${stamp_c}" ]]; then command grep -vxF -f <(printf '%s\n' "${stamp_c}") || true; else cat; fi; })"
   leftover_n="$(per_instance_docker "${insts}" network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"
@@ -2829,7 +2832,7 @@ step_postjob() {
     printf '    %s\n' "${cache_v}"
   fi
   if [[ -n "${stamp_c}" ]]; then
-    log "info: diag-prune stamp container (garm.docker/role=diag-prune-stamp, never started, kept by design):"
+    log "info: throttle stamp containers (garm.docker/role=diag-prune-stamp or throttle-stamp, never started, kept by design):"
     printf '    %s\n' "${stamp_c}"
   fi
   log "Note: the per-job network and the named workspace volume both carry"

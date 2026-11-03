@@ -498,8 +498,16 @@ func TestCreateInstanceContainerCreateFailureLeavesForeignUntouched(t *testing.T
 func assertNoLeftovers(t *testing.T, fake *docker.FakeClient) {
 	t.Helper()
 	conts, _ := fake.ContainerList(context.Background(), container.ListOptions{All: true})
-	if len(conts) != 0 {
-		t.Errorf("leftover containers = %d, want 0", len(conts))
+	leftover := 0
+	for _, c := range conts {
+		// A throttle stamp is a persistent, never-started container kept on
+		// purpose; it is not part of any allocation.
+		if c.Labels[spec.LabelRole] != spec.RoleThrottleStamp {
+			leftover++
+		}
+	}
+	if leftover != 0 {
+		t.Errorf("leftover containers = %d, want 0", leftover)
 	}
 	nets, _ := fake.NetworkList(context.Background(), network.ListOptions{})
 	if len(nets) != 0 {

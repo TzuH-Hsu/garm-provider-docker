@@ -210,6 +210,7 @@ stale_cache_eviction_days = 30
 	}
 	currentVol := spec.ToolcacheVolumeName(repoKey, imageOSKey(t, imageA), "1")
 
+	expireCacheGCStamp(controllerID) // the create above claimed this interval's GC pass
 	// Trigger an opportunistic GC pass via ListInstances (it runs runCacheGC) and
 	// capture the provider's stderr, where the stale-cache operator log line goes.
 	_, gcStderr, gcCode := runProviderIO(t, bin, configA, controllerID, "ListInstances", "", nil)
@@ -314,6 +315,7 @@ stale_cache_eviction_days = 30
 	// the same container (ADR-003 amendment 2026-10-26).
 	stampName := spec.DiagPruneStampName(controllerID)
 	stampBefore := strings.TrimSpace(dockerOut(t, "inspect", "-f", "{{.Id}}", stampName))
+	expireCacheGCStamp(controllerID) // let the GC pass run so only the diag-prune stamp throttles it
 	if out, err := dockerTry("run", "--rm", "-v", diagVol+":/logs", "alpine:3.20", "sh", "-c",
 		"touch -t "+oldStamp+" /logs/old-throttled.log"); err != nil {
 		t.Fatalf("(4c) seed diag file: %v\n%s", err, out)
@@ -425,6 +427,7 @@ func imageDigestHex(t *testing.T, image string) string {
 // earlier pass must have claimed a round, so a missing stamp is an error.
 func expireDiagPruneStamp(t *testing.T, controllerID, step string) {
 	t.Helper()
+	expireCacheGCStamp(controllerID)
 	stamp := spec.DiagPruneStampName(controllerID)
 	if _, err := dockerTry("inspect", stamp); err != nil {
 		t.Errorf("%s no diag-prune stamp %q after an earlier GC pass ran a prune round: %v", step, stamp, err)
@@ -433,4 +436,12 @@ func expireDiagPruneStamp(t *testing.T, controllerID, step string) {
 	if out, err := dockerTry("rm", "-f", stamp); err != nil {
 		t.Fatalf("%s remove the diag-prune stamp %q: %v\n%s", step, stamp, err, out)
 	}
+}
+
+// expireCacheGCStamp removes the controller's cache-GC stamp, standing in for
+// its throttle interval elapsing, so the next ListInstances or CreateInstance
+// runs a GC pass (ADR-004 amendment 2026-11-03). A missing stamp is fine: no
+// earlier pass may have claimed one.
+func expireCacheGCStamp(controllerID string) {
+	_, _ = dockerTry("rm", "-f", spec.ThrottleStampName(controllerID, spec.StampCacheGC))
 }

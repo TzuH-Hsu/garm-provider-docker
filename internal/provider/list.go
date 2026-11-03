@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
@@ -20,21 +19,23 @@ import (
 // It first runs the opportunistic orphan sweep (ADR-004): ListInstances is a
 // call the provider is invoked for anyway, so it is one of the two hooks (the
 // other being CreateInstance's pre-create sweep) where abandoned allocations
-// are collected without a background daemon. The sweep is best-effort — a sweep
-// failure must not fail the list GARM asked for.
+// are collected without a background daemon. GARM calls ListInstances once per
+// pool or scale set on every consolidation pass, so the sweep runs at most once
+// per orphanSweepInterval per controller across provider processes
+// (sweepThrottled; ADR-004 amendment 2026-11-03). The sweep is best-effort — a
+// sweep failure must not fail the list GARM asked for.
 func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.ProviderInstance, error) {
-	if err := p.topo.SweepOrphans(ctx); err != nil {
-		slog.WarnContext(ctx, "ListInstances: orphan sweep failed (continuing)", "error", err)
-	}
+	p.sweepThrottled(ctx)
 
 	// Opportunistic, best-effort cache GC (ADR-003 W2): ListInstances is the
 	// second piggyback hook (the other being CreateInstance) where superseded/
 	// aged cache volumes are DETECTED and LOGGED for operator visibility (never
 	// auto-removed — ADR-003 NEW-H1: cache-volume GC is non-destructive/log-only,
 	// reclaimed only via an explicit operator `docker volume prune`), diag logs
-	// pruned, and leaked helpers reaped. Best-effort — a GC failure must not fail
-	// the list GARM asked for.
-	p.runCacheGC(ctx)
+	// pruned, and leaked helpers reaped. Throttled to once per cacheGCInterval per
+	// controller, like the sweep. Best-effort — a GC failure must not fail the
+	// list GARM asked for.
+	p.runCacheGCThrottled(ctx)
 
 	f := filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),

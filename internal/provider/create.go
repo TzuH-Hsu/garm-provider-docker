@@ -182,7 +182,9 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	// action — it deletes FILES inside the diag volume, not the volume itself),
 	// and leaked helper containers reaped — there is no background daemon
 	// (ADR-004). It never hard-fails the create: every step logs and continues.
-	p.runCacheGC(ctx)
+	// Unlike the sweep above it is throttled (runCacheGCThrottled), sharing the
+	// once-per-cacheGCInterval round with ListInstances.
+	p.runCacheGCThrottled(ctx)
 
 	// enable_job_network=false is reserved and not yet honored (WP2): the job
 	// network is ALWAYS created, because it is the isolation guarantee AND

@@ -65,7 +65,9 @@ Full design rationale lives in [`docs/plan.md`](docs/plan.md) and the
   volume to `diagnostic_log_retention_days`, gated on full-identity
   validation, at most once every 6 hours per controller. That interval is
   recorded in one never-started `garm-diagprune-stamp-*` container per
-  controller, which is safe to remove. Org/enterprise-shared caches are an explicit opt-in
+  controller, which is safe to remove. `ListInstances` throttles its orphan
+  sweep (3 minutes) and the cache GC (5 minutes) the same way, with
+  `garm-sweep-stamp-*` and `garm-cachegc-stamp-*` containers. Org/enterprise-shared caches are an explicit opt-in
   (`allow_org_shared`), off by default. NAS operators with limited storage
   should plan for this manual step. See
   [ADR-003](docs/adr/ADR-003-cache-keying-and-lifecycle.md). The pnpm store
@@ -401,8 +403,8 @@ run in a container job (plain `run:` steps still work). See ADR-001's
   volumes carry `garm.docker/cache=true` plus controller-id (and their
   cache-kind/repo identity) but no pool-id or instance-name, precisely so
   they survive teardown and are reusable across jobs, and cache-helper
-  containers (and the diag-prune stamp) carry `role=cache-helper`
-  (`role=diag-prune-stamp`) with no instance-name so the
+  containers (and the throttle stamps) carry `role=cache-helper`
+  (`role=diag-prune-stamp` or `role=throttle-stamp`) with no instance-name so the
   teardown/sweep predicate structurally excludes them and `ListInstances`
   never reports them (ADR-003/ADR-004). Every cleanup path, including the
   manual `RemoveAllInstances` rescue operation, filters on the labels

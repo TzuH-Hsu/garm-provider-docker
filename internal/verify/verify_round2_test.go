@@ -175,6 +175,7 @@ stale_cache_eviction_days = 30
 	// a GC pass runs the prune helper, the diag volume STILL carries its full
 	// identity labels, and a later allocation gets a diag cache HIT.
 	// =========================================================================
+	expireCacheGCStamp(controllerID) // an earlier create claimed this interval's GC pass
 	if _, code := runProvider(t, bin, cfg, controllerID, "ListInstances", "", nil); code != 0 {
 		t.Fatalf("(H3c) ListInstances exit=%d, want 0", code)
 	}
