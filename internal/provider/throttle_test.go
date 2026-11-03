@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
@@ -317,6 +318,68 @@ func TestListInstancesStampTroubleSkipsWithoutFailing(t *testing.T) {
 			t.Errorf("the squatter was not logged; log was:\n%s", logs.String())
 		}
 	})
+}
+
+// TestClaimStampLosesQuietlyToAPeerRemoval: when two provider processes both
+// find the stamp expired, the loser's ContainerRemove gets a 409 ("removal of
+// container ... is already in progress"). That is a lost claim, not a fault: the
+// pass is skipped, the stamp is left to the peer, and nothing is logged at WARN.
+// Any other remove error still warns.
+func TestClaimStampLosesQuietlyToAPeerRemoval(t *testing.T) {
+	const peerMsg = "removal of container abc is already in progress"
+	expired := func(id string) map[string]string {
+		return throttleStampLabels(id, time.Now().Add(-(orphanSweepInterval + time.Minute)))
+	}
+	cases := []struct {
+		name      string
+		labels    func(controllerID string) map[string]string
+		removeErr error
+		wantWarn  bool
+	}{
+		{
+			name:      "expired stamp, peer is removing it",
+			labels:    expired,
+			removeErr: errdefs.Conflict(errors.New(peerMsg)),
+		},
+		{
+			name: "stamp with no usable time, peer is removing it",
+			labels: func(id string) map[string]string {
+				l := throttleStampLabels(id, time.Now())
+				delete(l, spec.LabelCreatedAt)
+				return l
+			},
+			removeErr: errdefs.Conflict(errors.New(peerMsg)),
+		},
+		{
+			name:      "expired stamp, other remove error",
+			labels:    expired,
+			removeErr: errors.New("daemon unavailable"),
+			wantWarn:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fake := newListThrottleProvider(t)
+			st := p.orphanSweepStamp()
+			oldID := seedNamedStamp(t, fake, st.name, tc.labels(p.controllerID))
+			logs := captureLogs(t)
+
+			fake.RemoveErr = tc.removeErr
+			claimed := p.claimStamp(context.Background(), st, p.cfg.EffectiveRunnerImage(""))
+			fake.RemoveErr = nil
+
+			if claimed {
+				t.Error("claimStamp claimed the round although the stamp could not be replaced")
+			}
+			if got := stampID(t, fake, st.name); got != oldID {
+				t.Errorf("stamp %s changed to %s although its removal failed", oldID, got)
+			}
+			out := logs.String()
+			if gotWarn := strings.Contains(out, "level=WARN"); gotWarn != tc.wantWarn {
+				t.Errorf("WARN logged = %v, want %v; log was:\n%s", gotWarn, tc.wantWarn, out)
+			}
+		})
+	}
 }
 
 // TestThrottleStampsAreNotListedOrReaped: a stamp carries no instance-name and

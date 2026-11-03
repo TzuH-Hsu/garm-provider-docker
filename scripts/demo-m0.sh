@@ -2811,8 +2811,10 @@ step_postjob() {
   # exempted by theirs; every other managed container, including every
   # role=runner one, must still be gone.
   local leftover_c leftover_n leftover_v cache_v stamp_c
-  stamp_c="$(docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}'
-    docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=throttle-stamp' --format '{{.Names}}')"
+  stamp_c="$(
+    docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=diag-prune-stamp' --format '{{.Names}}'
+    docker ps -a --filter 'label=garm.docker/managed=true' --filter 'label=garm.docker/role=throttle-stamp' --format '{{.Names}}'
+  )"
   leftover_c="$(per_instance_docker "${insts}" ps -a --filter 'label=garm.docker/managed=true' --format '{{.Names}}' \
     | { if [[ -n "${stamp_c}" ]]; then command grep -vxF -f <(printf '%s\n' "${stamp_c}") || true; else cat; fi; })"
   leftover_n="$(per_instance_docker "${insts}" network ls --filter 'label=garm.docker/managed=true' --format '{{.Name}}')"

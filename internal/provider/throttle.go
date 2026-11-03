@@ -134,8 +134,10 @@ func (p *Provider) claimRound(ctx context.Context, st throttleStamp) bool {
 // expired, exactly one wins and the others skip. Removing the old stamp by its
 // ID (not its name) keeps a slow peer from deleting the winner's fresh stamp. A
 // container of the stamp's name that is not provably this controller's stamp is
-// never removed: the round is skipped and the squatter logged. Any daemon error
-// also skips the round (run later); nothing here fails the caller.
+// never removed: the round is skipped and the squatter logged. A 409 Conflict on
+// removing the expired stamp means a peer is already replacing it and has won
+// the round; that skips quietly, like a conflicting create. Any other daemon
+// error also skips the round (run later); nothing here fails the caller.
 func (p *Provider) claimStamp(ctx context.Context, st throttleStamp, image string) bool {
 	existing, err := p.cli.ContainerInspect(ctx, st.name)
 	if err != nil {
@@ -162,6 +164,15 @@ func (p *Provider) claimStamp(ctx context.Context, st throttleStamp, image strin
 		return false
 	}
 	if err := p.cli.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		if errdefs.IsConflict(err) {
+			// A 409 here is "removal of container ... is already in progress":
+			// a peer found the same stamp expired and is replacing it, so it owns
+			// this round. Losing the claim is the expected outcome, as for a
+			// conflicting create, so it is not a warning.
+			slog.DebugContext(ctx, "throttle: a peer is replacing the stamp; skipping this pass",
+				"pass", st.what, "resource", "container", "container_name", st.name, "error", err)
+			return false
+		}
 		slog.WarnContext(ctx, "throttle: failed to replace the stamp; skipping this pass",
 			"pass", st.what, "resource", "container", "container_name", st.name, "error", err)
 		return false
