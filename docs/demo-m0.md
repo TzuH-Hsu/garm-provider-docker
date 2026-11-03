@@ -594,9 +594,10 @@ matches, or a GARM list that cannot be read is a FAIL, and `verify` never
 falls back to "the newest runner". This is what lets the gate run on a Docker
 host that also runs other GARM scale sets and pools (for example a production
 host): their runners carry the same `managed=true`/`role=runner` labels but a
-different instance name, so they are never inspected. `verify` remembers the
-instance it checked in `$PROVIDER_CONFIG_DIR/gate-instance` so `postjob`
-inspects the same one; `watch` clears it when a new run starts.
+different instance name, so they are never inspected. `verify` (and `watch`,
+on every poll) records the instances it sees in
+`$PROVIDER_CONFIG_DIR/gate-instances` so `postjob` can check all of them;
+`watch` clears the file when a new run starts.
 
 It prints PASS/FAIL for each check: ownership labels on the container, the labeled per-job
 network and named workspace volume, and that the runner is actually wired
@@ -629,10 +630,17 @@ disappear (bounded by `POST_JOB_WAIT_SECONDS`, default 300s — GARM's own
 reaper/polling cadence governs how quickly this happens, `docs/research.md`
 §1.F) and checks for any leftover `garm.docker/managed=true` container,
 **network**, or volume. All of this is scoped to the gate's own
-`garm.docker/instance-name` (the one `verify` remembered, or `GATE_INSTANCE`),
-so other scale sets' runners and resources on a shared host are neither waited
-for nor reported. With no instance known (`verify` was not run and
-`GATE_INSTANCE` is unset) `postjob` fails rather than checking the whole host.
+`garm.docker/instance-name` values: every instance `watch` and `verify`
+recorded, any runner GARM still lists for the gate, and any names in
+`GATE_INSTANCE` (commas or spaces). Other scale sets' runners and resources on
+a shared host are neither waited for nor reported. The `--dind` workflow runs
+two jobs (`demo` and `container-job`), each on its own ephemeral runner with
+its own network and volumes, so `postjob` requires two known instances in that
+variant (one otherwise) and FAILs if fewer are known, because the missing
+runner's teardown would go unchecked. To record both, let `watch` keep running
+until the second job's runner has started (or set `GATE_INSTANCE` to both
+names). With no instance known at all, `postjob` fails rather than checking
+the whole host.
 Only persistent cache volumes (`garm.docker/cache=true`
 and no `garm.docker/instance-name`) are excluded by label and listed
 informationally; a volume with an instance-name is job-scoped and counts as a
