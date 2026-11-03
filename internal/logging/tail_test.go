@@ -118,25 +118,57 @@ func TestSafeLogLinesWithholdsEveryFakeSecret(t *testing.T) {
 // TestSafeLogLinesKeepsOrdinaryRunnerOutput pins that the screen is not so
 // coarse it drops the lines an operator needs to see why a runner exited.
 func TestSafeLogLinesKeepsOrdinaryRunnerOutput(t *testing.T) {
-	lines := []string{
+	kept := []string{
 		"Current runner version: '2.329.0'",
+		"√ Connected to GitHub",
 		"2026-11-03 10:00:00Z: Listening for Jobs",
+		"2026-11-03 10:05:00Z: Running job: build",
+		"2026-11-03 10:05:00Z: Running job: integration-tests",
+		"2026-11-03 10:09:30Z: Job build completed with result: Failed",
 		"An error occurred: Runner listener exit with retryable error, re-launch runner in 5 seconds.",
 		"Runner listener exit because of updating, re-launch runner after successful update",
-		"Http response code: Unauthorized from 'POST https://pipelines.actions.example/abc/_apis/distributedtask/pools/1/sessions'",
-		"/actions-runner/_work/_tool/node/20.19.1/x64/bin/node exited",
-		"pulled sha256:9c8e5a1d0f7b4e3a2c6d8f0b1a3c5e7d9f1b3d5f7a9c1e3f5a7b9d1f3e5a7c9b", // a digest is hex too
+		"Runner.Listener exited with code 137",
+		"[entrypoint] waiting up to 120s for the delivery marker /run/garm/.delivered",
+		"[entrypoint] dropping privileges to runner via gosu",
+		"[entrypoint] raised open-file soft limit from 1024 to 65536 (hard limit 524288)",
 	}
-	safe, withheld := SafeLogLines(lines, 0)
-	for i, line := range lines[:6] {
+	safe, withheld := SafeLogLines(kept, 0)
+	if withheld != 0 {
+		t.Errorf("withheld %d ordinary lines, want 0", withheld)
+	}
+	for i, line := range kept {
 		if safe[i] != line {
-			t.Errorf("line %d = %q, want it kept as %q", i, safe[i], line)
+			t.Errorf("line %q was withheld or changed to %q", line, safe[i])
 		}
 	}
-	// A 64-hex digest is indistinguishable from a hex-encoded key, so it is
-	// withheld; this is the screen's documented bias.
-	if safe[6] != WithheldLine || withheld != 1 {
-		t.Errorf("digest line = %q (withheld %d), want it withheld", safe[6], withheld)
+}
+
+// TestSafeLogLinesWithholdsLongRunsWhateverTheirMix pins that a run of 20 or
+// more credential-alphabet characters withholds its line by length alone. A
+// composition rule (digit density, case mix) let credential-shaped values
+// through, so none applies; harmless long paths, digests and identifiers are
+// withheld with them.
+func TestSafeLogLinesWithholdsLongRunsWhateverTheirMix(t *testing.T) {
+	for name, line := range map[string]string{
+		"lower with few digits":      "key: " + "qwertyuiopasdfghjklz" + "xcvbnm123qwertyuiopasd",
+		"upper 29 without digits":    "id " + "QWERTYUIOPASDFGHJ" + "KLZXCVBNMQWE",
+		"all lower 40":               "value=" + strings.Repeat("abcdefghij", 4),
+		"all upper 20":               "x " + strings.Repeat("ABCDE", 4),
+		"mixed with dashes":          "v " + "abc-DEF_ghi-" + "JKL_mno-PQR",
+		"base64 with slash and plus": "blob " + "ab+cd/ef+gh" + "/ij+kl/mn==",
+		"path":                       "/actions-runner/_work/_tool/node/20.19.1/x64/bin/node exited",
+		"api path":                   "Http response code: Unauthorized from 'POST https://pipelines.actions.example/abc/_apis/distributedtask/pools/1/sessions'",
+		"digest":                     "pulled sha256:" + strings.Repeat("9c8e5a1d", 8),
+		"long identifier":            "ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1",
+	} {
+		safe, withheld := SafeLogLines([]string{line}, 0)
+		if withheld != 1 || safe[0] != WithheldLine {
+			t.Errorf("%s: %q kept as %q, want it withheld", name, line, safe[0])
+		}
+	}
+	// One short of the threshold is kept.
+	if safe, withheld := SafeLogLines([]string{"x " + strings.Repeat("a", credentialRunLen-1)}, 0); withheld != 0 {
+		t.Errorf("a %d-character run was withheld as %q", credentialRunLen-1, safe[0])
 	}
 }
 

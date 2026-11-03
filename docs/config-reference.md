@@ -490,9 +490,13 @@ before running it, so it is worth keeping with `file`.
 The tail is the runner's own output, so it is screened before it is logged: any
 line that might carry a credential (a token, JIT config or `.credentials`
 content, an authorization header, a metadata or callback URL, a URL with
-userinfo or a query string, key material, or a long base64 or hex value) is
-replaced whole by `[line withheld: it may carry a credential]`, and
-`log_tail_withheld` counts them. Each line is cut to 240 bytes, and at most
+userinfo or a query string, key material, or 20 or more letters, digits or
+`+/=_-` in a row) is replaced whole by
+`[line withheld: it may carry a credential]`, and `log_tail_withheld` counts
+them. The run rule goes by length alone, so long paths, image digests and long
+identifiers are withheld too; the runner's short status lines (`Listening for
+Jobs`, `Running job: ...`, listener errors) come through. Each line is cut to
+240 bytes, and at most
 64 KiB is read (`log_tail_truncated=true` when that cut the tail short). The
 report has a two-second budget. If the logs cannot be read (for example the
 `none` log driver), the line is logged at `warn` with `log_tail_error` instead

@@ -2,6 +2,7 @@ package logging
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -62,14 +63,20 @@ var riskyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)https?://\S*\?\S*=`),
 }
 
-// tokenRun finds runs of base64/base64url/hex characters long enough to be a
-// key or token (a GitHub registration token is 29 upper-case alphanumerics);
-// looksLikeSecret decides whether a run is one.
-var tokenRun = regexp.MustCompile(`[A-Za-z0-9+/=_-]{20,}`)
+// credentialRunLen is the length at which an unbroken run of credential-alphabet
+// characters withholds its line, whatever its case or digit mix: any such run
+// could be a key, and its composition cannot prove it is not. Twenty is the
+// shortest common credential format this has to catch (an AWS access key ID;
+// a GitHub registration token is 29, a GitHub token 40, the JIT config far
+// longer), and it still lets through the runner's own status lines and
+// ordinary job names. Paths, digests and long identifiers are withheld.
+const credentialRunLen = 20
 
-// hexSecretLen is the shortest run treated as a secret without upper case: an
-// all-hex run, or a digit-dense lower-case one.
-const hexSecretLen = 32
+// credentialRun matches credentialRunLen or more base64, base64url or hex
+// characters in a row. '.' is not in it, so a dotted name such as
+// Runner.Listener or a version number does not join two words into one run;
+// a JWT's segments are each long enough to match alone.
+var credentialRun = regexp.MustCompile(`[A-Za-z0-9+/=_-]{` + strconv.Itoa(credentialRunLen) + `,}`)
 
 // bareBlob matches a line that is nothing but base64 characters, such as a
 // line of a PEM body whose BEGIN line has already scrolled out of the tail.
@@ -93,9 +100,9 @@ var bareBlob = regexp.MustCompile(`^[A-Za-z0-9+/=_-]{8,}$`)
 //   - matches a known token shape (ghp_/ghs_/gho_/ghu_/ghr_, github_pat_,
 //     base64 JSON or a JWT, AWS and Slack keys);
 //   - holds a URL with userinfo or a query string;
-//   - holds a run of 20 or more base64 characters that mixes upper case and
-//     digits, or a run of 32 or more that is all hex or at least a fifth
-//     digits;
+//   - holds 20 or more base64, base64url or hex characters in a row, judged
+//     by length alone: a credential's alphabet can be any mix of case and
+//     digits, so no composition makes a long run safe;
 //   - is nothing but 8 or more base64 characters, at least one of them a
 //     digit or one of "+", "/" and "=";
 //   - lies between a PEM BEGIN line and its END line.
@@ -137,39 +144,11 @@ func lineIsRisky(line, lower string) bool {
 			return true
 		}
 	}
-	for _, run := range tokenRun.FindAllString(line, -1) {
-		if looksLikeSecret(run) {
-			return true
-		}
+	if credentialRun.MatchString(line) {
+		return true
 	}
 	trimmed := strings.TrimSpace(line)
 	return bareBlob.MatchString(trimmed) && strings.ContainsAny(trimmed, "0123456789+/=")
-}
-
-// looksLikeSecret reports whether a run of 20 or more base64/hex characters is
-// key- or token-like: upper case mixed with digits (base64, or an upper-case
-// token such as a registration token), 32 or more hex digits (a hex-encoded
-// secret), or 32 or more characters of which at least a fifth are digits (a
-// random lower-case alphanumeric key; a UUID counts too). A path or an
-// identifier made of plain words is none of these.
-func looksLikeSecret(run string) bool {
-	var upper, nonHex bool
-	digits := 0
-	for _, r := range run {
-		switch {
-		case r >= 'A' && r <= 'Z':
-			upper = true
-			nonHex = nonHex || r > 'F'
-		case r >= 'a' && r <= 'z':
-			nonHex = nonHex || r > 'f'
-		case r >= '0' && r <= '9':
-			digits++
-		default:
-			nonHex = true
-		}
-	}
-	long := len(run) >= hexSecretLen
-	return (upper && digits > 0) || (long && !nonHex) || (long && digits*5 >= len(run))
 }
 
 // printable replaces control characters with spaces and invalid UTF-8 with
