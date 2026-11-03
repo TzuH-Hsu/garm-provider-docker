@@ -32,10 +32,14 @@ func (f *FakeClient) SetStats(containerID, body string) {
 // empty sample (name and ID, no blkio counters) although the container still
 // runs; with the owner stopped but not removed its sandbox ID is cleared and
 // the request fails.
-func (f *FakeClient) ContainerStatsOneShot(_ context.Context, containerID string) (container.StatsResponseReader, error) {
+func (f *FakeClient) ContainerStatsOneShot(ctx context.Context, containerID string) (container.StatsResponseReader, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Like the real client, a request on a context that is already done fails.
+	if err := ctx.Err(); err != nil {
+		return container.StatsResponseReader{}, err
+	}
 	if f.StatsErr != nil {
 		return container.StatsResponseReader{}, f.StatsErr
 	}
@@ -62,22 +66,29 @@ func (f *FakeClient) ContainerStatsOneShot(_ context.Context, containerID string
 }
 
 // ExecOutput models an output-capturing docker exec: it records the call and
-// reports ExecOutputText and ExecOutputExit. Like the real daemon it requires
-// a running container.
-func (f *FakeClient) ExecOutput(_ context.Context, containerID string, cmd []string) (string, int, error) {
+// reports ExecOutputText and ExecOutputExit, or what ExecOutputFunc returns
+// when it is set. Like the real daemon it requires a running container.
+func (f *FakeClient) ExecOutput(ctx context.Context, containerID string, cmd []string) (string, int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	if f.ExecOutputErr != nil {
+		f.mu.Unlock()
 		return "", 0, f.ExecOutputErr
 	}
 	c := f.find(containerID)
 	if c == nil {
+		f.mu.Unlock()
 		return "", 0, notFoundf("container %s not found", containerID)
 	}
 	if c.state != "running" {
+		f.mu.Unlock()
 		return "", 0, fmt.Errorf("cannot exec in container %s: not running", containerID)
 	}
 	f.OutputExecs = append(f.OutputExecs, ExecRecord{ContainerID: c.id, Cmd: append([]string(nil), cmd...)})
-	return f.ExecOutputText, f.ExecOutputExit, nil
+	fn, out, code := f.ExecOutputFunc, f.ExecOutputText, f.ExecOutputExit
+	f.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, cmd)
+	}
+	return out, code, nil
 }

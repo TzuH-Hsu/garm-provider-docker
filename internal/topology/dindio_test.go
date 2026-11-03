@@ -109,7 +109,7 @@ func assertAllocationGone(t *testing.T, fake *docker.FakeClient) {
 }
 
 // TestTeardownReportsDindIO pins the primary path: the written bytes come from
-// the sidecar's io.stat, read in the same exec as the image probe, and the
+// the sidecar's io.stat, read in its own exec before the image probe, and the
 // stats endpoint is not consulted.
 func TestTeardownReportsDindIO(t *testing.T) {
 	logs := captureLogs(t)
@@ -141,8 +141,115 @@ func TestTeardownReportsDindIO(t *testing.T) {
 			t.Errorf("classic-store io.stat line must not carry %s:\n%s", bad, out)
 		}
 	}
-	if len(fake.OutputExecs) != 1 || fake.OutputExecs[0].Cmd[2] != sidecarProbeScript {
-		t.Errorf("OutputExecs = %+v, want one sh -c sidecar probe", fake.OutputExecs)
+	if len(fake.OutputExecs) != 2 || fake.OutputExecs[0].Cmd[2] != ioStatScript || fake.OutputExecs[1].Cmd[2] != imageProbeScript {
+		t.Errorf("OutputExecs = %+v, want the io.stat exec, then the image probe", fake.OutputExecs)
+	}
+}
+
+// stallingProbe answers the io.stat exec with ioOut and makes the image probe
+// hang until its context ends, as a probe stuck on a stalled disk would.
+func stallingProbe(ioOut string) func(context.Context, []string) (string, int, error) {
+	return func(ctx context.Context, cmd []string) (string, int, error) {
+		if cmd[len(cmd)-1] == ioStatScript {
+			return ioOut, 0, nil
+		}
+		<-ctx.Done()
+		return "", 0, ctx.Err()
+	}
+}
+
+// reportOne runs one sidecar report of gha-1's allocation with the given
+// budgets, as removeContainers would before stopping anything.
+func reportOne(t *testing.T, m *Manager, fake *docker.FakeClient, sidecar string, budget, step time.Duration) {
+	t.Helper()
+	list, err := fake.ContainerList(context.Background(), container.ListOptions{All: true})
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	r := m.newDindIOReporter(context.Background(), list, &teardownScope{m: m, mode: teardownModeAll, reportDindIO: true})
+	if r == nil {
+		t.Fatal("expected a reporter for an allocation with a sidecar")
+	}
+	r.budget, r.stepBudget = budget, step
+	for _, c := range list {
+		if c.ID == sidecar {
+			r.report(context.Background(), c)
+		}
+	}
+}
+
+// TestStalledProbeKeepsIOStatBytes is the regression for an image probe that
+// hangs past the report's budget (the sidecar's daemon stuck on a slow disk):
+// io.stat is read in its own exec first, so the line keeps written_bytes and
+// reports the probe's failure next to it.
+func TestStalledProbeKeepsIOStatBytes(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	fake.ExecOutputFunc = stallingProbe(ioTestIOStat)
+	fake.StatsErr = errors.New("stats must not be called")
+
+	start := time.Now()
+	reportOne(t, m, fake, sidecar, 300*time.Millisecond, 100*time.Millisecond)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("report took %v, want it bounded by its budget", d)
+	}
+	out := logs.String()
+	for _, want := range []string{"level=INFO", "written_bytes=123456", "written_source=io.stat", "probe_error", "deadline exceeded"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("IO line missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "stats_error") || strings.Contains(out, "images=") {
+		t.Errorf("line must carry neither a stats error nor image fields:\n%s", out)
+	}
+}
+
+// TestStalledIOStatExecFallsBackOnFreshBudget proves an io.stat exec that hangs
+// costs only its own step budget: the stats fallback then runs with time left
+// (the fake's stats call, like the real client, fails on a context that is
+// already done), and the image probe still runs after it.
+func TestStalledIOStatExecFallsBackOnFreshBudget(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	fake.ExecOutputFunc = func(ctx context.Context, cmd []string) (string, int, error) {
+		if cmd[len(cmd)-1] == ioStatScript {
+			<-ctx.Done()
+			return "", 0, ctx.Err()
+		}
+		return ioTestImages, 0, nil
+	}
+
+	reportOne(t, m, fake, sidecar, 2*time.Second, 100*time.Millisecond)
+	out := logs.String()
+	for _, want := range []string{"level=INFO", "written_bytes=654321", "written_source=stats",
+		"io_stat_error", "failed to read io.stat", "images=2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("IO line missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStatsFallbackSkippedWhenBudgetSpent proves the stats fallback does not
+// start once the report's budget is gone.
+func TestStatsFallbackSkippedWhenBudgetSpent(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake, sidecar := seedDindAllocation(t, "gha-1")
+	fake.ExecOutputFunc = func(ctx context.Context, _ []string) (string, int, error) {
+		<-ctx.Done()
+		return "", 0, ctx.Err()
+	}
+	fake.StatsErr = errors.New("stats must not be called")
+
+	// A step budget longer than the report's: the io.stat exec spends it all.
+	reportOne(t, m, fake, sidecar, 100*time.Millisecond, time.Second)
+	out := logs.String()
+	for _, want := range []string{"level=WARN", "report budget spent before the stats sample", "probe_error"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("IO line missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "must not be called") {
+		t.Errorf("the stats fallback ran on a spent budget:\n%s", out)
 	}
 }
 

@@ -167,11 +167,15 @@ type FakeClient struct {
 	// OutputExecs records every ExecOutput call, in order. ExecOutputText and
 	// ExecOutputExit are what the fake reports for each (stdout, exit code);
 	// ExecOutputErr, when non-nil, is returned instead. StatsErr, when non-nil,
-	// is returned by ContainerStatsOneShot. See fake_dindio.go.
+	// is returned by ContainerStatsOneShot. ExecOutputFunc, when non-nil,
+	// answers each recorded ExecOutput call instead of ExecOutputText and
+	// ExecOutputExit; it runs without the fake's lock held, so it may block
+	// on its context to model a stalled exec. See fake_dindio.go.
 	OutputExecs    []ExecRecord
 	ExecOutputText string
 	ExecOutputExit int
 	ExecOutputErr  error
+	ExecOutputFunc func(ctx context.Context, cmd []string) (string, int, error)
 	StatsErr       error
 
 	// Created records the SHAPE of every ContainerCreate call, in order, and
