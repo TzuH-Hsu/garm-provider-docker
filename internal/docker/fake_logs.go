@@ -65,6 +65,10 @@ func (c *fakeContainer) wakeLogFollowers() {
 //     container's body is the raw bytes instead;
 //   - at least one of ShowStdout/ShowStderr is required, and only the selected
 //     streams are returned;
+//   - Tail "N" starts the body at the last N lines recorded so far, counted
+//     across both streams before the stream selection, as the daemon counts
+//     them in its log file; "", "all" or anything that is not a non-negative
+//     integer means every line, as the daemon treats it;
 //   - without Follow the body ends (EOF) after the lines recorded so far;
 //   - with Follow it then stays open, streaming each new line, until the
 //     container is no longer running (EOF) or ctx is cancelled (the read
@@ -96,21 +100,27 @@ func (f *FakeClient) ContainerLogs(ctx context.Context, containerID string, opti
 		c.logNotify = make(chan struct{})
 	}
 
+	start := 0
+	if n, err := strconv.Atoi(options.Tail); err == nil && n >= 0 && n < len(c.logs) {
+		start = len(c.logs) - n
+	}
+
 	pr, pw := io.Pipe()
-	go f.pumpLogs(ctx, c, options, pw)
+	go f.pumpLogs(ctx, c, options, start, pw)
 	return pr, nil
 }
 
-// pumpLogs writes c's log lines into pw — framed exactly like the daemon — and,
-// when following, waits for more until the container stops or ctx ends.
-func (f *FakeClient) pumpLogs(ctx context.Context, c *fakeContainer, options container.LogsOptions, pw *io.PipeWriter) {
+// pumpLogs writes c's log lines from index start on into pw — framed exactly
+// like the daemon — and, when following, waits for more until the container
+// stops or ctx ends.
+func (f *FakeClient) pumpLogs(ctx context.Context, c *fakeContainer, options container.LogsOptions, start int, pw *io.PipeWriter) {
 	stdout, stderr := io.Writer(pw), io.Writer(pw)
 	if !c.tty {
 		stdout = stdcopy.NewStdWriter(pw, stdcopy.Stdout)
 		stderr = stdcopy.NewStdWriter(pw, stdcopy.Stderr)
 	}
 
-	next := 0
+	next := start
 	for {
 		f.mu.Lock()
 		pending := append([]fakeLogEntry(nil), c.logs[next:]...)

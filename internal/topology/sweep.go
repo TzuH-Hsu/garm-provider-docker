@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
@@ -26,6 +27,11 @@ import (
 // grace window — a peer's in-flight CreateInstance whose runner container does
 // not exist yet, or a just-finished job GARM may be about to delete itself.
 // Best-effort: a per-instance error is logged and the sweep continues.
+//
+// Before it tears down an allocation whose runner exited on its own, it logs
+// one line with the runner's exit details and screened log tail
+// (reportExitedRunner), since the teardown removes the only record of why the
+// runner exited.
 func (m *Manager) SweepOrphans(ctx context.Context) error {
 	names, err := m.enumerateInstanceNames(ctx)
 	if err != nil {
@@ -104,6 +110,7 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 		hasRunningRunner bool
 		hasExitedRunner  bool
 		exitedFinishedAt time.Time
+		latestExited     exitedRunner
 		youngest         time.Time
 		haveYoungest     bool
 	)
@@ -128,9 +135,10 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 		}
 		// An exited/dead runner: read its FinishedAt (F8) via inspect — the list
 		// summary does not carry it. Track the latest across any runners.
-		if fa, ok := m.runnerFinishedAt(ctx, c.ID); ok {
+		if info, fa, ok := m.runnerFinishedAt(ctx, c.ID); ok {
 			if !hasExitedRunner || fa.After(exitedFinishedAt) {
 				exitedFinishedAt, hasExitedRunner = fa, true
+				latestExited = exitedRunner{summary: c, info: info}
 			}
 		}
 	}
@@ -155,6 +163,9 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 		if m.now().Sub(exitedFinishedAt) < m.exitedGrace {
 			return false, nil // just-finished — do not race GARM's own delete
 		}
+		// The runner exited on its own and GARM has not deleted it: record why,
+		// while the container still holds its exit state and logs (exitreport.go).
+		m.reportExitedRunner(ctx, latestExited, containers)
 		return m.TeardownAllocation(ctx, instanceName)
 	}
 
@@ -172,25 +183,26 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	return m.TeardownAllocation(ctx, instanceName)
 }
 
-// runnerFinishedAt inspects a runner container and returns its State.FinishedAt
-// (F8), the moment the daemon recorded it exiting. The bool is false when the
-// container is gone (raced with a delete), the inspect fails, or FinishedAt is
-// absent/zero/unparseable — in which case the caller cannot age the allocation
-// on the exited-runner clock and falls back to the conservative skip.
-func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (time.Time, bool) {
+// runnerFinishedAt inspects a runner container and returns the inspect and its
+// State.FinishedAt (F8), the moment the daemon recorded it exiting. The bool is
+// false when the container is gone (raced with a delete), the inspect fails, or
+// FinishedAt is absent/zero/unparseable — in which case the caller cannot age
+// the allocation on the exited-runner clock and falls back to the conservative
+// skip.
+func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (types.ContainerJSON, time.Time, bool) {
 	inspected, err := m.cli.ContainerInspect(ctx, containerID)
 	if err != nil || inspected.State == nil {
-		return time.Time{}, false
+		return types.ContainerJSON{}, time.Time{}, false
 	}
 	raw := inspected.State.FinishedAt
 	if raw == "" {
-		return time.Time{}, false
+		return types.ContainerJSON{}, time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil || t.IsZero() || t.Year() <= 1 {
-		return time.Time{}, false
+		return types.ContainerJSON{}, time.Time{}, false
 	}
-	return t, true
+	return inspected, t, true
 }
 
 // enumerateInstanceNames returns the distinct instance names across this

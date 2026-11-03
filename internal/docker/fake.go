@@ -351,6 +351,10 @@ type fakeContainer struct {
 	state     string
 	oomKilled bool
 
+	// exitCode models State.ExitCode (SetExitCode), which the orphan sweep
+	// logs for a runner that exited on its own. Zero unless a test sets it.
+	exitCode int
+
 	// finishedAt models State.FinishedAt — the moment the daemon recorded the
 	// container exiting (F8). ContainerStop sets it to now; SetFinishedAt lets
 	// a test place it in the past to exercise the exited-runner sweep grace,
@@ -914,6 +918,17 @@ func (f *FakeClient) SetFinishedAt(containerID string, finishedAt time.Time) {
 	}
 }
 
+// SetExitCode sets the State.ExitCode a container reports, so a test can model a
+// runner that exited with a specific code. Unknown IDs are ignored.
+func (f *FakeClient) SetExitCode(containerID string, exitCode int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if c, ok := f.containers[containerID]; ok {
+		c.exitCode = exitCode
+	}
+}
+
 // ContainerInspect returns the recorded state of containerID.
 func (f *FakeClient) ContainerInspect(_ context.Context, containerID string) (types.ContainerJSON, error) {
 	f.mu.Lock()
@@ -1246,6 +1261,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		Running:   c.state == "running",
 		Dead:      c.state == "dead",
 		OOMKilled: c.oomKilled,
+		ExitCode:  c.exitCode,
 	}
 	// FinishedAt is surfaced only once the container has actually finished, as
 	// an RFC3339Nano string exactly like the real daemon, so the orphan sweep's
@@ -1275,6 +1291,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		ContainerJSONBase: base,
 		Config: &container.Config{
 			Image:  c.image,
+			Tty:    c.tty,
 			Env:    append([]string(nil), c.env...),
 			Cmd:    strslice.StrSlice(append([]string(nil), c.cmd...)),
 			Labels: cloneLabels(c.labels),
