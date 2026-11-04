@@ -1,67 +1,44 @@
 # syntax=docker/dockerfile:1
 #
-# garm-provider-docker runner image (Ubuntu 24.04 Noble base) - ADR-002.
+# Runner image, Ubuntu 24.04 Noble base.
 #
-# Build context is runner-images/ (not this directory), so the entrypoint shared
-# with the Resolute image can be copied from runner-images/common/:
+# The build context is runner-images/, so the entrypoint shared with the
+# Resolute image can be copied from runner-images/common/:
 #   docker build -f runner-images/noble/Dockerfile runner-images
 #
-# Digest pin below is the MANIFEST-LIST (index) digest for
-# myoung34/github-runner:ubuntu-noble, not a single-platform manifest,
-# resolved via:
+# The digest pin is the manifest-list (index) digest, not a single-platform
+# manifest, so the multi-platform build in images.yml resolves the right image
+# per architecture:
 #   docker buildx imagetools inspect myoung34/github-runner:ubuntu-noble
-# M0 pinned the linux/amd64-only platform manifest (plan.md M0 scope); M4-W1
-# re-pins to this manifest-list digest — confirmed upstream publishes both
-# linux/amd64 and linux/arm64 manifests under it — so buildx's
-# .github/workflows/images.yml multi-platform build resolves the correct
-# per-platform image automatically instead of needing a build matrix here.
 FROM myoung34/github-runner:ubuntu-noble@sha256:2299e3ced2c54ff07d3ca48db09f1e8e5b28d02bafe8007b10ba0b8e060204bf
 
 # garm.docker/os-release is read by the provider at create time and keys the
-# persistent toolcache and pnpm store volumes (ADR-003, 2026-10-12 amendment):
-# toolcache and pnpm contents built on one Ubuntu release must never be reused
-# on another. Change it only together with the FROM line's Ubuntu release.
+# persistent toolcache and pnpm store volumes: contents built on one Ubuntu
+# release must never be reused on another. Change it only together with the
+# FROM line's Ubuntu release.
 LABEL org.opencontainers.image.source="https://github.com/TzuH-Hsu/garm-provider-docker" \
       org.opencontainers.image.description="GARM external Docker provider runner image (Ubuntu 24.04 Noble base, ADR-002 JIT-aware entrypoint)" \
       org.opencontainers.image.licenses="Apache-2.0" \
       garm.docker/os-release="ubuntu-24.04"
 
-# LLVM release for clang-format/clang-tidy: Noble's own default (the release
-# the unversioned clang-format/clang-tidy packages point at), which is also the
-# default on GitHub's ubuntu-24.04 image. Newer LLVM on Noble only comes from
-# noble-updates (19, 20) or apt.llvm.org; a repository that needs LLVM 22 uses
-# the Resolute image instead.
+# LLVM release for clang-format/clang-tidy: Noble's default, which matches
+# GitHub's ubuntu-24.04 image. A repository that needs LLVM 22 uses the
+# Resolute image.
 ARG LLVM_VERSION=18
 
-# Commonly needed apt-level dependencies (runner-images/README.md, "What is in
-# the images"). Jobs should not need to apt-get install anything themselves:
-# system packages belong in the image, while languages and toolchains come from
-# the setup-* actions. (The runner user does have passwordless sudo, from the
-# base's sudoers rule, kept for parity with GitHub-hosted runners: ADR-002
-# 2026-10-12 Amendment. Nothing in the image relies on it.) The base
-# already ships the usual CLI tooling (jq, zip, unzip, xz, zstd, rsync, ssh,
-# gpg, git, curl, wget, gh, build-essential, python3 with venv and pip), so
-# only the verified gaps are added here:
-#   - the shared libraries a headless Chrome / Chromium for Testing needs
-#     (Puppeteer, Playwright's Chromium and Lighthouse CI download one at job
-#     time; the list is the missing set `ldd` reports for Chrome for Testing 155
-#     on this base, which is also what Puppeteer documents for Debian/Ubuntu);
-#   - fontconfig plus a minimal font set (fonts-liberation, fonts-noto-color-emoji)
-#     so pages render text and emoji instead of tofu boxes;
-#   - `file`, which the base lacks and build scripts routinely call;
-#   - pipx: PEP 668 blocks `pip install --user` on Ubuntu 24.04, so CI scripts
-#     install Python CLI tools with pipx into ~/.local/bin;
-#   - clang-format and clang-tidy (LLVM_VERSION above), registered under their
-#     unversioned names with update-alternatives the way GitHub-hosted images
-#     do, so both `clang-format` and `clang-format-18` resolve;
-#   - cmake and ninja-build, which GitHub-hosted images carry. Repositories that
-#     pin their own versions install them into /usr/local (writable below),
-#     which comes first on PATH.
-# Keep this list in step with runner-images/resolute/Dockerfile: the two images
-# carry the same package set, differing only where a package name or the LLVM
-# release differs between Ubuntu releases.
-# Every package exists for both amd64 and arm64 (images.yml builds both).
-# --no-install-recommends and the apt list cleanup keep the layer small.
+# Commonly needed apt packages (see runner-images/README.md), so jobs do not
+# apt-get install anything themselves. The base already ships the usual CLI
+# tooling; only the gaps are added:
+#   - shared libraries for a headless Chrome / Chromium for Testing
+#     (Puppeteer, Playwright, Lighthouse CI download one at job time);
+#   - fontconfig and a minimal font set, so pages render text and emoji;
+#   - `file`, which build scripts call and the base lacks;
+#   - pipx, because PEP 668 blocks `pip install --user` on this release;
+#   - clang-format and clang-tidy, registered under their unversioned names
+#     with update-alternatives as GitHub-hosted images do;
+#   - cmake and ninja-build, which GitHub-hosted images carry.
+# Keep this list in step with runner-images/resolute/Dockerfile. Every
+# package must exist for both amd64 and arm64.
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
@@ -101,18 +78,10 @@ RUN set -eux; \
     clang-format --version; \
     clang-tidy --version
 
-# Provide pnpm so W1's persistent pnpm store (npm_config_store_dir=/opt/pnpm-store,
-# ADR-003) is actually usable — the myoung34 base ships Node but NOT pnpm, npm, or
-# corepack (verified: Node 18 present, npm/corepack absent), so W1's store mount
-# was inert without this. PNPM_VERSION's MAJOR must match the provider's
-# [cache].pnpm_major (default "9"); bumping the major there is the signal to bump
-# this pin too (the pnpm store's on-disk layout is tied to the pnpm major).
-#
-# Installed lean: the pnpm npm-registry tarball (~20MB of JS) extracted to
-# /opt/pnpm and run by the base image's own Node via a tiny wrapper — no bundled
-# second Node runtime and no apt npm/build-toolchain bloat. Verified on Docker
-# Engine 29.6.1: `pnpm --version` works and, with npm_config_store_dir set,
-# `pnpm config get store-dir` resolves to /opt/pnpm-store.
+# The base ships Node but not pnpm, npm or corepack. PNPM_VERSION's major must
+# match the provider's [cache].pnpm_major (default "9"), because the pnpm
+# store layout is tied to the major. Installed lean: the registry tarball is
+# extracted to /opt/pnpm and run by the base image's own Node.
 ARG PNPM_VERSION=9.15.9
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
@@ -127,35 +96,24 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/pnpm; \
     pnpm --version
 
-# Create the default pnpm store mount point OWNED BY THE RUNNER USER (uid/gid
-# 1001) so a fresh named volume mounted here inherits runner ownership: Moby
-# copies an image directory's ownership onto an empty volume ONLY when the target
-# path already EXISTS in the image. Without this the mount point is absent, the
-# fresh volume mounts root-owned 0755, and a real `pnpm install` as the non-root
-# runner fails EACCES (H4 — verified on Docker Engine 29.6.1). The entrypoint
-# additionally chowns the CONFIGURED store path before the gosu drop, covering an
-# operator's custom [cache].pnpm_store_path; this handles the default path lean.
+# Create the pnpm store mount point owned by the runner user (uid/gid 1001).
+# Docker copies an image directory's ownership onto an empty volume only when
+# the path already exists in the image; otherwise the volume mounts root-owned
+# and `pnpm install` fails with EACCES. The entrypoint also chowns a custom
+# [cache].pnpm_store_path.
 RUN mkdir -p /opt/pnpm-store && chown 1001:1001 /opt/pnpm-store
 
-# Let the runner user install tools into /usr/local/bin and /usr/local/lib.
-# CI scripts written for GitHub-hosted runners drop single-binary tools there
-# and fall back to sudo only when the directory is not writable; owning the
-# directories lets them install without root, even where sudo is removed.
-# Only the two directories change owner, not their contents: the runner can add
-# and replace entries, while the files the base ships stay root-owned. This
-# leaks nothing between jobs: each runner container serves exactly one job and
-# its writable layer is discarded with it.
+# Let the runner user install tools into /usr/local/bin and /usr/local/lib
+# without sudo, as CI scripts written for GitHub-hosted runners expect. Only
+# the two directories change owner, not their contents.
 RUN chown runner:runner /usr/local/bin /usr/local/lib
 
-# Bypass the base image's config.sh-based entrypoint entirely (ADR-002):
-# this entrypoint never fetches JIT config itself, it only waits for
-# provider-delivered credential files (and, in DinD modes, Docker
-# readiness) before execing the runner. It is shared with the Resolute
-# image (runner-images/common/entrypoint.sh) and needs nothing beyond what
-# the base ships (gosu, docker-cli, coreutils).
+# Bypass the base image's config.sh-based entrypoint. The shared entrypoint
+# (runner-images/common/entrypoint.sh) never fetches JIT config itself; it
+# waits for provider-delivered credential files (and Docker readiness in DinD
+# modes) before execing the runner.
 COPY --chmod=0755 common/entrypoint.sh /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-# CMD is documentation only: the entrypoint always execs ./run.sh
-# directly regardless of "$@" (ADR-002 step 3).
+# CMD is documentation only: the entrypoint always execs ./run.sh.
 CMD ["./run.sh"]
