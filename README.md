@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/TzuH-Hsu/garm-provider-docker/actions/workflows/ci.yml"><img src="https://github.com/TzuH-Hsu/garm-provider-docker/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/TzuH-Hsu/garm-provider-docker/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/TzuH-Hsu/garm-provider-docker/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
   <a href="https://github.com/TzuH-Hsu/garm-provider-docker/releases/latest"><img src="https://img.shields.io/github/v/release/TzuH-Hsu/garm-provider-docker?sort=semver" alt="Latest release"></a>
   <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/TzuH-Hsu/garm-provider-docker" alt="Go version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/TzuH-Hsu/garm-provider-docker" alt="License"></a>
