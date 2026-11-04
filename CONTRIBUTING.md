@@ -8,6 +8,8 @@ conversation before a large change saves everyone time.
 - **Questions:** use [Discussions](https://github.com/TzuH-Hsu/garm-provider-docker/discussions).
 - **Security problems:** follow [SECURITY.md](SECURITY.md). Do not open a public issue.
 
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 Scheduling policy, such as limits across a whole host or fleet, belongs in
 GARM rather than in this provider.
 
