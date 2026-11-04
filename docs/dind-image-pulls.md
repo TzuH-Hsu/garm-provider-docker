@@ -1,79 +1,38 @@
 # Image pulls in DinD jobs
 
-In `privileged-sidecar` and `sysbox-runc` modes every job pulls the images it
-needs from the upstream registry, every time. This page explains why, and how
-to make those pulls faster and more reliable with a registry mirror. It
-applies only to the DinD modes: in `dind_mode = "none"` there is no daemon in
-the job, so nothing is pulled.
-
-- [Why every DinD job starts with an empty image store](#why-every-dind-job-starts-with-an-empty-image-store)
-- [Recommended: a shared Docker Hub pull-through cache](#recommended-a-shared-docker-hub-pull-through-cache)
-- [Pointing the sidecar at the mirror](#pointing-the-sidecar-at-the-mirror)
-  (the `registry_mirrors` setting, and the custom-image alternative)
-- [Zero-infrastructure alternative: `mirror.gcr.io`](#zero-infrastructure-alternative-mirrorgcrio)
-- [Registries other than Docker Hub](#registries-other-than-docker-hub)
-- [What a mirror does not fix](#what-a-mirror-does-not-fix)
-- [Measuring what a job writes: the teardown log line](#measuring-what-a-job-writes-the-teardown-log-line)
-- [Job-side advice](#job-side-advice)
+In `privileged-sidecar` and `sysbox-runc` modes every job pulls the images it needs, every time. This page
+explains why, and how a registry mirror makes pulls faster and more reliable. It does not apply to
+`dind_mode = "none"`, where there is no daemon in the job.
 
 ## Why every DinD job starts with an empty image store
 
-Each allocation gets its own DinD sidecar and its own `dind-state` volume,
-mounted at `/var/lib/docker`. The volume is created for the job and removed at
-teardown, together with the sidecar and the other job-scoped resources. This
-is the isolation design of [ADR-001](adr/ADR-001-dind-strategy.md) (see also
-[ADR-004](adr/ADR-004-teardown-and-orphan-cleanup.md) for teardown): one job's
-images, containers and build cache are never visible to the next job.
+Each allocation gets its own sidecar and its own `dind-state` volume at `/var/lib/docker`. The volume is
+removed with the sidecar at teardown ([ADR-001](adr/ADR-001-dind-strategy.md),
+[ADR-004](adr/ADR-004-teardown-and-orphan-cleanup.md)), so one job's images, containers and build cache are
+never visible to the next. The host daemon caches only the sidecar image itself. Two jobs that start the same
+database image each download it in full.
 
-The consequence is that no image layer survives a job. The host daemon caches
-only the sidecar image itself (`dind_image`); every image a job pulls *inside*
-the sidecar goes to the job's own `dind-state` volume and is gone when the job
-ends. Two jobs that start the same database image each download it in full.
+That makes jobs sensitive to upstream latency, timeouts and Docker Hub's pull rate limits. Anonymous pulls are
+counted per IP address, and every runner on one host shares one. See
+[Docker Hub pull usage](https://docs.docker.com/docker-hub/usage/pulls/).
 
-That is expected, not a malfunction, but it makes jobs sensitive to upstream
-latency, timeouts and Docker Hub's pull rate limits (at the time of writing,
-100 pulls per 6 hours for anonymous clients, counted per IPv4 address or IPv6
-/64, and 200 for a Personal account; see
-[Docker Hub pull usage](https://docs.docker.com/docker-hub/usage/pulls/) for
-the current numbers). Every runner on one host shares one address.
+## A shared Docker Hub pull-through cache
 
-## Recommended: a shared Docker Hub pull-through cache
+Run one pull-through cache per deployment, on the Docker host or elsewhere on the LAN. The official
+[`registry`](https://distribution.github.io/distribution/recipes/mirror/) image can run in proxy mode: it
+fetches from Docker Hub on first request, stores the content and serves later requests locally. Sharing one
+mirror across repositories is safe. A proxy-mode registry rejects pushes, so no job can write into it, and
+everything in it was fetched from the upstream and is addressed by digest.
 
-Run one pull-through cache per deployment, on the Docker host or elsewhere on
-the LAN, and let every repository and every runner use it. The official
-[`registry`](https://distribution.github.io/distribution/recipes/mirror/)
-image (distribution) can run in *proxy mode*, where it fetches content from
-Docker Hub on first request, stores it, and serves later requests from local
-storage.
-
-Sharing one mirror across repositories is safe. In proxy mode the registry
-rejects pushes, so no job can write into the cache, and everything in it was
-fetched from the upstream registry and is addressed by digest. A job cannot
-plant an image that another repository's job would then receive.
-
-### Compose snippet
-
-```yaml
-# compose.yaml - a Docker Hub pull-through cache.
-services:
-  registry-mirror:
-    image: registry:3  # pin by digest in a real deployment
-    restart: unless-stopped
-    ports:
-      # Bind to one address the Docker host and the job networks can reach,
-      # not 0.0.0.0 (see "Reachability" and the credentials note below).
-      - "<lan-ip>:5000:5000"
-    volumes:
-      - ./config.yml:/etc/distribution/config.yml:ro
-      - mirror-data:/var/lib/registry
-
-volumes:
-  mirror-data:
+```sh
+# Publish on one address the Docker host and the job networks can reach, not 0.0.0.0.
+# Pin the image by digest in a real deployment.
+docker run -d --restart unless-stopped -p <lan-ip>:5000:5000 \
+  -v "$PWD/config.yml:/etc/distribution/config.yml:ro" -v mirror-data:/var/lib/registry registry:3
 ```
 
-### `config.yml`
-
 ```yaml
+# config.yml
 version: 0.1
 storage:
   filesystem:
@@ -85,298 +44,92 @@ http:
 proxy:
   remoteurl: https://registry-1.docker.io
   ttl: 168h            # how long cached entries live; 0 disables expiry
-  # Optional Docker Hub credentials, see the warning below.
-  # username: <hub-user>
-  # password: <hub-access-token>
 ```
 
-- `proxy.remoteurl` is the one upstream this instance mirrors. A proxy
-  instance mirrors exactly one upstream.
-- Use the `filesystem` storage driver; the distribution documentation
-  recommends it for a pull-through cache. Without `storage.delete.enabled:
-  true` the TTL scheduler cannot clean up, and the cache only grows.
-- `proxy.ttl` defaults to `168h` (seven days). Size the volume for the set of
-  images your jobs use, and set the TTL to taste.
-- Docker Hub credentials are optional, and **leaving them out is the
-  recommended default**. They raise the pull allowance (see the numbers
-  above) and let the mirror pull private images, but **they also make every
-  private image that account can read available through the mirror to anyone
-  who can reach it**. Do not try to protect the mirror with HTTP
-  authentication: dockerd does not send credentials to a `registry-mirrors`
-  endpoint for Docker Hub image names (the long-standing, still open
-  [moby/moby#30880](https://github.com/moby/moby/issues/30880)), so a
-  password-protected mirror is skipped and every pull falls back to Docker
-  Hub. If you do set `username`/`password`, restrict access at the network
-  level instead: publish the mirror only on an address that the Docker host
-  and the job networks can reach, limit the host firewall to the Docker
-  address pools, and never expose it beyond the host or LAN segment. Treat
-  the mirror's storage as holding that account's private content, protect the
-  registry configuration file that holds the credentials, and use an access
-  token with read-only scope rather than the account password.
-
-### How dockerd uses the mirror
-
-- A mirror is consulted for pulls from Docker Hub (`docker pull postgres`,
-  `FROM node:22`) and is tried before Docker Hub itself. If the mirror is
-  down or does not have the image, dockerd falls back to the upstream, so the
-  mirror is not a single point of failure for jobs.
-- Pulls of content the mirror already holds are served locally. A pull by
-  tag still asks the upstream whether the tag has moved, so the mirror lowers
-  but does not remove the dependence on Docker Hub. Pulling by digest is the
-  most cache-friendly form.
-- A mirror URL must be a bare origin: scheme, host and optional port, no
-  path.
-
-### Reachability
-
-The sidecar's daemon reaches the mirror over the per-job bridge network:
-
-- Use a name or address that is routable from the job network, such as a LAN
-  DNS name or the host's LAN IP with the published port. The job network's
-  gateway address is **not** a usable address: it is different for every
-  job. Container DNS on the user-defined job network forwards to the host's
-  resolvers, so a name your host resolves normally also resolves in the job.
-- **Keep the address out of the nested daemon's default bridge range,
-  `172.17.0.0/16`.** The sidecar shares the runner container's network
-  namespace, and its own `dockerd` creates a `docker0` bridge there with
-  `172.17.0.1/16`. A mirror written as `http://172.17.0.1:5000` (the host's
-  `docker0` gateway, a common choice when the mirror runs on the Docker host)
-  therefore resolves to the nested bridge inside the sidecar: the dial gets
-  `connect: connection refused`, and `dockerd` silently falls back to Docker
-  Hub. **No job fails**: `docker info` still lists the mirror and pulls still
-  succeed, they just do not go through it. The symptom is a mirror that stays
-  cold and an access log with no pull requests, so check the mirror's access
-  log, not only the job result. This was observed live with the
-  privileged-sidecar mode; the host's LAN IP (`http://<host-lan-ip>:5000`)
-  worked, with the pulls visible in the mirror's log. Use the host's LAN IP or
-  a DNS name. Moving the nested bridge elsewhere (`--bip` or
-  `default-address-pools` in a custom `dind_image`) is possible but outside what
-  the provider's `registry_mirrors` key covers, so prefer an address that never
-  needs it.
-- The host firewall must allow traffic from the job networks (the Docker
-  address pools) to the mirror's port.
-- A mirror is unreachable when `[network].internal = true`, because the job
-  network then has no route out. With such a configuration the daemon cannot
-  use a mirror (or the upstream registry).
-- A plain-HTTP mirror needs no `insecure_registries` entry: dockerd takes the
-  scheme from the mirror URL (see [Pointing the sidecar at the
-  mirror](#pointing-the-sidecar-at-the-mirror)). An insecure-registries entry
-  is for a TLS mirror whose certificate the sidecar does not trust. The
-  alternative is a TLS mirror whose CA the sidecar trusts, which means baking
-  the CA into a custom image.
+- A proxy instance mirrors exactly one upstream. Use the `filesystem` storage driver. Without
+  `storage.delete.enabled: true` the cache only grows.
+- Leave Docker Hub credentials out. They raise the pull allowance, but they make every private image that
+  account can read available through the mirror to anyone who can reach it. dockerd does not send credentials
+  to a `registry-mirrors` endpoint ([moby/moby#30880](https://github.com/moby/moby/issues/30880)), so a
+  password-protected mirror is skipped. If you set `proxy.username` and `proxy.password`, restrict access at
+  the network level and use a read-only access token.
+- dockerd tries the mirror before Docker Hub and falls back to Hub if the mirror is down or lacks the image, so
+  the mirror is not a single point of failure. A pull by tag still asks the upstream whether the tag moved;
+  pulling by digest is the most cache-friendly form.
 
 ## Pointing the sidecar at the mirror
 
-Set `registry_mirrors` in the provider config
-([#26](https://github.com/TzuH-Hsu/garm-provider-docker/issues/26)). It is a
-top-level key next to `dind_image` and `storage_driver`, and the provider
-passes each entry to the sidecar's `dockerd` as `--registry-mirror=<url>`:
+Set `registry_mirrors` in the provider config:
 
 ```toml
 registry_mirrors = ["http://mirror.lan.example:5000"]
 ```
 
-- Each entry is a bare origin: `http://` or `https://`, a host, an optional
-  port, no path, query, fragment or userinfo. Anything else fails the config
-  load with a message naming the entry.
-- It is global and config-only. A pool's `extra_specs` cannot set or override
-  it, and it is not a per-flavor setting: a mirror belongs to the Docker
-  host's network, not to a pool. The provider reads its config on every
-  invocation, so each new sidecar picks up the current value; a sidecar that
-  already exists keeps the flags it was created with.
-- **An `http://` mirror does not need `insecure_registries`.** dockerd takes
-  the scheme from the mirror URL, so `http://mirror.lan.example:5000` is
-  contacted over plain HTTP by itself. This was verified live on Engine 29.9.2
-  with no `insecure_registries` entry: an `http://` mirror served the pulls,
-  which showed up in the mirror's access log. It also matches the Moby source
-  for the Engine 29.x line (release `docker-v29.8.2`): the mirror endpoint is
-  built from the URL as written (`daemon/pkg/registry/service_v2.go`), and the
-  containerd image-store pull path copies the URL's scheme into the registry
-  host (`daemon/hosts.go`); `insecure-registries` only switches off
-  certificate verification and enables an HTTP fallback for the hosts it
-  lists. Set `insecure_registries = ["mirror.lan.example:5000"]` only when the
-  mirror serves HTTPS with a certificate the sidecar does not trust, and for a
-  private HTTP registry that jobs pull from by name. Entries are `host[:port]`
-  or a CIDR, never a URL; each becomes `--insecure-registry=<entry>`.
-- The effective values are logged when each sidecar is created (`DinD sidecar
-  registry settings`). Duplicate and malformed entries fail the config load.
+The provider passes each entry to the sidecar's `dockerd` as `--registry-mirror=<url>`. Each entry is a bare
+origin (scheme, host, optional port, no path). The setting is global and config-only: a pool's `extra_specs`
+cannot change it, and a sidecar that already exists keeps the flags it was created with. An `http://` mirror
+needs no `insecure_registries` entry, because dockerd takes the scheme from the URL. The rules and the
+`insecure_registries` key are in the [config reference](config-reference.md#registry-mirrors-for-the-sidecar).
 
-To check the result, run `docker info` in a job and look for "Registry
-Mirrors" (and "Insecure Registries" if you set any). Mirrors are listed with
-a trailing `/`. The mirror's own access log shows whether pulls reach it; the
-real-job gate does both, see [`demo-m0.md`](demo-m0.md#registry-mirror-check-opt-in).
+To check it, run `docker info` in a job and look for "Registry Mirrors", then read the mirror's access log (the
+real-job gate does both, see [`demo-m0.md`](demo-m0.md#registry-mirror-check-opt-in)).
 
-> **Warning: do not combine these keys with a custom `dind_image` whose
-> `daemon.json` also sets `registry-mirrors` or `insecure-registries`.**
-> dockerd refuses to start when an option is set both as a flag and in the
-> configuration file ("the following directives are specified both as a flag
-> and in the configuration file"), so the sidecar would never become ready and
-> every DinD job would fail waiting for the daemon. Use the provider keys, or
-> the image's `daemon.json`, not both.
+**Do not combine these keys with a custom `dind_image` whose `daemon.json` also sets `registry-mirrors` or
+`insecure-registries`.** dockerd refuses to start when an option is set both as a flag and in the file, so
+every DinD job would fail waiting for the daemon.
 
-### Alternative: a custom `dind_image` (older provider versions)
+### Reachability
 
-On a provider version without `registry_mirrors`, the same result needs a
-custom sidecar image: `dind_image` accepts any digest-pinned image, and
-`dockerd` reads `/etc/docker/daemon.json` by default.
+- Use a name or address routable from the job network, such as a LAN DNS name or the host's LAN IP. The job
+  network's gateway address differs for every job and is not usable.
+- **Keep the address out of the nested daemon's default bridge range, `172.17.0.0/16`.** The sidecar shares
+  the runner's network namespace, and its own `dockerd` creates a `docker0` bridge there with `172.17.0.1/16`.
+  A mirror written as `http://172.17.0.1:5000` (the host's `docker0` gateway) therefore resolves to the nested
+  bridge, the dial is refused, and `dockerd` silently falls back to Docker Hub. **No job fails**: `docker info`
+  still lists the mirror and pulls still succeed, they just bypass it. The symptom is a cold mirror and an
+  access log with no pull requests. Use the host's LAN IP or a DNS name.
+- The host firewall must allow traffic from the job networks to the mirror's port. With
+  `[network].internal = true` the job network has no route out, so no mirror can be reached.
 
-`daemon.json`:
+## Alternatives and limits
 
-```json
-{
-  "registry-mirrors": ["http://mirror.lan.example:5000"]
-}
-```
-
-Add an `"insecure-registries"` list only for the cases described above (an
-HTTPS mirror with an untrusted certificate, or a private HTTP registry).
-
-`Dockerfile`:
-
-```dockerfile
-# Use the same base you would otherwise set as dind_image, pinned by digest.
-FROM docker:dind@sha256:<digest>
-COPY daemon.json /etc/docker/daemon.json
-```
-
-Build it, push it to a registry the Docker host can pull from, and set
-`dind_image` to the pushed image **by digest**
-(`registry.example/garm-dind@sha256:<digest>`), as for any other
-`dind_image` (see the README on digest pinning). Rebuild it when you update
-the base image.
-
-> **Warning: do not set `hosts`, `storage-driver` or `group` in this
-> `daemon.json`.** The provider already passes those as `dockerd` flags
-> (`--host`, `--storage-driver`, `--group`). Docker refuses to start when an
-> option is set both as a flag and in the configuration file, regardless of
-> the values, so the sidecar would never become ready and every DinD job
-> would fail waiting for the daemon. Keep the file to `registry-mirrors` and
-> `insecure-registries`, and drop those too once you move to the provider's
-> `registry_mirrors` / `insecure_registries` keys. Never add a TCP `hosts`
-> entry in any case: the ADR-001 rule that nothing listens on TCP is not
-> configurable.
-
-## Zero-infrastructure alternative: `mirror.gcr.io`
-
-Google operates a public cache of popular Docker Hub images at
-`mirror.gcr.io`. It needs nothing to run: set
-
-```toml
-registry_mirrors = ["https://mirror.gcr.io"]
-```
-
-(or, on a provider version without that key, the equivalent
-`"registry-mirrors": ["https://mirror.gcr.io"]` in the custom image's
-`daemon.json`).
-
-It caches frequently requested public images only, and Google gives no
-guarantee that a given image stays cached (see
-[Google's documentation](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images)).
-Anything it does not hold falls back to Docker Hub. It cannot serve private
-images, and you do not control its contents, so it suits popular base and
-service images better than a deployment-wide guarantee. It also needs outbound
-internet access from the job, so it is incompatible with
-`[network].internal = true`.
-
-## Registries other than Docker Hub
-
-`registry_mirrors` (dockerd's `registry-mirrors`) applies **only to Docker Hub**. Pulls from `ghcr.io`,
-`quay.io`, `gcr.io` and other registries never go through it, and a
-distribution proxy instance mirrors exactly one upstream. Options:
-
-- One distribution proxy instance per upstream registry (each with its own
-  `remoteurl`, port and storage).
-- [Harbor proxy-cache projects](https://goharbor.io/docs/main/administration/configure-proxy-cache/),
-  one project per upstream registry.
-- [zot](https://zotregistry.dev/v2.1.2/articles/mirroring/) with `sync` in
-  `onDemand` mode, which can front several upstreams in a single instance.
-
-All of these are addressed by the mirror's own name, so jobs must reference
-images through it, for example `mirror.lan.example:5001/owner/image:tag`
-instead of `ghcr.io/owner/image:tag`. They are not transparent. Unlike a
-Docker Hub mirror, these are ordinary registries to dockerd, not entries in
-`registry_mirrors`: if one is plain HTTP, the sidecar needs it in
-`insecure_registries` (`mirror.lan.example:5001`).
-
-## What a mirror does not fix
-
-A mirror cuts download latency and reduces the number of pulls that reach
-Docker Hub, so it lowers your exposure to its rate limits. It does not
-eliminate them: a cold or expired entry, or several jobs requesting the same
-uncached image at once, still pulls from Docker Hub and counts against its
-limits, and the mirror remains subject to Docker's fair-use policy. Set Hub
-credentials on the mirror (with the caveats above) if you need a higher
-allowance. A mirror also does not remove the per-job work of unpacking each
-image: layers are still extracted
-into the job's fresh `dind-state` volume, so every job still writes each image
-in full to local disk. Large images stay slow to start even from a warm
-mirror. Avoiding that cost would need an image store that outlives a job,
-which the per-job design of ADR-001 deliberately does not provide.
+- **`mirror.gcr.io`** needs nothing to run: `registry_mirrors = ["https://mirror.gcr.io"]`. It caches
+  frequently requested public images only, with no guarantee that an image stays cached, and it needs outbound
+  access from the job
+  ([Google's documentation](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images)).
+- **Registries other than Docker Hub.** `registry_mirrors` applies only to Docker Hub. For `ghcr.io`,
+  `quay.io` and others, run one proxy instance per upstream, a
+  [Harbor proxy-cache project](https://goharbor.io/docs/main/administration/configure-proxy-cache/) per
+  upstream, or [zot](https://zotregistry.dev/v2.1.2/articles/mirroring/) with `sync` in `onDemand` mode. Jobs
+  then reference images through the mirror's own name, and a plain-HTTP one needs an `insecure_registries` entry.
+- **What a mirror does not fix.** It lowers exposure to Docker Hub's limits but does not remove them: a cold
+  entry, or several jobs requesting the same uncached image at once, still reaches Hub. It also leaves the local
+  work of unpacking each image into the job's fresh `dind-state` volume, so large images stay slow to start even
+  from a warm mirror. A cache that outlives a job is a proposal in [ADR-006](adr/ADR-006-dind-image-cache.md).
 
 ## Measuring what a job writes: the teardown log line
 
-To judge how much of a job's disk writing is image pulls and extraction (the
-question [ADR-006](adr/ADR-006-dind-image-cache.md) gates on), `DeleteInstance`
-logs one line per DinD allocation before it stops any of the allocation's
-containers, the runner included. A short `docker exec` in the sidecar first
-reads the sidecar's own cgroup v2 `io.stat`, with a one-second budget of its
-own. A second exec then asks the sidecar's daemon what images it holds, with
-what is left of the report's budget, so a probe that stalls on a slow disk
-costs only the image fields, never the written bytes. The written bytes come
-from `io.stat`, not from the Docker stats endpoint: a privileged sidecar shares
-the runner's network namespace, the ephemeral runner has usually exited by
-itself when its job ended, before the delete arrives, and the daemon cannot
-build a stats sample for a container whose network namespace owner is stopped
-or gone. The stats sample is used only as a fallback when `io.stat` is not
-readable (a cgroup v1 host, or a runtime that virtualises cgroupfs); it also
-has a one-second budget and is taken before the image probe. The line is
-log-only and best-effort: all of it fits in a four-second budget, it never
-changes what is removed, and on any error it logs the reason and teardown
-continues. It is emitted by
-`DeleteInstance` only, not by the orphan sweep or `RemoveAllInstances`, and
-never in `dind_mode = "none"`.
-
-**The line needs `[logging] file`.** The provider logs to stderr, and GARM keeps
-a provider's stderr only when the call fails, so on a successful delete this line
-is discarded. Set `file` in the [`[logging]` table](config-reference.md#logging-persistent-log-file)
-(for example `/var/log/garm-provider-docker/provider.log`) to collect it; the
-`grep` below reads that file.
+To judge how much of a job's disk writing is image pulls and extraction (the question
+[ADR-006](adr/ADR-006-dind-image-cache.md) depends on), `DeleteInstance` logs one line per DinD allocation
+before it stops any container. It reads the sidecar's cgroup v2 `io.stat`, then asks the sidecar's daemon which
+images it holds. The line is log-only and best-effort, takes at most four seconds, never changes what is
+removed, and is not produced by the sweep, by `RemoveAllInstances` or in `none` mode. The written bytes come
+from `io.stat` and not from Docker's stats endpoint, which cannot sample a container whose network namespace
+owner has stopped. The stats sample is only a fallback. GARM keeps a provider's stderr only when a call fails,
+so **set `[logging] file`** ([config reference](config-reference.md#logging-persistent-log-file)) to collect it.
 
 ```text
 level=INFO msg="teardown: DinD sidecar IO" instance=gha-7f3a pool=0f6c2e1a-... repo=acme/widgets dind_mode=privileged-sidecar since_create_s=412 written_bytes=3187671040 written_source=io.stat written_by_device="8:0=3187671040" storage_driver=overlay2 image_store=classic images=4 image_bytes=1974321152
 ```
 
-(All values in examples are synthetic. A `containerd` store line also carries
-`content_bytes=<n>`.)
+(Synthetic values.) `written_bytes` is the sum of `wbytes` over every device in `io.stat`, recursive over nested
+containers, builds, volumes and `dockerd`'s own metadata. `written_by_device` splits it, so a swap device can be
+subtracted. `images` and `image_bytes` are the distinct images the daemon holds at teardown and the sum of their
+unpacked sizes; a containerd image store also reports `content_bytes` (the compressed blobs). `since_create_s`
+runs from allocation create to this line, including the wait for GARM's delete. `io_stat_error`, `probe_error`
+and the `teardown: DinD sidecar IO unavailable` warning say why a field is missing.
 
-| Field | Meaning |
-|---|---|
-| `instance`, `pool` | The GARM instance name and pool ID. |
-| `repo` | `org/repo` (or `org`, or `enterprises/name`) the runner registered against, read from the runner's environment. Omitted when the runner is already gone. |
-| `dind_mode` | `privileged-sidecar` or `sysbox-runc`. |
-| `since_create_s` | Seconds from allocation create to this line: startup, the job, and the wait for GARM's delete. |
-| `written_bytes` | Bytes the sidecar wrote to block devices over its life. From `io.stat`, it is the sum of `wbytes` over every device listed. From the stats fallback, it is the sum of the `write` entries of `blkio_stats.io_service_bytes_recursive` in a one-shot sample (`write` on cgroup v2, `Write` on v1; `Total`, `Sync` and `Async` are not summed). Either counter is recursive, so it covers nested containers, builds, volumes and `dockerd`'s own metadata, not only pulls. A present `io.stat` with no devices is logged as `written_bytes=0`. |
-| `written_source` | `io.stat` or `stats`: where `written_bytes` came from. |
-| `written_by_device` | `io.stat` only: `wbytes` per device as `major:minor=bytes`, comma separated. Devices are not filtered, so a swap device such as zram is included in `written_bytes`; its major number is assigned at boot, so subtract it here when it matters. |
-| `io_stat_error` | Why `io.stat` could not be used, when the line fell back to the stats sample or has no `written_bytes`. |
-| `storage_driver`, `image_store` | The sidecar daemon's driver, and `classic` (a graph driver such as `overlay2`) or `containerd` (the containerd image store). The provider always passes `--storage-driver`, so sidecars normally report `classic`; `containerd` appears only if a custom `dind_image` enables the containerd snapshotter itself. |
-| `images`, `image_bytes` | Distinct images the sidecar daemon holds at teardown, and the sum of their `docker image inspect` `Size`: the unpacked, uncompressed size. |
-| `content_bytes` | `containerd` image store only: the on-disk size (`du -sk`) of the containerd content store, the compressed blobs pulls wrote. |
-| `probe_error` | The image probe failed; `storage_driver`, `images`, `image_bytes` and the other image fields are omitted, and the rest of the line is still logged. |
-
-When neither `io.stat` nor the stats sample yields a counter, the line is
-logged as `level=WARN msg="teardown: DinD sidecar IO unavailable" ...
-io_stat_error=... stats_error=...` (for example when the cgroup has no io
-controller). The image probe still runs, so the WARN line carries the image
-fields or `probe_error`, but no `written_bytes`. A sidecar that has already
-exited is skipped with a debug line, since its counters are gone.
-
-**Computing the ratio.** The question is what share of `written_bytes` comes
-from pulling and extracting images. Estimate the bytes the pulls wrote as
-`image_bytes + content_bytes` (containerd store: unpacked snapshots plus
-compressed blobs) or `image_bytes` alone (classic store, where the compressed
-download is also written to a temporary file but is not measured). Aggregate
-over many jobs as a ratio of sums, not a mean of per-job ratios:
+To estimate the share of writes caused by pulls, aggregate over many jobs as a ratio of sums:
 
 ```sh
 grep 'teardown: DinD sidecar IO"' /var/log/garm-provider-docker/provider.log | awk '/image_bytes=/ {
@@ -385,47 +138,14 @@ grep 'teardown: DinD sidecar IO"' /var/log/garm-provider-docker/provider.log | a
   END { printf "jobs=%d written=%d pull_estimate=%d share=%.2f\n", n, w, p, p / w }'
 ```
 
-**Known biases.** Treat the result as an estimate with a direction, not an exact
-figure:
-
-- `image_bytes` counts a layer shared by several images once per image, and
-  counts images the job built as if they were pulled. Both overstate the pull
-  share. Lines with `images=1` are free of the sharing effect.
-- Images the job removed (`docker rmi`, `docker system prune`) before teardown,
-  intermediate build layers and build cache are not in `image_bytes`, and are
-  in `written_bytes`. This understates the pull share.
-- `image_bytes` is a size, not a write count. On the classic store the
-  compressed download is also written once and is not measured, which
-  understates the pull share; on the containerd store `content_bytes` covers it.
-- `written_bytes` counts only bytes that reached the block device. Pages still
-  dirty in the page cache when the sample is taken are missed, which lowers the
-  denominator and can push the ratio above 1. In a local run with freshly
-  started sidecars that had only pulled two images, `written_bytes` came out
-  20 to 25 percent below the unpacked plus compressed size of those images,
-  on both image stores.
-- `content_bytes` rounds up to filesystem blocks, and `written_bytes` includes
-  writes to any device the sidecar's cgroup used, not only the one holding
-  `dind-state`.
+The result is an estimate with a direction. `image_bytes` counts a shared layer once per image and counts images
+the job built, which overstates the pull share. Images removed before teardown, build cache and the compressed
+download on the classic store are missing from it, which understates the share. `written_bytes` counts only
+bytes that reached the block device, so dirty pages are missed, which can push the ratio above 1.
 
 ## Job-side advice
 
-The provider can make pulls faster; it cannot make them guaranteed. Jobs that
-depend on service containers should:
-
-- Pull explicitly, with retries, before starting anything that has a
-  readiness deadline:
-
-  ```sh
-  for attempt in 1 2 3 4 5; do
-    docker compose pull && break
-    [ "$attempt" -eq 5 ] && exit 1
-    sleep $((attempt * 5))
-  done
-  docker compose up --wait
-  ```
-
-- Start the services only after the pull has finished, and set health-check
-  `start_period` and any wait loop to cover start-up only. Image download time
-  should not count against a service's readiness window.
-- Reference images by digest where possible, which is also the friendliest
-  form for a pull-through cache.
+Jobs that start service containers should run `docker compose pull` in a retry loop before anything that has a
+readiness deadline, and start the services only after the pull has finished. Set health-check `start_period`
+and wait loops to cover start-up only, so that download time does not count against a service's readiness
+window. Reference images by digest where possible.
