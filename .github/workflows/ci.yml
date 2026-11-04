@@ -1,38 +1,6 @@
-# M3-W2: the first CI workflow for this repository. Kept minimal and
-# comment-heavy on purpose — see plan.md §3 M3, item 2.
-#
-# The `build` job runs go build, go vet, gofmt, and `go test ./... -race`
-# (unit tests only — the internal/verify package's live-daemon scenarios
-# are gated behind the `dockerverify` build tag, so a plain `go test
-# ./...` never compiles or runs them; see that package's own doc
-# comment). shellcheck runs against the repo's shell scripts last.
-#
-# Whether `build` is actually enforced as a required gate lives in a
-# repository RULESET, not in this file. Ruleset id 20447102
-# ("main-branch-protection", target `~DEFAULT_BRANCH`) is active and
-# requires: no branch deletion, no non-fast-forward pushes, and a pull
-# request (0 approving reviews required) whose status checks include one
-# named "build, vet, fmt, unit tests, shellcheck" passing. Verify the live
-# rule with `gh api repos/TzuH-Hsu/garm-provider-docker/rulesets/20447102`.
-#
-# That makes the coupling below load-bearing: a required check is matched
-# by the check-run NAME, which is this job's `name:` field — the string
-# "build, vet, fmt, unit tests, shellcheck" below. That string is a
-# load-bearing external identifier the ruleset references; renaming it
-# here silently detaches the ruleset's required check from this job, with
-# no error anywhere. Do not change that `name:` value without also
-# updating the ruleset.
-#
-# Honest caveat: the ruleset's `bypass_actors` grants the repository ADMIN
-# role `bypass_mode: always`, so an admin push can skip every rule above,
-# required check included, with no override prompt. For the solo
-# maintainer — who holds that role — this ruleset functions as a
-# guard-rail against accidental force-pushes, branch deletion, and
-# unreviewed merges from anyone else, not as a hard technical gate the
-# maintainer themself is unable to bypass.
-#
-# The `dockerverify` job is OPTIONAL and manual-only (workflow_dispatch) —
-# see its own comment below for why it is not part of the required gate.
+# The branch ruleset requires a check named after the `build` job's `name:`
+# below. Renaming that job detaches the required check with no error, so
+# update the ruleset first.
 name: CI
 
 on:
@@ -41,94 +9,32 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancellation is PR-only. On a PR a superseded run is dead weight — the
-# new push already supersedes it — but on `main` cancelling a run leaves a
-# merged commit with no green check and no record it ever built. Since
-# nothing outside this workflow consumes CI's result (release.yml and
-# images.yml trigger independently on pushed tags, not on ci.yml's
-# outcome), that build record IS the artifact for a main push, not a
-# byproduct. On a public repo with GitHub-hosted runners the minutes
-# "saved" by cancelling cost $0, so there is nothing on the other side of
-# that trade. Same-group pushes to `main` now queue rather than cancelling
-# the RUNNING run — but GitHub's concurrency model holds at most one
-# running plus one PENDING run per group, and a new push while one is
-# already pending cancels that earlier pending run to take its place. So
-# this is not a guarantee that every push to `main` gets a completed run:
-# two pushes in a row both get to run, but a burst of three or more in
-# quick succession can still leave an intermediate commit's run cancelled
-# before it starts. At ~47s per run that is a narrow edge case, not a
-# constraint worth engineering around. PRs are unaffected either way:
-# `github.ref` for a PR is `refs/pull/<N>/merge`, so each PR already has
-# its own concurrency group.
+# Cancel superseded runs on PRs only. On `main` every pushed commit should
+# keep its own build record.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# release.yml:42-43 and images.yml:50-51 already pin this explicitly;
-# ci.yml silently inherited the repository's default instead. That default
-# lives in an unversioned Settings toggle invisible to code review, and
-# this is the one workflow that executes repository code (`go test
-# ./...`), so pin it here too. Neither job needs more than read: `build`
-# reads/compiles/tests/lints the checked-out code, and `dockerverify` talks
-# to the runner's local Docker socket, not the GitHub API. Declaring this
-# can only narrow the token's scope, never widen it.
+# Pinned explicitly: this workflow runs repository code (`go test ./...`).
 permissions:
   contents: read
 
 jobs:
   build:
     name: build, vet, fmt, unit tests, shellcheck
-    # Stays on ubuntu-latest, not ubuntu-slim: this job's `go test ./...
-    # -race` step is the cost driver, and the race detector's CPU/memory
-    # overhead makes its wall-clock time on slim's single vCPU (vs.
-    # ubuntu-latest's standard multi-core allotment) impossible to bound
-    # without an empirical run against the hard 15-minute job cap — not a
-    # risk worth taking for a required gate. Splitting the cheap lint-only
-    # steps (gofmt, shellcheck) into a second, slim-hosted job was
-    # considered and rejected on WALL-CLOCK grounds, not cost: those steps
-    # are ~3s of measured work, but a second job pays its own
-    # checkout+setup-go overhead (~14s measured) just to relocate them —
-    # net slower, not a saving, regardless of price. (This repo is public,
-    # so GitHub-hosted runner minutes are $0 here either way — GitHub
-    # Actions is free for standard GitHub-hosted runners on public repos.
-    # A $/min argument for this split only applies if this pattern is
-    # reused in a private repo, where minutes are billed.)
+    # Not ubuntu-slim: the `-race` step is too CPU-bound for one vCPU.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # go.mod is this repo's single source of truth for the Go version; CI
-      # must never drift from it by hardcoding a version here. go-version-file
-      # is setup-go's own mechanism for that.
-      #
-      # This narrows the old grep's failure mode rather than eliminating it:
-      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
-      # missing the `go`/`toolchain` directive entirely still falls through
-      # to the same preinstalled-Go fallback the old `grep '^go '` produced
-      # on a no-match — core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.'), NOT
-      # setFailed. So go-version-file is not a universal, "strictly safer"
-      # replacement for that grep; go.mod having no `go` line at all still
-      # falls back to whatever Go the runner image ships. What it does
-      # concretely fix:
-      #
-      #   - the failed-grep-produces-empty-string case specifically (a
-      #     malformed but PRESENT `go` line the grep pattern missed)
-      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
-      #     get -u` can add one), which `grep '^go '` would silently ignore
-      #   - it parses go.mod inside the action itself, with no shell and no
-      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
-      #     (see the release.yml/images.yml file headers) that repo content,
-      #     which is attacker-controlled on a fork PR, must never round-trip
-      #     through a shell
+      # go.mod is the single source of truth for the Go version. setup-go
+      # parses it directly, so repo content never passes through a shell.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # caching is explicit here for clarity; the default cache key
-          # hashes go.mod (set cache-dependency-path to go.sum to key on it)
           cache: true
 
       - name: go build ./...
@@ -146,10 +52,7 @@ jobs:
             exit 1
           fi
 
-      # Unit tests only. The dockerverify-tagged live-daemon suite
-      # (internal/verify) is NOT compiled or run by this command — it is
-      # gated behind `-tags dockerverify` specifically so a plain `go test
-      # ./...` (what this step runs) never needs a Docker daemon.
+      # The `dockerverify`-tagged live-daemon suite is not built here.
       - name: go test ./... -race (unit)
         run: go test ./... -race -count=1
 
@@ -159,98 +62,28 @@ jobs:
       - name: shellcheck
         run: shellcheck runner-images/common/entrypoint.sh scripts/*.sh
 
-  # OPTIONAL, manual-only: the -tags dockerverify live-Docker-daemon
-  # integration suite (internal/verify). Gated behind workflow_dispatch
-  # rather than push/pull_request — NOT part of the required gate — because:
-  #
-  #   1. Several of these scenarios deliberately run for real wall-clock
-  #      minutes rather than mocking the clock (e.g. the credential-timeout
-  #      scenario waits out CreateInstance's own 60s credentialFetchDeadline,
-  #      and the crash-orphan-sweep scenario waits past the orphan sweep's
-  #      ~2-minute exited-runner grace window — see
-  #      internal/verify/verify_m3_scenarios_test.go). That is appropriate for
-  #      a manual run, not for gating every push/PR. (There is no cron
-  #      schedule anywhere in this repo — nothing runs nightly. Scheduling
-  #      this suite was considered and deliberately not done: as reason 3
-  #      below explains, it has not yet been validated against the
-  #      GitHub-hosted amd64 environment, so putting it on a schedule
-  #      today would just produce recurring red runs with no one watching
-  #      them.)
-  #   2. This suite drives the REAL provider binary against a REAL Docker
-  #      daemon. GitHub's hosted ubuntu-latest runners ship Docker Engine
-  #      pre-installed and already running, so no separate docker:dind
-  #      service container is needed here — the tests exec the provider
-  #      directly against the runner's OWN daemon at
-  #      unix:///var/run/docker.sock (see internal/docker.Client /
-  #      config.DockerHost's default). A docker:dind SERVICE would only be
-  #      needed if this job itself ran inside a container without Docker
-  #      access; the standard GitHub-hosted runner already has it.
-  #   3. This project's own dev/verification daemon is Docker Engine 29.6.1 on
-  #      linux/arm64 (Docker Desktop on Apple silicon); GitHub's hosted
-  #      ubuntu-latest runners are linux/amd64 on whatever Docker Engine
-  #      version ships with that image. Image availability, storage-driver
-  #      defaults, and DinD/sysbox-runc runtime availability are NOT
-  #      guaranteed identical across that gap (docs/research.md §3.C already
-  #      flags DinD storage-driver behavior as host-dependent) — this suite
-  #      has not yet been validated against the GitHub-hosted amd64
-  #      environment, so it is kept manual/advisory rather than a blocking
-  #      gate until it has.
+  # Manual only, not part of the required gate: scenarios wait out real
+  # timeouts (minutes), and it has not been validated on GitHub-hosted amd64.
   dockerverify:
     name: dockerverify (live-daemon integration suite; manual only)
     if: github.event_name == 'workflow_dispatch'
-    # Stays on ubuntu-latest: this job execs the real provider binary
-    # against a real Docker daemon (see the file-level comment above).
-    # ubuntu-slim runs the job itself inside a container with no Docker
-    # daemon available — GitHub has declined to add Docker-in-Docker
-    # support there (actions/runner-images#13541) — so slim cannot satisfy
-    # this job's hard requirement regardless of cost.
+    # Not ubuntu-slim: it has no Docker daemon (actions/runner-images#13541).
     runs-on: ubuntu-latest
-    # Job-level backstop above the live-daemon test step's own 30-minute
-    # step timeout (see that step's comment below), leaving headroom for
-    # checkout/setup-go before the test step even starts.
+    # Backstop above the test step's own 30-minute timeout.
     timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # go.mod is this repo's single source of truth for the Go version; this
-      # suite must never drift from it by hardcoding a version here.
-      # go-version-file is setup-go's own mechanism for that.
-      #
-      # This narrows the old grep's failure mode rather than eliminating it:
-      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
-      # missing the `go`/`toolchain` directive entirely still falls through
-      # to the same preinstalled-Go fallback the old `grep '^go '` produced
-      # on a no-match — core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.'), NOT
-      # setFailed. So go-version-file is not a universal, "strictly safer"
-      # replacement for that grep; go.mod having no `go` line at all still
-      # falls back to whatever Go the runner image ships. What it does
-      # concretely fix:
-      #
-      #   - the failed-grep-produces-empty-string case specifically (a
-      #     malformed but PRESENT `go` line the grep pattern missed)
-      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
-      #     get -u` can add one), which `grep '^go '` would silently ignore
-      #   - it parses go.mod inside the action itself, with no shell and no
-      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
-      #     (see the release.yml/images.yml file headers) that repo content,
-      #     which is attacker-controlled on a fork PR, must never round-trip
-      #     through a shell
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # caching is explicit here for clarity; the default cache key
-          # hashes go.mod (set cache-dependency-path to go.sum to key on it)
           cache: true
 
       - name: Verify Docker is reachable
         run: docker version
 
-      # This job's own timeout-minutes below is the real backstop; -timeout
-      # here just makes `go test` itself fail cleanly with a Go-native
-      # timeout report instead of being hard-killed by the runner.
       - name: go test -tags dockerverify (live daemon)
         run: go test -tags dockerverify -v -timeout 25m ./internal/verify/...
         timeout-minutes: 30

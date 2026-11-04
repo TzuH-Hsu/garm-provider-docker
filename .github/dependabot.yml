@@ -1,136 +1,23 @@
-# This file configures Dependabot VERSION updates only. It has no bearing
-# on whether Dependabot SECURITY updates run: those are a repo-level GitHub
-# setting, already enabled, and already running WITHOUT any config file —
-# confirmed by two real security-update jobs that ran here before this file
-# existed, on 2026-07-26 and 2026-08-01, both logged with
-# `"command":"security"`. Security updates fire promptly on a new advisory,
-# on GitHub's own cadence, regardless of anything `schedule:` below says —
-# `schedule.interval` governs version updates only. Deleting this entire
-# file would stop the monthly version-update PRs below; it would not touch
-# security updates at all.
+# Version updates only. Security updates are a repo-level GitHub setting and
+# run regardless of this file's `schedule:`.
 #
-# Several keys in the blocks below DO leak into the security-update path
-# (per GitHub's own docs), so each is called out at its use site rather
-# than assumed obvious:
-#   - `ignore:` (used once, on the `golang` base-image dependency in the
-#     `docker` block below — that is a Docker image tag named `golang`,
-#     not a Go module; do not confuse it with the separate `gomod` block
-#     also below). It is scoped with `update-types:` so it only suppresses
-#     VERSION bumps — a bare `dependency-name:` with no `update-types:`
-#     would have also suppressed the security PR for that dependency; see
-#     https://github.com/dependabot/dependabot-core/issues/4027).
-#   - `target-branch:` — deliberately absent everywhere in this file. This
-#     header previously claimed that pointing it at a non-default branch
-#     "silently disables security updates" for that ecosystem; GitHub's
-#     docs do not say that, and that was wrong. What they actually say is
-#     that specific per-ecosystem options stop applying to security PRs
-#     once `target-branch` targets a non-default branch — verbatim: "All
-#     pull requests for security updates are created with the chosen
-#     assignees, unless `target-branch` defines updates to a non-default
-#     branch," and "All commit messages follow the defined pattern, unless
-#     `target-branch` defines updates to a non-default branch." Security
-#     updates themselves keep running regardless. Keeping `target-branch`
-#     absent here is still correct — this repo has no reason to target a
-#     non-default branch — the reason is just "keep `assignees` /
-#     `commit-message` applying to security PRs too," not "or security
-#     updates stop."
-#   - `commit-message:` — set on all three ecosystem blocks below. Per the
-#     same docs quoted above, its prefix also shapes security-update
-#     commit messages, not just version-update ones, so `ci(deps)` /
-#     `build(deps)` are not version-update-only cosmetics.
-#   - `groups:` — both groups below are pinned to
-#     `applies-to: version-updates` so a group can never batch a security
-#     fix behind an unrelated version bump and delay it.
-#
-# Cadence: `interval: monthly` on every ecosystem, with `time:` and
-# `timezone:` deliberately OMITTED so GitHub picks the slot itself and
-# spreads scheduler load; a single maintainer gains nothing from pinning a
-# fixed local window. Weekly was rejected as roughly 4x the triage burden
-# for a dependency set that moves this slowly. Quarterly was rejected
-# because it lets three months of drift accumulate into one diff that is
-# no longer reviewable in one sitting.
-#
-# There IS a `gomod` block below (added 2026-09-21) — but not because
-# `go.mod` has gomod version updates coming; it does not (see the
-# terminal-pin paragraph below). It exists for a narrower, already-
-# observed reason: on 2026-09-21, Dependabot's own gomod SECURITY PR #2
-# (bumping go.opentelemetry.io/otel/exporters/otlp/otlptrace/
-# otlptracehttp past GHSA-8wmf-6v46-5gfg, alert #7) could not be rebased,
-# because at the time PR #2 was opened this file had no `gomod` entry for
-# Dependabot to re-derive the PR from. Commenting `@dependabot rebase` on
-# PR #2 got back, verbatim:
-#
-#   "The dependabot.yml entry that created this PR has been deleted so
-#   this PR can't be rebased. Please close the PR so Dependabot can
-#   create a new one with the current dependabot.yml."
-#
-# PR #2 could not be rebased, so the same bump was applied by hand
-# instead (see the `build(deps)` commit bumping `otlptracehttp` to
-# v1.45.0). PR #2 itself is still OPEN as of this writing; if Dependabot
-# has not closed it as superseded by the time this lands, close it by
-# hand as a duplicate. The `gomod`
-# block below exists SOLELY so the next gomod security PR has a config
-# entry to be recreated from and to attach `@dependabot rebase` /
-# `@dependabot recreate` to — it is not there to invite gomod
-# version-update PRs. `open-pull-requests-limit: 0` on the block is what
-# keeps those version-update PRs at zero: per GitHub's Dependabot options
-# reference, that setting lets you "temporarily disable version updates
-# for a package manager by setting this option to zero," while — same
-# page — "Security update pull requests are not subject to this limit and
-# do not count toward it. There is no limit on the number of open pull
-# requests for security updates." So the block mutes exactly the
-# version-update noise this ecosystem has zero of anyway (below), and
-# leaves gomod security PRs, and their rebase/recreate commands, fully
-# working.
-#
-# `go.mod` pins `github.com/docker/docker` at `v28.5.2+incompatible`.
-# That module path never adopted a `/vN` suffix, so proxy.golang.org caps
-# what it will ever resolve there at `v28.5.2+incompatible` — this pin is
-# already the TERMINAL version reachable on this import path. The one
-# version bump this path ever had, v27.5.1 to v28.5.2, LANDED on
-# 2026-09-21 via PR #5, gated on a live run of this repo's `dockerverify`
-# suite against a real daemon (Docker Engine 29.8.0, all 18 scenarios
-# passing in 398.180s — see PR #5's description) rather than the fake
-# client alone. There is now no v29 and no further version bump for
-# Dependabot to ever propose on this import path again — a gomod
-# version-update PR for `github.com/docker/docker` specifically can never
-# appear again, which is one more reason the limit-0 block above costs
-# this repo nothing: even without that cap, this particular dependency
-# would already be silent. Moving past v28.5.2 is not a version bump at
-# all: it is a migration to the separately-versioned
-# github.com/moby/moby/v2 import path, tracked as its own deliberate piece
-# of work in issue #1, not something a routine monthly Dependabot PR on
-# this block could ever produce — and not something
-# `open-pull-requests-limit: 0` would block either, since that migration
-# is a manual dependency-name change a maintainer makes, not a
-# Dependabot-generated version-update PR.
-#
-# No `ignore:` rule is added for `docker/docker` on the `gomod` block
-# below. The reasoning is the same one this file already uses for
-# `ignore:` elsewhere (see the `docker` ecosystem block's `golang` entry
-# lower down): `ignore` cannot distinguish "silence a pointless version
-# bump" from "silence a security fix," so it is the wrong tool even for a
-# dependency this terminally pinned. `open-pull-requests-limit: 0` mutes
-# ALL version updates for the whole `gomod` ecosystem without that
-# ambiguity, so a per-dependency `ignore:` would be strictly narrower for
-# no benefit here.
+# Keys that also affect security PRs:
+#   - `ignore:` must always carry `update-types:`. A bare `dependency-name:`
+#     would also suppress security PRs for that dependency
+#     (https://github.com/dependabot/dependabot-core/issues/4027).
+#   - `commit-message:` prefixes security PRs too.
+#   - `target-branch:` stays unset so the two keys above keep applying.
+#   - `groups:` are limited to `applies-to: version-updates` so a security
+#     fix is never batched behind an unrelated bump.
 version: 2
 updates:
-  # 3 workflows (ci.yml, images.yml, release.yml), 24 `uses:` lines, 8
-  # distinct actions, every one of them SHA-pinned with a trailing
-  # `# vX.Y.Z` comment. Dependabot updates the SHA AND rewrites that
-  # trailing comment to match (GitHub changelog, 2022-10-31, "Dependabot
-  # now updates comments in GitHub Actions workflows referencing action
-  # versions": "Dependabot will now update the semver version in comments
-  # when updating Actions workflows with a commit SHA version."
-  # https://github.blog/changelog/2022-10-31-dependabot-now-updates-comments-in-github-actions-workflows-referencing-action-versions/).
+  # Every `uses:` line is SHA-pinned with a trailing `# vX.Y.Z` comment.
+  # Dependabot rewrites that comment together with the SHA, and needs it to
+  # classify a bump as minor/patch versus major. Keep it on every `uses:` line.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: monthly
-    # This repo's existing Action-related commits use `ci(release):` and
-    # `ci(images):`; `ci(deps)` follows the same `ci(scope):` shape for
-    # Dependabot's own commits.
     commit-message:
       prefix: "ci(deps)"
     groups:
@@ -138,43 +25,12 @@ updates:
         applies-to: version-updates
         patterns:
           - "*"
-        # Minor/patch bumps land together in one PR; a major is split out
-        # into its own ungrouped PR so it gets its own review and its own
-        # CI run, and one failing major can never hold a batch of
-        # otherwise-safe minor/patch bumps hostage.
-        #
-        # Spelling note: `minor` / `patch` (bare, no `version-update:`
-        # prefix) is the documented spelling INSIDE a group's
-        # `update-types:`. The `version-update:semver-minor` /
-        # `version-update:semver-patch` spelling is documented for
-        # `ignore:` blocks instead — see the `docker` block below for
-        # where that spelling IS the correct one, in an `ignore:` entry.
-        # What happens if the two spellings are swapped inside a group is
-        # not documented behavior, so this comment does not claim to know
-        # it; the bare spelling is used here because it is the documented
-        # one for this context, not because the alternative has been
-        # observed to fail in a specific way.
+        # Majors get their own PR. Inside a group the spelling is bare
+        # `minor` / `patch`.
         update-types:
           - minor
           - patch
-    # LOAD-BEARING PRECONDITION for the update-types filter above:
-    # Dependabot can only classify a bump as minor/patch (vs. major) by
-    # resolving the OLD and NEW SHAs against the semver each `# vX.Y.Z`
-    # trailing comment declares. Every `uses:` line in this repo's
-    # workflows carries that comment today (verified above). If a future
-    # edit strips or malforms one of those comments, Dependabot degrades
-    # to treating that action as an unversioned SHA pin — it will still
-    # update it, but by chasing the branch tip with no semver to classify
-    # against, so this filter silently stops filtering for that one
-    # action and every bump for it (major included) lands in the group.
 
-  # Exactly three Dockerfiles are tracked by git: the root Dockerfile (the
-  # provider binary image), runner-images/noble/Dockerfile and
-  # runner-images/resolute/Dockerfile (the two runner images). Further
-  # Dockerfiles can exist under .claude/worktrees/, but
-  # that whole path is gitignored (see .gitignore), so it is invisible to
-  # Dependabot by construction — it needs no `directories:` entry and no
-  # `ignore:` exclusion.
   - package-ecosystem: "docker"
     directories:
       - "/"
@@ -182,9 +38,6 @@ updates:
       - "/runner-images/resolute"
     schedule:
       interval: monthly
-    # This repo's existing Docker-related commits use `build(docker):` and
-    # `build(provider):`; `build(deps)` follows the same `build(scope):`
-    # shape for Dependabot's own commits.
     commit-message:
       prefix: "build(deps)"
     groups:
@@ -192,212 +45,30 @@ updates:
         applies-to: version-updates
         patterns:
           - "*"
-        # Deliberately NO `update-types:` filter here — this is NOT an
-        # oversight relative to the github-actions group above, it is the
-        # opposite choice for a reason specific to this ecosystem. A
-        # digest-only refresh of an otherwise-unchanged rolling tag (e.g.
-        # `golang:1.25.0` or `myoung34/github-runner:ubuntu-noble` getting
-        # rebuilt with base-OS CVE fixes, same tag, new digest) carries NO
-        # semver update-type at all — there is no "minor" or "patch" to
-        # classify it as. A minor/patch filter here would therefore
-        # exclude exactly the kind of update these Dockerfiles mostly
-        # produce, stranding each one as an ungrouped one-off PR instead
-        # of batching it. The github-actions group above can safely filter
-        # on update-types because every action bump there DOES have a
-        # resolvable semver (see that group's own comment); this
-        # ecosystem's bumps mostly don't, so the filter would do the
-        # opposite of what it does above.
-        #
-        # Scope of the batching above: "directories:" lists three
-        # Dockerfiles and this one `groups:` block covers all of them, but
-        # that does NOT mean updates from every directory land in a single
-        # PR. Grouping is per directory unless `group-by: dependency-name`
-        # is also set, and even then it only merges updates that share the
-        # exact SAME dependency name across directories. The root
-        # Dockerfile pins golang/distroless; the two runner Dockerfiles both
-        # pin myoung34/github-runner, but on different tags (ubuntu-noble,
-        # ubuntu-resolute) whose digests move independently, so this
-        # configuration produces one PR per directory when several have
-        # pending updates — "batching" here means "the updates within one
-        # directory ride together," not "the Dockerfiles ride together."
-        # `group-by: dependency-name` is deliberately not added: the two
-        # runner images are released and verified independently, and
-        # nobody has asked for cross-directory batching.
+        # No `update-types:` filter: digest-only refreshes have no semver
+        # type and would escape the group. Grouping is per directory.
     ignore:
-      # Dockerfile:49 pins `golang:1.25.0` as this image's build toolchain.
-      # go.mod's `go 1.25.0` line is this repo's single source of truth for
-      # the Go version — ci.yml and release.yml both derive their toolchain
-      # from go.mod via setup-go's own `go-version-file: go.mod` input on
-      # every `Set up Go` step, so nothing else hardcodes a second copy
-      # (setup-go parses go.mod itself now — stronger than this repo's
-      # earlier shell-based `grep '^go ' go.mod` approach, since it also
-      # picks up a future `toolchain` directive and never round-trips repo
-      # content through a shell). The golang base image pin here IS that
-      # second copy, unavoidably: a FROM line cannot read go.mod. Left
-      # unattended, a Dependabot bump to `golang:1.26` would mean this
-      # repo's release images get compiled by a toolchain CI has never run
-      # a single test against.
-      #
-      # All three semver update-types are ignored. What this `ignore` rule
-      # does NOT do is filter digest-only changes: a rebuild of the same
-      # `golang:1.25.0` tag with base-OS CVE fixes baked in has no semver
-      # update-type to match against, so `ignore` semantics alone mean this
-      # rule is simply silent on that case — it neither suppresses it nor
-      # promises to let it through.
-      #
-      # Whether Dependabot actually EMITS a digest-only PR for that case is
-      # a separate, moving question this file does not promise an answer
-      # to: dependabot-core has shipped digest-suppression logic (e.g.
-      # "Respect cooldown for Docker digest updates and suppress
-      # multi-arch no-ops"), and which suppression behavior is active on
-      # GitHub.com at any given time is not something checked into this
-      # repo can verify. If a digest-refresh PR for `golang:1.25.0` shows
-      # up, take it — it is still gated by this repo's normal review. If
-      # it never shows up, the outcome is simply staying pinned at the
-      # current digest, which is the safe direction to fail in either way.
-      #
-      # Rejected alternative: leave it unignored as a standing "new Go is
-      # out" reminder PR. Rejected because that PR is wrong as merged —
-      # merging it silently breaks the go.mod-is-the-only-source-of-truth
-      # invariant above — and a PR that must always be closed unmerged is
-      # worse than no PR at all; nobody needs Dependabot to tell them a new
-      # Go release exists.
+      # go.mod is the single source of truth for the Go version. The
+      # Dockerfile's `golang` tag is the one second copy, so bump it by hand
+      # together with go.mod.
       - dependency-name: "golang"
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
           - "version-update:semver-patch"
-    # runner-images/noble/Dockerfile and runner-images/resolute/Dockerfile
-    # document (in their header comments) that their
-    # `myoung34/github-runner:ubuntu-noble` / `:ubuntu-resolute` pins are
-    # deliberately the MANIFEST-LIST (index) digest, resolved via
-    # `docker buildx imagetools inspect myoung34/github-runner:<tag>`,
-    # not a single-platform manifest digest — that is what lets the
-    # multi-platform build in images.yml resolve the correct per-platform
-    # image automatically instead of needing a build matrix here.
-    # Dependabot resolves a tag update to that same manifest-list digest,
-    # so its automated bumps preserve this property and are safe to take
-    # unreviewed on that front. The risk is a human one: a reviewer who
-    # ever hand-substitutes a platform-specific digest (e.g. copying the
-    # amd64-only digest reported by `docker pull` on their own machine)
-    # would silently break the arm64 leg of that build, with no error
-    # until an arm64 runner tries to pull it.
-    #
-    # No `registries:` block: gcr.io (the distroless base image),
-    # docker.io (myoung34/github-runner), and ghcr.io (this repo's own
-    # published images, not a dependency source) are all reached
-    # anonymously today, and all three images this repo pulls FROM are
-    # public. If Docker Hub's anonymous manifest-pull rate limit ever
-    # starts failing Dependabot's lookup of myoung34/github-runner
-    # specifically, THAT failure is the symptom that would justify adding
-    # a `registries:` entry with a read-only Docker Hub token — not a
-    # preemptive addition now.
+    # The runner image pins are the manifest-list (index) digest, not a
+    # single-platform digest, so the multi-platform build resolves the right
+    # image per architecture. Dependabot preserves this; do not hand-replace
+    # one with a platform-specific digest.
 
-  # This block exists ONLY so a gomod SECURITY pull request always has a
-  # `dependabot.yml` entry to be recreated from and to attach
-  # `@dependabot rebase` / `@dependabot recreate` to — see the file header
-  # for the 2026-09-21 PR #2 incident that motivated adding it. It is NOT
-  # here to produce gomod version-update PRs: `github.com/docker/docker`
-  # is this module's only version-pinned dependency of any consequence on
-  # this front and it is already at its terminal reachable version on
-  # this import path (see header), so there is nothing for a monthly
-  # gomod version-update check to find today. If that changes — most
-  # plausibly once the moby/moby/v2 migration in issue #1 lands and the
-  # new import path starts producing its own real version updates — raise
-  # `open-pull-requests-limit` off of `0` at that point. Leaving it at `0`
-  # after that would silently recreate the exact "PR nobody can rebase"
-  # failure mode this block was added to fix, just for a different
-  # dependency.
+  # Exists only so a gomod security PR has a config entry to be rebased or
+  # recreated from. `open-pull-requests-limit: 0` mutes version-update PRs;
+  # security PRs are not subject to that limit. Raise the limit if gomod
+  # version updates are ever wanted.
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
       interval: monthly
-    # Mutes ALL version-update PRs for this ecosystem — see the file
-    # header and the "Options considered and rejected" footer entry for
-    # `open-pull-requests-limit` for the GitHub docs quote confirming this
-    # does not touch security updates, which keep running and keep being
-    # reachable by `@dependabot rebase` / `@dependabot recreate`
-    # regardless of this setting.
     open-pull-requests-limit: 0
-    # No `ignore:` entry for `github.com/docker/docker`: see the file
-    # header — `ignore` cannot distinguish a version bump from a security
-    # fix, and `open-pull-requests-limit: 0` above already mutes every
-    # version update in this ecosystem without that ambiguity.
-    #
-    # No `groups:` block: grouping only matters when more than one PR
-    # could be open at once to batch together, and
-    # `open-pull-requests-limit: 0` guarantees zero version-update PRs are
-    # ever open here to batch. Add one only alongside raising the limit
-    # off `0` (see above).
     commit-message:
       prefix: "build(deps)"
-
-# ---------------------------------------------------------------------------
-# Options considered and rejected for this file. Recorded here so they are
-# not re-litigated the next time someone reads this file wondering why it
-# doesn't have them:
-#
-# - `assignees` — the single maintainer is already notified of every
-#   Dependabot PR by virtue of being the only person watching the repo; the
-#   only thing an explicit assignee adds is a row on the cross-repo
-#   /pulls/assigned dashboard, which `is:pr author:app/dependabot` already
-#   reproduces without hardcoding anything. The cost is a hardcoded GitHub
-#   username that silently stops resolving on an account rename.
-#
-# - `reviewers` — removed from the dependabot.yml schema on 2025-08-08;
-#   setting it now would simply be ignored.
-#
-# - custom `labels` — REPLACES Dependabot's default labels rather than
-#   adding to them, which would lose the per-ecosystem label (e.g.
-#   `github-actions`, `docker`) that is the most useful filter on this
-#   repo's Dependabot PR list. Custom labels must also already exist on the
-#   repo or they are dropped silently, and this repo has neither a
-#   `dependencies` nor a `type:build` label today. Separately,
-#   release.yml's `gh release create --generate-notes` step has no
-#   `.github/release.yml` categorization config yet; the eventual fix for
-#   Dependabot PRs cluttering auto-generated release notes is a release-notes
-#   category keyed on the `dependencies` label — which requires keeping that
-#   default label intact now, not replacing it.
-#
-# - a `groups` entry with `applies-to: security-updates` — GitHub already
-#   injects an implicit `{patterns: ["*"], applies-to: security-updates}`
-#   group per ecosystem with no config needed (visible in this repo's own
-#   security-update job logs, see the file header). Writing one out here
-#   would only restate that default, and any version of it that is NOT
-#   exactly equivalent to the implicit default would be strictly worse.
-#
-# - `cooldown` — a monthly `schedule.interval` already gives roughly 15
-#   days of average soak time between a dependency release and this repo
-#   picking it up; the built-in 3-day default cooldown (applied even with
-#   `cooldown:` unset) stays as-is on top of that.
-#
-# - `open-pull-requests-limit` — for the `github-actions` and `docker`
-#   blocks, the default of 5 remains slack this repo does not need at
-#   roughly 2-3 version-update PRs/month across those two ecosystems
-#   combined; lowering it there would strand updates silently past the cap
-#   with no visible signal, so both are left at the default. For the
-#   `gomod` block this option is NOT rejected: it is set to `0`, which
-#   GitHub's Dependabot options reference confirms is the documented way
-#   to "temporarily disable version updates for a package manager by
-#   setting this option to zero," while, per the same page, "Security
-#   update pull requests are not subject to this limit and do not count
-#   toward it." Setting `0` is also preferable to deleting an ecosystem's
-#   whole block if muting it is ever needed for `github-actions` or
-#   `docker` too, because it preserves all the reasoning in this file in
-#   place instead of losing it. See the `gomod` block above (and the file
-#   header) for why that block exists and is muted this way rather than
-#   deleted outright.
-#
-# - `rebase-strategy: disabled` — the real lever to reach for if CI churn
-#   from rebasing open Dependabot PRs ever becomes a problem, but ci.yml's
-#   concurrency group already sets `cancel-in-progress:
-#   ${{ github.event_name == 'pull_request' }}`, which collapses superseded
-#   runs on exactly the PR-triggered runs a Dependabot rebase produces, so
-#   there is no churn to fix yet. Disabling it now would just mean
-#   resolving merge conflicts on stale PRs by hand for no present benefit.
-#
-# - `commit-message.include: "scope"` — appends a prod/dev dependency-group
-#   suffix to commit messages; neither the github-actions nor the docker
-#   ecosystem in this repo distinguishes prod from dev dependencies, so
-#   there is nothing for it to add.
-# ---------------------------------------------------------------------------
