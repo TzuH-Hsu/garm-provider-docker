@@ -53,7 +53,7 @@ type dindIOReporter struct {
 // Docker calls. The runner's repository is read here, before any container is
 // stopped.
 func (m *Manager) newDindIOReporter(ctx context.Context, list []types.Container, scope *teardownScope) *dindIOReporter {
-	if !scope.reportDindIO || !hasRole(list, spec.RoleDind) {
+	if !scope.reportOnDelete || !hasRole(list, spec.RoleDind) {
 		return nil
 	}
 	r := &dindIOReporter{m: m, budget: dindIOReportTimeout, stepBudget: dindIOStepTimeout}

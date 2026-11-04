@@ -26,7 +26,9 @@ import (
 //
 // For a DinD allocation the teardown also logs one best-effort line with the
 // sidecar's block-device writes and image footprint before the sidecar stops
-// (ADR-006 rollout step 0); it never affects the result.
+// (ADR-006 rollout step 0), and for a runner that is not running one best-effort
+// line with its exit details, phase and screened log tail before it is removed
+// (ADR-004 amendment 2026-11-04); neither affects the result.
 func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error {
 	instanceName, found, err := p.resolveInstanceName(ctx, instanceID)
 	if err != nil {

@@ -166,7 +166,7 @@ func reportOne(t *testing.T, m *Manager, fake *docker.FakeClient, sidecar string
 	if err != nil {
 		t.Fatalf("ContainerList: %v", err)
 	}
-	r := m.newDindIOReporter(context.Background(), list, &teardownScope{m: m, mode: teardownModeAll, reportDindIO: true})
+	r := m.newDindIOReporter(context.Background(), list, &teardownScope{m: m, mode: teardownModeAll, reportOnDelete: true})
 	if r == nil {
 		t.Fatal("expected a reporter for an allocation with a sidecar")
 	}
@@ -316,7 +316,7 @@ func TestReportBudgetStartsWhenReportStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ContainerList: %v", err)
 	}
-	scope := &teardownScope{m: m, mode: teardownModeAll, reportDindIO: true}
+	scope := &teardownScope{m: m, mode: teardownModeAll, reportOnDelete: true}
 	r := m.newDindIOReporter(context.Background(), list, scope)
 	if r == nil {
 		t.Fatal("expected a reporter for an allocation with a sidecar")
