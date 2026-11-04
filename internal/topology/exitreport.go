@@ -110,13 +110,14 @@ func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, contai
 // path and never the sweep's line. The sweep's own teardown does not ask for
 // this report, having logged already; a runner in the "removing" state is
 // skipped because another removal has it, and a sweep or delete behind that
-// removal has logged already.
+// removal has logged already. A runner in the "created" state never started, so
+// it has no exit or logs to lose, and the sweep treats it as no runner too.
 //
-// A running runner, the ordinary scale-down, costs no Docker call. Removal
-// checks that fail are left to the removal loop to report. exitReportTimeout
-// bounds the whole report, the removal check's live read included, however many
-// stopped runners the allocation holds: it is the delay this adds to
-// DeleteInstance.
+// A running runner, the ordinary scale-down, costs no Docker call, and neither
+// does a skipped one. Removal checks that fail are left to the removal loop to
+// report. exitReportTimeout bounds the whole report, the removal check's live
+// read included, however many stopped runners the allocation holds: it is the
+// delay this adds to DeleteInstance.
 func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Container, scope *teardownScope) {
 	if !scope.reportOnDelete {
 		return
@@ -125,7 +126,7 @@ func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Contain
 	defer cancel()
 
 	for _, c := range list {
-		if c.Labels[spec.LabelRole] != spec.RoleRunner || c.State == "running" || c.State == "removing" {
+		if c.Labels[spec.LabelRole] != spec.RoleRunner || c.State == "running" || c.State == "removing" || c.State == "created" {
 			continue
 		}
 		if ok, err := scope.mayRemove(ctx, c.Labels); err != nil || !ok {

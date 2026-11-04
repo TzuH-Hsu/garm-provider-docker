@@ -501,7 +501,8 @@ arrives after a mid-job crash or when scale-down picks a dead runner,
 `DeleteInstance` logs the same fields just before it removes the container, on a
 line of its own: `teardown: runner was not running at delete`. It logs at `debug`
 for the normal end of an ephemeral runner (`runner_phase=job_completed`, exit code
-0, not OOM-killed) and at `warn` otherwise. A running runner gets no line. Whichever
+0, not OOM-killed) and at `warn` otherwise. A running runner gets no line, and
+neither does one that never started (`created`). Whichever
 path runs first removes the container, so one exit is normally logged once; two
 paths overlapping, or a removal that fails and is retried, can repeat the line.
 
