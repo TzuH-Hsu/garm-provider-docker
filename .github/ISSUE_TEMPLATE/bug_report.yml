@@ -1,0 +1,64 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider version
+      placeholder: v0.2.8
+    validations:
+      required: true
+  - type: input
+    id: garm-version
+    attributes:
+      label: GARM version and interface_version
+      placeholder: v0.2.1, v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: dispatch
+    attributes:
+      label: Dispatch mode
+      options:
+        - Scale set
+        - Pool
+    validations:
+      required: true
+  - type: dropdown
+    id: dind-mode
+    attributes:
+      label: dind_mode
+      options:
+        - none
+        - privileged-sidecar
+        - sysbox-runc
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: OS, architecture, Docker Engine version and storage filesystem.
+      placeholder: Ubuntu 26.04, amd64, Docker 29.9, ext4
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Provider and GARM log lines around the failure. Remove tokens and other secrets first.
+      render: text
