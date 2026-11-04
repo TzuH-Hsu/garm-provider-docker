@@ -219,6 +219,25 @@ func TestDeleteOfRunningRunnerReportsNothing(t *testing.T) {
 	}
 }
 
+// TestDeleteOfNeverStartedRunnerReportsNothing pins that a runner still in the
+// "created" state gets no line: it has no exit or logs to lose, the sweep also
+// treats it as no runner, and a delete landing mid-create is not a fault.
+func TestDeleteOfNeverStartedRunnerReportsNothing(t *testing.T) {
+	m, spy := newSpyManager(t)
+	old := time.Now().Add(-time.Hour).UTC()
+	seedNetworkFor(t, spy.FakeClient, testControllerID, "job-1", old, "n1")
+	seedRunnerFor(t, spy.FakeClient, testControllerID, "job-1", old, "n1", "created")
+
+	deleteAndCheck(t, m, spy.FakeClient, "job-1")
+
+	if out := spy.logs.String(); strings.Contains(out, deleteExitLine) {
+		t.Errorf("a never-started runner was reported:\n%s", out)
+	}
+	if spy.inspects != 0 || spy.logReads != 0 {
+		t.Errorf("a never-started runner cost %d inspects and %d log reads, want none", spy.inspects, spy.logReads)
+	}
+}
+
 // TestDeleteOfRunningRunnerAddsNoNetworkList pins the same for an allocation
 // with no claim network, where the removal check reads the network list: the
 // report must not run that check for a running runner.
