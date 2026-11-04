@@ -2,18 +2,18 @@
 
 This document is the operator- and pool-admin-facing reference for
 `garm-provider-docker`'s configuration and for the pool `extra_specs` contract
-(ADR-005). Both contracts are published as machine-readable JSON Schemas that the
-binary itself can emit (v0.1.1 self-description commands), so this document is
-generated from the same source of truth the code validates against, not
-maintained separately.
+([ADR-005](adr/ADR-005-config-and-extra-specs-schema.md)). Both contracts are also
+published as machine-readable JSON Schemas that the binary can emit (see below).
+This page and the schemas are maintained by hand next to the code. If they
+disagree with the binary's behaviour, the code wins; please report it.
 
 ## Trust tiers (why there are two contracts)
 
 Three inputs feed every provider decision, in strict trust order (ADR-001/ADR-005):
 
-1. **Provider config** (TOML) — set by the host **operator**, the most trusted tier.
-2. **Pool `extra_specs`** (JSON) — set by a **GARM admin**, a narrower and more dynamic tier. Read from the stdin `BootstrapInstance.extra_specs` field, **never** `GARM_POOL_EXTRASPECS` (which GARM leaves empty for scale-set commands other than `CreateInstance`).
-3. **The workflow payload** — controlled by anyone who can open a PR; **never** consulted for a privileged decision.
+1. **Provider config** (TOML), set by the host **operator**, the most trusted tier.
+2. **Pool `extra_specs`** (JSON), set by a **GARM admin**, a narrower and more dynamic tier. Read from the stdin `BootstrapInstance.extra_specs` field, **never** `GARM_POOL_EXTRASPECS` (which GARM v0.2.1 sets to `base64("null")` for scale-set instances on every command except `CreateInstance`).
+3. **The workflow payload**, controlled by anyone who can open a pull request; **never** consulted for a privileged decision.
 
 `extra_specs` can select *within* what the operator config allows; it can never
 escalate beyond it.
@@ -27,7 +27,7 @@ the command line yourself. On GARM <= v0.2.1 register the provider with
 `interface_version = "v0.1.0"` (GARM v0.2.1's v0.1.1 `ListInstances` wrapper
 misreports every successful list as an error; fixed upstream by
 [cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878), unreleased
-as of 2026-10-11 — see the README's "Register with GARM" section).
+as of 2026-10-11; see the README's "Register with GARM" section).
 
 ```sh
 # The extra_specs JSON Schema (draft-07)
@@ -53,53 +53,53 @@ GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=ValidatePoolInfo \
 ## `extra_specs` allowlist (what a pool admin may set)
 
 Only these keys are accepted. **Any other key is rejected** (`additionalProperties:
-false`) — which is what structurally keeps a raw image reference, `docker_host`,
+false`), which structurally keeps a raw image reference, `docker_host`,
 and the `privileged` flag out of this channel: they have no field at all.
 
 | Key | Type | Bound |
 |---|---|---|
-| `flavor` | string | Must name a `[flavors.<name>]` entry in the provider config. The **only** channel that varies the runner image (ADR-002) — `extra_specs` never accepts a raw image ref. |
+| `flavor` | string | Must name a `[flavors.<name>]` entry in the provider config. The **only** channel that varies the runner image ([ADR-002](adr/ADR-002-runner-image-and-jit-delivery.md)). `extra_specs` never accepts a raw image reference. |
 | `dind_mode` | `none` \| `privileged-sidecar` \| `sysbox-runc` | Bounded by the operator's `allowed_dind_modes` **ceiling**: a mode outside that list is rejected. |
-| `runner_memory` | byte-size string (`"4GiB"`, `"512MiB"`, `"2GB"`) | Bounded by the effective configured `runner_memory`. Must be **positive** (a zero value in any form is rejected — H1). **Rejected if it exceeds the ceiling** (reject, not clamp). |
-| `dind_memory` | byte-size string | Bounded by the effective configured `dind_memory`, same rules (positive-only; reject-not-clamp). |
+| `runner_memory` | byte-size string (`"4GiB"`, `"512MiB"`, `"2GB"`) | Bounded by the effective configured `runner_memory`. Must be **positive** (a zero value in any form is rejected). **Rejected if it exceeds the ceiling** (reject, not clamp). |
+| `dind_memory` | byte-size string | Bounded by the effective configured `dind_memory`, same rules (positive only, rejected and not clamped). |
 | `storage_driver` | `overlay2` \| `vfs` | Defaults to the configured `storage_driver`. |
-| `runner_labels` | array of strings | Appended to the runner's labels. **Non-JIT mode only** — in JIT mode GARM bakes the label set server-side, so these are inert. |
+| `runner_labels` | array of strings | Appended to the runner's labels. **Non-JIT mode only.** With JIT, GARM bakes the label set server-side, so these are inert. |
 | `extra_env` | object of string→string | Extra runner-container env. Governed by an **operator allowlist** and a **hard-reserved** set (see below). |
 
 ### GARM-reserved keys (accepted and ignored)
 
-GARM itself writes some keys into `extra_specs`. These — and only these — are
+GARM itself writes some keys into `extra_specs`. Only these are
 removed before the schema check, so they are accepted and have **no effect**
 on this provider:
 
 | Key | Why it appears | Effect here |
 |---|---|---|
-| `runner_install_template` | GARM v0.2.0+ injects its rendered userdata wrapper (base64) into every `CreateInstance` payload unless the admin set the key; GARM also *requires* an admin to set it on a pool/scale set with no install template. | None — it drives GARM's userdata install flow, which this provider does not use (prebuilt runner image, ADR-002). Must be a JSON string. |
+| `runner_install_template` | GARM v0.2.0+ injects its rendered userdata wrapper (base64) into every `CreateInstance` payload unless the admin set the key; GARM also *requires* an admin to set it on a pool/scale set with no install template. | None. It drives GARM's userdata install flow, which this provider does not use (prebuilt runner image, [ADR-002](adr/ADR-002-runner-image-and-jit-delivery.md)). Must be a JSON string. |
 
 Every other unknown key is still rejected, including next to a reserved key.
 GARM's other install-flow keys (`extra_context`, `pre_install_scripts`,
 `enable_boot_debug`) are never injected by GARM and have no effect here, so
-they are rejected rather than silently ignored (ADR-005 amendment 2026-10-11).
+they are rejected rather than silently ignored.
 
-### Ceilings, the extra_env allowlist, and the hard-reserved set (read this)
+### Ceilings, the `extra_env` allowlist and the hard-reserved set
 
-- **`allowed_dind_modes` ceiling (ADR-001 F7), fail-closed by default.** The operator's `allowed_dind_modes` is the final word on `dind_mode`, and it **defaults to `["none"]`**: DinD is unavailable on a host whose config never mentions it, so no pool's `extra_specs.dind_mode` can obtain a privileged sidecar by omission. To enable DinD you must widen the ceiling *and* set `dind_image`, e.g. `allowed_dind_modes = ["none", "privileged-sidecar"]` — read ADR-001's "Residual risk" section first. `dind_mode` itself must be a member of this list, so widening the ceiling is also what makes a non-`none` `dind_mode` load at all. No pool's `extra_specs.dind_mode` can escalate past it, full stop.
-- **A DinD mode with no `dind_image` is rejected before any Docker work.** Config load already requires `dind_image` when the *config's own* `dind_mode` is non-`none`, but that cannot see a pool's `extra_specs`. If a pool selects a DinD mode within a widened ceiling on a host that has no `dind_image` set, `CreateInstance` rejects it up front — before the orphan sweep, the claim network, the volumes, or the credential fetch — rather than failing at the sidecar image pull with a partial allocation to roll back.
+- **`allowed_dind_modes` ceiling, fail-closed by default.** The operator's `allowed_dind_modes` is the final word on `dind_mode`, and it **defaults to `["none"]`**: DinD is unavailable on a host whose config never mentions it, so no pool's `extra_specs.dind_mode` can obtain a privileged sidecar by omission. To enable DinD you must widen the ceiling *and* set `dind_image`, for example `allowed_dind_modes = ["none", "privileged-sidecar"]`. Read ADR-001's "Residual risk" section first: a privileged sidecar is root-equivalent on the host for the jobs that run in it. `dind_mode` itself must be a member of this list, so widening the ceiling is also what makes a non-`none` `dind_mode` load at all. No pool's `extra_specs.dind_mode` can escalate past it.
+- **A DinD mode with no `dind_image` is rejected before any Docker work.** Config load already requires `dind_image` when the *config's own* `dind_mode` is non-`none`, but that cannot see a pool's `extra_specs`. If a pool selects a DinD mode within a widened ceiling on a host that has no `dind_image` set, `CreateInstance` rejects it up front, before the orphan sweep, the claim network, the volumes or the credential fetch, rather than failing at the sidecar image pull with a partial allocation to roll back.
 - **Registry mirrors for the sidecar are provider config only.** Every DinD job starts with an empty image store. The operator sets `registry_mirrors` and `insecure_registries` in the provider config (see [Registry mirrors for the sidecar](#registry-mirrors-for-the-sidecar)); no `extra_specs` key carries them, so a pool admin cannot redirect a sidecar's pulls.
-- **Memory is positive-only and reject-not-clamp (H1).** A `runner_memory`/`dind_memory` over the configured (or flavor-resolved) ceiling is rejected with a clear error; it is never silently reduced. A request at or below the ceiling is accepted; an unset ceiling (unlimited) accepts any finite request. A **zero** value in any representation (`"0"`, `"0GiB"`, `"0 B"`) is rejected — Docker treats a 0 memory limit as *unset* (unlimited), so accepting it would silently remove the operator's ceiling.
-- **`extra_env` is fail-closed via an operator ALLOWLIST (H2).** The operator lists the env NAMES a pool may set in `[extra_specs].allowed_env` (default **empty**). A name not on the allowlist is **rejected** — by default a pool can inject **no** extra environment at all.
-- **`extra_env` names must match a strict charset (H3):** `^[A-Za-z_][A-Za-z0-9_]*$`. A key containing `=`, whitespace, unicode, or a leading digit is rejected — this closes the bypass where `JIT_CONFIG_ENABLED=false` would be emitted as `JIT_CONFIG_ENABLED=false=<value>` and flip a reserved variable.
-- **Hard-reserved `extra_env` names — always rejected, even if allowlisted, case-insensitive:**
+- **Memory is positive only and rejected, not clamped.** A `runner_memory`/`dind_memory` over the configured (or flavor-resolved) ceiling is rejected with a clear error; it is never silently reduced. A request at or below the ceiling is accepted, and an unset ceiling (unlimited) accepts any finite request. A **zero** value in any representation (`"0"`, `"0GiB"`, `"0 B"`) is rejected, because Docker treats a 0 memory limit as unset (unlimited), so accepting it would remove the operator's ceiling.
+- **`extra_env` is fail-closed through an operator allowlist.** The operator lists the variable names a pool may set in `[extra_specs].allowed_env`, which is **empty** by default. A name not on the list is **rejected**, so by default a pool can inject no extra environment at all.
+- **`extra_env` names must match `^[A-Za-z_][A-Za-z0-9_]*$`.** A key containing `=`, whitespace, non-ASCII characters or a leading digit is rejected. Otherwise the key `JIT_CONFIG_ENABLED=false` would reach Docker as `JIT_CONFIG_ENABLED=false=<value>` and set a reserved variable.
+- **Hard-reserved `extra_env` names are always rejected, even if allowlisted (case-insensitive):**
   - prefixes `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*`, `GARM_*`, `LD_*`
   - exact `JIT_CONFIG_ENABLED`, `GITHUB_URL`, `RUN_AS_ROOT`, `WAIT_FOR_DOCKER_SECONDS`, `BASH_ENV`, `ENV`, `IFS`, `PATH`, `NODE_OPTIONS`
 
-  These are names the provider, the runner-image entrypoint, or the interpreter relies on. Letting a pool set `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=…` would break the single-job teardown model or the DinD socket-reachability guarantees; `RUN_AS_ROOT=true` would run the runner and its job as **root** (defeating non-root isolation); the entrypoint reads `GARM_CRED_WAIT_SECONDS`/`WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic where a crafted value is a command-substitution RCE as root; and `BASH_ENV`/`LD_*`/`PATH`/… are classic shell/loader hijack vectors. A non-reserved, allowlisted `extra_env` name that merely collides with another provider-injected variable is dropped in favor of the provider's value — **provider-injected environment always wins**.
+  The provider, the runner-image entrypoint or the interpreter relies on these names. `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=...` would break the single-job teardown model or the DinD socket guarantees. `RUN_AS_ROOT=true` would run the runner and its job as **root**. The entrypoint reads `GARM_CRED_WAIT_SECONDS` and `WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic, where a crafted value is command substitution as root. `BASH_ENV`, `LD_*` and `PATH` are shell and loader hijack vectors. A non-reserved, allowlisted name that collides with another provider-injected variable is dropped in favour of the provider's value: **provider-injected environment always wins**.
 
 ### Never settable from `extra_specs` (structurally)
 
 `docker_host`; any host-socket mount (no such field exists); the `privileged`
 flag (derived from `dind_mode` only, capped by `allowed_dind_modes`); the
-`garm.docker/*` managed-label set (ADR-004); a raw image reference; and the
+`garm.docker/*` managed-label set ([ADR-004](adr/ADR-004-teardown-and-orphan-cleanup.md)); a raw image reference; and the
 reserved runner-contract env names above.
 
 ## Published `extra_specs` JSON Schema (draft-07)
@@ -155,24 +155,46 @@ operator's `[extra_specs].allowed_env` allowlist):
 Rejected examples (each fails closed, before any container is created):
 
 ```jsonc
-{ "image": "attacker/evil:latest" }              // unknown key — raw image is not a channel
+{ "image": "attacker/evil:latest" }              // unknown key: a raw image is not a channel
 { "dind_mode": "privileged-sidecar" }            // if allowed_dind_modes = ["none"]
 { "runner_memory": "64GiB" }                     // if the ceiling is 8GiB
-{ "runner_memory": "0GiB" }                      // H1 — zero is not a valid limit
+{ "runner_memory": "0GiB" }                      // zero is not a valid limit
 { "extra_env": { "RUNNER_EPHEMERAL": "false" } } // hard-reserved name
-{ "extra_env": { "RUN_AS_ROOT": "true" } }       // hard-reserved — would run the job as root
+{ "extra_env": { "RUN_AS_ROOT": "true" } }       // hard-reserved: would run the job as root
 { "extra_env": { "MY_CI_FLAG": "on" } }          // if MY_CI_FLAG is not on [extra_specs].allowed_env
-{ "extra_env": { "JIT_CONFIG_ENABLED=false": "x" } } // H3 — '=' in the key
+{ "extra_env": { "JIT_CONFIG_ENABLED=false": "x" } } // '=' in the key
 ```
 
 ## Provider config (TOML)
 
-See ADR-005 for the full illustrative config and rationale, and emit the
-authoritative schema with `GetConfigJSONSchema`. The keys most relevant to the
-`extra_specs` bounds above are `allowed_dind_modes` (the `dind_mode` ceiling),
-`[resources].runner_memory`/`dind_memory` (the memory ceilings), `storage_driver`
-(the default), the `[flavors.*]` map (the only image-varying channel), and
-`[extra_specs].allowed_env` (the `extra_env` allowlist).
+[`examples/config.full.toml`](../examples/config.full.toml) lists every key with its default, and
+[`examples/config.minimal.toml`](../examples/config.minimal.toml) is the smallest valid file (only
+`runner_image`). A test loads both. The loader ignores unknown keys, so a misspelled key is silently ignored
+in a real config. `GetConfigJSONSchema` emits the machine-readable schema.
+
+| Key | Default | Notes |
+|---|---|---|
+| `docker_host` | `unix:///var/run/docker.sock` | The provider's own connection to the Docker host. Not settable from `extra_specs`. |
+| `runner_image` | required | Must be pinned by a `sha256` digest. |
+| `allow_unpinned_runner_image`, `allow_unpinned_dind_image` | `false` | Development only. Each relaxes the digest rule for one image. |
+| `dind_mode` | `none` | `none`, `privileged-sidecar` or `sysbox-runc`. Must be in `allowed_dind_modes`. |
+| `allowed_dind_modes` | `["none"]` | The ceiling for pools. See above. |
+| `dind_image` | unset | Required when `dind_mode` is not `none`, and checked at load whenever it is set. Digest-pinned. |
+| `storage_driver` | `overlay2` | `overlay2` or `vfs`. |
+| `registry_mirrors`, `insecure_registries` | empty | See the next section. |
+| `[resources]` `runner_memory`, `dind_memory` | unset (unlimited) | Byte sizes such as `8GiB` or `512MiB`. They are the ceilings for `extra_specs`. There are no CPU or PID limits. |
+| `[network]` `internal` | `false` | Docker's `internal` flag on each job network. `true` gives a job no egress at all. |
+| `[network]` `enable_job_network` | `true` | Reserved. The network is always created, and a warning is logged if this is `false`. |
+| `[cache]` `enabled` | `true` | Turns the persistent caches off, including the externals volume. JavaScript actions then cannot run in container jobs in DinD modes. |
+| `[cache]` `generation`, `pnpm_major` | `"1"`, `"9"` | Salts in the volume names. A new value starts a new volume. `pnpm_major` must match the pnpm in the runner image. |
+| `[cache]` `toolcache_path`, `pnpm_store_path` | `/opt/hostedtoolcache`, `/opt/pnpm-store` | Absolute, canonical, different from each other, and not under a reserved runner mount. |
+| `[cache]` `allow_org_shared` | `false` | Allows organization and enterprise pools persistent caches. It treats the whole organization as one trust domain. |
+| `[cache]` `stale_cache_eviction_days` | `30` | Age after which a cache volume is logged as stale. Nothing is deleted. `0` turns the age check off. |
+| `[cache]` `diagnostic_log_retention_days` | `7` | Runner diagnostic logs older than this are deleted by the provider. `0` deletes every file as soon as a prune round runs. |
+| `[extra_specs]` `allowed_env` | empty | See above. |
+| `[status_report]` `timeout_seconds` | `90` | `0` to `600`. |
+| `[logging]` `file` | unset | See below. |
+| `[flavors.<name>]` | none | `runner_image`, `runner_memory`, `dind_memory`. Unset fields use the top-level value. |
 
 ### Registry mirrors for the sidecar
 
@@ -218,13 +240,11 @@ insecure_registries = ["registry.lan.example:5001"]
   unreachable or does not have the image. Pulls from other registries are not
   redirected; see [`dind-image-pulls.md`](dind-image-pulls.md).
 - **An `http://` mirror needs no `insecure_registries` entry.** dockerd takes
-  the scheme from the mirror URL, so a mirror configured as
-  `http://host:5000` is contacted over plain HTTP whether or not it is also
-  listed as insecure (checked in Moby's registry service for the Engine 29.x
-  line, `daemon/pkg/registry/service_v2.go` and `daemon/hosts.go`, release
-  `docker-v29.8.2`, for both the classic graph-driver and the containerd
-  image-store pull paths, and verified live on Engine 29.9.2 without an
-  `insecure_registries` entry). An `insecure_registries` entry matters for an
+  the scheme from the mirror URL, so a mirror configured as `http://host:5000`
+  is contacted over plain HTTP whether or not it is also listed as insecure.
+  This follows from Moby's registry code for the Engine 29.x line, for both the
+  classic graph-driver and the containerd image-store pull paths, and was
+  confirmed on Engine 29.9.2. An `insecure_registries` entry matters for an
   `https://` mirror whose certificate the sidecar does not trust (it turns off
   certificate verification for that host), and for non-mirror registries that
   jobs pull from by name over plain HTTP.
@@ -235,8 +255,7 @@ insecure_registries = ["registry.lan.example:5001"]
   conflicts with these flags, and dockerd refuses to start ("the following
   directives are specified both as a flag and in the configuration file"), so
   every DinD job fails waiting for the daemon. Use either the config keys or
-  the image's `daemon.json`, not both. The custom-image route remains the way
-  to do this on provider versions without these keys.
+  the image's `daemon.json`, not both.
 
 The keys appear in the machine-readable schema (`GetConfigJSONSchema`) and,
 with illustrative values, in `examples/config.full.toml`. The setup around the
@@ -255,15 +274,15 @@ stays on Ubuntu 24.04 (see [`runner-images/README.md`](../runner-images/README.m
 runner_image = "ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>"
 
 # Pools with extra_specs {"flavor": "resolute"} run the Ubuntu 26.04 image
-# (GCC 15, LLVM 22), the toolchain of ubuntu-latest from 2026-10-19.
+# (GCC 15, LLVM 22).
 [flavors.resolute]
   runner_image = "ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:<digest>"
 ```
 
 A flavor's `runner_image` must be digest-pinned like the top-level one. Pools
 of one repository on the two images get separate toolcache and pnpm store
-volumes (keyed on the image's `garm.docker/os-release` label, ADR-003) and
-share its diagnostic-log volume.
+volumes (keyed on the image's `garm.docker/os-release` label,
+[ADR-003](adr/ADR-003-cache-keying-and-lifecycle.md)) and share its diagnostic-log volume.
 
 ### `[extra_specs]` (the `extra_env` allowlist)
 
@@ -359,8 +378,8 @@ applies.
 **GARM in a container: run it with an init.** When the provider exits, the
 detached watcher is adopted by PID 1 of its PID namespace, which must wait for
 it when it finishes. systemd (GARM as a service) does. In a container, PID 1 is
-whatever the image starts — in GARM's own image that is `/bin/garm` (its
-`ENTRYPOINT`), and GARM's Docker quickstart starts it without an init — and
+whatever the image starts. In GARM's own image that is `/bin/garm` (its
+`ENTRYPOINT`), and GARM's Docker quickstart starts it without an init, and
 GARM never waits for processes it did not start, so each finished watcher
 would stay a zombie (one per runner) until the container restarts. Start GARM's
 container with an init: `docker run --init`, or `init: true` for the service
@@ -424,7 +443,8 @@ file = "/var/log/garm-provider-docker/provider.log"
 How it behaves:
 
 - **Same lines as stderr.** The file gets the same slog text format, the same
-  level (`GARM_PROVIDER_DOCKER_LOG_LEVEL`, default `info`) and the same
+  level (`GARM_PROVIDER_DOCKER_LOG_LEVEL`, default `info`; GARM passes it on only
+  if it is listed in `[provider.external] environment_variables`) and the same
   redaction as stderr; stderr keeps receiving every line too. Each line starts
   with a `time=` field.
 - **Opened per call.** The provider is exec'd once per GARM call, so it opens the
