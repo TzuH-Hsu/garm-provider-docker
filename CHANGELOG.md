@@ -12,7 +12,7 @@ Earlier versions are described on the
 
 ### Added
 
-- Contributing guide, security policy, support guide, issue forms and pull
-  request template.
+- Contributing guide, code of conduct, security policy, support guide, issue
+  forms and pull request template.
 
 [Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.8...HEAD

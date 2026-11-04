@@ -4,7 +4,8 @@
 
 Please report vulnerabilities through
 [private vulnerability reporting](https://github.com/TzuH-Hsu/garm-provider-docker/security/advisories/new).
-Do not open a public issue or discussion.
+Do not open a public issue or discussion. If you cannot use that, email
+security@tzuhsuan.dev.
 
 Include the affected version, your configuration (`dind_mode` in particular),
 steps to reproduce, and the impact you expect.
