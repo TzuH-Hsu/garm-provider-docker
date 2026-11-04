@@ -60,6 +60,17 @@ type statusWatchRequest struct {
 	// Proxy URLs can embed credentials, so they travel here, not in the
 	// watcher's exec environment.
 	ProxyEnv map[string]string `json:"proxy_env,omitempty"`
+
+	// LogFile and LogLevel are the provider's [logging] file and resolved log
+	// level (a slog level name), both empty when no file is configured. The
+	// watcher's stdout and stderr are /dev/null and it starts with an empty
+	// environment, so without these its warnings would be lost. They are not
+	// secrets, and they select where and how much the watcher logs, never
+	// what: no log call in the watcher includes the token or the callback
+	// URL. An unusable file or an unknown level never rejects the request
+	// (see validate); the watcher falls back to discarding its logs.
+	LogFile  string `json:"log_file,omitempty"`
+	LogLevel string `json:"log_level,omitempty"`
 }
 
 // proxyEnvVars are the variables net/http's ProxyFromEnvironment reads (the
@@ -218,6 +229,7 @@ func RunStatusWatcher(in io.Reader) int {
 	if err := req.validate(time.Now()); err != nil {
 		return 2
 	}
+	defer installWatcherLogger(req).Close()
 	if err := applyProxyEnv(req.ProxyEnv); err != nil {
 		return 2
 	}
@@ -233,6 +245,23 @@ func RunStatusWatcher(in io.Reader) int {
 	}
 	runStatusWatch(ctx, &Provider{cli: cli}, req)
 	return 0
+}
+
+// installWatcherLogger makes the process-wide default logger append to the
+// provider's configured [logging] file at its level, so the watcher's warnings
+// survive its /dev/null stdout and stderr. It is the same logger normal
+// provider commands use (logging.NewWithFileAt), so the file is opened
+// O_APPEND and a line is one write(2): concurrent provider processes and
+// logrotate's copytruncate stay safe. With no file configured it changes
+// nothing. It never fails: an unusable path costs one warning on the discarded
+// stderr and the watcher carries on. The returned closer is never nil.
+func installWatcherLogger(req statusWatchRequest) io.Closer {
+	if req.LogFile == "" {
+		return io.NopCloser(nil)
+	}
+	logger, closer := logging.NewWithFileAt(req.LogFile, logging.ParseLevel(req.LogLevel))
+	slog.SetDefault(logger)
+	return closer
 }
 
 // runStatusWatch waits until req.Deadline for the runner to come online, then
