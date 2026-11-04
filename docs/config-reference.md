@@ -27,7 +27,7 @@ the command line yourself. On GARM <= v0.2.1 register the provider with
 `interface_version = "v0.1.0"` (GARM v0.2.1's v0.1.1 `ListInstances` wrapper
 misreports every successful list as an error; fixed upstream by
 [cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878), unreleased
-as of 2026-10-11; see the README's "Register with GARM" section).
+when checked on 2026-10-11; see the README's "Register with GARM" section).
 
 ```sh
 # The extra_specs JSON Schema (draft-07)
@@ -353,8 +353,8 @@ where its result shows.
 
 **Interaction with GARM's provider timeouts.** GARM v0.2.1 puts no deadline on
 a provider's `CreateInstance` call. Newer GARM (from
-[cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), unreleased as
-of 2026-10-11) bounds it by the pool's or scale set's `runner_bootstrap_timeout`
+[cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), in no
+release when checked on 2026-10-11) bounds it by the pool's or scale set's `runner_bootstrap_timeout`
 and, if set, the smaller `[provider.external].exec_timeout_seconds`; on expiry
 GARM kills the provider binary and marks the create failed. Because only the
 watcher handoff runs inside `CreateInstance`, neither the callback's latency
@@ -399,7 +399,7 @@ a runner to `active` with a checked status transition that only `idle` (or
 `offline`) may take, so a runner left at GARM's initial `pending` stalls the
 scale-set listener until GARM removes the runner. Upstream relaxed this in
 [cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817) (commit
-`1a9aeff2`), which is not in any release as of 2026-10-11. Pools work either
+`1a9aeff2`), which was in no release when checked on 2026-10-11. Pools work either
 way and also get accurate status.
 
 ```toml
