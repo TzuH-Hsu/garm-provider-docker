@@ -208,9 +208,10 @@ of that uses the host's Docker socket, and all of it is a direct host-takeover p
 sidecar is root-equivalent on the host for any job that runs in it.** It contains accidents, not an
 adversarial job.
 
-- On hosts that run untrusted job code (fork pull requests, multiple tenants, contributors the operator does
-  not trust), use `sysbox-runc` or `none`. Sysbox removes `Privileged=true` from the sidecar and narrows the
-  risk considerably. `none` removes it.
+- This provider is meant for repositories the operator controls. For untrusted job code (fork pull requests,
+  multiple tenants, contributors the operator does not trust), use a provider that runs jobs in VMs.
+- Within this provider, `sysbox-runc` removes `Privileged=true` from the sidecar and narrows the risk
+  considerably. `none` removes the sidecar. Both still leave jobs in containers that share the host kernel.
 - Where neither is possible, restrict `privileged-sidecar` to pools that run only trusted repositories and
   branches. This is an operator policy; the provider cannot enforce it, because it does not know the job.
 
