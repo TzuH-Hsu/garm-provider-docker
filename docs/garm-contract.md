@@ -27,7 +27,7 @@ GARM starts the provider executable once per call. Nothing persists between call
 - Stdout carries only the result JSON. Logs go to stderr, and GARM keeps a provider's stderr only when the call
   fails (see [`[logging]`](config-reference.md#logging-persistent-log-file)).
 - GARM forwards only the environment variables listed in `[provider.external] environment_variables`. It runs
-  `provider_executable` as a path, so the provider cannot run as a container (see the README).
+  `provider_executable` as a path, so the provider cannot run as a container (see [Installation](install.md#from-the-image)).
 
 ## The `CreateInstance` payload
 
