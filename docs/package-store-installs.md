@@ -73,7 +73,7 @@ what it finds under `cache-dir` and deleted a whole store in a test.
 **Why it matters on pnpm 11.** pnpm 11 checks every lockfile entry against supply-chain policies before it
 installs anything, even with `--frozen-lockfile`, and the check reads each package's metadata. With an empty
 cache that is one registry request per package name, tens of megabytes. Measured with `--frozen-lockfile`, a warm
-store and a public monorepo of about 1,300 lockfile entries (medians of five runs on a laptop). Seconds depend
+store and a public monorepo of about 1,300 lockfile entries (medians of five runs on a development machine). Seconds depend
 on the registry link and disk, and request counts and ratios carry over better.
 
 | pnpm | Metadata cache | Install time | Received |

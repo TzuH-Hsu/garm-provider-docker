@@ -72,7 +72,7 @@ seconds.
 **Resulting properties.** The credential files exist only in the container's memory-backed tmpfs: never in
 the image, the writable layer, a `docker inspect`-visible variable or host disk. The tmpfs is anonymous and
 per container, so no other container can mount or see it. The runner user can read the files, so job code
-can read its own runner's credentials. They identify one single-job runner and are of no use after the job.
+can read its own runner's credentials. They identify one single-job runner and nothing else.
 
 ### Environment
 
@@ -106,7 +106,7 @@ verified against a real GARM pool.
 GARM creates every runner as `pending`. On GARM v0.2.1 scale sets, the job-started handler moves a runner to
 `active` with a checked update that allows only `idle` or `offline` as the previous state, so a runner that
 never reports leaves the listener refetching the same message and the scale set stalls. Pools force the
-update and are not affected. Upstream relaxed the check in cloudbase/garm#817, which was in no release as of
+update and are not affected. Upstream relaxed the check in cloudbase/garm#817, which was in no release when checked on
 2026-10-11.
 
 The provider therefore reports status itself, from the provider process, using the token it already holds.

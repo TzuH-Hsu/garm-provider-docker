@@ -82,9 +82,15 @@ GARM's reaper runs every 5 minutes and removes instances that are not online aft
 |---|---|---|
 | 0.2.0 and later | GARM adds `runner_install_template` to the `extra_specs` of every `CreateInstance`. | Accepted and ignored. Any other unknown key is rejected ([ADR-005](adr/ADR-005-config-and-extra-specs-schema.md)). |
 | 0.2.1, scale sets | Under `v0.1.1`, `GARM_POOL_ID` is empty on `DeleteInstance`, `GetInstance`, `StartInstance` and `StopInstance`, and `garm-provider-common` v0.1.9 rejects that. | `internal/garmenv` tolerates the empty value for those four commands only. |
-| 0.2.1 | The `v0.1.1` `ListInstances` wrapper tests `err == nil` instead of `err != nil` and reports every successful list as an error. Fixed by [cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878), in no release as of 2026-10-11. | Register with `interface_version = "v0.1.0"` on GARM 0.2.1 and earlier. GARM does not call the `v0.1.1`-only commands, so nothing is lost. |
-| 0.2.1, scale sets | A runner at `pending` or `installing` cannot become `active`, so the scale set stalls on the first job. Relaxed by [cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), in no release as of 2026-10-11. | The status reports above narrow the window. See [`[status_report]`](config-reference.md#status_report-runner-status-reported-to-garm). |
-| 0.2.1 | A pool with `extra_specs` of JSON `null` makes GARM panic before it calls the provider ([cloudbase/garm#787](https://github.com/cloudbase/garm/issues/787)). The fix was planned for 0.2.2 as of 2026-10-11. | Set `extra_specs` to `{}`. |
+| 0.2.1 | The `v0.1.1` `ListInstances` wrapper tests `err == nil` instead of `err != nil` and reports every successful list as an error. Fixed by [cloudbase/garm#878](https://github.com/cloudbase/garm/pull/878), in no release when checked on 2026-10-11. | Register with `interface_version = "v0.1.0"` on GARM 0.2.1 and earlier. GARM does not call the `v0.1.1`-only commands, so nothing is lost. |
+| 0.2.1, scale sets | A runner at `pending` or `installing` cannot become `active`, so the scale set stalls on the first job. Relaxed by [cloudbase/garm#817](https://github.com/cloudbase/garm/pull/817), in no release when checked on 2026-10-11. | The status reports above narrow the window. See [`[status_report]`](config-reference.md#status_report-runner-status-reported-to-garm). |
+| 0.2.1 | A pool with `extra_specs` of JSON `null` makes GARM panic before it calls the provider ([cloudbase/garm#787](https://github.com/cloudbase/garm/issues/787)). The fix was planned for 0.2.2 when checked on 2026-10-11. | Set `extra_specs` to `{}`. |
 
 GARM's `main` branch replaces the scale-set pseudo pool ID with a UUIDv5. `ListInstances` is scoped to whatever
 pool ID GARM sends, so both forms work. Releases newer than 0.2.1 have not been checked.
+
+## What has been verified
+
+The live gate ([`demo-m0.md`](demo-m0.md)) runs a real job through GARM v0.2.1 with scale-set dispatch and JIT, on
+a `linux/amd64` host, with `dind_mode = "none"` and `privileged-sidecar`. Pool (webhook) dispatch, the non-JIT
+path, `sysbox-runc` and `linux/arm64` hosts have not been verified end to end.

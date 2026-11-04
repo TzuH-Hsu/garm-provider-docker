@@ -95,8 +95,8 @@ Runner, then sidecar, then volumes, then the network last. The daemon rejects re
 endpoints and a volume that a container references, so containers go first. The network goes last because it is
 the claim marker: while it exists, a concurrent same-name `CreateInstance` cannot claim a new generation and
 create volumes that this still-running teardown would delete. Teardown lists once per resource kind and removes
-each resource by the name or ID it read. Before each removal it re-asserts the ownership rule on the labels
-in hand and the generation, which protects the stable-named network. Every step tolerates "not found", so
+each resource by the name or ID it read. Before each removal it re-asserts ownership on the labels
+in hand, and the generation, which protects the stable-named network. Every step tolerates "not found", so
 teardown is idempotent. `DeleteInstance` on an instance that is already gone returns 30, which GARM treats as
 success. The same order applies to `DeleteInstance`, the sweep, the creation guard and `RemoveAllInstances`.
 
