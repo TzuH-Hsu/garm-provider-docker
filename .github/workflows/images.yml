@@ -1,89 +1,25 @@
-# M4-W1: builds and publishes this repo's container images to GHCR: the two
-# runner images (Ubuntu 24.04 Noble and Ubuntu 26.04 Resolute, ADR-002) and
-# the provider binary image.
+# Builds and publishes the runner images and the provider binary image to GHCR.
 #
-# Four jobs, split by trigger and by which of them can reach GHCR at all:
+# On a pushed `v*` tag, publish-build pushes each image by digest only (no tag
+# moves), and publish-tag, which needs every build leg, then tags all images.
+# promote-latest moves `:latest` when a release becomes a full release, so a
+# tag push alone never does; release.yml creates a draft and a maintainer
+# publishes it. dry-run (workflow_dispatch) builds with `push: false`, no
+# `packages` scope and no registry login.
 #
-#   On a pushed `v*` tag:
-#   publish-build — matrix, one leg per image. Builds multi-arch and pushes
-#     BY DIGEST ONLY: the image manifest lands in GHCR but no tag is moved,
-#     so nothing a `docker pull <image>:<tag>` resolves changes yet. Each
-#     leg hands its digest to publish-tag as a run artifact.
-#   publish-tag — no matrix, `needs: publish-build`, so it only starts once
-#     EVERY build leg has succeeded. Checks that every digest is present,
-#     then points `<image>:<tag>` at them for every image. One failed build
-#     therefore publishes nothing under a tag, instead of advancing some
-#     images of the set and not the others (#8). It never touches `:latest`.
+# Every job's `if:` names the one event it runs for. Publish jobs check
+# `event_name == 'push'` as well as `ref_type == 'tag'`, because
+# `workflow_dispatch` accepts a tag as `--ref`.
 #
-#   On a GitHub release becoming a full (non-pre-release) release:
-#   promote-latest — moves `<image>:latest` to `<image>:<tag>` for every
-#     image. It runs on `release: released`, which fires when a full
-#     release is published (including publishing release.yml's draft as
-#     one) or when a published pre-release is changed to a full release.
-#     A tag push alone therefore never moves `:latest` (#7): release.yml
-#     turns the same tag into a DRAFT release, and `:latest` follows only
-#     once a maintainer has reviewed it and made it a full release.
+# promote-latest uses `release: released`, which fires when a draft is
+# published as a full release or a pre-release is promoted, not when a
+# pre-release is published. Releases created with GITHUB_TOKEN do not start
+# workflows, so publishing the draft by hand is what triggers it. Its `if:`
+# also checks `prerelease` as a second guard.
 #
-#   On workflow_dispatch:
-#   dry-run — runs the exact same multi-arch build with `push: false`,
-#     holds NO `packages` scope at all, and has no registry-login step to
-#     skip in the first place.
-#
-# publish-build, publish-tag and promote-latest are the only jobs carrying
-# `packages: write`. The first two are gated on
-# `github.event_name == 'push' && github.ref_type == 'tag'`, promote-latest
-# on `github.event_name == 'release'`, and dry-run on
-# `github.event_name == 'workflow_dispatch'` — every job names the one
-# event it runs for, so no trigger can fall through into another's job.
-#
-# Why promote-latest can rely on `release: released` firing at all:
-# release.yml creates the draft with GITHUB_TOKEN, and per GitHub's docs
-# ("Triggering a workflow from a workflow"), "events triggered by the
-# `GITHUB_TOKEN` will not create a new workflow run" (the documented
-# exceptions are workflow_dispatch, repository_dispatch, and some
-# pull_request activity types). That rules out release.yml itself kicking
-# off promote-latest. Publishing the draft, or changing a pre-release to
-# a full release, is a maintainer's own action in the UI or API, not a
-# GITHUB_TOKEN event, so it does start this workflow.
-#
-# Why `released` and not `published`: GitHub's webhook reference defines
-# `published` as "A release, pre-release, or draft of a release was
-# published." and `released` as "A release was published, or a
-# pre-release was changed to a release." The `release` event docs add
-# that to run "when stable *and* pre-releases publish, subscribe to
-# `published` instead of `released` and `prereleased`" — `released` is
-# the stable-only activity. So `released` alone covers both routes to a
-# full release (a draft published as one, a pre-release promoted to one),
-# fires once per promotion, and does not fire when a pre-release is
-# published. promote-latest's `if:` still checks the payload's
-# `prerelease` flag as defence in depth, so a pre-release cannot move
-# `:latest` even if that reading of the docs ever stops holding.
-#
-# The push gate is deliberate and load-bearing: `workflow_dispatch`
-# accepts a `--ref` of any kind, INCLUDING a tag (`gh workflow run --ref
-# v1.2.3`), in which case `github.ref_type` is `tag` even though nothing
-# was pushed. A job that keyed its login/push decision on `ref_type` alone
-# would therefore publish from a manual invocation — breaking the dry-run
-# promise. Requiring `event_name == 'push'` as well, and scoping
-# `packages: write` to the publish jobs only, means there is no path by
-# which a manual run can authenticate to or write to the registry: even if
-# the `push` input were somehow forced true, the dispatch job's token has
-# no packages scope to push with. For the same reason there is no
-# dispatch path to promote-latest: moving `:latest` by hand means making
-# the tag's GitHub release a full release, not running this workflow.
-#
-# No `pull_request` trigger: this workflow only ever runs against a ref that
-# has already been reviewed and merged (a pushed tag), a release a
-# maintainer made a full release, or an explicit manual invocation.
-#
-# Script-injection hygiene (same rationale as release.yml): git tag names
-# are not restricted to a safe shell-metacharacter-free set, so
-# $GITHUB_REF_NAME (GitHub's own built-in env var) and the release
-# payload's tag_name are read as quoted shell variables inside `run:` steps
-# below (the latter via `env:`), never spliced via `${{ }}` into script
-# text, and each is checked against Docker's tag grammar before use.
-# Values that end up in `with:` inputs to the pinned Docker actions
-# (build-args) are not run through a shell at all.
+# Tag names are not shell-safe: $GITHUB_REF_NAME and the release's tag_name
+# are read as quoted shell variables (the latter via `env:`), never spliced
+# with `${{ }}`, and are checked against Docker's tag grammar first.
 name: Container Images
 
 on:
@@ -94,55 +30,34 @@ on:
     types: [released]
   workflow_dispatch:
 
-# For a `release` event, `github.ref` is the release's tag ref
-# (`refs/tags/<tag_name>`, per the events-that-trigger-workflows docs) —
-# the same ref the tag-push run for that tag had. Both runs therefore land
-# in the same concurrency group, and with cancel-in-progress: false the
-# promote run waits for a still-running publish run of the same tag rather
-# than overlapping it. That is intended: publishing the draft early must
-# not let promote-latest look for `:<tag>` before publish-tag has written
-# it. Caveat: GitHub keeps at most one pending run per group by default,
-# so a THIRD run for the same ref arriving while one is pending — e.g. a
-# dry-run dispatched at that tag — cancels the pending one. The cancelled
-# run shows up as such in the Actions tab and can be re-run from there.
+# The release event and the tag push share a ref, so promote-latest waits for
+# a running publish-tag instead of looking for `:<tag>` before it exists. A
+# third run on the same ref cancels the pending one; re-run it if so.
 concurrency:
   group: images-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-# Workflow-level default is read-only. `packages: write` is granted ONLY to
-# the publish-build, publish-tag and promote-latest jobs below; the dry-run
-# job explicitly holds none.
 permissions:
   contents: read
 
 jobs:
-  # Real publish, stage 1 of 2: a pushed vX.Y.Z tag, and nothing else.
-  # Pushes each image by digest; moves no tag.
+  # Stage 1 of 2: pushes each image by digest and moves no tag.
   publish-build:
     name: publish-build (${{ matrix.name }})
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    # Stays on ubuntu-latest: multi-platform buildx/QEMU builds need a real
-    # Docker daemon, which ubuntu-slim's container-only runtime cannot
-    # provide (see ci.yml's dockerverify job comment for the same
-    # constraint, and actions/runner-images#13541).
+    # Not ubuntu-slim: buildx needs a Docker daemon (actions/runner-images#13541).
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     strategy:
-      # Still false here, on purpose: a failing leg can no longer publish a
-      # half-release (publish-tag below never starts unless every leg
-      # succeeded), so letting the other leg finish costs nothing and
-      # surfaces every failure in one run instead of one per re-run.
+      # publish-tag needs every leg, so let the others finish and surface all
+      # failures in one run.
       fail-fast: false
       matrix:
         include:
-          # (a) the runner images (ADR-002): each built from runner-images/
-          # with its own Dockerfile, so the entrypoint both share
-          # (runner-images/common/entrypoint.sh) resolves the same way it
-          # does for a local `docker build -f runner-images/<name>/Dockerfile
-          # runner-images`.
+          # Runner images use runner-images/ as context for the shared entrypoint.
           - name: garm-runner-noble
             image: ghcr.io/tzuh-hsu/garm-runner-noble
             context: runner-images
@@ -153,9 +68,6 @@ jobs:
             context: runner-images
             dockerfile: runner-images/resolute/Dockerfile
             needs_version_arg: false
-          # (b) the provider binary image (plan.md M4 item 1): built from
-          # the repo root so the root Dockerfile's `COPY . .` sees the
-          # module.
           - name: garm-provider-docker
             image: ghcr.io/tzuh-hsu/garm-provider-docker
             context: .
@@ -171,13 +83,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # A pushed vX.Y.Z tag IS the version — this job's `if:` guarantees
-      # $GITHUB_REF_NAME is that tag, so there is no branching left to do.
-      # It is checked against Docker's tag grammar (a leading `v<digit>`,
-      # then only [A-Za-z0-9_.-]) HERE, before a long multi-arch build,
-      # rather than letting publish-tag discover an untaggable name after
-      # every image is already sitting in the registry. publish-tag reads
-      # the same $GITHUB_REF_NAME in the same run and relies on this check.
+      # Validate the tag before the long build, not after the push.
       - name: Determine build metadata
         id: meta
         run: |
@@ -195,34 +101,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # provenance: mode=max / sbom: true match the dry-run job exactly
-      # (verified locally: buildx generates both for a multi-platform build
-      # even with push: false, so the dry run exercises the identical
-      # attestation path a real release does).
-      #
-      # RULING (M4-W1, not to be revisited here): per-platform attestations
-      # are accepted as-is; no cosign keyless signing is added. Known
-      # quirk: for a multi-arch manifest LIST, provenance/SBOM attestations
-      # are attached per-platform-manifest, not once for the top-level
-      # index — a client that inspects the manifest list itself (rather
-      # than resolving to one platform's digest first, or using the OCI
-      # Referrers API) will not see a single combined attestation, and GHCR's
-      # Referrers API support for discovering them by digest should be
-      # verified against whatever tooling operators point at this image.
-      #
-      # Push by digest, no tags: the `outputs:` line is the image exporter
-      # form from Docker's "distribute build across multiple runners"
-      # workflow. Per Docker's image-exporter reference, `push-by-digest`
-      # means "Push image without name" (no tag is written) and
-      # `name-canonical` adds the "canonical name `name@<digest>`".
-      # The action's `push:` input is left unset on purpose: it is only
-      # shorthand for `--output=type=registry`, and would add a second
-      # output alongside this one. The attestations are unaffected by
-      # pushing by digest — BuildKit stores them as manifests inside the
-      # image index itself (Docker's attestation-storage docs: "Attestations
-      # are stored as manifest objects in the image index."), and
-      # `steps.build.outputs.digest` is that index's digest, so tagging it
-      # later tags the attestations along with the platform images.
+      # `push-by-digest` writes the image without a tag. `push:` stays unset
+      # because it would add a second registry output. The digest is the
+      # image index's, so it covers the attestations (attached per platform
+      # manifest, not once on the index).
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -235,9 +117,7 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      # One file per image, named after the image and holding its digest,
-      # so publish-tag can check for each image by name rather than infer
-      # completeness from a file count.
+      # One file per image, so publish-tag can check each by name.
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -250,13 +130,7 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/digests"
           printf '%s\n' "${DIGEST}" > "${RUNNER_TEMP}/digests/${NAME}"
 
-      # overwrite: true for the same reason, and with the same caveat, as
-      # release.yml's "Upload binary artifact" step: artifacts are scoped
-      # to the run, not the attempt, so a "Re-run all jobs" is inferred
-      # (not yet reproduced) to fail re-uploading a name attempt 1 already
-      # created. By the same run scoping, "Re-run failed jobs" after one
-      # failed leg should rebuild only that leg and let publish-tag pick up
-      # the other leg's digest from the earlier attempt.
+      # overwrite: true so a re-run can re-upload (see release.yml).
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -266,25 +140,14 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # Real publish, stage 2 of 2. `needs: publish-build` means this job is
-  # skipped unless every matrix leg above succeeded, so a tag only ever
-  # moves once EVERY image exists. `docker buildx imagetools create` with a
-  # single image-index source re-pushes that index's original bytes under
-  # the new tag (buildx util/imagetools/create.go: "on single source,
-  # return original bytes"), so `<image>:<tag>` resolves to exactly the
-  # digest built above, attestations included, with nothing rebuilt.
-  #
-  # Honest limit: a registry has no multi-tag transaction, so the tag
-  # writes below are still sequential. What this job guarantees is that
-  # none of them starts until every image is built and every digest is
-  # in hand; if a tag write itself fails part-way, re-running this job
-  # re-applies every tag to the same digests.
+  # Stage 2 of 2. `imagetools create` from one index source re-pushes the
+  # original bytes, so `<image>:<tag>` is exactly the built digest. Tag writes
+  # are sequential; if one fails, re-running re-applies every tag.
   publish-tag:
     name: publish-tag
     needs: publish-build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    # `docker buildx` needs a Docker daemon for setup-buildx-action's
-    # builder, which ubuntu-slim cannot provide (see publish-build).
+    # Not ubuntu-slim: buildx needs a Docker daemon.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -308,11 +171,8 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Two passes over the same fixed image list: the first only reads and
-      # checks, so a missing or malformed digest fails the job before a
-      # single tag is written. $GITHUB_REF_NAME was validated against the
-      # tag grammar by publish-build in this same run. The list must name
-      # every publish-build matrix leg.
+      # The first pass only checks, so nothing is tagged on a bad digest. The
+      # list must name every publish-build matrix leg.
       - name: Tag every image
         run: |
           version="${GITHUB_REF_NAME}"
@@ -344,34 +204,20 @@ jobs:
               "${image}@${digest}"
           done
 
-  # Moves `:latest` for every image to the release's `:<tag>` when that
-  # GitHub release becomes a full release: its draft is published as a
-  # non-pre-release, or an already-published pre-release is changed to a
-  # full release. Both routes fire `release: released` (see the file
-  # header for why that activity, why it fires here at all, and why the
-  # `prerelease` check in `if:` is kept anyway). Publishing a pre-release
-  # does not move `:latest`; promoting that pre-release later does.
-  # Nothing is built or checked out: every `:<tag>` image must already
-  # exist from the tag-push run, and this job refuses to move any
-  # `:latest` unless ALL do, so the set can never end up split across
-  # releases.
+  # Moves `:latest` to `:<tag>` for every image, only if all `:<tag>` exist.
   promote-latest:
     name: promote-latest
     if: github.event_name == 'release' && !github.event.release.prerelease
-    # setup-buildx-action's builder needs a Docker daemon, which
-    # ubuntu-slim cannot provide (see publish-build).
+    # Not ubuntu-slim: buildx needs a Docker daemon.
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # No checkout, so no `contents` scope is needed; `packages: write` is
-    # the only thing this job does with its token.
+    # No checkout, so no `contents` scope.
     permissions:
       packages: write
     env:
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      # Before any registry contact: the tag must look like a release
-      # version and be a valid Docker tag. Same grammar publish-build
-      # enforces on the tag-push side.
+      # Same tag grammar as publish-build.
       - name: Validate release tag
         run: |
           if ! [[ "${TAG}" =~ ^v[0-9][A-Za-z0-9_.-]*$ ]]; then
@@ -389,10 +235,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Two passes, as in publish-tag: every `:<tag>` is confirmed to exist
-      # before any `:latest` is written. A single image-index source is
-      # re-pushed byte for byte, so `:latest` ends up at exactly the
-      # digest `:<tag>` points to.
+      # Check every `:<tag>` before writing any `:latest`.
       - name: Promote every image to latest
         run: |
           images=(
@@ -415,14 +258,11 @@ jobs:
               "${image}:${TAG}"
           done
 
-  # Dry run: `workflow_dispatch`, including a dispatch aimed at a tag ref.
-  # Builds only. It holds no `packages` scope, performs no registry login,
-  # and passes `push: false`, so there is no path from here to GHCR.
+  # Builds only, with no `packages` scope and no registry login.
   dry-run:
     name: dry-run (${{ matrix.name }})
     if: github.event_name == 'workflow_dispatch'
-    # Stays on ubuntu-latest: same buildx/QEMU Docker requirement as the
-    # publish-build job above; ubuntu-slim cannot run a Docker daemon.
+    # Not ubuntu-slim: buildx needs a Docker daemon.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -457,11 +297,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # A synthetic version that can never collide with a real release tag,
-      # while still exercising the identical build-arg/-ldflags path. The
-      # ref name is deliberately NOT consulted here: a dispatch may point at
-      # a tag, and treating that as a release version is exactly the
-      # confusion this job's separation exists to prevent.
+      # Synthetic version; the ref is ignored because a dispatch may be a tag.
       - name: Determine build metadata
         id: meta
         env:

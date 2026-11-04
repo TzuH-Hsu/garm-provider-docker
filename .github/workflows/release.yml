@@ -1,29 +1,14 @@
-# M4-W1: builds and publishes static release binaries.
+# Builds static release binaries for version tags (`v*`). A manual
+# `workflow_dispatch` is a dry run: it builds and hashes but never creates a
+# release. There is no `pull_request` trigger.
 #
-# Triggered ONLY by version tags (`v*`) — a normal release — or manually via
-# `workflow_dispatch`, which exercises the exact same build+checksum steps
-# as a dry run: it builds and hashes the binaries but never creates or
-# publishes a GitHub Release (see the `publish` job's `if:` conditions
-# below). No `pull_request` trigger: this workflow only ever runs against a
-# ref that has already been reviewed and merged (a pushed tag) or an
-# explicit manual invocation — never against untrusted PR content.
+# The release gate is `event_name == 'push' && ref_type == 'tag'`, not
+# `ref_type` alone: `workflow_dispatch` accepts a tag as `--ref`
+# (`gh workflow run --ref v1.2.3`), which sets ref_type=tag without a push.
+# `contents: write` is scoped to the publish job as a second guard.
 #
-# The release gate is `github.event_name == 'push' && github.ref_type ==
-# 'tag'`, NOT `ref_type` alone: `workflow_dispatch` accepts a --ref of any
-# kind, including a tag (`gh workflow run --ref v1.2.3`), which sets
-# ref_type=tag even though nothing was pushed. Keying on ref_type alone let
-# a manual run reach `gh release create` — a remote write — on the supposed
-# dry-run path. `contents: write` is likewise scoped to the publish job
-# only, so the dispatch path's token cannot create a release even if the
-# guard were bypassed.
-#
-# Script-injection hygiene: git tag/ref names are NOT restricted to a safe
-# shell-metacharacter-free set (git's own ref-format rules permit `$`,
-# backticks, parens, etc.), so every value derived from `github.ref_name` /
-# `github.ref_type` below is passed into `run:` steps via `env:` (or
-# GitHub's own $GITHUB_REF_NAME/$GITHUB_REF_TYPE) and referenced as a quoted
-# shell variable — never spliced directly into a script via `${{ }}` — so a
-# maliciously named tag can never become a command in this job's shell.
+# Tag names are not shell-safe. Values derived from them go into `run:` steps
+# via `env:` or $GITHUB_REF_NAME as quoted variables, never via `${{ }}`.
 name: Release
 
 on:
@@ -32,9 +17,7 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# A superseded run on the SAME tag/ref is still allowed to finish rather
-# than being cancelled mid-build — unlike ci.yml's cancel-in-progress, a
-# half-finished release build/upload is worse than a slightly redundant one.
+# Let a superseded run finish rather than leave a half-uploaded release.
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -45,21 +28,7 @@ permissions:
 jobs:
   build:
     name: build (${{ matrix.goos }}/${{ matrix.goarch }})
-    # ubuntu-slim: this step is a single `go build` per matrix leg with
-    # CGO_ENABLED=0 — pure Go cross-compilation needs no C toolchain, no
-    # QEMU, and no Docker, so slim's container-only runtime is not a
-    # constraint here (confirmed: GitHub has no plans to add a Docker
-    # daemon there, actions/runner-images#13541). No -race, no test suite
-    # runs here (that's ci.yml's job), and this repo is small (~26k LOC,
-    # 10 packages, 74 total modules), so a cold build+link comfortably
-    # clears slim's hard 15-minute cap with room to spare. timeout-minutes
-    # below is set to 10, not the 20 used for heavier ubuntu-latest builds
-    # elsewhere in this repo, because any value here still has to fit
-    # under slim's own 15-minute platform ceiling. slim is chosen here for
-    # sufficiency and portability, not cost: this repo is public, so
-    # GitHub-hosted runner minutes are $0 on either runs-on choice. A
-    # $/min argument for this choice only applies if this pattern is
-    # reused in a private repo, where minutes are billed.
+    # ubuntu-slim is enough: a pure-Go cross-compile needs no Docker.
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
@@ -76,50 +45,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # go.mod is this repo's single source of truth for the Go version;
-      # release builds must never drift from it by hardcoding a version here.
-      # go-version-file is setup-go's own mechanism for that (same technique
-      # as ci.yml).
-      #
-      # This narrows the old grep's failure mode rather than eliminating it:
-      # at the pinned SHA b7ad1dad31e06c5925ef5d2fc7ad053ef454303e, a go.mod
-      # missing the `go`/`toolchain` directive entirely still falls through
-      # to the same preinstalled-Go fallback the old `grep '^go '` produced
-      # on a no-match — core.info('[warning]go-version input was not
-      # specified. The action will try to use pre-installed version.'), NOT
-      # setFailed. So go-version-file is not a universal, "strictly safer"
-      # replacement for that grep; go.mod having no `go` line at all still
-      # falls back to whatever Go the runner image ships. What it does
-      # concretely fix:
-      #
-      #   - the failed-grep-produces-empty-string case specifically (a
-      #     malformed but PRESENT `go` line the grep pattern missed)
-      #   - it honours a `toolchain` directive if go.mod ever gains one (`go
-      #     get -u` can add one), which `grep '^go '` would silently ignore
-      #   - it parses go.mod inside the action itself, with no shell and no
-      #     $GITHUB_OUTPUT round-trip — matching this repo's documented rule
-      #     (see this file's and images.yml's file headers) that repo
-      #     content, which is attacker-controlled on a fork PR, must never
-      #     round-trip through a shell
+      # go.mod is the single source of truth for the Go version.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # caching is explicit here for clarity; the default cache key
-          # hashes go.mod (set cache-dependency-path to go.sum to key on it)
           cache: true
 
-      # A pushed vX.Y.Z tag IS the version. Every other trigger — including
-      # a workflow_dispatch aimed at a tag ref, which sets ref_type=tag
-      # without anything having been pushed — gets a synthetic version that
-      # can never collide with a real release tag, while still exercising
-      # the exact same -ldflags injection path. IS_RELEASE is computed from
-      # the same `event_name == 'push' && ref_type == 'tag'` predicate the
-      # publish job below gates on, so a dry run can never even produce
-      # release-NAMED artifacts to be mistaken for one.
-      # $GITHUB_REF_NAME is GitHub Actions' own built-in env var (equal to
-      # github.ref_name) — read here as a shell variable, never spliced via
-      # `${{ }}`, so a crafted tag name cannot inject shell commands.
+      # A pushed tag is the version. Anything else, including a dispatch
+      # aimed at a tag, gets a synthetic one. IS_RELEASE matches the publish
+      # job's predicate.
       - name: Determine version
         id: version
         env:
@@ -132,14 +67,7 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Static cross-compile: CGO_ENABLED=0 plus this repo's pure-Go
-      # dependency set (no cgo / `import "C"` anywhere in the tree) means
-      # the resulting binary has no libc dependency on either target. The
-      # -ldflags -X path below targets the exact variable
-      # internal/version/version.go documents as its build-time injection
-      # point. VERSION is passed via env (not `${{ }}` splicing) since it
-      # may carry an attacker-influenceable tag name — see the file-level
-      # comment above.
+      # CGO_ENABLED=0 gives a binary with no libc dependency.
       - name: Build static binary
         env:
           CGO_ENABLED: '0'
@@ -154,34 +82,8 @@ jobs:
             -o "${out}" .
           chmod +x "${out}"
 
-      # overwrite: true. At the pinned SHA 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      # (v7.0.1), overwrite defaults to 'false' and the action FAILS if an
-      # artifact of this name already exists — confirmed from the action's
-      # own source at that SHA. It does NOT fail when the artifact is
-      # simply absent, so `overwrite: true` is safe and purely defensive on
-      # a normal first run: it changes nothing when there is nothing to
-      # overwrite.
-      #
-      # Why it is defensive rather than provably necessary: artifacts are
-      # scoped to the RUN, not the run attempt — the REST artifact record
-      # carries workflow_run.id only, with no run_attempt field — and
-      # GITHUB_RUN_ID is unchanged by a re-run. From that we INFER, but have
-      # not empirically reproduced here, that "Re-run all jobs" on a
-      # release would make this step try to re-upload a name that already
-      # exists from attempt 1 and fail without `overwrite: true`. ("Re-run
-      # failed jobs" is unaffected either way; it skips this build job.)
-      # Even if that inference turns out wrong, `overwrite: true` costs
-      # nothing on the common path, so it stays set as a no-downside
-      # precaution.
-      #
-      # Deleting the stale artifact first also keeps the downstream
-      # publish/dry-run download unambiguous: both use merge-multiple: true
-      # with no name filter, so two attempts' artifacts — which carry
-      # identical filenames — would otherwise be merged and SHA256SUMS
-      # computed over a nondeterministic result. A run_attempt name suffix
-      # was considered and rejected for exactly this reason: it would let
-      # both attempts' artifacts coexist and get merged instead of the
-      # later attempt cleanly replacing the earlier one.
+      # overwrite: true because artifacts are scoped to the run, not the
+      # attempt, so a re-run would otherwise fail re-uploading the same name.
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -191,24 +93,11 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # Real release: a pushed vX.Y.Z tag, and nothing else. This is the ONLY
-  # job in this workflow with `contents: write`, and the only one that
-  # performs a remote write of any kind.
+  # The only job with `contents: write`.
   publish:
     name: checksum and publish
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    # ubuntu-slim: this job only downloads artifacts, runs sha256sum
-    # (coreutils, present on slim), and invokes `gh release create`. `gh`
-    # (GitHub CLI 2.85.0) is confirmed present on ubuntu-slim per
-    # actions/runner-images' ubuntu-slim-Readme.md, and actions/
-    # download-artifact is a Node.js-based action with no Docker
-    # dependency, so nothing here needs ubuntu-latest. slim is chosen here
-    # for sufficiency, not cost: this repo is public, so GitHub-hosted
-    # runner minutes are $0 on either runs-on choice — GitHub Actions is
-    # free for standard GitHub-hosted runners on public repos. A $/min
-    # argument for this choice only applies if this pattern is reused in a
-    # private repo, where minutes are billed.
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
@@ -227,28 +116,9 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
-      # This job's `if:` guarantees $GITHUB_REF_NAME is the pushed tag. The
-      # only branching left is SemVer pre-release detection: a tag carrying
-      # a hyphen (e.g. `v0.2.0-rc.1`) is created with `--prerelease` as
-      # well as `--draft`. Such a tag still publishes `:<tag>` images via
-      # images.yml, but publishing its draft as a pre-release does NOT
-      # move `:latest`: images.yml's promote-latest job runs on
-      # `release: released`, which fires only for full releases, and also
-      # skips anything still flagged as a pre-release. Changing that
-      # pre-release into a full release later DOES move `:latest`. That
-      # makes an `-rc` tag a safe end-to-end rehearsal of the whole publish
-      # path (binaries, draft release, both images) that leaves `:latest`
-      # alone for as long as it stays a pre-release.
-      #
-      # `gh release create` (the GitHub CLI, preinstalled on every
-      # GitHub-hosted runner) is used directly instead of a third-party
-      # release action: it needs no extra SHA pin, is maintained by GitHub
-      # itself, and this workflow's needs (a draft release with file
-      # attachments) are exactly its job — no goreleaser config to maintain
-      # for two static binaries plus a checksum file. `--draft` so the owner
-      # reviews and publishes manually; nothing here makes the release
-      # public. VERSION is passed via env, not `${{ }}` splicing — see the
-      # file-level comment above.
+      # A tag with a hyphen (e.g. `v0.2.0-rc.1`) becomes a pre-release draft.
+      # `:latest` moves only once it is a full release (see images.yml), so an
+      # `-rc` tag rehearses the publish path. The draft is for maintainer review.
       - name: Create draft GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -266,18 +136,11 @@ jobs:
             "${prerelease[@]}" \
             --generate-notes
 
-  # Dry run: every trigger that is NOT a pushed tag — in practice
-  # workflow_dispatch, including a dispatch aimed at a tag ref. It proves
-  # the build + checksum steps work end to end and reports what a real
-  # release WOULD have published, while holding only `contents: read`, so
-  # it has no token scope with which to create a release.
+  # Every trigger that is not a pushed tag. `contents: read` only.
   dry-run:
     name: checksum dry run
     needs: build
     if: github.event_name != 'push' || github.ref_type != 'tag'
-    # ubuntu-slim: this job only downloads artifacts, runs sha256sum, and
-    # writes a step summary — no Docker, no gh CLI, no compile step. Same
-    # rationale as the publish job above.
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
