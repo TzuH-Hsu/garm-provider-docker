@@ -70,6 +70,7 @@ func TestSweepLogsExitedRunnerBeforeTeardown(t *testing.T) {
 		"exit_code=137",
 		"finished_at=" + finishedAt.Format(time.RFC3339Nano),
 		"oom_killed=true",
+		"runner_phase=" + phaseListeningNoJob,
 		"log_tail_withheld=0",
 		"runner line 08",
 		"runner line 25",
@@ -133,14 +134,11 @@ func TestSweepExitLineReportsStoppedDindSidecar(t *testing.T) {
 	}
 }
 
-// TestSweepExitLineLeaksNoSecrets is the end-to-end redaction proof: a runner
-// tail carrying a JIT config, a registration token, GitHub tokens, a bearer
-// header, a metadata URL and a private key reaches the log with none of them.
-func TestSweepExitLineLeaksNoSecrets(t *testing.T) {
-	logs := captureLogs(t)
-	m, fake := newManager(t)
-	id, _ := seedExitedRunner(t, fake, "job-1", 1, false)
-
+// appendSecretLogLines writes a runner tail carrying a JIT config, a
+// registration token, GitHub tokens, a bearer header, a metadata URL and a
+// private key, 11 lines of it risky and the last one harmless, and returns the
+// secret values.
+func appendSecretLogLines(fake *docker.FakeClient, id string) []string {
 	filler := strings.Repeat("Zq8Xw2Pk5Rt7Ym3Nb6Vc", 4)
 	jit := base64.StdEncoding.EncodeToString([]byte(`{".runner":"x",".credentials":"y",".credentials_rsaparams":"` + filler + `"}`))
 	secrets := []string{
@@ -168,11 +166,12 @@ func TestSweepExitLineLeaksNoSecrets(t *testing.T) {
 	} {
 		fake.AppendLog(id, docker.LogStdout, line)
 	}
+	return secrets
+}
 
-	if err := m.SweepOrphans(context.Background()); err != nil {
-		t.Fatalf("SweepOrphans returned unexpected error: %v", err)
-	}
-	out := logs.String()
+// assertNoSecretMaterial fails if any 12-character window of a secret is in out.
+func assertNoSecretMaterial(t *testing.T, out string, secrets []string) {
+	t.Helper()
 	for _, s := range secrets {
 		for i := 0; i+12 <= len(s); i++ {
 			if strings.Contains(out, s[i:i+12]) {
@@ -180,6 +179,21 @@ func TestSweepExitLineLeaksNoSecrets(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSweepExitLineLeaksNoSecrets is the end-to-end redaction proof: a runner
+// tail carrying credentials reaches the log with none of them.
+func TestSweepExitLineLeaksNoSecrets(t *testing.T) {
+	logs := captureLogs(t)
+	m, fake := newManager(t)
+	id, _ := seedExitedRunner(t, fake, "job-1", 1, false)
+	secrets := appendSecretLogLines(fake, id)
+
+	if err := m.SweepOrphans(context.Background()); err != nil {
+		t.Fatalf("SweepOrphans returned unexpected error: %v", err)
+	}
+	out := logs.String()
+	assertNoSecretMaterial(t, out, secrets)
 	line := lineWith(t, out, exitLogMsg)
 	if !strings.Contains(line, "Listening for Jobs") || !strings.Contains(line, "log_tail_withheld=11") {
 		t.Errorf("exit line should keep the harmless line and count 11 withheld:\n%s", line)
@@ -218,8 +232,8 @@ func TestSweepExitLineWhenLogsUnreadable(t *testing.T) {
 
 // TestSweepExitLineOnlyPastGraceAndOnlyFromSweep pins that the line changes no
 // timing: a runner still inside the exited-runner grace is neither reported
-// nor removed, and a DeleteInstance teardown of an exited runner does not
-// report it either.
+// nor removed, and a DeleteInstance teardown of an exited runner logs its own
+// line (exitreport_delete_test.go), not this one.
 func TestSweepExitLineOnlyPastGraceAndOnlyFromSweep(t *testing.T) {
 	t.Run("within grace", func(t *testing.T) {
 		logs := captureLogs(t)
@@ -265,9 +279,9 @@ func TestRunnerLogTailBounds(t *testing.T) {
 		fake.SetState(resp.ID, "exited", false)
 		fake.AppendLog(resp.ID, docker.LogStdout, "raw line\r")
 
-		tail, withheld, truncated, err := m.runnerLogTail(context.Background(), resp.ID, true)
-		if err != nil || withheld != 0 || truncated || len(tail) != 1 || tail[0] != "raw line" {
-			t.Errorf("runnerLogTail = (%q, %d, %v, %v), want ([raw line], 0, false, nil)", tail, withheld, truncated, err)
+		tail, err := m.runnerLogTail(context.Background(), resp.ID, true)
+		if err != nil || tail.withheld != 0 || tail.truncated || len(tail.lines) != 1 || tail.lines[0] != "raw line" {
+			t.Errorf("runnerLogTail = (%q, %d, %v, %v), want ([raw line], 0, false, nil)", tail.lines, tail.withheld, tail.truncated, err)
 		}
 	})
 	t.Run("byte cap", func(t *testing.T) {
@@ -278,17 +292,17 @@ func TestRunnerLogTailBounds(t *testing.T) {
 			fake.AppendLog(id, docker.LogStdout, long)
 		}
 
-		tail, _, truncated, err := m.runnerLogTail(context.Background(), id, false)
+		tail, err := m.runnerLogTail(context.Background(), id, false)
 		if err != nil {
 			t.Fatalf("runnerLogTail: %v", err)
 		}
-		if !truncated {
+		if !tail.truncated {
 			t.Errorf("a stream past %d bytes was not flagged truncated", exitLogReadLimit)
 		}
-		if len(tail) == 0 || len(tail) >= exitLogTailLines {
-			t.Errorf("got %d lines, want some but fewer than %d", len(tail), exitLogTailLines)
+		if len(tail.lines) == 0 || len(tail.lines) >= exitLogTailLines {
+			t.Errorf("got %d lines, want some but fewer than %d", len(tail.lines), exitLogTailLines)
 		}
-		for _, l := range tail {
+		for _, l := range tail.lines {
 			if len(l) > exitLogLineLimit+len("…") {
 				t.Errorf("a line of %d bytes passed the %d-byte line cap", len(l), exitLogLineLimit)
 			}

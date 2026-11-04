@@ -404,7 +404,8 @@ key is config-only; `extra_specs` cannot change it.
 The provider logs to stderr, and GARM keeps a provider's stderr only when the
 call fails. A successful call's log lines are therefore lost, including the ones
 that explain what happened after the fact: orphan-sweep teardowns, the
-`orphan sweep: runner exited on its own` line, a `DeleteInstance` that found
+`orphan sweep: runner exited on its own` and
+`teardown: runner was not running at delete` lines, a `DeleteInstance` that found
 nothing to delete, `CreateInstance` progress and the `teardown: DinD sidecar IO`
 line. Set `file` to also append every line to a file:
 
@@ -483,9 +484,32 @@ start of `CreateInstance`) tears the allocation down. Just before it does, it
 logs one `orphan sweep: runner exited on its own` line with `instance`, `pool`,
 the runner's `state`, `exit_code`, `finished_at` and `oom_killed`, the same
 fields prefixed `dind_` when the DinD sidecar has stopped too (`dind_state`
-alone while it still runs), and `log_tail`: the runner's last 20 lines of
-stdout and stderr. This is the record of why a runner that took a job died
-before running it, so it is worth keeping with `file`.
+alone while it still runs), `runner_phase`, and `log_tail`: the runner's last 20
+lines of stdout and stderr. This is the record of why a runner that took a job
+died before running it, so it is worth keeping with `file`.
+
+If GARM reaches the runner first, as it does when a job's completed message
+arrives after a mid-job crash or when scale-down picks a dead runner,
+`DeleteInstance` logs the same fields just before it removes the container, on a
+line of its own: `teardown: runner was not running at delete`. It logs at `debug`
+for the normal end of an ephemeral runner (`runner_phase=job_completed`, exit code
+0, not OOM-killed) and at `warn` otherwise. A running runner gets no line. Whichever
+path runs first removes the container, so one exit is normally logged once; two
+paths overlapping, or a removal that fails and is retried, can repeat the line.
+
+`runner_phase` says how far the runner got, read from the listener's own lines in
+the tail, the latest one deciding:
+
+| `runner_phase` | The tail shows |
+|---|---|
+| `before_listening` | no `Listening for Jobs`, and the tail is short enough that it would show |
+| `listening_no_job` | `Listening for Jobs` last |
+| `job_started` | `Running job: ...` last |
+| `job_completed` | `Job ... completed with result: ...` last |
+| `unknown` | the phase cannot be told: 20 lines with no marker, a tail cut by the 64 KiB cap (it loses the newest lines) with anything short of `job_completed`, or logs that cannot be read |
+
+The phase is read before the screen below, so a line withheld from `log_tail`
+still counts, and only the phase's name reaches the log.
 
 The tail is the runner's own output, so it is screened before it is logged: any
 line that might carry a credential (a token, JIT config or `.credentials`
@@ -500,7 +524,8 @@ Jobs`, `Running job: ...`, listener errors) come through. Each line is cut to
 64 KiB is read (`log_tail_truncated=true` when that cut the tail short). The
 report has a two-second budget. If the logs cannot be read (for example the
 `none` log driver), the line is logged at `warn` with `log_tail_error` instead
-of the tail, and the sweep carries on. A `DeleteInstance` teardown never logs
-this line.
+of the tail, and the sweep or teardown carries on. On the `DeleteInstance` path
+that budget is added to the call, only when a runner is not running, on top of
+the DinD IO report's own.
 
 This key is config-only; `extra_specs` cannot change it.
