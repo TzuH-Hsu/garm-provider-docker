@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or setup help
+    url: https://github.com/TzuH-Hsu/garm-provider-docker/discussions
+    about: Ask here rather than opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/TzuH-Hsu/garm-provider-docker/security/advisories/new
+    about: Report it privately. Do not open a public issue.
+  - name: Problem in GARM itself
+    url: https://github.com/cloudbase/garm/issues
+    about: Report it to the GARM project.
