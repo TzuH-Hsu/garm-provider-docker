@@ -1,375 +1,233 @@
-# ADR-002: Runner Image and JIT Config Delivery
+# ADR-002: Runner image and JIT configuration delivery
 
-Status: Accepted (2026-07-19)
-
-> **Amendment (2026-07-19):** A cross-family implementation review found the
-> original `create → start → poll → docker cp` delivery mechanism unbuildable:
-> `docker cp` cannot write into a running container's memory-backed tmpfs
-> (see the Decision below), and the original entrypoint copied credentials
-> onto the container's disk-backed writable layer. The Decision's
-> delivery-mechanism steps are amended accordingly — fetch-first ordering with
-> an aggregate deadline; `docker exec` tar-streaming into the tmpfs instead of
-> `docker cp`; an atomic `.delivered` ready marker; symlink installation that
-> keeps credentials tmpfs-resident in both delivery modes (JIT **pre-links**
-> the delivered tmpfs files, which works because all JIT files are delivered up
-> front; **non-JIT does a post-config move** — it lets `config.sh` write
-> `.runner`/`.credentials`/`.credentials_rsaparams` into the install dir
-> normally and, only after `config.sh` SUCCEEDS, moves them onto the tmpfs and
-> replaces them with symlinks, backed by a scrub-on-failure trap. Non-JIT does
-> **not** pre-link, because the real .NET runner's `Runner.Listener configure`
-> reads `.credentials` in its startup `HostContext` constructor and a
-> pre-created dangling symlink — whose tmpfs target is not delivered in non-JIT
-> mode (`.credentials` is created BY `config.sh` during registration) — makes
-> that read fail with a `FileNotFoundException` (exit 134) BEFORE registration
-> runs; this was confirmed on a live daemon against the real runner image);
-> HTTPS-only metadata fetch (loopback exception); and non-JIT `config.sh` run
-> via `gosu` with `--disableupdate`.
-> The design goal (credential invisibility to `docker inspect`, no credentials
-> on host disk) is unchanged; only the mechanism that achieves it is corrected.
-
-> **Amendment (2026-10-11): provider-side runner status reporting.** The
-> statement below that callbacks are "a latency optimization ..., not a
-> correctness requirement" does not hold for GARM v0.2.1 scale sets. GARM
-> creates every runner with runner status `pending`, and only an instance
-> callback moves it on. The scale-set job-started handler
-> (`workers/scaleset/scaleset_helper.go`) then sets `active` through a
-> *checked* update, and `params.RunnerStatusTransitions` allows `active` only
-> from `idle` or `offline`. A runner still at `pending` therefore fails that
-> update, the listener does not acknowledge the message and keeps refetching
-> it, and the scale set stalls until GARM's consolidation removes the runner.
-> Pools are not affected (their status updates are forced). Upstream relaxed
-> the transition table in `cloudbase/garm#817` (commit `1a9aeff2`), which is
-> not in any release as of 2026-10-11.
->
-> Provider-side reporting narrows the stall rather than removing it: a job
-> assigned while the row is still `installing` fails the checked update
-> (`installing` allows only `failed`, `idle`, `terminated`, `installing`),
-> and the listener refetches the unacknowledged message at once, so the
-> retry succeeds as soon as `idle` is posted. Whenever `idle` is not
-> posted (timeout, `0`, an `installing` or `idle` callback that still fails
-> after its retries, a watcher that cannot start, or a GARM restart while the
-> watcher waits), the stall persists as above.
->
-> The provider now reports status itself, from the provider process, using
-> the instance token it already holds for the credential fetch:
-> `POST {callback-url}/status` with `{"status": "installing", ...}` once the
-> credentials are delivered and the runner is verified running, then
-> `{"status": "idle", ...}` once the runner's own stdout shows
-> `Listening for Jobs` (read through the Docker logs API, bounded by
-> `[status_report].timeout_seconds`, default 90 s, `0` disables). `idle` is
-> never reported before the runner is listening: GARM's bootstrap-timeout
-> reaper only collects `pending`/`installing` runners, so a runner reported
-> `idle` early that then failed to come up would never be reaped. On timeout
-> the runner stays `installing`. Both reports are best-effort and never fail
-> `CreateInstance`. `agent_id` is omitted (GARM rejects a mismatch with the
-> value already on a scale-set row). The callback URL gets the metadata URL's
-> transport rules (https, or http to loopback only; no userinfo; CA bundle)
-> and no redirect is followed.
->
-> Status is reported for **JIT runners only**. GARM stores a JIT runner's
-> agent ID when it generates the JIT config (scale sets:
-> `workers/scaleset/scaleset.go`; pools: `runner/pool/pool.go`), so omitting
-> `agent_id` is safe. A non-JIT runner registers inside the container, GARM
-> has no agent ID for it, and its own bootstrap would send one with `idle`;
-> an ID-less `idle` would leave the row at agent ID 0, and GARM skips
-> removing the GitHub registration of such a runner on delete. Non-JIT only
-> occurs on pools, which move runners to `active` with forced updates
-> (`runner/pool/pool.go` `setInstanceRunnerStatus`), so they lose nothing.
->
-> If the daemon cannot return the runner's logs (log driver `none`, which
-> answers HTTP 501 "configured logging driver does not support reading", or
-> a remote driver with dual logging disabled), readiness falls back to the
-> `Runner.Listener` process appearing in `docker top` and staying up for 5 s,
-> within the same timeout, and a warning recommends a readable log driver.
-> This is weaker evidence than the "Listening for Jobs" line (the listener
-> process starts before its session with GitHub is open). The provider does
-> not override the container's log driver.
->
-> **The wait never runs inside `CreateInstance`.** GARM v0.2.1 imposes no
-> deadline on the provider's create call, but `cloudbase/garm#817` (unreleased
-> as of 2026-10-11) bounds it by `runner_bootstrap_timeout` and the optional
-> `[provider.external].exec_timeout_seconds`, killing the binary and marking
-> the create failed on expiry; a synchronous wait could therefore turn a
-> healthy create into a failed one, and so could a slow callback. `CreateInstance`
-> therefore makes no request to GARM at all: it re-executes the provider
-> binary as a detached watcher (hidden first argument, `os.StartProcess` with
-> `Setsid`, stdout/stderr on `/dev/null` so GARM's pipes are not held open, an
-> environment holding only `SSL_CERT_FILE`, `SSL_CERT_DIR` and `GODEBUG` when
-> set — no secrets, and needed at process start for root-CA loading and
-> runtime settings — and the request — token, callback URL, container ID,
-> deadline, proxy variables — written to a private stdin pipe, never argv or
-> environment) and returns after that handoff (at most 5 s). The watcher
-> reports `installing`, does the log follow (or the `docker top` fallback), reports `idle`,
-> or reports `installing` again with the reason when it gives up, and exits
-> no later than about 25 s past `timeout_seconds` regardless. The token's
-> lifetime in memory is extended accordingly; it is still never in the
-> container, on disk, or in any process's argv or environment. The provider's
-> proxy variables travel in the same stdin request and are installed in the
-> watcher in-process, so its requests take the provider's network path. The
-> watcher reports `idle` only after inspecting the container and finding it
-> still running: a stopped container's logs replay a "Listening for Jobs" line
-> printed before it exited (verified on a live daemon), and an `idle` dead
-> runner would never be reaped.
->
-> A detached watcher is adopted by PID 1 when the provider exits. In a
-> container whose PID 1 is GARM itself (GARM's image has `/bin/garm` as its
-> entrypoint and its Docker quickstart uses no init), nothing waits for it and
-> each finished watcher stays a zombie. The provider therefore detaches only
-> when `/proc/1/comm` names a known init (systemd, docker-init, tini,
-> catatonit, ...); otherwise it runs the watcher inside `CreateInstance`,
-> bounded by `timeout_seconds`, and warns that GARM's container should run
-> with an init (`docker run --init`, Compose `init: true`). Verified on a live
-> daemon: an orphan under a non-init PID 1 stays a zombie, and under
-> `--init` (PID 1 `docker-init`) it is reaped.
->
-> The credential-invisibility design goal is unchanged: the runner container
-> still never calls GARM and never sees the instance token or the callback
-> URL; `docker inspect` output is the same as before. The
-> `enable_runner_callbacks` opt-in discussed below (which would have put the
-> token in the container) remains unbuilt and is not needed for this.
-
-> **Amendment (2026-10-11): the runner container has IPv6 disabled.** The
-> runner is created with `HostConfig.Sysctls`
-> `net.ipv6.conf.all.disable_ipv6=1` (`internal/spec/mounts.go`,
-> `RunnerIPv6Sysctl`), unconditionally. From Docker Engine 26, a container on
-> an IPv4-only network keeps `::1` on `lo` and gets `::1 localhost
-> ip6-localhost ip6-loopback` in its `/etc/hosts`. A server that binds
-> `localhost` through plain `getaddrinfo` then listens on `::1` only, while a
-> Node client resolves with `AI_ADDRCONFIG`, drops `::1` because the
-> container has no non-loopback IPv6 address, and dials `127.0.0.1`
-> (`ECONNREFUSED`; seen with Astro's `@astrojs/cloudflare` prerender). On a VM
-> host or a GitHub-hosted runner `localhost` maps to `127.0.0.1` only, so the
-> same job passes there. With the sysctl, `::1` is gone from `lo` and Docker
-> 26+ also leaves the `::1` lines out of `/etc/hosts`, so `localhost` is
-> IPv4-only. Engine 25 and earlier already disable IPv6 in such a container,
-> `lo` included, and ignore the sysctl when writing `/etc/hosts`: the `::1
-> localhost` line stays but points at nothing, and resolvers that sort by
-> reachability (glibc `getaddrinfo`, so Node) put `127.0.0.1` first. Measured
-> on a user-defined bridge network with Node 22 (`server.listen(port,
-> 'localhost')`, then `fetch('http://localhost:port')`):
->
-> | Engine | `lo` IPv6 without the sysctl | Without the sysctl | With the sysctl |
-> |---|---|---|---|
-> | 24.0.9, 25.0.5 | disabled | passes (binds `127.0.0.1`) | passes; `::1 localhost` line kept |
-> | 26.1.4, 29.9.0 | enabled | `ECONNREFUSED 127.0.0.1` (binds `::1`) | passes; no `::1` lines |
->
-> The one leftover on Engine 25 and earlier is that a lookup that prefers
-> IPv6 without checking reachability (`getent hosts localhost`) still returns
-> the dead `::1`; no real tool has been seen to trip on it. The live checks
-> (`internal/verify`, `scripts/demo-m0.sh`) therefore assert the sysctl and
-> `lo`'s `disable_ipv6=1`, which hold on every engine, and only report the
-> `/etc/hosts` line. `net.*` sysctls are per network namespace, so this needs
-> no privilege and changes nothing on the host. Only the `all` key is set: it
-> is the one the daemon consults when writing `/etc/hosts`, and it also covers
-> `lo` and `eth0`, which already exist when the sysctl is applied (verified
-> live on Docker 29.9: `default` alone leaves the `::1` line in place). The
-> DinD sidecar sets no sysctl of its own; it runs `dockerd`, not job code, and
-> containers it launches get their own network namespaces. Since ADR-001's
-> shared network namespace amendment (2026-10-12) a `privileged-sidecar`
-> sidecar joins the runner's namespace, so the runner's setting covers it too;
-> `dockerd` runs, NATs and publishes ports there unchanged (IPv4). There is
-> no config knob. The
-> compatibility cost: a job that binds or dials `::1` explicitly (or a service
-> that needs IPv6 loopback) will not work in the runner container, which
-> already could not use IPv6 beyond loopback.
->
-> On a Docker host whose kernel has no IPv6 (booted with `ipv6.disable=1`, or
-> built without it) there is no `/proc/sys/net/ipv6`, and the daemon cannot
-> apply the sysctl. The create succeeds and the start fails; Docker 29.1.3
-> with runc 1.3.4 reports `open sysctl net.ipv6.conf.all.disable_ipv6 file:
-> ... no such file or directory`. `CreateInstance` therefore classifies a
-> create or start error that names this sysctl, by key or by its path below
-> `/proc` (`internal/provider/runner_start.go`):
->
-> - with `no such file or directory`: the host has no IPv6. `::1` cannot
->   exist in the runner and Docker writes no `::1` lines, so dropping the
->   sysctl loses nothing. One warning says so.
-> - any other reason (permission denied, read-only `/proc/sys`, a runtime or
->   security policy): the sysctl could not be applied while IPv6 may still be
->   enabled, so `localhost` can resolve to `::1` and the split described
->   above can come back. This degraded case is still retried, because failing
->   every allocation on such a host, with no knob to drop the sysctl, is
->   worse; the warning carries the daemon's error and says that IPv6 may
->   remain enabled, and the live checks fail it by name.
->
-> In both cases the provider removes the rejected runner and creates and
-> starts it once more without the sysctl. Context cancellation and every
-> other error are not retried, the retry happens at most once, and a failed
-> removal stops it; labels, mounts, the claim network, the create-nonce
-> rollback and credential delivery are unchanged, and the cache volumes are
-> revalidated again before the second start. The live checks report a runner
-> without the sysctl and without `/proc/sys/net/ipv6` as a warning, and fail
-> a runner without the sysctl whose `lo` has IPv6 enabled. Verified with the
-> real provider binary (`TestVerifyM1WP2Allocation`) on Ubuntu 24.04 arm64
-> booted with `ipv6.disable=1` and Docker 29.1.3: the allocation succeeds
-> after one retry and tears down cleanly, and fails at `ContainerStart`
-> without the retry. The refused class was not reproduced on a live daemon.
-> There is no knob to skip the sysctl up front: the retry costs one extra
-> create on affected hosts only, and probing the host first would add a
-> Docker call to every allocation.
-
-> **Amendment (2026-10-11): what the base image carries.** (Corrected
-> 2026-10-12: the next sentence is wrong. Runner jobs do have passwordless
-> sudo through the base image's sudoers rule, and keep it; see the 2026-10-12
-> Amendment. The package policy below stands.) Runner jobs have no
-> passwordless sudo, so a job cannot install system packages, and the
-> `setup-*` actions only supply languages and toolchains. The policy is
-> therefore: the base image carries the commonly needed apt-level
-> dependencies (the shared libraries a headless Chrome needs, a minimal font
-> set, and the few everyday CLI tools the `myoung34` base lacks), languages
-> and toolchains come from `setup-*` at job time, and a repository with
-> exotic needs gets a derived image selected through a provider flavor (the
-> config-only image selection described under "Version updates" below). The
-> image does not try to mirror GitHub-hosted runner images, and it is not
-> grown for one repository's niche dependency. The entrypoint also raises the
-> open-file soft limit from Docker's 1024 to 65536 (clamped to the hard
-> limit, best effort, never fatal) before the privilege drop, as hosted
-> runners do. The package list and the reasoning behind each entry are in
-> `runner-images/README.md` (moved there from `runner-images/noble/README.md`
-> by the 2026-10-12 Amendment).
-
-> **Amendment (2026-10-12): two base images, `/usr/local` writable, pipx and
-> LLVM tools.** GitHub moves `ubuntu-latest` to Ubuntu 26.04 on 2026-10-19,
-> and repositories written against it need that release's toolchain (GCC 15
-> as the default compiler, LLVM 22). The Decision's single Noble image
-> becomes two images built side by side, both published on every release and
-> both supported:
->
-> - `runner-images/noble/` → `ghcr.io/tzuh-hsu/garm-runner-noble`, `FROM`
->   `myoung34/github-runner:ubuntu-noble` (Ubuntu 24.04), unchanged in role;
-> - `runner-images/resolute/` → `ghcr.io/tzuh-hsu/garm-runner-resolute`,
->   `FROM` `myoung34/github-runner:ubuntu-resolute` (Ubuntu 26.04), pinned by
->   its multi-arch index digest exactly like Noble.
->
-> Image selection stays config-only: `runner_image` is the default, and a
-> pool that needs the other release selects a `[flavors.*]` entry whose
-> `runner_image` points at it. The two images share one entrypoint,
-> `runner-images/common/entrypoint.sh`: it contains nothing release-specific,
-> and two copies would drift. Docker cannot `COPY` from outside the build
-> context (a symlink to `../noble/entrypoint.sh` is not followed out of it),
-> so the build context for both images is `runner-images/` and each
-> Dockerfile is selected with `-f`; named build contexts were rejected
-> because a plain `docker build` without the extra flag would then fail
-> obscurely. Each image carries a `garm.docker/os-release` label
-> (`ubuntu-24.04`, `ubuntu-26.04`) that the provider keys the toolcache and
-> pnpm store volumes on (ADR-003, 2026-10-12 Amendment).
->
-> Both images also close gaps found by running real repositories' CI-tool
-> installers in them:
->
-> - **`/usr/local/bin` and `/usr/local/lib` are owned by the runner user.**
->   Hosted-runner CI scripts install pinned single-binary tools (and tool
->   trees such as CMake) there and use `sudo` only when the directory is not
->   writable; owning the directories lets them install without root (and
->   keeps them working in a derived image without sudo). Only the two
->   directories change owner, not the files the base ships in them. This
->   leaks nothing between jobs: a runner container serves one job and its
->   writable layer is discarded.
-> - **`pipx`**, because PEP 668 blocks `pip install --user` on both releases.
-> - **`clang-format` and `clang-tidy`** from the Ubuntu archive: LLVM 18 on
->   Noble (its default, and the hosted ubuntu-24.04 default; newer LLVM
->   exists there only in `noble-updates` or apt.llvm.org, and no third-party
->   apt repository is added), LLVM 22 on Resolute (its archive's newest; the
->   unversioned packages still point at 21). The unversioned names resolve to
->   the installed release through `update-alternatives`, as on hosted
->   images.
-> - **`cmake` and `ninja-build`**, which hosted images carry; about 50 MB.
->
-> The LLVM libraries `clang-tidy` depends on are the main size cost, about
-> 300 MB per image (Noble grows from 3.66 GB to 4.15 GB unpacked on amd64).
->
-> **Correction and decision: the runner user has passwordless sudo, and keeps
-> it.**
-> The 2026-10-11 Amendment above states that runner jobs have no passwordless
-> sudo. That is not what the images do: both `myoung34/github-runner` bases
-> (the Noble pin in use since v0.2.0 and the new Resolute pin) ship
-> `%sudo ALL=(ALL) NOPASSWD: ALL` in `/etc/sudoers` and add `runner` to the
-> `sudo` group, and the provider sets no `no-new-privileges` security option,
-> so after the entrypoint's `gosu runner` drop, `sudo -n id -u` prints `0`
-> (verified on both images). A job therefore can become root inside its own
-> container. Container isolation is unchanged: the container is unprivileged
-> in `none` mode, carries no host socket, and its credentials sit on a tmpfs
-> the job could already read as the runner user; a DinD job could already
-> reach a root-equivalent daemon. **Decision (owner, 2026-10-12): keep
-> passwordless sudo**, for parity with GitHub-hosted runners, where jobs have
-> it too. Operators who want to harden can build a derived image without the
-> sudoers rule; a provider option to set `no-new-privileges` (which also
-> blocks every other setuid binary) could be added later. Nothing in these
-> images depends on sudo: tool installs go to the runner-owned `/usr/local`,
-> and Python tools to `pipx`.
+Status: Accepted
 
 ## Context
 
-GARM (see ADR-001 for the provider/GARM split of responsibilities) generates just-in-time (JIT) runner configuration for scale-set pools and expects the provider to get that configuration onto the instance it creates. The provider receives a bootstrap payload on stdin that includes an instance token; it must turn that into a running, registered GitHub Actions runner without ever letting GARM's credentials — the instance token, the metadata/callback URLs backing it, or (further upstream) the GitHub App key — reach the container's environment or filesystem. This is one of the project's explicit security red lines and the primary acceptance criterion for the M0 milestone (see plan.md): `docker inspect` of a running runner must show no host Docker socket, no GARM credentials, and no GitHub App key, in either its environment or its mounts.
+GARM generates just-in-time (JIT) runner configuration and expects the provider to get it onto the
+instance it creates ([`garm-contract.md`](../garm-contract.md)). The provider receives an instance token
+on stdin. It must turn that into a registered runner without letting GARM's credentials (the token, the
+metadata and callback URLs, or the GitHub App key behind them) reach the container's environment or
+filesystem. The acceptance test is that `docker inspect` of a running runner shows no host Docker socket,
+no GARM credential and no GitHub App key, in either its environment or its mounts.
 
-Two realistic runner base images exist in the ecosystem: `myoung34/github-runner` (tool-rich, Ubuntu/Debian based, actively used by many self-hosted-runner projects) and the official `ghcr.io/actions/actions-runner` (minimal, no entrypoint, designed for JIT-style bootstrapping as used by ARC). Neither ships a ready-made "fetch JIT config yourself and never expose the token" entrypoint; both require the provider to make its own choice about who fetches the JIT config and how it reaches the container.
+Two base images are realistic. `myoung34/github-runner` includes common build tools, and its entrypoint only
+runs `config.sh --token`. The official `ghcr.io/actions/actions-runner` is a minimal image with no
+entrypoint and no build tools, so every job would install its own. Neither has an entrypoint that waits for
+credentials the provider delivers.
 
 ## Decision
 
-Build and maintain an own runner image at `runner-images/noble/` in this repository, `FROM` a digest-pinned `myoung34/github-runner` Noble (Ubuntu 24.04) base image, with a custom entrypoint. Publish it as `ghcr.io/tzuh-hsu/garm-runner-noble`, as a multi-arch (`linux/amd64` + `linux/arm64`) manifest, digest-pinned in provider config (see ADR-005).
+### Images
 
-**JIT delivery is provider-side fetch, not container-side fetch.** The provider holds the instance token from the stdin bootstrap payload and never passes it into the container. Per the GARM wire contract (research.md §1.C, §2.A), there is no single base64 `--jitconfig` blob for the provider to fetch or inject: GARM's metadata service serves three **individual** credential files — `.runner`, `.credentials`, `.credentials_rsaparams` — one at a time via `GET {metadata-url}/credentials/{fileName}`, sourced server-side from `Instance.JitConfiguration`. The provider fetches these three files itself over **HTTPS only** (a plain-`http` metadata-url is rejected unless the host is a loopback address, which keeps `httptest`-based tests working; a metadata-url embedding userinfo credentials is rejected outright), trusting the `ca-cert-bundle` (`[]byte`) supplied in the stdin bootstrap payload for TLS verification — not just the host's default trust store — so that private-CA GARM deployments don't fail this fetch. The instance token is a Bearer credential, so cleartext transport is forbidden.
+The repository builds its own runner images, each `FROM` a digest-pinned `myoung34/github-runner` and sharing
+one entrypoint, `runner-images/common/entrypoint.sh`:
 
-Delivery into the container is **fetch-first**, then create/start/exec-deliver, because a Docker `tmpfs` mount only materializes once its container is running (there is no host-side path to write into before the container's main process starts), and because fetching the credentials up front — before the container even exists — removes the race in which a slow post-start fetch outlives the entrypoint's credential wait.
+| Directory | Image | Base | Default toolchain |
+|---|---|---|---|
+| `runner-images/noble/` | `ghcr.io/tzuh-hsu/garm-runner-noble` | Ubuntu 24.04 | GCC 13, LLVM 18 |
+| `runner-images/resolute/` | `ghcr.io/tzuh-hsu/garm-runner-resolute` | Ubuntu 26.04 | GCC 15, LLVM 22 |
 
-1. **Fetch** the three credential files provider-side, before creating anything, bounded by an aggregate deadline (≤60s across all files, well inside the ~60-minute JIT-config validity), with bounded per-request retries inside that deadline. Because nothing has been created yet, a fetch failure leaves nothing to clean up. The in-memory tar is built here, with the atomic ready marker as its last entry (step 4).
-2. **Create** the runner container (status `created`, not yet started) with a `tmpfs` mount at the credential directory (`/run/garm`, `type=tmpfs`, memory-backed, `mode=0700`, **owned by the runner user's uid/gid**, e.g. `uid=1001,gid=1001`, so the unprivileged delivery exec can write into it and the runner user can read the files back). Pull the image first if it is missing.
-3. **Start** the container. The entrypoint's first action is to block waiting for the single delivery marker `/run/garm/.delivered` to appear, bounded by a timeout that fails the runner cleanly rather than hanging indefinitely.
-4. **Deliver** the credentials by streaming the in-memory tar into a `docker exec`-run `tar -x -p -C /run/garm` (the exec runs as the runner uid/gid so the extracted files are runner-owned), then requiring exit code 0. **`docker cp` cannot be used**: Docker's archive endpoints resolve the destination path in a *separate filesystem view* that does not include the container's user tmpfs mounts (moby v27.5.1 `daemon/containerfs_linux.go`), so a `docker cp` into a running container's tmpfs cannot land there — it silently misses the tmpfs or fails. A process started by `docker exec`, by contrast, runs in the container's own mount namespace where the tmpfs is visible. The `.delivered` marker is the tar's **last** entry, so — because `tar -x` creates entries in archive order — it appears only after every real credential file is fully written; the entrypoint waiting for that one marker therefore never observes a partial credential set. The provider never writes the credential files to a host-side temporary file at any point — the tar is constructed and streamed entirely in memory. After delivery, the provider verifies the container is still running (a `ContainerInspect`) before reporting it running to GARM.
-5. The entrypoint, on seeing the marker, **symlinks** `.runner`/`.credentials`/`.credentials_rsaparams` in the runner install dir at the tmpfs files (never copying them onto the disk-backed writable layer), then execs `run.sh` directly — `config.sh` is skipped entirely, because a JIT-configured runner is single-job ephemeral by construction and needs no separate registration step, and `run.sh` reads `.runner`/`.credentials`/`.credentials_rsaparams` (via the symlinks) straight from the working directory (matching the reference k8s provider's pattern, research.md §2.A). There is no `--jitconfig` argument anywhere in this path.
+Both are published as multi-arch (`linux/amd64`, `linux/arm64`) manifests. The build context is
+`runner-images/` and each Dockerfile is selected with `-f`, because Docker cannot `COPY` from outside the
+context and a symlink to the shared script is not followed. Image selection is config-only: `runner_image`
+is the default and a `[flavors.*]` entry points a pool at the other image. `extra_specs` never carries an
+image reference, so image provenance stays with the operator. Each image carries a `garm.docker/os-release`
+label that keys the toolcache and pnpm volumes ([ADR-003](ADR-003-cache-keying-and-lifecycle.md)).
 
-In Docker-in-Docker (DinD) modes, the entrypoint's delivery-marker wait and Docker daemon readiness wait (via `until docker info`) are independent and concurrent; the runner execs `run.sh` only after both complete. In `none` mode, only the marker wait applies.
+### The provider fetches the credentials
 
-**Resulting properties:** the credential files live only in the container's memory-backed tmpfs — never in the image rootfs, never on the disk-backed writable layer, never as a `docker inspect`-visible environment variable, never on host disk — reached from the install dir only through symlinks, and destroyed with the rest of the container's tmpfs at teardown (ADR-004). The tmpfs mount is anonymous and per-container, so it is not mountable by, or visible to, any other container on the host; there is no shared credential-staging volume of any kind.
+The instance token never enters the container. The provider fetches the three credential files from
+GARM's metadata service itself: `.runner`, `.credentials` and `.credentials_rsaparams`, one request each.
+It requires https (plain http only to a loopback host), refuses URLs with userinfo, and trusts the
+`ca-cert-bundle` from the payload instead of only the host's trust store, so private-CA deployments work.
+Cleartext is forbidden because the token is a Bearer credential.
 
-> **M0-demo verification item (symlink compatibility):** `run.sh`/`config.sh` are expected to accept symlinked `.runner`/`.credentials*` config files. If `actions/runner` rejects symlinked config files in practice, the fallback is a container-scoped writable layer destroyed at teardown (never host-backed shared storage). This must be verified on the real runner during the M0 demo; the provider does not silently choose the fallback. The non-JIT path deliberately does **not** rely on symlink write-through: rather than pre-create a symlink and hope `config.sh` writes through it, it lets `config.sh` write the credentials into the install dir normally and then (only on success) moves them onto the tmpfs and symlinks them — a post-config move. Pre-linking was rejected because the real .NET runner's `Runner.Listener configure` reads `.credentials` in its startup `HostContext` constructor and a dangling pre-created symlink (its tmpfs target is not delivered in non-JIT mode) crashes it (`FileNotFoundException`, exit 134) before registration runs; this was confirmed on a live daemon. The scrub-on-failure trap is the belt-and-braces for the failure path.
+The sequence is fetch first, then create, start and deliver, because a tmpfs exists only once its container
+runs and because fetching first removes the race between a slow fetch and the entrypoint's credential wait.
 
-**Base image analysis.** `myoung34/github-runner` has no native JIT support: its stock entrypoint only performs `config.sh --token`, so a custom entrypoint is required regardless of which base is chosen. The official `ghcr.io/actions/actions-runner` image is JIT-friendly out of the box (no entrypoint at all; ARC's convention is to set the `ACTIONS_RUNNER_INPUT_JITCONFIG` environment variable and let the container's default command consume it) but ships almost no build tooling, which would force per-job tool installation and defeat the toolcache design in ADR-003. The tool-rich `myoung34` base wins on that basis; its Noble variant is confirmed to build and run on both target architectures.
+1. **Fetch** the files before creating anything, within a 60 second budget and with bounded retries. A
+   failure leaves nothing to clean up. Build an in-memory tar whose last entry is the marker `.delivered`.
+2. **Create** the runner with a memory-backed tmpfs at `/run/garm` (`mode=0700`, 16 MiB, owned by uid and
+   gid 1001, the runner user). Pull the image first if it is missing.
+3. **Start** it. The entrypoint's first action is to wait for `/run/garm/.delivered`, for up to 120 seconds
+   (`GARM_CRED_WAIT_SECONDS`).
+4. **Deliver** by streaming the tar into a `docker exec` of `tar -x -p -C /run/garm`, and require exit code
+   0. `docker cp` cannot be used: Docker resolves its archive paths in a separate filesystem view that
+   excludes a running container's user tmpfs mounts. A process started by `docker exec` runs in the
+   container's own mount namespace, where the tmpfs is visible. Because `tar` creates entries in archive
+   order, the marker appears only after every credential file is written, so the entrypoint never sees a
+   partial set. The files are never written to host disk.
+5. **Verify** that the runner (and, in DinD modes, the sidecar) is still running before reporting success.
 
-**Environment contract injected by the provider, clarified per delivery mode.** The `myoung34`/actions-runner-controller k8s-provider convention informs the variable names, but the two delivery modes genuinely diverge in which variables are meaningful — the entrypoint must not assume the non-JIT set applies in JIT mode:
+The entrypoint then installs the files and starts the runner. With JIT it symlinks `.runner`,
+`.credentials` and `.credentials_rsaparams` in the install directory to the tmpfs files, never copying them
+to the writable layer, and runs `run.sh` directly. No `config.sh` and no `--jitconfig` are involved, because
+GARM serves the files and not a single blob. In DinD modes the Docker readiness wait runs in parallel with
+the credential wait, and the runner starts after both.
 
-- **Always set**: `JIT_CONFIG_ENABLED` (`true`/`false`), `RUNNER_WORKDIR`, `GITHUB_URL` (connectivity-check / informational use inside the entrypoint), `DISABLE_RUNNER_UPDATE=true`, and, in DinD modes, `DOCKER_HOST` (ADR-001).
-- **JIT mode only** (`JIT_CONFIG_ENABLED=true`): the provider does **not** set `RUNNER_ORG`/`RUNNER_REPO`/`RUNNER_ENTERPRISE`/`RUNNER_GROUP`/`RUNNER_NAME`/`RUNNER_LABELS`/`RUNNER_NO_DEFAULT_LABELS`/`RUNNER_EPHEMERAL`. These are not the source of truth in JIT mode: GARM bakes the runner's name, labels, group, and ephemeral flag into the `.runner`/`.credentials` files themselves at JIT-config-generation time (research.md §1.C), and `run.sh` reads them from those files. An env var named `RUNNER_LABELS` in JIT mode would be inert at best, misleading at worst, so it is deliberately absent rather than set-and-ignored.
-- **Non-JIT fallback only** (`disable_jit_config`): `RUNNER_ORG`/`RUNNER_REPO`/`RUNNER_ENTERPRISE` (whichever applies), `RUNNER_GROUP`, `RUNNER_NAME`, `RUNNER_LABELS`, `RUNNER_NO_DEFAULT_LABELS`, and `RUNNER_EPHEMERAL=true` are all provider-injected and consumed by `config.sh --ephemeral --token …` before `run.sh` runs.
+JIT configuration is valid for about an hour, which is ample, since delivery follows the fetch within
+seconds.
 
-**Deliberately absent** from the container's environment: the instance token / bearer token, the metadata URL, and the callback URL. As a direct result, `docker inspect` output — both `Config.Env` and `Mounts` — contains no bearer token and no credential value in any form. This is the only design considered that literally satisfies the acceptance criterion quoted above, because every alternative that puts a JIT config or a bearer token into container environment variables makes that value visible to `docker inspect` by definition.
+**Resulting properties.** The credential files exist only in the container's memory-backed tmpfs: never in
+the image, the writable layer, a `docker inspect`-visible variable or host disk. The tmpfs is anonymous and
+per container, so no other container can mount or see it. The runner user can read the files, so job code
+can read its own runner's credentials. They identify one single-job runner and are of no use after the job.
 
-JIT config validity (~60 minutes per credential-file set) is ample headroom, since the provider fetches the credential files up front — bounded by an aggregate ≤60s deadline — and delivers them immediately after starting the container, rather than on any delayed schedule.
+### Environment
 
-**Runner callbacks default to off** (`enable_runner_callbacks = false` in config, ADR-005). Enabling this flag is an explicit, informed operator **opt-out** of the credential-invisibility guarantee that is this ADR's central design goal — not a minor trade-off to wave through. Turning it on puts the instance token into the runner container's environment, which means: (1) the token is visible in plaintext to anyone with `docker inspect` access on the host, and (2) it is reachable by the untrusted workflow job code running inside the runner, which could read its own environment and call the metadata service with that token on the job's own behalf. With callbacks off (the default), GARM still reconciles runner state by polling GitHub's own runner list plus this provider's stdout status responses — callbacks are a latency optimization for faster `agent_id` correlation, not a correctness requirement. (Superseded for GARM v0.2.1 scale sets — see the 2026-10-11 Amendment: runner *status* must reach GARM's callback, and the provider now reports it itself, without the container ever holding the token.) plan.md's M3 milestone includes a test that enumerates exactly what becomes newly visible when callbacks are turned on, so this exposure is bounded and deliberate rather than assumed.
+Always set: `JIT_CONFIG_ENABLED`, `RUNNER_WORKDIR`, `GITHUB_URL`, `DISABLE_RUNNER_UPDATE=true`, and in DinD
+modes `DOCKER_HOST` and `DOCKER_SOCK_GID`. Cache variables are set when caches are mounted
+([ADR-003](ADR-003-cache-keying-and-lifecycle.md)). With JIT the provider sets none of `RUNNER_ORG`,
+`RUNNER_REPO`, `RUNNER_ENTERPRISE`, `RUNNER_GROUP`, `RUNNER_NAME`, `RUNNER_LABELS` or `RUNNER_EPHEMERAL`, because GARM
+bakes the name, labels, group and ephemeral flag into the credential files and `run.sh` reads them there.
+Variables that the runner would ignore would only mislead.
 
-> **Status (M3-W2, unimplemented — post-M4 follow-up):** the `enable_runner_callbacks` opt-in described above was never built. There is no such field in provider config or in the self-describing config JSON Schema (`internal/config/schema.json`); setting it in TOML today does nothing, since it is silently ignored as an unknown key. GARM currently always learns runner completion via polling — the "callbacks off (the default)" behavior above is the only in-container behavior that exists (see `internal/verify/verify_m3_scenarios_test.go`); runner status is reported by the provider process, not the container (2026-10-11 Amendment). The design rationale above (opt-out framing, the exact exposure it would create) stands unchanged for whenever the opt-in is actually implemented; that implementation work is deferred, not scheduled for any milestone through M4.
+The container never receives the instance token, the metadata URL or the callback URL. Every design that
+puts a JIT blob or a Bearer token into an environment variable fails the `docker inspect` test by
+definition. The `ACTIONS_RUNNER_INPUT_JITCONFIG` convention used by ARC is rejected for that reason, and
+GARM does not serve a single blob anyway. A mode in which the container holds the token and calls GARM
+itself is not implemented: it would expose the token to `docker inspect` and to job code.
 
-**Non-JIT fallback**: needed when a pool explicitly sets `disable_jit_config`. In that case the provider fetches a registration token from `/runner-registration-token` instead of the three JIT credential files, delivers it into the container's tmpfs via the identical fetch → create → start → exec-deliver sequence described above (now carrying one token file plus the `.delivered` marker instead of three credential files), and the entrypoint runs `config.sh --ephemeral --disableupdate --token "$(cat …)"` followed by `run.sh`. Two mode-specific details matter here: (1) the base `myoung34/github-runner` image's `config.sh` refuses to run as root without `RUNNER_ALLOW_RUNASROOT=1`, so the entrypoint runs `config.sh` as the runner user via `gosu` by default (it exports `RUNNER_ALLOW_RUNASROOT=1` and runs as root only when the operator explicitly sets `RUN_AS_ROOT=true`); and (2) the entrypoint lets `config.sh` write `.runner`/`.credentials`/`.credentials_rsaparams` into the install dir normally and, **only after `config.sh` SUCCEEDS**, moves those files onto the tmpfs and replaces them with symlinks (a post-config move), leaving the non-JIT credentials tmpfs-resident at steady state, exactly like the JIT path. It deliberately does **not** pre-link the symlinks before `config.sh`: the real .NET runner's `Runner.Listener configure` reads `.credentials` in its startup `HostContext` constructor, and a pre-created dangling symlink — whose tmpfs target is not delivered in non-JIT mode (`.credentials` is created BY `config.sh` during registration) — makes that read fail (`FileNotFoundException`, exit 134) BEFORE registration runs (confirmed on a live daemon against the real runner image). JIT keeps its pre-link because all its files ARE delivered up front, so its symlinks are never dangling. A scrub-on-failure trap around the `config.sh` phase removes any credential-pattern files from the writable layer (and tmpfs) if registration fails, so no failure path leaves credentials on the writable layer. `--disableupdate` is appended unconditionally because the image is digest-managed (ADR-005). In practice, GARM scale sets force `jit_config_enabled = true` upstream, so JIT is the primary and expected path; the non-JIT fallback exists for completeness and for non-scale-set pools, and deliberately shares the same provider-side-fetch, never-a-host-temp-file, credentials-only-on-tmpfs mechanism for a uniform threat model across both paths.
+### Non-JIT path
 
-**Version updates**: bumping the base image digest or the `GH_RUNNER_VERSION` build argument triggers a rebuild, which produces a new digest; the operator then updates the digest pinned in provider config. **Image selection is config-only**, via a named flavor map (ADR-005); `extra_specs` cannot carry a raw image reference under any circumstance — this is an explicit design choice to keep image provenance under operator control.
+When a pool sets `disable_jit_config`, the provider fetches a registration token from
+`runner-registration-token` instead, and delivers it the same way. The entrypoint runs
+`config.sh --ephemeral --disableupdate --token ...` as the runner user through `gosu` (the base image's
+`config.sh` refuses to run as root) and starts `run.sh`. It lets `config.sh` write the credential files
+normally and, only after success, moves them onto the tmpfs and replaces them with symlinks. Pre-linking
+before `config.sh` would leave dangling symlinks, and `Runner.Listener configure` reads `.credentials` at
+start-up and crashes (`FileNotFoundException`, exit 134), as observed on a live daemon. A trap removes
+credential files from the writable layer if `config.sh` fails. This path is implemented but has not been
+verified against a real GARM pool.
+
+### Status reporting
+
+GARM creates every runner as `pending`. On GARM v0.2.1 scale sets, the job-started handler moves a runner to
+`active` with a checked update that allows only `idle` or `offline` as the previous state, so a runner that
+never reports leaves the listener refetching the same message and the scale set stalls. Pools force the
+update and are not affected. Upstream relaxed the check in cloudbase/garm#817, which was in no release as of
+2026-10-11.
+
+The provider therefore reports status itself, from the provider process, using the token it already holds.
+It posts `installing` to `{callback-url}/status` once the credentials are delivered and the runner is
+running, then `idle` once the runner's own stdout shows `Listening for Jobs`, read through the Docker logs
+API, within `[status_report].timeout_seconds` (default 90, `0` disables). `idle` is never sent early,
+because GARM's bootstrap-timeout reaper collects only `pending` and `installing` runners, and a runner
+reported `idle` that then failed to start would never be reaped. On timeout the runner stays `installing`.
+If the daemon cannot return logs (log driver `none`), readiness falls back to `Runner.Listener` appearing in
+`docker top` and staying up for 5 seconds. That is weaker evidence, so the provider warns. It never changes
+the container's log driver.
+
+Reporting is best-effort and never fails `CreateInstance`. `agent_id` is omitted, since GARM rejects a value
+that differs from the one on a scale-set row. Only JIT runners are reported: GARM stores a JIT runner's
+agent ID when it generates the configuration, while a non-JIT runner registers inside the container and an
+ID-less `idle` would leave GARM unable to remove its GitHub registration. Non-JIT runners exist only on
+pools, which do not need the reports. The callback URL follows the same transport rules as the metadata URL,
+and no redirect is followed.
+
+**The wait never runs inside `CreateInstance`.** GARM v0.2.1 puts no deadline on the create call, but
+cloudbase/garm#817 bounds it by `runner_bootstrap_timeout` and `exec_timeout_seconds` and kills the binary on
+expiry. `CreateInstance` therefore makes no request to GARM. It re-executes the provider binary as a
+detached watcher (hidden first argument, own session, stdout and stderr on `/dev/null` so GARM's pipes are
+not held open) and returns after handing the request over a private stdin pipe, within 5 seconds. The request
+carries the token, callback URL, container ID, deadline and proxy variables, and never appears in argv or
+the environment. The watcher's environment holds only `SSL_CERT_FILE`, `SSL_CERT_DIR` and `GODEBUG`, when
+set. It exits within about 25 seconds of the deadline whatever happens, and reports `idle` only after
+inspecting the container and finding it running, because a stopped container's logs still replay a
+`Listening for Jobs` line printed before it exited.
+
+An orphaned watcher is adopted by PID 1. If PID 1 is GARM itself in a container started without an init, no
+one reaps it and every finished watcher stays a zombie. The provider therefore detaches only when
+`/proc/1/comm` names a known init (systemd, docker-init, tini, catatonit and similar). Otherwise it runs the
+watcher inside `CreateInstance`, bounded by `timeout_seconds`, and warns that GARM's container should run
+with an init (`docker run --init`, Compose `init: true`).
+
+### IPv6 is disabled in the runner
+
+The runner is created with `net.ipv6.conf.all.disable_ipv6=1`. From Docker Engine 26, a container on an
+IPv4-only network keeps `::1` on `lo` and gets `::1 localhost` in `/etc/hosts`. A server that binds
+`localhost` through plain `getaddrinfo` then listens on `::1` only, while a Node client resolves with
+`AI_ADDRCONFIG`, drops `::1` because the container has no non-loopback IPv6 address, and dials `127.0.0.1`.
+The result is `ECONNREFUSED`, which does not happen on a VM or a GitHub-hosted runner. Measured on a
+user-defined bridge network with Node 22 (`server.listen(port, 'localhost')`, then
+`fetch('http://localhost:port')`):
+
+| Engine | `lo` IPv6 without the sysctl | Without the sysctl | With the sysctl |
+|---|---|---|---|
+| 24.0.9, 25.0.5 | disabled | passes (binds `127.0.0.1`) | passes, `::1 localhost` line kept |
+| 26.1.4, 29.9.0 | enabled | `ECONNREFUSED 127.0.0.1` (binds `::1`) | passes, no `::1` lines |
+
+Only the `all` key is set. It is the one the daemon consults when writing `/etc/hosts`, and it also covers
+`lo` and `eth0`. The sysctl is per namespace, needs no privilege and changes nothing on the host. There is
+no setting for it. A job that binds or dials `::1` explicitly will not work, and the runner could not use
+IPv6 beyond loopback anyway.
+
+On a host whose kernel has no IPv6 there is no `/proc/sys/net/ipv6`, so the create succeeds and the start
+fails with an error naming the sysctl. `CreateInstance` classifies that error and retries once, after
+removing the rejected runner and recreating it without the sysctl:
+
+- With `no such file or directory`, the host has no IPv6, `::1` cannot exist and nothing is lost. One
+  warning is logged.
+- For any other reason (permission denied, read-only `/proc/sys`, a security policy), the sysctl could not be
+  applied while IPv6 may still be on, so `localhost` can resolve to `::1` again. This is still retried,
+  because failing every allocation on such a host is worse, and the warning says IPv6 may remain enabled.
+
+Cancellation and every other error are not retried. The cache volumes are revalidated before the second
+start.
+
+### Image contents and privileges
+
+**The runner user has passwordless sudo.** Both `myoung34/github-runner` bases ship
+`%sudo ALL=(ALL) NOPASSWD: ALL` and add `runner` to the `sudo` group, and the provider sets no
+`no-new-privileges`. After the entrypoint drops privileges with `gosu`, `sudo -n id -u` prints `0`. A job can
+therefore become root inside its own container. This is kept for parity with GitHub-hosted runners. The
+container is unprivileged in `none` mode and has no host socket, but a job in a DinD mode also reaches a
+root-equivalent daemon ([ADR-001](ADR-001-dind-strategy.md)). An operator who wants sudo gone builds a
+derived image without the rule. A provider option to set `no-new-privileges` could be added, and it would
+also block every other setuid binary. Nothing in the images depends on sudo. Setting `RUN_AS_ROOT=true` in
+the container's own environment runs the runner and the job as root, and `extra_specs` cannot set it.
+
+Package policy: the images carry the commonly needed apt-level dependencies (the shared libraries headless
+Chrome needs, a minimal font set, `pipx`, `file`, `cmake`, `ninja-build`, `clang-format` and `clang-tidy`).
+Languages and toolchains come from `setup-*` actions at job time. A repository with unusual needs gets a
+derived image selected through a flavor. The images do not mirror GitHub-hosted runner images. `/usr/local/bin`
+and `/usr/local/lib` are owned by the runner user, because CI scripts install pinned tools there and use
+`sudo` only when the directory is not writable. A runner serves one job and its writable layer is discarded,
+so nothing leaks between jobs. LLVM comes from the Ubuntu archive of each release and no third-party apt
+repository is added. The entrypoint raises the open-file soft limit from 1024 to 65536 (clamped to the hard
+limit, best effort), as hosted runners do. The package list is in
+[`runner-images/README.md`](../../runner-images/README.md).
+
+### Updates
+
+Bumping the base digest or `GH_RUNNER_VERSION` produces a new image digest. The operator then updates the
+digest in provider config.
 
 ## Rationale
 
-The combination of "tool-rich base + custom entrypoint + provider-side JIT fetch" is the only path that satisfies both the toolcache requirement (ADR-003) and the credential-invisibility requirement simultaneously. Any design that lets the container itself fetch its JIT config, or that passes the config/token through environment variables, fails the `docker inspect` acceptance criterion by construction, regardless of how carefully the fetch is implemented. The fetch-first + `docker exec` tar-streaming delivery sequence preserves this invariant exactly: the credential files still never touch environment variables or host disk, only a container-local, memory-backed tmpfs populated (via the container's own mount namespace) after the container is already running, and reached from the install dir only through symlinks. `docker exec` rather than `docker cp` is not a stylistic choice but a correctness requirement — `docker cp` resolves paths in a filesystem view that cannot see the tmpfs at all (moby v27.5.1 `daemon/containerfs_linux.go`).
+A tool-rich base, a custom entrypoint and a provider-side fetch together satisfy both the toolcache
+requirement ([ADR-003](ADR-003-cache-keying-and-lifecycle.md)) and the credential-invisibility requirement.
+A design in which the container fetches its own configuration, or receives it through the environment,
+fails the `docker inspect` test by construction. `docker exec` and not `docker cp` is a correctness
+requirement, not a style choice.
 
 ## Alternatives considered
 
-- **Official `ghcr.io/actions/actions-runner` base**: rejected for v1 — no bundled tooling, which would force per-job tool installation and defeat the toolcache.
-- **`summerwind/actions-runner`**: rejected — the project is deprecated upstream.
-- **From-scratch Ubuntu build**: rejected — would re-implement most of what `myoung34/github-runner` already provides, for no clear benefit.
-- **JIT via `ACTIONS_RUNNER_INPUT_JITCONFIG` environment variable** (the ARC/actions-runner convention): rejected — puts the JIT config, and thus the credential, directly into `docker inspect`-visible environment. Note this convention does not actually map onto GARM's wire contract anyway: GARM's metadata service never hands out a single base64 jitconfig blob to fetch (research.md §1.C, §2.A), only the three individual credential files — so this alternative was rejected both on the visibility grounds above and because it would require inventing a blob GARM does not provide.
-- **k8s-provider-style `BEARER_TOKEN` entrypoint-fetch pattern** (container fetches its own JIT config using a bearer token supplied via environment): rejected — the GARM-issued bearer token itself becomes visible in `docker inspect`.
+- The official `actions-runner` image: no tooling, which forces per-job installs and defeats the toolcache.
+- `summerwind/actions-runner`: deprecated upstream.
+- A from-scratch Ubuntu image: re-implements what the `myoung34` base provides.
+- Container-side fetch with a Bearer token in the environment: exposes the token to `docker inspect`.
 
 ## Consequences
 
-- This project must maintain its own `Dockerfile` and entrypoint script and track a rebuild cadence against both `myoung34/github-runner` and upstream `actions/runner` releases.
-- Forge scope for v1 is GitHub only; Gitea support is deferred, though the non-JIT registration-token fallback path is still implemented and forge-agnostic in shape.
+- The repository maintains two Dockerfiles and an entrypoint, and rebuilds them when `myoung34/github-runner`
+  or `actions/runner` releases.
+- The forge is GitHub only. The non-JIT path is not specific to GitHub in shape, but Gitea is not supported.
+- Each image carries about 300 MB of LLVM libraries for `clang-tidy`.
 
 ## Open questions
 
-- The exact timeout for the entrypoint's delivery-marker wait before it fails the runner cleanly (currently defaults to 120s via `GARM_CRED_WAIT_SECONDS`, comparable to the DinD readiness wait in ADR-001; the fetch-first ordering makes a longer default safe, since the marker is written promptly after start).
-- Whether a `ca-cert-bundle` TLS-verification failure during the provider's metadata fetch should be surfaced as its own `provider_fault` category, distinct from a generic fetch failure, to make private-CA misconfiguration easier for operators to diagnose.
-- **M0-demo verification (see the Decision):** whether `actions/runner` accepts symlinked `.runner`/`.credentials*` config files, or whether the container-scoped-writable-layer fallback is needed.
-
-Resolved by the 2026-07-19 amendment (previously open):
-- The tmpfs directory is `/run/garm` (`mode=0700`, owned by the runner uid/gid); credential transport filenames inside it are the bare `runner`/`credentials`/`credentials_rsaparams` (JIT) or `registration-token` (non-JIT), plus the `.delivered` marker. The entrypoint dots them into `.runner`/`.credentials`/`.credentials_rsaparams` at install time via symlinks.
-- Credentials are streamed as a **single** tar archive over one `docker exec` stdin (not three calls, and not `docker cp`), with the `.delivered` marker as the last entry, so the entrypoint never observes a partial set.
-- The non-JIT fallback path is confirmed to stay fully provider-side, sharing the same fetch → create → start → exec-deliver mechanism as JIT delivery, and to keep its credentials tmpfs-resident via a **post-config move**: `config.sh` writes the credentials into the install dir, then (only on success) they are moved onto the tmpfs and symlinked, guarded by a scrub-on-failure trap. Pre-linking (as JIT does) was ruled out for non-JIT because the real runner's `configure` step reads `.credentials` in its startup constructor and a dangling pre-created symlink crashes it (exit 134) before registration — confirmed on a live daemon.
-
-See research.md §1.C and §2.A for the ground truth on GARM's per-file `/credentials/{fileName}` metadata contract and the reference k8s provider's direct-`run.sh`-boot pattern this decision is built on, and §3 for the base-image comparison and the upstream JIT/callback behavior. See ADR-001 for the DinD sidecar this runner pairs with and the `DOCKER_HOST` wiring, ADR-003 for the toolcache this base image choice is optimized for, and ADR-005 for how `runner_image` and `dind_image` are exposed in config (`enable_runner_callbacks` is not — see the Status note above).
+- Whether a TLS failure during the metadata fetch should be reported as its own fault, to make private-CA
+  mistakes easier to find.
+- Whether to add a provider option for `no-new-privileges`.

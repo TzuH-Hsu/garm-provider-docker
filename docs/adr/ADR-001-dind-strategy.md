@@ -1,207 +1,225 @@
-# ADR-001: Docker-in-Docker (DinD) Strategy
+# ADR-001: Docker-in-Docker strategy
 
-Status: Accepted (2026-07-19); amended 2026-07-21, 2026-07-26, 2026-10-12, 2026-10-17 and 2026-10-29 (see Amendments below)
+Status: Accepted
 
 ## Context
 
-`garm-provider-docker` is an external provider executable for [GARM](https://github.com/cloudbase/garm) (`cloudbase/garm`). GARM owns GitHub App authentication, scale-set long-polling, JIT runner-config generation, and pool scheduling; this provider is responsible only for instance lifecycle on a single Docker host, invoked as a subprocess (environment variables and a stdin JSON payload in, a stdout JSON payload out), built against `garm-provider-common` v0.1.9.
+`garm-provider-docker` is an external provider for
+[GARM](https://github.com/cloudbase/garm). GARM owns GitHub authentication, scale-set polling,
+JIT runner configuration and pool scheduling. This provider creates and destroys runner containers on
+one Docker host. The call contract is in [`garm-contract.md`](../garm-contract.md).
 
-The target deployment is a single Docker host, NAS-first: Synology DSM, Unraid, Raspberry Pi, and generic Linux hosts, across `linux/amd64` and `linux/arm64`. Many CI jobs need Docker-in-Docker (DinD) to build and run containers themselves. The intended differentiator versus prior art (in particular the GitHub Actions Runner Controller, ARC, and existing community Docker providers) is per-job isolation topology combined with first-class, configurable DinD support that does not hang a hard dependency on Sysbox — Sysbox has no straightforward install path on Synology DSM or Unraid, the two most common NAS targets.
+Many CI jobs need Docker inside the job (Docker-in-Docker, DinD). Sysbox is the usual way to run an
+unprivileged nested daemon, but it cannot be installed on every host, so the design cannot depend on it.
+The model this provider enforces has three trust tiers. The operator's provider config is the most
+trusted. A pool's `extra_specs`, set by a GARM admin, is narrower. The workflow payload is untrusted and
+never decides anything privileged. One rule holds in every configuration: a runner, or the job it runs,
+must never reach the host's Docker socket.
 
-The trust model that shapes this decision (see also ADR-005): provider config, set by the host operator, is the most trusted input; pool `extra_specs`, set by a GARM admin and read from the stdin `extra_specs` field (not the `GARM_POOL_EXTRASPECS` environment variable, which is empty for scale sets due to an upstream gap — see research.md §1), is a narrower trust tier; the workflow payload running inside the job is untrusted and is never consulted for privileged decisions. The hardest security red line this ADR must satisfy: a runner or the job it executes must never be able to reach the host's Docker socket, under any configuration.
+The provider process itself talks to the host daemon, so it is as trusted as GARM and effectively has root
+on the host. This ADR is about what the containers it creates can reach.
 
 ## Decision
 
-Support three config-selectable DinD modes — `none` (the config default — see the "default dind_mode is none" Amendment below; this ADR originally named `privileged-sidecar` the default), `privileged-sidecar`, and `sysbox-runc` — sharing one uniform per-allocation topology. `privileged-sidecar` remains the default *DinD mechanism* — the one universally available on every target platform, so the recommended mode once an operator enables DinD — but DinD is off by default: `dind_mode` defaults to `none`, and an operator must opt in to any privileged workload. DinD, when enabled, is always run as a **sidecar container** sharing a job-scoped Unix socket volume with the runner container, following the pattern established by ARC's `gha-runner-scale-set` Helm chart. The host Docker socket is never mounted into any container in any mode.
+Three DinD modes share one per-allocation topology: `none`, `privileged-sidecar` and `sysbox-runc`.
+DinD is off by default. `dind_mode` defaults to `none`, and `allowed_dind_modes`, the operator's ceiling on
+what any pool may request, defaults to `["none"]`. To use DinD an operator widens the ceiling and sets a
+digest-pinned `dind_image`. `dind_mode` must itself be a member of `allowed_dind_modes`, so a config that
+selects a DinD mode without widening the ceiling fails to load. A pool's `extra_specs.dind_mode` can select
+a mode inside the ceiling and never beyond it. If a pool selects a DinD mode on a host with no
+`dind_image`, `CreateInstance` rejects it before any Docker call.
 
-**Operator ceiling on `dind_mode`.** The three modes above are what a pool's `extra_specs` may *request* (ADR-005), but the operator gets the final word: provider config defines `allowed_dind_modes`, a list defaulting to `["none"]` — fail-closed, so DinD is unavailable until an operator widens the ceiling explicitly (this ADR originally specified all three modes; the Decision text is corrected in place, see the "fail-closed `allowed_dind_modes` default" Amendment below) — and any `dind_mode` selected via `extra_specs` is validated against this list and rejected if it falls outside it. `extra_specs` can select a mode *within* the allowed set; it can never escalate beyond it, no matter what a GARM admin configures at the pool level. This is the concrete mechanism that keeps the trust-tier boundary described above (operator config > pool `extra_specs` > workflow payload) enforced in code: on a shared or otherwise sensitive host, an operator can set `allowed_dind_modes = ["none"]` to forbid any privileged workload on that host outright, regardless of what any pool's `extra_specs` requests. See ADR-005 for the full `extra_specs` schema and validation behavior this ceiling is implemented in.
+`privileged-sidecar` is the mode available on every host, so it is the mechanism to use when DinD is
+wanted and Sysbox is not available. It is never enabled by omission. The host socket is never mounted
+into any container in any mode.
 
-Per-allocation resources, created on `CreateInstance` and destroyed on `DeleteInstance` (see ADR-004 for teardown ordering):
+DinD runs as a sidecar container that shares a job-scoped Unix socket volume with the runner, as in ARC's
+`gha-runner-scale-set`. Each allocation owns these resources, created by `CreateInstance` and removed by
+`DeleteInstance` ([ADR-004](ADR-004-teardown-and-orphan-cleanup.md)):
 
-- Job network (a labeled bridge network) — all modes.
-- Runner container — all modes.
-- DinD sidecar container, job-scoped socket volume, and a dedicated `dind-state` volume mounted at `/var/lib/docker` — DinD modes only (`privileged-sidecar`, `sysbox-runc`).
-- Workspace volume — all modes. In DinD modes the sidecar mounts it at the runner's workspace path too, and, when the externals cache is enabled, mounts the shared externals volume read-only at the runner's externals path (corrected 2026-10-29 — see the container jobs Amendment below), so that bind sources the runner hands the daemon resolve to the runner's own files.
+- a labelled bridge network (all modes);
+- the runner container (all modes);
+- a workspace volume (all modes);
+- in DinD modes, the sidecar, a socket volume and a `dind-state` volume at `/var/lib/docker`.
 
-**`privileged-sidecar` wiring** (the default DinD *mechanism* when DinD is enabled; not enabled by default — `dind_mode` defaults to `none`, see the Amendment below): the DinD sidecar runs `dockerd --host=unix:///run/docker.sock --storage-driver=overlay2` with `DOCKER_TLS_CERTDIR=""` — TLS is disabled because the daemon socket is exposed only over the shared volume, never over TCP. This mirrors ARC's own `gha-runner-scale-set` DinD values file. The runner container mounts the same socket volume **at `/run`** (corrected 2026-07-21 — see the DinD socket path Amendment below; originally this ADR specified `/var/run`) and sets `DOCKER_HOST=unix:///run/docker.sock`; the entrypoint polls for daemon readiness (`until docker info; do sleep …; done`, budget roughly 120 seconds) before proceeding. The sidecar joins the runner's network namespace (`HostConfig.NetworkMode = container:<runner ID>`, added 2026-10-12 — see the shared network namespace Amendment below; originally the sidecar had its own namespace on the job network), so ports the inner daemon publishes are reachable on the runner's `127.0.0.1`, as in an ARC pod; the runner is therefore started first and the sidecar right after it.
+In DinD modes the sidecar also mounts the workspace at the runner's workspace path, and, when the
+externals cache is enabled, the shared externals volume read-only at the runner's externals path (see
+"Container jobs"). Persistent caches are described in [ADR-003](ADR-003-cache-keying-and-lifecycle.md).
 
-**`sysbox-runc` mode**: the same topology as `privileged-sidecar` except for network placement. Two `HostConfig` fields differ on the DinD sidecar: `HostConfig.Runtime = "sysbox-runc"` and `Privileged = false`; and the sidecar keeps its own network namespace on the job network instead of joining the runner's (corrected 2026-10-12 — see the shared network namespace Amendment below). Everything else — volumes, entrypoint, readiness wait, start order — is shared code.
+### `privileged-sidecar`
 
-**Storage driver**: DSM's and other NAS distributions' host filesystems (frequently btrfs, sometimes overlay-on-overlay) make storage-driver autodetection inside the DinD container unreliable. The provider therefore always allocates a dedicated, ephemeral `dind-state` volume and passes an explicit `--storage-driver` flag: `overlay2` by default, with `vfs` documented as the safe (slower, more compatible) fallback. This is a config knob (see ADR-005), never something the payload or `extra_specs` can override implicitly.
+The sidecar runs `dockerd --host=unix:///run/docker.sock --storage-driver=<driver> --group=2000` with
+`DOCKER_TLS_CERTDIR=""`. TLS is off because the daemon listens only on the shared socket volume, never on
+TCP. The runner mounts the same volume at `/run` and sets `DOCKER_HOST=unix:///run/docker.sock`. Group
+2000 owns the socket, and the entrypoint adds the runner user to it, because the runner and `docker:dind`
+base images number their `docker` groups differently. The runner's entrypoint polls `docker info` for up
+to 120 seconds before it starts the runner.
 
-**`none` mode**: no DinD sidecar, no socket volume, no `dind-state` volume; `DOCKER_HOST` is left unset in the runner. Job network, workspace volume, and persistent caches (ADR-003) are still provisioned. Any `docker` invocation inside the job fails fast, which is the correct signal for a job that needs Docker but was scheduled onto a `none`-mode pool. This is the M0 spike target (see plan.md) because it lets the rest of the lifecycle (create/delete/list, labeling, JIT delivery) be proven without the added complexity of DinD wiring.
+The socket volume is mounted at `/run` and not at `/var/run`. On Debian, Ubuntu and Alpine, `/var/run` is a
+symlink to `/run`, and a volume mounted there would hide the credential tmpfs at `/run/garm`
+([ADR-002](ADR-002-runner-image-and-jit-delivery.md)). Mounting the volume at the parent lets Docker mount
+`/run` first and the tmpfs on top. This is also what ARC does. It concerns the nested daemon's socket
+only; `docker_host` in the provider config is the provider's own connection to the host daemon.
 
-**Job network capacity is finite and must be sized deliberately.** Every allocation, in every mode, creates its own per-job bridge network (see Decision above). Docker draws these from its **default address pools**, a finite resource on any single host — the number of per-job networks the daemon can hand out concurrently is bounded by how that pool is sized, not just by host CPU/RAM. This sets a hard concurrency ceiling on simultaneous jobs that is independent of runner/DinD resource limits, and it is a ceiling operators must size for explicitly (via the daemon's `default-address-pools` configuration) rather than discover by surprise. Pool exhaustion must fail cleanly: `CreateInstance` reports a clear `provider_fault` (not a generic, unattributed error) when network creation fails because the address pool is exhausted, so the failure is immediately diagnosable as a capacity problem rather than a Docker or provider bug.
+**Shared network namespace.** The sidecar joins the runner's network namespace
+(`HostConfig.NetworkMode = container:<runner ID>`). A port that the inner daemon publishes (`docker run -p`,
+testcontainers, Compose `ports:`) is then reachable on the runner's `127.0.0.1`, as on a GitHub-hosted
+runner or in an ARC pod. With separate namespaces, such jobs fail with `ECONNREFUSED`. The runner owns the
+namespace and the sidecar joins it, for four reasons:
 
-**Job networks default to `internal=false`** (revised 2026-07-21 — see Amendment below; originally this ADR defaulted to `internal=true`). Per-job bridge networks are created WITHOUT Docker's `internal` flag by default, so the runner/DinD retain a normal route to the external network. Job-to-job isolation does not come from this flag: it comes structurally from every allocation getting its **own separate network** (see Decision above) — a job on one allocation's network cannot reach a container on another allocation's network by IP, regardless of either allocation's `internal` setting. The `[network].internal` config field is retained, not removed: an operator who wants a fully airgapped job can still set it `true`, and it remains the building block for a reserved, not-yet-implemented future opt-in (see Amendment). This is a config-only knob, never an `extra_specs` one, consistent with this ADR's trust model. Independently of this, operators are required to ensure the host Docker daemon itself is not configured to listen on TCP (`dockerd -H tcp://…` or an equivalent `daemon.json` `hosts` entry) — a TCP-exposed daemon socket would bypass every one of this ADR's per-job containment guarantees regardless of `internal` networking, since it is a host-level exposure, not a per-job one; see the Amendment for why this now carries more of the weight `internal=true` used to carry as defense-in-depth.
+1. The runner is what GitHub sees. The sidecar carries the `dind_memory` limit and is more likely to be
+   OOM-killed. If it owned the namespace, its death would cut the runner off the network and lose the job.
+2. A container that joins another's namespace takes the `/etc/hosts`, `/etc/resolv.conf` and hostname of the
+   container that created it. The runner keeps the files the daemon writes for it, including the IPv4-only
+   `localhost` entry from ADR-002.
+3. `net.*` sysctls are per namespace. The runner's `disable_ipv6` sysctl and its single retry without it
+   stay where they are, applied once by the namespace owner. The sidecar sets no sysctl.
+4. The runner stays the single endpoint on the job network, so its attachment checks are unchanged.
+
+Keeping separate namespaces and pointing jobs at the sidecar by name would need changes in every job and
+tool, and would not fix code that hard-codes `127.0.0.1`. A TCP `DOCKER_HOST` would break the no-TCP rule.
+
+The daemon refuses to start a container that joins a namespace whose owner is not running. `CreateInstance`
+therefore pulls the dind image first, then creates and starts the runner (including its IPv6 retry), then
+creates and starts the sidecar, delivers the credentials, and verifies that both containers run. The
+runner's Docker wait runs in parallel with its credential wait, which covers a sidecar that starts a moment
+later. A failure at any step rolls back the whole attempt.
+
+Teardown order is unchanged: runner, sidecar, volumes, network. Removing the namespace owner first is
+allowed while the joined sidecar exists, and the network removal does not wait for the sidecar because the
+sidecar holds no endpoint on it. A runner removed out of band leaves a sidecar with no external
+connectivity, and `DeleteInstance` still removes it by label. Neither container has a restart policy.
+
+Inside the shared namespace, `dockerd` creates `docker0`, enables IP forwarding and installs its NAT rules,
+and `docker-proxy` serves published ports on `0.0.0.0` there. Nested bridge networking, `docker run -p` with
+fixed and ephemeral ports, and `127.0.0.1` and `localhost` from the runner (as root and as the runner user)
+were checked against `dockerd` 29.9.0 with the runner's `disable_ipv6=1`. IPv6 inside nested networks is not
+supported, and the job network carries no IPv6 anyway. The runner and the inner daemon now share one port
+space, so `docker run -p 8080:...` fails with "address already in use" if a runner process listens on 8080.
+This matches GitHub-hosted runners and ARC. The Actions runner listens on no port.
+
+Isolation analysis: the trust boundary does not move, because the runner and its sidecar belong to the same
+job. The privileged sidecar now holds every capability over the runner's network namespace, including
+observing its traffic. Job code already controls that daemon through `DOCKER_HOST`, and the residual risk
+below already accepts that it can reach the host, so nothing new is exposed. The runner container stays
+unprivileged with Docker's default capabilities. A nested container run with `--network host` lands in the
+runner's namespace, as on a GitHub-hosted runner. Job-to-job isolation and the no-host-socket rule are
+unchanged.
+
+### `sysbox-runc`
+
+Same topology, with two `HostConfig` differences on the sidecar: `Runtime = "sysbox-runc"` with
+`Privileged = false`, and a network namespace of its own on the job network. Sysbox runs the sidecar in a
+user namespace in which its root has no `CAP_NET_ADMIN` over the runner's namespace, so joining that namespace
+would stop `dockerd` from creating `docker0`. In this mode, ports published by the inner daemon are not
+reachable on the runner's `localhost`. A job reaches them at the sidecar's container name (`<instance>-dind`)
+on the job network. If the daemon has no `sysbox-runc` runtime, the error says so. This mode is not covered by
+the live gate.
+
+### `none`
+
+No sidecar, socket volume or `dind-state` volume, and `DOCKER_HOST` stays unset. Any `docker` call in the job
+fails fast. The network, workspace and caches are still provisioned.
+
+### Storage driver
+
+The provider always creates a dedicated `dind-state` volume and passes an explicit `--storage-driver`
+(`overlay2` by default, `vfs` as the slower, more compatible fallback). Autodetection inside a nested
+container is unreliable on some host filesystems. A pool may choose between the two through `extra_specs`.
+The workflow cannot change it.
+
+### Registry mirrors
+
+`registry_mirrors` and `insecure_registries` in the provider config become `--registry-mirror` and
+`--insecure-registry` flags appended to the three fixed ones. They are typed lists and not a `daemon.json`
+passthrough, because a free-form file could set `hosts` (a TCP listener), `storage-driver` or `group`, which
+the provider owns, and `dockerd` refuses to start when an option appears both as a flag and in the file. They
+are provider config only, since a mirror belongs to the host's network, so a pool admin cannot redirect a
+sidecar's pulls. The `dind-state` volume is still fresh for every job. A custom `dind_image` whose
+`daemon.json` sets the same options conflicts with these flags. See [`dind-image-pulls.md`](../dind-image-pulls.md).
+
+### Container jobs
+
+A workflow job with `container:` runs inside a container the runner creates through the sidecar's daemon.
+The runner asks the daemon to bind-mount `/actions-runner/_work` as `/__w` and `/actions-runner/externals`
+read-only as `/__e`. The daemon resolves those sources in its own filesystem, which is the sidecar's.
+Mounting the workspace in the sidecar covers `/__w`. Mounting the externals volume there, read-only like
+the runner's own mount, covers `/__e`, which holds the Node runtime that JavaScript actions need. The volume
+is shared across repositories, so a writable mount would let one job poison runtimes other repositories
+execute ([ADR-003](ADR-003-cache-keying-and-lifecycle.md)). With `[cache].enabled = false` there is no
+externals volume, `/__e` stays empty, and JavaScript actions cannot run in a container job. Plain `run:`
+steps are unaffected.
+
+### Job network
+
+Every allocation gets its own bridge network, drawn from the daemon's `default-address-pools`. The pool is
+finite, so it limits how many jobs can run at once, independently of CPU and memory. Size
+`default-address-pools` for the concurrency you plan. When the pool is exhausted, `CreateInstance` fails with
+the daemon's error text on stderr and exit code 1. The provider does not classify the error, and a failed
+create cannot carry a `provider_fault`, because the library drops the result when an error is returned.
+
+`[network].internal` defaults to `false`. With Docker's `internal` flag a network has no external route at
+all, so a runner could not reach `api.github.com` and a sidecar could not pull images. Job-to-job isolation
+comes from each allocation having its own network, not from this flag. The consequence is that egress is
+unrestricted: a job can reach other hosts on the LAN, the host's own services through the network gateway,
+and any metadata endpoint reachable from the host. An operator who needs less sets `internal = true`, which
+allows no egress at all. A forward-proxy sidecar with an allowlist would give both properties, and it is not
+built. The host daemon must also not listen on TCP (`dockerd -H tcp://...` or a `hosts` entry). A
+TCP-exposed daemon bypasses every per-job guarantee, and with `internal = false` this requirement carries
+that weight together with the rule that `extra_specs` can never set `DOCKER_HOST`
+([ADR-005](ADR-005-config-and-extra-specs-schema.md)).
+
+### Scope
+
+One Docker host, with Linux runners on `linux/amd64` or `linux/arm64`. Windows and macOS runners, rootless
+DinD and multi-host orchestration are out of scope. Rootless DinD needs `uidmap`, cgroup v2 with systemd and
+an outer container that is usually privileged anyway.
 
 ## Rationale
 
-Sysbox is not installable on Synology DSM or Unraid through any supported path, so it cannot be the default DinD mechanism — a NAS-first provider that defaulted to Sysbox as its DinD mechanism would be unusable out of the box for its primary audience whenever DinD is enabled. `privileged-sidecar` is the only DinD mechanism universally available on every target platform, so it is the default *DinD mechanism* — the one used when DinD is turned on. DinD itself is off by default, though: `dind_mode` defaults to `none` (see the "default dind_mode is none" Amendment below), so an operator must opt in to DinD before any privileged sidecar is created. `sysbox-runc` remains available as an opt-in for hosts that have it installed and want reduced-privilege isolation. Keeping the host socket out of every mode's mount table is a **structural** guarantee of the "no host socket" red line rather than a conventional one enforced only by code review: there is no code path, in any mode, that mounts `/var/run/docker.sock` from the host into a job-scoped container. The `allowed_dind_modes` operator ceiling exists because the trust-tier ordering in Context (operator config strictly outranks pool `extra_specs`) would otherwise be only aspirational for this one setting — without it, a GARM admin's `extra_specs` could unilaterally opt a pool into `privileged-sidecar` on a host the operator intended to keep at `none`, which is exactly the kind of privilege escalation this project's trust model exists to prevent.
+`privileged-sidecar` is the only mechanism that works wherever Docker does, so it is the one to use when
+Sysbox is not available. DinD is opt-in at two levels because a privileged sidecar is a host-compromise
+path. Without the ceiling, a GARM admin could switch a pool to `privileged-sidecar` on a host the operator
+meant to keep at `none`. Keeping the host socket out of every mount table makes the "no host socket" rule
+structural: no code path mounts `/var/run/docker.sock` into a job-scoped container.
 
 ## Alternatives considered
 
-- **Single privileged runner-with-Docker container** (Docker-in-the-runner, no sidecar): rejected — couples the runner and DinD lifecycles, and offers weaker isolation than a dedicated sidecar with its own crash/restart boundary.
-- **Rootless DinD**: rejected for v1 — needs `uidmap` and cgroup v2 with systemd, the outer container still typically needs to run privileged, and it is impractical to guarantee on DSM/Unraid kernels today. Left as an open question for a future iteration.
-- **Host socket passthrough**: rejected outright — direct violation of the "runner can never reach the host Docker socket" red line.
-- **Shared static network/volumes across jobs** (in the style of the `werdnum` community provider): rejected — defeats the per-job isolation topology that is this project's core differentiator; see research.md §2 for the prior-art comparison.
+- A privileged runner with Docker inside it and no sidecar: couples the two lifecycles and has weaker
+  isolation than a sidecar with its own crash boundary.
+- Host socket passthrough: violates the central rule.
+- Shared static networks or volumes across jobs: removes per-job isolation.
+- Rootless DinD: see "Scope".
 
 ## Consequences
 
-- Privileged containers are required on NAS platforms whenever DinD is enabled — `privileged-sidecar` is the only DinD mechanism available there, so enabling DinD on such a host means accepting a privileged sidecar; this is documented honestly as a platform ceiling rather than hidden. It is not incurred by default: `dind_mode` defaults to `none` (see the "default dind_mode is none" Amendment below), so no privileged container exists on a host until an operator opts in to DinD.
-- Teardown must cover five distinct resource kinds (network, runner, DinD sidecar, socket volume, `dind-state` volume) in a defined order (ADR-004).
-- Two DinD-adjacent images (the runner image from ADR-002 and the `docker:dind`-derived sidecar image) must be digest-pinned and tracked for updates.
-- Job network concurrency is bounded by the host's Docker `default-address-pools` sizing, a capacity limit operators must plan for explicitly.
-- Per-job bridge networks default to `internal=false` (Amendment, 2026-07-21): the "host Docker daemon must never listen on TCP" operational requirement, previously one layer of defense-in-depth alongside `internal=true`, is now — together with F8 (no `DOCKER_HOST` override, ADR-005) — the primary mitigation for that host-level exposure, and must be treated as a real deployment requirement rather than a nice-to-have.
+- Teardown covers five resource kinds in a fixed order ([ADR-004](ADR-004-teardown-and-orphan-cleanup.md)).
+- The runner image and the sidecar image must both be digest-pinned and kept up to date.
+- Concurrency is bounded by Docker's address pools.
+- No privileged container exists on a host until the operator opts in.
 
-### Residual risk (host compromise under `privileged-sidecar`)
+### Residual risk
 
-This ADR's isolation guarantees are real but bounded, and should be stated honestly rather than implied to be absolute. Per-job isolation (own network, own volumes, own DinD sidecar) protects **other jobs'** data from a compromised job, and the "never mount the host socket" rule keeps the **host** Docker socket structurally unreachable from inside any container, in every mode — that red line holds regardless of what follows below.
+Per-job isolation (own network, volumes and sidecar) protects other jobs' data from a compromised job, and
+the host socket stays unreachable in every mode. But in `privileged-sidecar` mode the job's code controls a
+**privileged** daemon through `DOCKER_HOST`. It can run a nested privileged container, reach devices the
+sidecar can reach, mount the host's root filesystem through a crafted container, and take over the host. None
+of that uses the host's Docker socket, and all of it is a direct host-takeover path. **A privileged
+sidecar is root-equivalent on the host for any job that runs in it.** It contains accidents, not an
+adversarial job.
 
-But in `privileged-sidecar` mode — which an operator must opt into, since it is not the default (`dind_mode` defaults to `none`, see the "default dind_mode is none" Amendment below) — a malicious workflow's job code holds `DOCKER_HOST` pointed at a **privileged** dind daemon that it fully controls. From there, that job can: run a nested privileged container of its own choosing, access host devices passed through to (or reachable from) the privileged dind container, potentially mount the host's root filesystem via a crafted nested container, and — from any of those — compromise the underlying host itself. None of this goes through the host's own Docker socket (the letter of red line 1 in this ADR's Context holds throughout), but it is nonetheless a real, direct host-takeover path, achieved via the privileged dind daemon this project itself provisions on the job's behalf.
-
-**Privileged dind is not a containment boundary against malicious job code.** It contains accidents and well-behaved jobs; it does not contain an adversarial one. Concretely:
-
-- For hosts that run genuinely untrusted job code (public-fork PR workflows, multi-tenant CI, or any workload where the pool operator does not fully trust every contributor), `sysbox-runc` mode or `none` mode are the honest choices — `sysbox-runc` narrows this residual risk considerably (no `Privileged=true` on the sidecar), and `none` removes it entirely by removing DinD altogether.
-- Where neither is viable, `privileged-sidecar` should be restricted to pools running only trusted repositories/branches, as an explicit operator policy decision, not a provider-enforced one.
-- NAS platforms without a Sysbox install path (Synology DSM, Unraid — research.md §3.C) inherently accept this residual-risk ceiling if they need DinD at all; this is a platform limitation to document plainly for those operators, not a gap to paper over.
+- On hosts that run untrusted job code (fork pull requests, multiple tenants, contributors the operator does
+  not trust), use `sysbox-runc` or `none`. Sysbox removes `Privileged=true` from the sidecar and narrows the
+  risk considerably. `none` removes it.
+- Where neither is possible, restrict `privileged-sidecar` to pools that run only trusted repositories and
+  branches. This is an operator policy; the provider cannot enforce it, because it does not know the job.
 
 ## Open questions
 
-- Whether `cgroupns=host` vs `cgroupns=private` is needed on older NAS kernels, and how to detect/configure it.
-- Whether DinD readiness should also be probed provider-side (in addition to the entrypoint's own wait loop) for faster failure reporting.
-- Whether a single-container Sysbox variant (no sidecar, Sysbox itself runs Docker inside the runner) is worth adding as a fourth mode.
-- Whether `sysbox-runc` mode can also give published ports on the runner's `localhost` (the 2026-10-12 shared network namespace Amendment applies to `privileged-sidecar` only): the runner joining the sysbox sidecar's namespace, or the single-container variant above, are the candidates; neither can be verified without a Sysbox install.
-- The pinning/versioning surface for `dockerd` inside the DinD sidecar image, independent of the runner image's own update cadence.
-- ~~Whether `allowed_dind_modes` should default to all three modes unconditionally, or whether a more conservative out-of-the-box default (e.g. excluding `privileged-sidecar`) is warranted given the residual host-compromise risk documented above — currently defaulting to all three on the theory that an operator who never touches the config should get the previously-documented default behavior, with the ceiling available for those who need to tighten it.~~ **Resolved (M4-W1, cross-family review F9): the ceiling defaults to `["none"]`** — see the "fail-closed `allowed_dind_modes` default" Amendment below.
-- A concrete, documented `default-address-pools` sizing recommendation for the NAS-first target hosts, so operators have a starting point rather than having to derive one from Docker's own defaults.
-- Whether the provider should actively verify (and warn, or refuse to start) if the host Docker daemon appears to be listening on TCP, versus documenting the "no TCP-exposed daemon" recommendation only in the README — this question is more load-bearing after the 2026-07-21 amendment below, since `internal=false` is now the default and the no-TCP-listener requirement carries more of the host-level defense-in-depth weight than it used to.
-- Whether/when the reserved forward-proxy-sidecar egress-allowlist opt-in (Amendment, 2026-07-21) should actually be designed and built, and what its `extra_specs` surface (if any) should look like versus being config-only like `internal` is today.
-
-## Amendment (2026-07-21)
-
-**Job networks default to `internal=false`.** This ADR originally shipped with per-job bridge networks defaulting to Docker's `internal` flag set to `true`; the Decision text above has been edited in place to state the corrected default directly, rather than left to silently contradict this amendment. Real-daemon testing during M1/WP2 showed that Docker's `internal` flag does not mean "reduced egress" or "egress to an allowlist" — it means **no external route at all**, for anything on that network. Under that default, a real runner container could not reach `api.github.com` to register itself, and a DinD sidecar could not pull images from any registry: the provider was non-functional for real jobs, not merely more locked down than intended.
-
-**Owner ruling: flip the default to `internal=false` (Option 1).** The rationale:
-
-1. **Per-job isolation was never actually provided by the `internal` flag.** It comes from the Decision above: every allocation gets its **own separate network**. Two allocations' containers cannot reach each other by IP because they are never on the same network, full stop — independent of whether either allocation's network happens to be `internal`. Defaulting `internal` to `false` does not weaken job-to-job isolation at all.
-2. **The runner and DinD fundamentally require egress to do their jobs.** The runner needs to reach `api.github.com` (and GitHub's action/dependency download endpoints) to register as a JIT runner and to run ordinary workflow steps; a DinD sidecar needs to reach container registries to pull images. A provider that cannot deliver this is not a stricter version of the intended design — it is a broken one.
-3. **F21's original concern (a host Docker daemon reachable over TCP bypassing per-job containment) is a real, separate risk, but `internal=true` was never a substitute for addressing it directly.** It is mitigated by two things this ADR already requires or now requires explicitly: **F8** — this provider never lets pool `extra_specs` or the workflow payload override `DOCKER_HOST` (ADR-005) — and the **operational requirement that the host Docker daemon must not be configured to listen on a TCP socket** (`dockerd -H tcp://…` or an equivalent `daemon.json` `hosts` entry). That second point is elevated from "operators are advised" to a **documented deployment requirement** by this amendment: a TCP-exposed host daemon is a host-level exposure that bypasses every per-job containment guarantee in this ADR regardless of any per-job network's `internal` setting, so it cannot be treated as optional hardening once `internal=true` is no longer the default doing part of that job.
-
-**The stricter egress-allowlist posture is reserved as a future opt-in, not implemented in M1.** A design that gets both properties — job egress AND a bounded allowlist of reachable endpoints — is possible: an `internal=true` job network paired with a forward-proxy sidecar that the runner reaches via `HTTP(S)_PROXY`, itself configured to allow only GitHub and registry endpoints. This is deliberately **not** built in M1; it is future work for advanced/enterprise deployments that want tighter egress control than the M1 default provides. The `[network].internal` config field is kept in the schema, unremoved, specifically so it remains the building block that future opt-in can be layered on top of — an operator who sets `internal=true` today already gets the "no egress at all" half of that posture; the proxy sidecar half is what remains to be designed (see Open questions above).
-
-**Config default**: `[network].internal` now defaults to `false` (`internal/config/config.go`). Operators who want the pre-amendment behavior (or the future proxy-sidecar opt-in once it exists) can still set `internal = true` explicitly; nothing about that knob's mechanics changed, only its default.
-
-## Amendment (2026-07-21) — DinD socket mounted at `/run`, not `/var/run`
-
-**The shared DinD socket volume (sidecar and runner alike) is mounted at `/run`, not `/var/run`.** This ADR originally specified the socket path literally as `/var/run/docker.sock` throughout the Decision text above (the `dockerd --host=...` flag, the mount target, and the runner's `DOCKER_HOST`); those references have been corrected in place to `/run/docker.sock` (mount target `/run`), rather than left to silently contradict this amendment, mirroring how the `internal=false` amendment above was applied.
-
-**Why**: real-daemon verification during M1/WP3 (Docker Engine 29.6.1) found that on the Debian/Ubuntu/Alpine bases this provider actually runs on — the `myoung34` runner image and `docker:dind` alike — `/var/run` is a symlink to `/run`. Mounting the shared socket volume "at `/var/run`" therefore resolves onto `/run` itself and **shadows** the credential tmpfs ADR-002 mounts directly at `/run/garm`: the tmpfs is no longer reachable at that path once the socket volume is mounted over its parent directory, and credential delivery (`tar -x -p -C /run/garm`) fails on the live daemon — confirmed exit 1, "can't change directory to `/run/garm`". Mounting the socket volume at `/run` instead — the *parent* of `/run/garm` — lets Docker mount `/run` first and the `/run/garm` tmpfs on top of it, so both coexist; confirmed on the same live daemon: delivery exits 0, both paths present. This is also **ARC's actual `gha-runner-scale-set` pattern**, which this ADR's Decision already says it mirrors: the shared var-run volume is mounted at `/run` with `DOCKER_HOST=unix:///run/docker.sock`, not at `/var/run`.
-
-**Scope**: this correction is the shared DinD socket volume only (`internal/spec.DindSocketDir`/`DindSocketPath`/`DindDockerHost`) — the job-scoped path the DinD sidecar and runner share for the *nested* daemon. It does not touch `docker_host`, this provider's own connection to the **host** Docker daemon it manages allocations on (`internal/config.Config.DockerHost`, still conventionally `/var/run/docker.sock`); that is a separate socket serving a separate purpose and was never part of this shadowing hazard.
-
-**Status**: the code was already correct as of M1/WP3 (commit `bb4b8a4`, real-daemon-confirmed per the evidence above); this amendment brings the ADR text into agreement with the code and records why, so the ADR is not left silently wrong about its own topology.
-
-## Amendment (2026-07-21) — the default `dind_mode` is `none` (F11)
-
-**`dind_mode` defaults to `none`, not `privileged-sidecar`.** This ADR originally described `privileged-sidecar` as *the* default; the code, however, has always defaulted `dind_mode` to `none` (`internal/config.Load` sets `DindMode: DindModeNone`). The Decision text above has been corrected in place to name `none` as the config default, rather than left to silently contradict the code and this amendment — mirroring how the `internal=false` and `/run` amendments were applied.
-
-**Which default was correct: `none`.** The code default is kept and the ADR is brought into line with it, deliberately, on a conservative / security-first reading: `none` provisions no privileged workload at all, so an operator who never touches the config gets no `Privileged=true` sidecar and no host-compromise exposure. This is the honest default given the residual-risk section above (privileged dind is not a containment boundary against malicious job code) and the `allowed_dind_modes` ceiling design (ADR-005): an operator must *opt in* to DinD, and to `privileged-sidecar` specifically, rather than having a privileged daemon stood up on their behalf by omission. `privileged-sidecar` remains the default DinD *mechanism* — the universally-available mode this ADR recommends once DinD is enabled, since Sysbox is not installable on the NAS-first targets — but "default mechanism when enabled" and "enabled by default" are distinct, and only the former is true of `privileged-sidecar`.
-
-**Docs reconciled.** `internal/config`'s `dind_mode` field comment already documents `none` as the default; ADR-005's illustrative TOML shows `privileged-sidecar` only as one possible operator-chosen value (an omitted `dind_mode` yields `none`). This amendment closes the one place — this ADR's own Decision text — that still called `privileged-sidecar` the default. This resolves the doc-vs-code discrepancy without changing the code default (which stays `none`).
-
-See research.md §1–§2 for the upstream `GARM_POOL_EXTRASPECS` gap and the prior-art comparison this decision responds to, and §3.C for the Sysbox/DSM/Unraid platform-support gap underlying the residual-risk discussion above. See ADR-002 for the runner image the sidecar pairs with (and the `/run/garm` credential tmpfs this amendment's shadowing hazard involves), ADR-004 for teardown ordering of the five per-allocation resource kinds, and ADR-005 for how `dind_mode`, `allowed_dind_modes`, and `storage_driver` are exposed in config and `extra_specs`.
-
-## Amendment (2026-07-26) — fail-closed `allowed_dind_modes` default (M4-W1 F9)
-
-**`allowed_dind_modes` now defaults to `["none"]`, not to all three modes.** This is a deliberate default change, resolving the Open question above. The Decision text has been corrected in place, mirroring how the `internal=false`, `/run`, and `dind_mode = none` amendments were applied.
-
-**Why the old default was wrong.** The all-three default rested on "an operator who never touches the config should get the previously-documented default behavior". But the previously-documented default behavior for `dind_mode` is `none` (see the F11 amendment above), so the ceiling was the one setting that granted, by omission, exactly the mode this ADR's own Residual-risk section says is not a containment boundary against malicious job code. Concretely: on a minimal config — one with no `dind_image` at all — a GARM admin could set `extra_specs.dind_mode = "privileged-sidecar"` and clear the ceiling, because the ceiling permitted it by default. Every other fail-closed default in this provider (`dind_mode = none`, `[extra_specs].allowed_env` empty) requires an explicit opt-in for privilege; the ceiling did not, which made "the operator gets the final word" aspirational rather than true for an operator who had not enumerated the ceiling by hand.
-
-**What an operator must now do to use DinD.** Two explicit steps, not one: widen the ceiling (`allowed_dind_modes = ["none", "privileged-sidecar"]`) **and** set a digest-pinned `dind_image`. Because `dind_mode` must itself be a member of `allowed_dind_modes` (validated at load), widening the ceiling is also what makes a non-`none` `dind_mode` loadable at all — an operator who sets `dind_mode = "privileged-sidecar"` without widening the ceiling now gets a clear config-load error at startup rather than a working-looking config.
-
-**Companion check: a DinD mode with no `dind_image` is rejected before any Docker operation.** Load-time validation requires `dind_image` when the *config's own* `dind_mode` is non-`none`, but it cannot see a pool's `extra_specs`. An operator at `dind_mode = "none"` (never asked for a `dind_image`) who has widened the ceiling can still receive a pool that selects a DinD mode. `CreateInstance` now rejects that combination in its resolution phase — ahead of the orphan sweep, the claim-marker network, the volumes, and the credential fetch — so the failure is a clean `provider_fault` with nothing to roll back, instead of surfacing at the sidecar image pull mid-allocation.
-
-**Blast radius.** Any existing deployment that relies on the ceiling's old permissiveness while never having set `allowed_dind_modes` explicitly will now fail to load if its `dind_mode` is non-`none`, or will reject a pool's DinD `extra_specs` if its `dind_mode` is `none`. That is the intended, visible consequence of a fail-closed default: the failure is loud, at startup or before any Docker work, and the fix is one explicit line of config.
-
-## Amendment (2026-10-12) — `privileged-sidecar` shares the runner's network namespace
-
-**Problem (observed in production).** With the sidecar in its own network namespace on the job network, a port the inner daemon publishes (`docker run -p`, testcontainers, `docker compose` with `ports:`) is bound in the *sidecar's* namespace. A job that then connects to `127.0.0.1:<port>` or `localhost:<port>` from the runner gets `ECONNREFUSED`. The real failure: a repository's migration tests start TimescaleDB through Docker and connect to `('127.0.0.1', 32768)`. The same job passes on a GitHub-hosted runner, where the daemon is local, and under ARC, where the runner and the `dind` sidecar share the pod's network namespace. The real-job gate did not catch it because its DinD workflow never connected to a published port.
-
-**Decision (owner ruling: ARC parity).** In `privileged-sidecar` mode the DinD sidecar joins the runner container's network namespace: `HostConfig.NetworkMode = "container:<runner ID>"` (`spec.DindSharesRunnerNetns`, `spec.ContainerNetworkMode`). The runner remains the only container attached to the per-job network, and the sidecar has no network attachment of its own. The shared socket volume at `/run` stays the only runner-to-daemon channel (`DOCKER_HOST=unix:///run/docker.sock`); nothing listens on TCP. The Decision text above is corrected in place, as with the earlier amendments.
-
-**The runner owns the namespace; the sidecar joins it.** The alternative, the runner joining the sidecar's namespace, was rejected:
-
-1. *Failure domain.* The runner is what GitHub sees. The sidecar is the component with the hard `dind_memory` limit, so it is the more likely of the two to be OOM-killed or to crash. If the sidecar owned the namespace, a sidecar crash would cut the runner off the network, losing the GitHub session and the job's result. With the runner as owner, a sidecar crash loses Docker only, exactly as before.
-2. *Per-container files.* A container that joins another's namespace also takes the owner's `/etc/hosts`, `/etc/resolv.conf` and hostname. With the runner as owner, the runner keeps the files the daemon writes for it, including ADR-002's IPv4-only `localhost` `/etc/hosts`.
-3. *The IPv6 sysctl stays where it is.* `net.*` sysctls are per network namespace. The runner's `net.ipv6.conf.all.disable_ipv6=1` and its single retry without the sysctl (`provider.createAndStartRunner`) are unchanged, and they are applied exactly once, by the namespace owner. The sidecar sets no sysctl. The retry recreates the runner before the sidecar exists, so the sidecar always joins the runner that actually serves the job. With the runner joining the sidecar instead, the sysctl and its retry would have had to move to a privileged `docker:dind` container.
-4. *Verification topology.* The runner remains the single endpoint on the job network, so the existing runner attachment checks hold as they are. Only the sidecar checks change: `NetworkMode=container:<runner ID>`, no network of its own, and one shared `/proc/self/ns/net`.
-
-Two other alternatives were rejected. Keeping separate namespaces and pointing jobs at the sidecar (by its container name, or with a `TESTCONTAINERS_HOST_OVERRIDE`-style variable) requires changes in every job and tool, and does not fix code that hard-codes `127.0.0.1`. A TCP `DOCKER_HOST` would breach the no-TCP rule above, and would still not move the published ports.
-
-**Start order.** The daemon refuses to start a container that joins the namespace of a container that is not running ("cannot join network namespace of a non running container"; verified on Docker Engine 29.8.2). A missing owner is refused too; the create itself succeeds either way. `CreateInstance` therefore now runs:
-
-1. pull the dind image if missing, before the runner exists, so the pull never eats into the entrypoint's readiness wait;
-2. create and start the runner, including the IPv6 retry;
-3. create and start the sidecar;
-4. deliver the credentials;
-5. verify that both containers are running.
-
-The runner's entrypoint waits for `docker info` (up to 120 s) in parallel with its credential wait, so a sidecar that starts a moment after the runner is covered. Every failure is rolled back by the existing nonce-keyed creation guard: a failed sidecar create or start removes the started runner as well, and a failed runner create never creates a sidecar. `sysbox-runc` uses the same order.
-
-**Teardown, crash and restart.** ADR-004's order is unchanged: the runner first, then the sidecar, then the volumes, and the network last. Removing the namespace owner first is allowed while the joined sidecar still exists. The sidecar keeps running, with only `lo` and its inner `docker0`, until it is removed right after. The network removal does not wait on the sidecar, which holds no endpoint (verified live: stop and remove the owner, remove the network, then remove the joiner). A runner removed out of band leaves a sidecar without external connectivity. `DeleteInstance` still reaps it by label (the F6 provider_id), as before. Neither container has a restart policy. A runner crash ends the allocation either way, and a sidecar crash leaves the runner's networking intact. The GC and orphan-sweep predicates are label-based, so they are unaffected.
-
-**What `dockerd` does in the shared namespace.** It creates `docker0`, enables `net.ipv4.ip_forward` and installs its NAT and filter rules there. Ports published by inner containers are served by `docker-proxy` on `0.0.0.0:<port>` in that namespace. Under the runner's `disable_ipv6=1`, these were verified live with `dockerd` 29.9.0 in `docker:dind`:
-- inner bridge networking and egress;
-- `docker run -p` with fixed and ephemeral ports;
-- `127.0.0.1` and `localhost` from the runner, both as root and as the unprivileged `runner` user.
-
-IPv6 inside nested networks is not supported in this mode. It was not supported in practice before either, since the job network carries no IPv6.
-
-**Isolation analysis.** The trust boundary does not move: the runner and its sidecar belong to the same job, as in an ARC pod.
-
-- *Shared namespace.* The privileged sidecar now holds every capability over the runner's network namespace: interfaces, routes, iptables, and observing the runner's (TLS) traffic. Job code already controls that privileged daemon through `DOCKER_HOST`, and the Residual-risk section above already accepts that it can reach the host. A capability over the job's own namespace adds nothing beyond that. The runner container itself is still unprivileged with Docker's default capabilities (no `NET_ADMIN`). Its processes cannot use the sidecar's capabilities: capabilities belong to processes, not to the namespace.
-- *Nested `--network host`.* A nested container run with `--network host` now lands in the runner's namespace instead of the sidecar's. It shares the runner's loopback and can reach services a job step bound to `127.0.0.1`. This matches a GitHub-hosted runner, where `--network host` is the VM's network, and ARC. It is a widening only relative to the previous topology, and only within one job.
-- *Job-to-job isolation.* Unchanged. Each allocation's namespace is attached only to its own job network. The sidecar no longer has an endpoint there at all, so each job network carries one IP fewer.
-- *Exposure of published ports.* Unchanged. `docker-proxy` binds in the shared namespace, so the port is reachable at the runner's job-network address. That is reachable from the Docker host, as any bridge-network container address is, and from nothing on another allocation's network. Before, the same port was bound at the sidecar's job-network address, with the same reach. The outer (host) daemon publishes nothing, so no port opens on the host's own interfaces.
-- *Host socket red line.* Unchanged. No mount changed, and no host socket is reachable from either container.
-
-**Port collisions.** The runner and the inner daemon now share one port space. An inner `docker run -p 8080:…` fails with "address already in use" if a runner process already listens on 8080, and the reverse. A job step that binds a port an inner container has published fails the same way. This is the behaviour on GitHub-hosted runners and in ARC, so it is accepted. The Actions runner itself only dials out and listens on no port. Docker's embedded DNS listener on `127.0.0.11` uses a random high port.
-
-**`sysbox-runc` is unchanged (own namespace on the job network).** A sysbox container runs in its own user namespace. The runner's network namespace is owned by the host's initial user namespace, in which the sidecar's root has no `CAP_NET_ADMIN`. Its `dockerd` could therefore not create `docker0` or its NAT rules there, so joining would break DinD rather than fix published ports. The reverse, the runner joining a sysbox sidecar's namespace, would bring back the failure-domain and IPv6-sysctl drawbacks above, and nothing on this project's development daemon or NAS targets can run Sysbox to verify it. Consequence: in `sysbox-runc` mode, ports published by the inner daemon are still not reachable on the runner's `localhost`. A job reaches them at the sidecar's container name (`<instance>-dind`) on the job network. This is recorded as an open question above. `none` mode has no sidecar and is unaffected.
-
-**Verification.**
-- *Unit tests* cover the spec builder (`NetnsContainerID` takes precedence over `NetworkName`, no sysctl on the sidecar) and the provider flow with the fake client. The flow tests check: create order (runner, then sidecar); sidecar `NetworkMode`; the IPv6 retry followed by the sidecar joining the recreated runner; refusal to join a stopped runner; rollback on every sidecar and runner failure; and teardown order. The fake now models the daemon's `container:` start rules.
-- *Live check `dockerverify`* (`TestVerifyM1WP3DindAllocation` and `TestVerifyM1NonRootDindAllocation`) checks the shared namespace. It also starts a nested `busybox` httpd with an ephemeral published port and fetches it from the runner at `127.0.0.1` and `localhost`. Against the previous topology the same check fails with "Connection refused".
-- *`scripts/demo-m0.sh verify`* runs the same checks. Its sample DinD workflow gains a published-port step.
-
-## Amendment (2026-10-17) — registry mirrors and insecure registries for the sidecar daemon
-
-The sidecar's `dockerd` argv was fixed (`--host`, `--storage-driver`, `--group`), so an operator had no way to make the per-job daemon pull through a registry mirror short of baking a `daemon.json` into a custom `dind_image` (issue #26, [`docs/dind-image-pulls.md`](../dind-image-pulls.md)). Two optional, operator-set settings now extend it:
-
-- `registry_mirrors` (a list of bare `http(s)://host[:port]` origins) is emitted as one `--registry-mirror=<url>` flag each.
-- `insecure_registries` (a list of `host[:port]` or CIDR entries) is emitted as one `--insecure-registry=<entry>` flag each.
-
-Both are appended after the three fixed flags, which stay first and unchanged. Both default to empty, which adds no flag.
-
-**Typed flags, not a `daemon.json` passthrough.** A free-form daemon configuration could set `hosts` (a TCP listener, breaking the no-TCP rule), `storage-driver` or `group`, which the provider owns, and dockerd refuses to start when an option is set both as a flag and in the file. Two typed lists cannot reach those options.
-
-**Trust tier.** Both settings are provider config only: the top-level keys sit next to `dind_image` and `storage_driver`, no `extra_specs` key carries them (the schema has `additionalProperties: false`), and they are not per-flavor either, because a provider config describes one Docker host and a mirror is a property of that host's network. A pool admin therefore cannot redirect a sidecar's pulls.
-
-**Isolation is unchanged.** The per-job `dind-state` volume is still created fresh and removed at teardown; a mirror only changes where a job's pulls are fetched from. dockerd consults mirrors only for Docker Hub names and falls back to the upstream when a mirror is unreachable. A mirror is trusted to the degree its operator is: a shared distribution registry in proxy mode refuses pushes, so no job can write into it. Entries are validated at config load (see `docs/config-reference.md`), and the effective values are logged at sidecar creation.
-
-**Combining with a custom image.** A custom `dind_image` whose `daemon.json` also sets `registry-mirrors` or `insecure-registries` conflicts with these flags, and dockerd refuses to start. Use one mechanism.
-
-## Amendment (2026-10-29) — the sidecar mounts the runner's externals so container jobs can run JavaScript actions
-
-A workflow job with `container:` runs its steps inside a container the runner creates through the sidecar's daemon. To do that the runner asks the daemon to bind-mount two of its own paths into the job container: `/actions-runner/_work` as `/__w`, and `/actions-runner/externals` as `/__e` (read-only). The daemon resolves a bind source in **its own** filesystem, which is the sidecar's, not the runner's. The sidecar already shared the workspace volume at the runner's workspace path (the F2 mount, for the same reason with a nested `docker run -v "$PWD":/work`), so `/__w` worked. It did not share the externals, so `/__e` was an empty directory in every job container, and the first JavaScript action (`actions/checkout`, for one) failed because the Node runtime it runs on was not there.
-
-**Decision.** When the externals cache is enabled, the sidecar mounts the same digest-keyed externals volume the runner uses, **read-only**, at the same path (`spec.RunnerExternalsDir`). `DindContainerSpec.ExternalsVolumeName` carries it, set from the same cache plan the runner's mount comes from, in both DinD modes (`sysbox-runc` builds the same sidecar spec). Read-only is as load-bearing here as on the runner (ADR-003, red-line F4): the volume is shared across repositories, and a read-write mount would let a job poison the Node runtimes other repositories execute. The sidecar's mount is read-only as well, and the runner binds it into the job container as `:ro`.
-
-**Lifecycle and ordering.** Nothing new is created or removed. The externals volume is the existing shared cache volume: ensured and seeded before the runner is created, and revalidated after the runner is created and before it starts. The sidecar is created after the runner, so the runner already pins the volume by then. The provider never deletes a cache volume, so teardown (ADR-004) is unchanged: it removes the sidecar with the other job-scoped resources and leaves the cache volume in place.
-
-**Externals cache disabled.** With `[cache].enabled = false` there is no externals volume: the runner uses the externals baked into its image, which the stock `docker:dind` sidecar does not have. The sidecar then gets no externals mount and a job container's `/__e` stays empty, so JavaScript actions cannot run in a container job. Plain `run:` steps in the container are unaffected. The cache is on by default, and container jobs that use JavaScript actions require it. The provider does not try to substitute an ephemeral copy: that would mean seeding about 380 MB per job into a job-scoped volume, which is the cost the shared cache exists to avoid.
-
-**Trade-offs.** The sidecar's mount set grows by one: socket, `dind-state`, workspace, and (cache enabled) externals, and still no other cache volume (toolcache, pnpm store, diagnostics). The gate's `verify` checks exactly that set and that the sidecar's externals mount is the runner's volume, read-only. The gate workflow gains a container job whose first step is `actions/checkout`, followed by a step that reads a checked-out file; it is the acceptance test for this amendment.
-
-*Unit tests* cover the spec builder (the read-only externals mount at `RunnerExternalsDir` when the volume is set, absent when not, in both modes) and the provider flow with the fake client (the same volume on runner and sidecar, read-only, with the cache on; no mount on either with it off; no sidecar without DinD).
+- Whether `cgroupns=host` is needed on older kernels.
+- Whether the provider should also probe the sidecar's readiness, for faster failure reports.
+- Whether a single-container Sysbox variant is worth adding, and whether `sysbox-runc` can offer published ports
+  on the runner's `localhost`. Neither can be checked without a Sysbox install.
+- How the `dockerd` version inside the sidecar image should be pinned and tracked.
+- Whether the provider should refuse to start, or warn, when the host daemon appears to listen on TCP.
+- Whether to build the forward-proxy egress allowlist.
