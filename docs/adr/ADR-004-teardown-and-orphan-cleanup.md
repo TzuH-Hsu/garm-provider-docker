@@ -1,154 +1,181 @@
-# ADR-004: Teardown and Orphan Cleanup
+# ADR-004: Teardown and orphan cleanup
 
-Status: Accepted (2026-07-19); amended 2026-07-21 (see Amendments below)
+Status: Accepted
 
 ## Context
 
-This provider runs as a one-shot external-provider subprocess (see ADR-001): GARM invokes it once per lifecycle call (`CreateInstance`, `DeleteInstance`, `GetInstance`, `ListInstances`, `RemoveAllInstances`, …) with environment variables and a stdin JSON payload, and the process exits after writing a stdout JSON response. There is no long-running provider process to hold in-memory ownership state, and the provider must survive being killed and restarted between any two calls without losing track of what it owns or double-provisioning resources.
+The provider is a one-shot subprocess ([`garm-contract.md`](../garm-contract.md)). GARM starts it once per
+call and it exits after writing a result. No process holds ownership state, and the provider can be killed
+between any two calls without losing track of what it owns or provisioning an instance twice.
 
-Per-allocation resources span up to five kinds (job network, runner container, DinD sidecar, socket volume, `dind-state` volume — ADR-001) plus a workspace volume, all of which must be fully removed at job end, on cancellation, or on timeout — one of this project's explicit security/hygiene red lines. Cleanup must also never touch anything it does not own: no `docker system prune`, no unscoped deletion, ever.
+An allocation spans a job network, a runner container, in DinD modes a sidecar, a socket volume and a
+`dind-state` volume ([ADR-001](ADR-001-dind-strategy.md)), and a workspace volume. All of it must be removed
+when the job ends, is cancelled or times out. Cleanup must never touch anything the provider does not own: no
+`docker system prune` and no unscoped deletion.
 
-A further wrinkle: `GARM_INSTANCE_ID`, the identifier GARM passes to `DeleteInstance` and other calls, may be either the provider-assigned `ProviderID` or the instance `Name` — GARM falls back to `Name` when `ProviderID` is empty, an upstream behavior this provider must tolerate rather than assume away (see research.md §1).
+`GARM_INSTANCE_ID` can be the provider's `provider_id` or the instance name, because GARM falls back to the
+name when `provider_id` is empty.
 
-A second, distinct wrinkle: **GARM invokes provider subprocesses concurrently.** Nothing in the external-provider contract serializes `CreateInstance` calls against each other, so two or more allocations can be mid-flight on the same host at once. During any single `CreateInstance(A)`, there is necessarily a window in which allocation `A`'s network and/or volumes exist on the host before `A`'s runner container does (containers are created after their network, by construction). If the orphan sweep's rule were simply "a managed network/volume whose instance-name has no live container is orphaned," a concurrently running sweep — triggered by a *different*, unrelated `CreateInstance(B)` or `ListInstances` call — could observe `A`'s pre-runner resources in exactly that state and delete them out from under the in-flight `A` allocation, or cause `A`'s own subsequent `CreateInstance` step to collide with a duplicate-detection check that has nothing solid to key off yet. This must be closed structurally, not by making the sweep merely "less aggressive."
+GARM also runs provider processes concurrently, and nothing serialises `CreateInstance` calls. During one
+`CreateInstance(A)`, A's network and volumes exist before its runner container does. A sweep started by an
+unrelated `CreateInstance(B)` or `ListInstances` that treated "a managed network or volume with no live
+container" as orphaned would delete A's resources mid-create, or make A's duplicate check have nothing to
+key on. The design closes that structurally instead of making the sweep less aggressive.
 
 ## Decision
 
-Use **stateless, label-driven ownership** with **idempotent, allowlist-scoped teardown**, and no local state store of any kind — every "what do I own" query is a Docker label filter, following the precedent set by Kubernetes controllers and the `werdnum` community provider (see research.md §2).
+### Ownership is labels
 
-**Label schema**, applied to every resource this provider creates:
+Ownership is stateless and label-driven, with idempotent, allowlist-scoped teardown and no local state
+store. Every "what do I own" question is a Docker label filter. Every resource carries:
 
-- `garm.docker/managed=true` — the allowlist master switch; **all** cleanup operations, including the manual-rescue path below, filter on this label and never on anything broader. **Every** resource this provider creates carries this label, including cache volumes (ADR-003) — `managed=true` alone is not the job-scoping predicate; see below.
-- `garm.docker/controller-id` — scopes resources to a specific GARM controller instance, so multiple controllers can safely share one Docker host.
-- `garm.docker/pool-id`, `garm.docker/instance-name` — scope resources to a specific pool and instance. **Only job-scoped resources carry `instance-name`.** Cache volumes (ADR-003) deliberately do not: they carry `garm.docker/cache=true` plus `garm.docker/repo=<repokey>` and `garm.docker/generation=<gen>` instead, and no `instance-name` at all.
-- `garm.docker/role=runner|dind` — on containers.
-- `garm.docker/resource=job-network|workspace|socket|dind-state` — on networks and volumes.
-- `garm.docker/created-at` — an RFC3339 timestamp set at the moment of first creation, used by the concurrency-safe orphan sweep below (not a cache or instance identity label, just a clock for grace-period math).
+- `garm.docker/managed=true`, the master switch that all cleanup filters on;
+- `garm.docker/controller-id`, so several controllers can share one host;
+- on job-scoped resources only, `pool-id` and `instance-name`;
+- `role=runner|dind` on containers and `resource=job-network|workspace|socket|dind-state` on networks and
+  volumes;
+- `created-at` (RFC3339) and `create-nonce` (one random value per `CreateInstance` attempt).
 
-**Teardown and orphan-sweep match predicate (the single authoritative rule, reconciling this ADR with ADR-003):**
+The single rule for teardown, the orphan sweep and `RemoveAllInstances` is:
 
 ```
-garm.docker/managed=true
-  AND has garm.docker/instance-name
-  AND NOT garm.docker/cache=true
+managed=true AND has instance-name AND NOT cache=true
 ```
 
-Every job-scoped resource (runner, DinD sidecar, job network, workspace/socket/`dind-state` volumes) satisfies this predicate. Cache volumes never do, because they never carry `instance-name` — this is a structural exclusion, not a label-value check that could be gotten wrong at one call site and right at another. `DeleteInstance`, the orphan sweep, and `RemoveAllInstances` all share this exact predicate; there is exactly one place in the codebase that defines it.
+It is defined in one place in the code. Cache volumes ([ADR-003](ADR-003-cache-keying-and-lifecycle.md))
+never carry `instance-name`, so they cannot match. `RemoveAllInstances` therefore removes a controller's
+job-scoped resources and never its caches. Purging caches is an operator action (`docker volume prune`
+with the cache labels), not a provider command.
 
-The `provider_id` returned to GARM from `CreateInstance` is the **GARM instance name** (revised 2026-07-21 — see the F6 Amendment below; this ADR originally returned the runner container's ID). The instance name is the label every allocation resource carries, so keying `provider_id` to it makes `DeleteInstance` — which GARM invokes with that `provider_id` as `GARM_INSTANCE_ID` — able to resolve and tear down the whole allocation (including the privileged DinD sidecar) by label, even after the runner container itself has been removed out of band.
+### Identity
 
-**`RemoveAllInstances` does not delete caches.** Applying the predicate above, `RemoveAllInstances` deletes every job-scoped resource for the controller-id (runner containers, DinD sidecars, job networks, workspace/socket/`dind-state` volumes) but **not** cache or diagnostic volumes (ADR-003), because those never match `has garm.docker/instance-name`. Purging caches is a distinct, explicit operation — **a manual operator action via `docker volume prune -a --filter label=garm.docker/cache=true --filter label=garm.docker/controller-id=<id>`, NOT a provider verb** *(amended 2026-07-22 — see ADR-003 "M2 cache-GC safety" Amendment: no new GARM command verb is added; cache purging is operator-driven via the `docker volume prune` command, logged by the provider for visibility)*; it is never a side effect of the ordinary rescue path.
+`CreateInstance` returns the instance name as `provider_id`. `GetInstance` and `ListInstances` return the
+same, so GARM never replaces it with a container ID. Every allocation resource is labelled with the instance
+name, so `DeleteInstance` can find and remove the whole allocation, including the privileged sidecar, even
+when the runner container was removed out of band. If `provider_id` were the container ID, the stale ID
+could not be mapped back, `DeleteInstance` would return 30 as if the allocation were gone, and the sidecar,
+network and volumes would leak.
 
-**Delete ordering** (revised 2026-07-21 to network-**last** — see the Amendment below; this ADR originally ordered the network *before* volumes), used both by `DeleteInstance` and by the creation-guard rollback described below: (1) stop and remove the runner container, (2) stop and remove the DinD sidecar, (3) remove job-scoped volumes (workspace, socket, `dind-state`), (4) remove the job network (the claim marker) **last**. Containers come first so the network has no active endpoints and no volume is removed while a container still references it (the real daemon rejects both); the claim-marker network is removed last so it is held for the entire teardown, which is what stops a concurrent same-name `CreateInstance` from claiming a new generation and creating volumes that this still-running teardown would then delete (see the Amendment for the full concurrency rationale). Cache and diagnostic volumes (ADR-003) are never touched by this path, because they never match the predicate above. Every step tolerates a "not found" result from Docker — teardown is fully idempotent, and the generation nonce is re-validated immediately before each destructive op (every removal re-asserts the full ownership predicate on the labels in hand). `DeleteInstance` on an instance that is already gone returns exit code 30 (GARM treats this as success); a duplicate `CreateInstance` for an already-existing instance name returns exit code 31 (see the concurrency-safe claim-marker mechanism below for what this check actually keys off of).
+`DeleteInstance`, `GetInstance`, `StartInstance` and `StopInstance` resolve `GARM_INSTANCE_ID` solely by the
+`instance-name` label, restricted to `role=runner` so the sidecar that shares the label is never selected, and
+validate ownership. There is no inspect-by-ID fallback. Since `provider_id` and the name are the same value,
+the fallback serves no real case, and it would let an instance name that looks like a container ID resolve a
+foreign or other-generation container. If the runner is gone but a network, volume or sidecar remains, those
+leftovers are removed before the call returns.
 
-**ID-or-name resolution** (revised 2026-07-21 to instance-name-label-first/only — see the NEW-H1 Amendment below; this ADR originally attempted an inspect-by-ID *first*): because `GARM_INSTANCE_ID` may be a `ProviderID` or a `Name` (the upstream fallback behavior noted above) and `provider_id` is now the instance name (F6), *both* possible values equal the instance name. The resolver therefore resolves **authoritatively by the `instance-name` label**, validating ownership, and does **not** fall back to a raw inspect-by-ID. If that resolution finds the runner container already gone but its network, volumes, or a lingering DinD sidecar still present, those leftovers are swept before the call returns.
+### Creation and the claim marker
 
-**Creation guard**: any error during `CreateInstance` triggers a full best-effort teardown of that instance name (same ordering as above) before the error is returned to GARM, so a failed create never leaves a partial allocation behind.
+The first resource of every allocation is the job network, stamped with `instance-name`, `created-at` and
+the attempt's nonce. It is the **claim marker**. `NetworkCreate` fails with 409 on a duplicate name, which is
+the atomic duplicate primitive. A same-controller, same-name collision returns exit 31. A network with that
+name that is not ours is a hard error and is never claimed.
 
-**Concurrency-safe creation: the atomic claim marker.** To close the concurrent-create race described in Context, the **first** resource created for any allocation — before the job network, before any volume, before the runner container — is a labeled **claim marker**: in practice the job network itself (already the first resource created in every mode) doubles as this marker, stamped with `garm.docker/instance-name=<name>` and `garm.docker/created-at=<RFC3339 timestamp>` at the moment of its creation, atomically with that creation call. (A dedicated placeholder volume is an equally valid implementation if a future mode ever needs a claim marker before any network exists; the requirement is "first resource, timestamped, labeled with the instance name," not specifically "network.")
+The marker closes both races:
 
-This claim marker changes two things:
+1. **The sweep's exclusion window.** The sweep skips any allocation whose marker is younger than the
+   **in-flight create deadline** of 20 minutes, aligned with GARM's `runner_bootstrap_timeout`. A cold image
+   pull plus credential fetch must never look abandoned. Only an allocation with a marker past that deadline
+   and no runner container is treated as a create that never completed.
+2. **Duplicate detection** keys off the marker, which exists from the first moment, and not off a runner
+   container, which may not exist yet. Two concurrent creates of one name get 31 for the loser.
 
-1. **Orphan-sweep exclusion window.** The sweep's rule is no longer just "no live container ⇒ orphaned." It excludes any resource whose claim marker's `created-at` is younger than the **in-flight-create** grace window — a hard deadline aligned with GARM's `runner_bootstrap_timeout` (~20 minutes), long enough that a cold, emulated image pull plus credential fetch is never mistaken for an abandoned create (this is distinct from, and much longer than, the ~2-minute exited-runner grace; see the F5/F8 grace-window split in the Amendment below) — **and** excludes any instance-name for which *any* live-or-recent claim marker exists — live meaning the marker resource still exists, recent meaning within that window. Only once an allocation's claim marker is both present and past that window, with no runner container ever having appeared, does the sweep treat it as a genuinely abandoned, never-completed create — not a peer allocation still mid-flight.
-2. **Duplicate detection keys off the claim marker, not the runner container.** A duplicate `CreateInstance` for an already-existing instance name is detected by checking for an existing claim marker with that instance name — which exists from the very first moment of the allocation — rather than by checking for an existing runner container, which may not exist yet even for a fully legitimate, still-in-progress `CreateInstance`. This closes the double-provisioning half of the race: two concurrent `CreateInstance` calls for the same instance name will have one of them observe the other's claim marker and fail with exit code 31, instead of both racing to create a runner container for the same name.
+Any error after the marker exists runs a **creation guard**: a best-effort teardown of this attempt's resources,
+selected by the nonce, under a context detached from the caller's with a 30 second limit. It never touches a
+concurrent peer's resources, and a rollback failure is logged and joined to the original error.
 
-**Provider-restart safety**: because ownership is entirely reconstructed from labels, a provider process that is killed and restarted between calls loses nothing — the next invocation rebuilds its view of what exists purely from `docker ps`/`docker network ls`/`docker volume ls` label filters, including claim-marker state.
+Volume names embed the attempt's nonce (`<instance>-<nonce>-workspace`, `-socket`, `-dind-state`). The
+network keeps the stable name `<instance>-net`, since that is what makes the 409 work. Teardown finds volumes
+by label and removes each by the name it read, and a generation-unique name means a stale teardown can never
+name a newer generation's volume. A pre-flight check rejects an instance name long enough to push a volume
+name past Docker's 255-byte limit, before the first Docker call.
 
-**Orphan sweep without a daemon**: since there is no background process, sweeping runs opportunistically at the start of `CreateInstance` and during `ListInstances` — calls the provider is invoked for anyway (the `ListInstances` sweep is rate-limited per controller, see the 2026-11-03 amendment). An exited runner container past a short grace period (roughly 2 minutes) is treated as a finished or failed job whose allocation should be fully torn down, since runners are single-job ephemeral by construction (ADR-002). Managed networks or volumes whose instance name has no corresponding live container **and** whose claim marker is past the concurrency grace window (above) are treated the same way. The grace periods exist specifically to avoid racing both GARM's own in-flight `DeleteInstance` call for the same instance, and a peer, concurrently-executing `CreateInstance` for a different instance that simply hasn't reached the runner-container step yet.
+### Teardown order
 
-**`RemoveAllInstances`** is a manual rescue operation: it deletes all `garm.docker/managed=true` resources scoped to this provider's `controller-id`, still fully label-scoped — never a global wipe of the Docker host.
+Runner, then sidecar, then volumes, then the network last. The daemon rejects removing a network with active
+endpoints and a volume that a container references, so containers go first. The network goes last because it is
+the claim marker: while it exists, a concurrent same-name `CreateInstance` cannot claim a new generation and
+create volumes that this still-running teardown would delete. Teardown lists once per resource kind and removes
+each resource by the name or ID it read. Before each removal it re-asserts the ownership rule on the labels
+in hand and the generation, which protects the stable-named network. Every step tolerates "not found", so
+teardown is idempotent. `DeleteInstance` on an instance that is already gone returns 30, which GARM treats as
+success. The same order applies to `DeleteInstance`, the sweep, the creation guard and `RemoveAllInstances`.
 
-**Timeout authority remains with GARM.** GARM's own reaper cycle (every 5 minutes by default) and `runner_bootstrap_timeout` (default 20 minutes) decide when a stuck instance should be torn down; GARM calls `DeleteInstance` itself when that happens. This provider implements no timers of its own — only idempotency, so that however many times or however late `DeleteInstance` is called, the result converges correctly.
+### Orphan sweep
+
+There is no background process, so the sweep runs at the start of `CreateInstance` and in `ListInstances`. It
+removes:
+
+- an allocation whose runner has been exited for more than **2 minutes**, measured from the container's
+  `FinishedAt`. Runners are single-job, so an exited runner is a finished or failed job, and the grace avoids
+  racing GARM's own `DeleteInstance`;
+- an allocation with no live container whose marker is past the 20 minute deadline.
+
+Both windows exist so the sweep races neither GARM's own delete nor a peer create that has not yet reached the
+runner. The sweep before a create is not throttled, because a stale allocation of the instance being created
+must go before the create reuses its names. The sweep in `ListInstances` runs at most once per **3 minutes** per
+controller, across processes, using the stamp claim described in ADR-003 (a never-started container,
+`garm-sweep-stamp-<16 hex of sha256(controller ID)>`, with `role=throttle-stamp` and no `instance-name`).
+Running the sweep less often delays a collection and never changes what is collected. An exited runner's
+leftovers wait about the grace plus the interval, 5 minutes at most. GARM calls `ListInstances` once per
+pool or scale set on each consolidation pass, each in a new process, so without the throttle a controller with
+a dozen scale sets runs the same host-wide sweep a dozen times in a row, which queues badly on a slow daemon.
+
+### Recording why a runner died
+
+Teardown destroys the container's exit state and logs, which are the only record of why a runner stopped.
+The sweep logs them before it removes an exited runner (`orphan sweep: runner exited on its own`). A runner
+that crashes mid-job usually reaches `DeleteInstance` first, because GARM marks the instance for deletion as
+soon as the job's completed message arrives, so `DeleteInstance` logs the same fields
+(`teardown: runner was not running at delete`) before it stops anything, for a runner whose state is not
+`running`. Nothing is sent to GARM. Both lines carry `runner_phase` (`before_listening`, `listening_no_job`,
+`job_started`, `job_completed` or `unknown`), classified from the listener's own lines in the log tail
+before the tail is screened for credentials, so a marker on a withheld line still counts. A tail with no
+marker is `before_listening` only if it could have shown one: a full tail may have scrolled past the markers,
+and the 64 KiB cap keeps the oldest lines, so on a cut tail anything short of `job_completed` is `unknown`.
+Markers are matched at the start of a line or after `: `, so a job's display name cannot pass for one. A normal
+ephemeral end (`job_completed`, exit 0, not OOM-killed) logs at debug, anything else at warn. A running runner
+gets no line and no extra Docker call. The report costs at most 2 seconds per teardown, in total.
+
+This happens at teardown and not in the status watcher ([ADR-002](ADR-002-runner-image-and-jit-delivery.md)),
+because keeping the watcher alive for hours would hold a process and a log stream per idle runner, and it
+could not report to GARM anyway: GARM v0.2.1's instance middleware rejects an instance token once the runner
+has left `installing` or `pending`. Docker keeps the exit state until teardown, so reading it there is free
+and survives a provider restart. The cost is timing: the line appears at teardown and not at the exit. Two
+paths that overlap before either has removed the container can each log it. A job that writes a
+marker-shaped line to the listener's stdout can misclassify the phase, which is why the tail is logged beside it.
+
+### Timeouts belong to GARM
+
+GARM's reaper (every 5 minutes) and `runner_bootstrap_timeout` decide when a stuck instance is deleted, and
+GARM calls `DeleteInstance`. The provider has no runner timers, only idempotency.
 
 ## Rationale
 
-Stateless label-driven ownership is the only approach that survives provider restarts without extra machinery, matches the one-shot subprocess execution model this provider is built on, and keeps the cleanup logic auditable as a small set of label-filtered Docker queries rather than a stateful reconciliation loop. Deferring timeout decisions to GARM avoids duplicating a scheduling concern GARM already owns and is better positioned to get right across all its providers. The claim-marker mechanism preserves this same statelessness — it adds one label and one timestamp to a resource that was already the first thing created, rather than introducing any new store, lock service, or long-running coordination process; a concurrent GARM invocation model was always implicit in "one-shot subprocess," and the claim marker is the minimal addition that makes the existing label-query approach safe under that concurrency rather than merely safe under sequential invocation.
+Label-driven ownership survives restarts without extra machinery, fits the one-shot model, and keeps cleanup
+auditable as a few label-filtered queries. The claim marker adds one label and one timestamp to a resource
+that was already created first, instead of a lock service. Leaving timeouts to GARM avoids two sources of
+truth.
 
 ## Alternatives considered
 
-- **A background GC daemon**: rejected — contradicts the one-shot subprocess execution model this and every other GARM external provider is built around.
-- **An external state database** (tracking allocations outside of Docker labels): rejected — fragile across provider restarts and unnecessary complexity when Docker's own label-filter queries already provide exactly the lookup needed.
-- **Provider-side timeouts**: rejected — timeout policy belongs to GARM, which already owns the reaper cycle and `runner_bootstrap_timeout` across all providers; duplicating it here would create two sources of truth.
-- **Sweep keyed purely on "no live runner container" with no claim marker**: rejected — this is exactly the concurrent-create race described in Context; without a claim marker created atomically with the very first per-allocation resource, a peer allocation's in-flight `CreateInstance` is indistinguishable from a genuinely abandoned one during the window before its runner container exists.
-- **Duplicate detection keyed on runner-container existence**: rejected — a legitimate, still-in-progress `CreateInstance` for a brand-new instance name has no runner container yet either, so this check cannot tell "duplicate" apart from "in progress," which is precisely the double-provisioning risk the claim marker closes.
+- A background GC daemon: contradicts the one-shot model.
+- An external state database: fragile across restarts, and Docker labels already give the lookup.
+- Provider-side runner timeouts: GARM owns them.
+- A sweep keyed only on "no live runner container": this is the concurrent-create race above.
+- Duplicate detection keyed on the runner container: a legitimate create in progress has none yet.
 
 ## Consequences
 
-- Orphaned resources can linger for as long as the next `CreateInstance` or unthrottled `ListInstances` call plus the grace period — this is documented behavior, not a bug, and is bounded in practice by GARM's own polling cadence.
-- The sweep logic must be written to tolerate races with GARM's own in-flight `DeleteInstance` calls rather than assuming exclusive access to an instance's resources, **and** to tolerate races with peer `CreateInstance` calls for other instances, per the claim-marker mechanism above.
-- The concurrency (in-flight-create) grace window and the exited-runner grace window are conceptually distinct (one guards against deleting a not-yet-fully-created peer allocation, the other against deleting a just-finished one) and are in fact tuned to different durations — the in-flight-create deadline is ~20 minutes (aligned with `runner_bootstrap_timeout`), the exited-runner grace ~2 minutes (see the F5/F8 split in the Amendment below); both must be validated together, not assumed independent.
+- Orphans can linger until the next call that sweeps, plus the grace. GARM's call rate bounds this in practice.
+- The sweep must tolerate races with GARM's own `DeleteInstance` and with peer creates.
+- The two grace windows are independent constants (20 minutes and 2 minutes) and are not configurable.
+- Each controller keeps up to three never-started stamp containers (sweep, cache GC, diag prune). They mount
+  nothing, are excluded from the predicate, and can be removed by hand. The next pass then runs one round early.
 
 ## Open questions
 
-- The two orphan-sweep grace windows are now two independently-tuned constants — the ~20-minute in-flight-create deadline and the ~2-minute exited-runner grace (the F5/F8 split in the Amendment below settled that they are NOT one shared value). The remaining question is only whether to additionally expose them as operator-configurable knobs rather than leave them fixed in code.
-- Whether to expose a config flag to disable opportunistic sweeping entirely (for operators who prefer fully manual cleanup).
-- Documenting the multi-controller-per-host scenario explicitly — the `controller-id` label already makes it safe, but it deserves a worked example in the README.
-- Whether the claim marker should always be the job network (simplest, reuses an already-first-created resource) or whether a dedicated, purpose-built placeholder volume is worth the extra resource for clarity/robustness, particularly for any future mode where network creation is not guaranteed to be the literal first step.
-- ~~The exact mechanics of `RemoveAllInstances --purge-caches` (or equivalent explicit cache-purge verb)~~ *(RESOLVED 2026-07-22: cache purging is NOT a provider verb; operators use manual `docker volume prune` with cache labels, logged by the provider — see ADR-003 Amendment "M2 cache-GC safety".)*
-
-## Amendment (2026-07-21) — provider_id is the instance name, not the container id (F6)
-
-**`CreateInstance` now returns the GARM instance name as `provider_id`**, not the runner container's ID; the Decision text above has been corrected in place. `GetInstance` and `ListInstances` return the same stable identity, so GARM never overwrites a name-keyed `provider_id` with a container id from a later list.
-
-**Why (the sidecar-leak defect this closes).** GARM passes `provider_id` back as `GARM_INSTANCE_ID` on `DeleteInstance`. Every per-allocation resource — the runner, the **privileged** DinD sidecar, the job network, and all volumes — is labeled with the instance *name*, never the runner's container id. Under the original `provider_id`=container-id scheme, if the runner container was removed out of band (a crash, or an external `docker rm`) before `DeleteInstance` ran, the provider could no longer map the stale container id back to the instance name: an inspect-by-id returned 404, the label fallback keyed on the container id (which is not an instance-name label value) found nothing, and `DeleteInstance` returned exit 30 as if the allocation were already gone — while the privileged sidecar, network, and volumes silently leaked. Returning the instance name as `provider_id` makes `DeleteInstance` resolve-and-teardown by the instance-name label directly, so the whole allocation is reaped regardless of the runner container's state. The resolver also now treats a lingering managed container (e.g. a role=dind sidecar) under the instance name as a reap-able leftover, not just networks/volumes, closing the case where only the sidecar remains. At the time of this amendment, a `GARM_INSTANCE_ID` that was instead a runner-container id (the runner still existed) still fell back to resolving the instance name via an inspect-by-id on that container's own label before removing it. That raw inspect-by-id fallback was itself removed the same day — see the NEW-H1 Amendment below — once the F6 change above made it redundant: `provider_id` is now always the instance name, so both possible `GARM_INSTANCE_ID` values (`ProviderID` or `Name`) are already the instance name, and no container-id-shaped value is ever expected. The operative resolver described in NEW-H1 is authoritative; this paragraph is left as the historical record of the defect F6 closed.
-
-## Amendment (2026-07-21) — teardown removes the claim network LAST
-
-**Teardown order is now container(s) → volumes → network, with the claim-marker network removed LAST.** This ADR originally ordered removal as container(s) → **network** → volumes; the Decision's "Delete ordering" text above has been edited in place to the corrected order (network last), rather than left to silently contradict this amendment, mirroring how ADR-001's amendments were applied.
-
-**Why (the concurrency defect this closes).** The job network doubles as the allocation's atomic claim marker (see "Concurrency-safe creation" above): a `CreateInstance` for a given instance name first tries to create that network, and `NetworkCreate`'s unconditional 409-on-duplicate is the primitive that makes a same-name create fail closed while the network exists. Under the original network-before-volumes order, a teardown of generation *A* removed the claim network *first* and only then enumerated and removed *A*'s volumes by instance-name label. That opened a window: the instant *A*'s claim network was gone, a concurrent same-name `CreateInstance` (generation *B*) could successfully claim the name, create *its own* fresh volumes, and then have *A*'s still-running teardown — which enumerates volumes purely by instance-name — delete *B*'s brand-new volumes out from under it. Removing the claim network **last** holds exclusive ownership of the instance name for the entire teardown: *B*'s `CreateClaimNetwork` 409s until *A*'s teardown has removed every one of *A*'s resources and only then drops the network, so *B* cannot create anything that overlaps with what *A* is tearing down. Mechanically, teardown **lists once per resource kind** (all containers, then all volumes, then all networks) and removes each resource **by the exact name/ID it read from that list**; it does not re-list the whole kind before each individual removal. What is re-validated immediately before each destructive op is the generation/ownership predicate on the labels already in hand (the `teardownScope` gate re-asserts `managed + controller-id + has instance-name + NOT cache=true`, and in the generation-fallback case re-reads the live claim nonce fresh), so a resource whose ownership or generation changed since it was enumerated is skipped. This gate is defense-in-depth on top of a stronger structural guarantee introduced the same day — generation-unique **volume names** (see the F4 Amendment below): because each generation's volume name embeds that generation's create-nonce, a stale teardown removing a volume by the name it read can never even *name* a different generation's volume, so the removal-by-name is generation-safe by construction rather than only by the gate.
-
-This ordering applies uniformly to `DeleteInstance`, the orphan sweep (both run through the same `TeardownAllocation`), the creation-guard rollback, and `RemoveAllInstances` (`TeardownAll`, which removes all containers, then all volumes, then all networks last). The container-first half of the order is unchanged and still required for its own reasons: the real daemon rejects removing a network with active endpoints and rejects removing a volume still referenced by any container (running or stopped), so containers must go first regardless.
-
-**Grace-window split (F5/F8).** The two grace windows this ADR always described as "conceptually distinct" (see Consequences and Open questions) are now, in fact, two independently-tuned constants rather than one shared value: an **in-flight-create** deadline (~20 min, aligned with GARM's `runner_bootstrap_timeout`) guarding an allocation whose runner container does not yet exist — long enough that a cold, emulated image pull plus credential fetch is never mistaken for an abandoned create — and a separate, much shorter **exited-runner** grace (~2 min) guarding a just-finished job, now measured from the runner container's `State.FinishedAt` rather than from allocation creation. The host-wide sweep-on-`CreateInstance` (matching this ADR's "sweeping runs opportunistically at the start of CreateInstance and during ListInstances") is safe precisely because a peer's in-flight create inside the ~20-min window is never swept.
-
-## Amendment (2026-07-21) — volumes are generation-nonce-named; the network stays stable (F4)
-
-**Per-generation volumes now carry generation-unique names.** The workspace, socket, and `dind-state` volume names embed the allocation's per-`CreateInstance`-attempt **create-nonce**: `<instance>-<nonce>-workspace`, `<instance>-<nonce>-socket`, `<instance>-<nonce>-dind-state`. The **job network keeps its stable per-instance name** (`<instance>-net`) unchanged — it is the atomic claim marker, and `NetworkCreate`'s unconditional 409-on-duplicate only works as the dedup primitive if two concurrent same-instance creates collide on one stable name.
-
-**Why (the name-based-teardown TOCTOU this closes structurally).** Teardown and the orphan sweep discover job-scoped volumes **by label** (`managed + controller-id + instance-name + resource=…`) and then remove each volume **by the name they read from that label-scoped list**. Under the original scheme every generation of a given instance name reused the *same* deterministic volume names (`<instance>-workspace`, …), so a stale teardown of generation *A* — even one that re-listed and re-checked ownership — could, in a sufficiently adversarial interleave, remove a volume *name* that a concurrent generation *B* had since re-created under that identical name: the two generations shared a name, so removal-by-name was only ever as safe as the generation-nonce gate that guarded it (a check, not a structural guarantee). Making each generation's volume name embed that generation's nonce removes the hazard **by construction**: *A*'s teardown removes `<instance>-<nonceA>-workspace`, which is a *different string* from *B*'s `<instance>-<nonceB>-workspace`, so the two can never name-collide regardless of interleave. The re-list-and-recheck approach alone could not provide this — it narrowed the window but left removal keyed on a shared name; the unique name closes it.
-
-The generation-nonce **gate** (`teardownScope`, which re-asserts ownership and compares the resource's nonce against the generation captured at teardown start) is **retained as defense-in-depth**, and it remains load-bearing for the one resource whose name is deliberately *not* generation-unique: the **stable-named claim network**. A stale teardown could still, by name, target a claim network a concurrent create re-claimed mid-teardown; the gate (which re-reads the live claim nonce in the fallback case) is what protects it. So: volumes are protected structurally by their unique names; the stable claim network is protected by the nonce gate; together they make name-based teardown generation-safe.
-
-The create path's ownership-validated stale-volume replacement (F3) is unchanged in intent but now applies only to a *same-generation* name collision (a retried create step within one attempt), since a prior generation's stale volume has a *different* name and is simply reaped by the sweep/teardown rather than idempotent-hit at create time.
-
-## Amendment (2026-07-21) — instance-name-label resolution is authoritative; the raw inspect-by-ID fallback is dropped (NEW-H1)
-
-**`DeleteInstance`/`GetInstance`/`Start`/`Stop` resolve `GARM_INSTANCE_ID` solely by the `instance-name` label** (ownership-validated), with **no raw inspect-by-ID fallback.** The Decision's "ID-or-name resolution" text above has been corrected in place.
-
-**Why (the identity ambiguity this closes).** After the F6 amendment, `provider_id` is *always* the GARM instance name, and GARM's only two possible `GARM_INSTANCE_ID` values — `provider_id` or the instance `Name` — are therefore the *same* value: the instance name. A raw `docker inspect <id>` fallback served no legitimate case (this pre-release provider never emitted a container-ID `provider_id`, so there is nothing to migrate) while opening a residual ambiguity: an instance name that happens to be *container-ID-shaped* could inspect-resolve a **foreign or other-generation container** by id even though that container does not own the instance-name label. Resolving solely by the instance-name label — iterating candidates to the first *owned* runner (`role=runner`, full ownership tuple), so the DinD sidecar sharing the label is never selected — removes the ambiguity by construction: an id-shaped instance name resolves *its own* allocation via its label, never an id collision. GARM's "ProviderID or Name" contract is still satisfied, because both equal the instance name. `DeleteInstance` continues to reap the whole allocation (including a lingering privileged DinD sidecar) by the instance-name label even when the runner container is already gone (the F6 behavior).
-
-See research.md §1 for the `GARM_INSTANCE_ID` ID-or-name upstream behavior this ADR's resolver accounts for, and §2 for the label-driven-ownership prior art this decision follows and the concurrent-subprocess invocation model that motivates the claim-marker mechanism. See ADR-001 for the five per-allocation resource kinds this teardown ordering covers, ADR-003 for the cache-volume label shape that the teardown/sweep predicate structurally excludes, and ADR-005 for the `garm.docker/*` label keys as part of the broader config surface.
-
-## Amendment (2026-11-03) — ListInstances sweeps and collects garbage at most once per interval
-
-The sweep runs on every `CreateInstance` and `ListInstances`. GARM calls `ListInstances` once per pool or scale set on every consolidation pass, each call a fresh provider process, so a controller with a dozen scale sets ran the same controller-wide sweep (and the cache GC of ADR-003) a dozen times per pass, each listing containers and volumes and inspecting candidates. On a healthy disk that is cheap; on a slow daemon the passes queue behind each other and lengthen every `ListInstances` call, at the moment the host can least afford the load.
-
-**Decision.** `ListInstances` runs the orphan sweep at most once per `orphanSweepInterval` (3 minutes) per controller, and the cache GC at most once per `cacheGCInterval` (5 minutes), across provider processes. `CreateInstance` runs the GC through the same throttle (so whichever hook arrives first runs the round) but its pre-create sweep is **not** throttled: a stale allocation of the instance being created must be torn down before the create reuses its names, whatever a `ListInstances` did a minute earlier.
-
-The throttle is the stamp-claim mechanism of ADR-003's 2026-10-26 amendment, generalised: one never-started container per controller and pass, `garm-sweep-stamp-<16 hex of sha256(controller-id)>` and `garm-cachegc-stamp-<...>`, labelled `managed=true`, `controller-id`, `role=throttle-stamp` and the `created-at` of the round. The claim rules are unchanged (no stamp: create and run; younger than the interval: skip; expired: remove by ID, create, run; unusable `created-at`: replace without running; foreign container at the name: leave it and skip; daemon error: skip). The diag-prune stamp keeps its name and role. Each pass has its own stamp, so one pass never holds back another; the diag prune is still limited by its own 6-hour stamp inside a GC round.
-
-**Intervals.** The sweep only collects allocations that are already abandoned, so running it less often delays a collection and never changes what is collected: the grace periods (`exitedRunnerGrace`, the in-flight create deadline) are untouched. An exited runner's leftovers now wait about `exitedRunnerGrace` plus the interval (5 minutes) at most, where before they waited for the next call. The GC's work (leaked-helper reaping, stale-cache and cruft logging, the diag prune) is not time-critical, hence the longer interval. Both are constants, like the other GC tunables, with no config key.
-
-**No stamp without the runner image.** A stamp container references the runner image, which must exist locally to create it. On a host that has not pulled it, the pass runs unthrottled rather than being skipped: a host that has never run a job has little to repeat, and housekeeping is never lost for want of an image. Any other daemon error on the stamp skips the pass, as for the diag prune; a skipped pass never fails the GARM call.
-
-**Consequences.** Each controller keeps up to two more `Created` containers (`docker ps -a`). Like the diag-prune stamp they mount nothing, carry no `instance-name`, and are not matched by the teardown and sweep predicate, the leaked-helper reaper or `ListInstances`. Removing them by hand is harmless: the next pass runs one round early. The live harness and the demo gate exempt `role=throttle-stamp`, and the harness expires the cache-GC stamp before steps that need a GC pass.
-
-Tests: `internal/provider/throttle_test.go` (first `ListInstances` sweeps and stamps, a burst inside the interval sweeps nothing; an expired stamp sweeps again; eight concurrent processes run exactly one sweep and one GC pass; the pre-create sweep still tears down a stale allocation under a fresh stamp; the GC runs once per interval and again after expiry; the sweep and GC stamps are independent; no runner image means no throttle; a stamp error or a foreign container at the stamp name skips the pass without failing the list; stamps are never listed, swept or reaped) and `internal/spec/diag_test.go` (stamp names).
-
-## Amendment (2026-11-04) — teardown records the phase a runner died in, including on delete
-
-Teardown destroys the only record of why a runner stopped: the container's exit state and logs. The orphan sweep already logged those before removing an exited runner, but it only reaches a runner GARM has left alone past the exited-runner grace. When a job's completed message arrives, GARM marks the instance for deletion at once, so a runner that crashed mid-job reaches `DeleteInstance` first, and so does a dead idle runner that scale-down picks. Those exits left no trace. The sweep's line also could not say how far a runner had got without reading the tail by eye.
-
-**Decision.** Two log-only additions, with nothing sent to GARM:
-
-- Both lines carry `runner_phase`: `before_listening`, `listening_no_job`, `job_started`, `job_completed` or `unknown`. A pure classifier reads it from the raw log tail, before `logging.SafeLogLines` screens the tail, so a marker on a withheld line still counts while the line stays withheld; only the enum leaves the function. The latest marker decides. A tail with no marker is `before_listening` only if it could have shown one: a full tail may have scrolled past the markers, and the 64 KiB cap keeps a tail's oldest lines and loses its newest, so on a cut tail anything short of `job_completed` is `unknown` rather than a phase the runner may have passed. Markers are matched at the start of a line or after a `: ` so that a job's display name, which is the workflow author's text and lands inside the listener's lines, cannot pass for another marker.
-- `DeleteInstance`'s teardown logs `teardown: runner was not running at delete` with the sweep line's fields, before any container stops, for a runner whose list state is not `running` and that the generation gate lets it remove. A normal ephemeral end (`job_completed`, exit 0, not OOM-killed) logs at debug, anything else at warn. A running runner, the ordinary scale-down, gets no line and no extra Docker call. A runner already in the `removing` state is skipped: a sweep or delete behind that removal has logged, while a rollback, `RemoveAllInstances` or an operator's own removal leaves no line. A runner in the `created` state is skipped too: it never started, so it has no exit or logs to lose, and the sweep already treats it as no runner.
-
-**Why at teardown, not from a longer-lived status watcher.** Keeping the watcher (ADR-002) alive past `idle` would hold one process and one log-follow stream per idle runner, for hours, and it could not report to GARM anyway: per GARM v0.2.1's source, its instance middleware rejects an instance token once the runner has left `installing`/`pending`, and once the instance is marked for deletion. Docker keeps the exit state until teardown, so reading it there costs nothing while the runner lives, survives a provider restart and has no bound to fall outside. The price is timing: the line appears at teardown, not at the moment of the exit, and nothing acts on it in real time.
-
-**Cost.** The report adds up to `exitReportTimeout` (2 s) to `DeleteInstance`, one budget per teardown however many stopped runners it finds, only when a runner is not running, and typically one inspect plus a 20-line log read. That is on top of the DinD IO report's own budget on the same call (ADR-006). The inspect is needed because the list summary has neither the exit details nor the TTY flag the log read depends on. Nothing in the report changes what teardown removes or returns.
-
-**Limits.** Whichever of the sweep and `DeleteInstance` runs first removes the container, and the sweep's own teardown does not ask for the delete report, so one exit is normally logged once. Two paths overlapping before either has removed the container can each log it, as can a removal that fails and is retried; the provider has no shared state to prevent that, and the repeat is harmless. A job that writes a marker-shaped line to the listener's stdout could misclassify; the tail is logged beside the phase. `paused` and `restarting` runners count as not running and log at warn; the line's `state` says which.
-
-Tests: `internal/topology/exitreport_phase_test.go` (all five phases, CRLF, cut and full tails, job names shaped like markers, markers on withheld lines, the field on the sweep's line) and `internal/topology/exitreport_delete_test.go` (one line before the first stop or remove, sidecar fields, levels, no line and no Docker call for a running runner, no report from the plain teardown or for another generation or a runner being removed, one line whichever path runs first, one budget across all runners and the removal check, log and inspect failures with the teardown result unchanged, no credential in the line).
+- Whether to expose the grace windows and the throttle intervals as config.
+- Whether to add a switch that disables opportunistic sweeping.
+- A worked multi-controller example for the README.
+- Whether the claim marker should be a dedicated resource and not the network, if a mode ever exists in which
+  the network is not created first.

@@ -1,274 +1,198 @@
-# ADR-003: Cache Keying and Lifecycle
+# ADR-003: Cache keying and lifecycle
 
-Status: Accepted (2026-07-19); amended 2026-07-22, 2026-10-11, 2026-10-12, 2026-10-17 and 2026-10-26 (see Amendments below)
+Status: Accepted
 
 ## Context
 
-CI jobs on this provider benefit heavily from persistent caches — a language/tool cache (equivalent to GitHub-hosted runners' `hostedtoolcache`), a package-manager store (pnpm's content-addressed store as the representative case), and a set of runtime "externals" bundled with the runner. Per ADR-001/ADR-004, every job gets its own network, runner, and (in DinD modes) DinD sidecar and socket, all fully torn down at job end. Caches are the deliberate exception: they must **outlive** individual job allocations so that repeated jobs against the same repository benefit from warm caches, while still respecting the isolation rule that one repository's job must never see another repository's cached data.
+CI jobs benefit from caches that outlive a single job: a language toolcache (the equivalent of GitHub-hosted
+runners' `hostedtoolcache`), the pnpm package store, and the runner's bundled "externals" (Node runtimes).
+Every job otherwise gets its own network, runner and sidecar, all destroyed at job end
+([ADR-001](ADR-001-dind-strategy.md), [ADR-004](ADR-004-teardown-and-orphan-cleanup.md)). Caches are the
+exception, but one repository's job must never see another repository's cached data.
 
-The natural cache key candidate, GARM's `pool_id`, does not work: for scale sets, `pool_id` is a synthetic, non-UUID string due to an upstream gap (see research.md §1, the same gap that makes `GARM_POOL_EXTRASPECS` unusable — ADR-005). Provider one-shot subprocess execution (no long-running daemon; see ADR-004) also means cache garbage collection cannot run on a timer and must instead piggyback on invocations the provider already receives.
+GARM's `pool_id` cannot be the key. For scale sets it is a synthetic string that changes shape when a scale
+set is renamed ([`garm-contract.md`](../garm-contract.md)). The provider is also a one-shot process, so cache
+housekeeping cannot run on a timer. It piggybacks on calls the provider already receives.
 
 ## Decision
 
-Key persistent caches on the **normalized repository URL**, not `pool_id` — but only when the pool is actually repo-scoped (see the entity-scope subsection below; org/enterprise pools are handled differently (see the entity-scope subsection below)). Normalization: lowercase, strip the URL scheme, strip a trailing `.git` suffix, then form `<slug>-<hash>` where `<hash>` is the first **12 hex characters** (minimum) of `sha256(repo_url)` — a human-readable slug plus a short hash suffix. This is a collision-*resistant* scheme, not a collision-*proof* one: 12 hex characters is 48 bits of hash space, which is more than sufficient for the number of distinct repositories any single Docker host will realistically ever see, but it is not a cryptographic uniqueness guarantee. The provider does not claim "guaranteed" uniqueness; it treats a truncated-hash collision as an extremely low-probability event worth monitoring for (e.g. logging a warning if two different `repo_url` values ever normalize to the same `<repokey>`) rather than an impossibility.
+### Keys and scope
 
-**Entity-scope detection (default: repo-scoped caches only; operator opt-in required for org-wide sharing).** research.md §1.B establishes that `repo_url` is the entity's ForgeURL, and for org- and enterprise-level pools, `repo_url` is the **same** org/enterprise URL shared by every member repository — so keying on `repo_url` alone cannot isolate per-repo caches for those pools; it would silently pool every repo in the org into one shared cache. The provider must therefore classify each `CreateInstance` call's entity scope before deciding whether to use persistent caches at all:
+Caches are keyed on the normalized repository URL: lowercased, scheme removed, `.git` and trailing slashes
+removed. The key is `<slug>-<hash>`, where the slug is a readable, Docker-name-safe form of the path (at most
+40 characters) and the hash is the first 32 hex characters (128 bits) of the SHA-256 of the normalized URL.
+Every cache volume also carries the full 64-character digest in a `repo-url-digest` label, and adoption of
+an existing volume checks it, so two repositories that collided on the shorter key would not share a volume.
 
-- **Repo-scoped pools**: `repo_url` uniquely identifies one repository. Per-repo persistent toolcache and pnpm caches work exactly as designed above.
-- **Org- or enterprise-scoped pools**: `repo_url` is shared across every repository in the org/enterprise. Persistent toolcache/pnpm caches are **disabled by default** — no cross-repo cache is created or reused — because doing so would silently cross the per-repo isolation boundary that is this project's core differentiator. An operator-only config flag, `[cache] allow_org_shared = false` (default), may opt into org-keyed shared caches; enabling it is documented explicitly as **treating the entire org/enterprise as a single trust domain** for cache purposes, a deliberate operator decision, not a provider default.
+`repo_url` is the entity's URL, and for an organization or enterprise pool it is shared by every member
+repository, so keying on it cannot separate those repositories. The provider classifies the URL by shape
+(`owner/repo` is a repository, a single segment is an organization, `/enterprises/<name>` is an
+enterprise; GitHub URL shapes only):
 
-**Detection heuristic**: bootstrap `labels` are populated only in non-JIT mode (research.md §1.B), so they cannot be relied on as a general scope signal. Instead the provider infers entity scope from the **structure** of `repo_url` itself: a repository URL has an `owner/repo` path (two path segments beyond the host), while an organization or enterprise URL has only one path segment (the org/enterprise slug) or a forge-specific enterprise path shape. When the path shape does not confidently match the two-segment repo pattern, the provider treats the pool as **non-repo-scoped** and withholds persistent caches unless `allow_org_shared` is set — a fail-safe default, not fail-open. This heuristic's robustness across forges (GitHub, and any future Gitea/enterprise-server URL shapes) is called out explicitly in Open questions below, since it is inference from URL shape rather than an explicit scope field GARM provides.
+- **Repository pools** get per-repository toolcache, pnpm store and diagnostic-log volumes.
+- **Organization and enterprise pools** get none, unless the operator sets `[cache].allow_org_shared = true`.
+  That setting treats the whole organization as one trust domain for caches.
+- **A URL that cannot be classified** never gets a persistent cache, even with `allow_org_shared`.
 
-Cache volumes, by kind:
+Classification uses the URL because the bootstrap `labels` exist only without JIT, and GARM provides no scope
+field. The URL must be an absolute http(s) URL with a host, so a scheme-less `github.com/acme` cannot be
+mistaken for a repository.
 
-- **Toolcache**: `garm-cache-toolcache-<repokey>-<gen>`, mounted at `/opt/hostedtoolcache` (matching the `RUNNER_TOOL_CACHE` convention). `<gen>` is a generation salt that bumps whenever the image generation changes, giving a clean way to invalidate stale toolcache contents without an explicit GC pass. Repo-scoped only, per the entity-scope rule above.
-- **pnpm store**: `garm-cache-pnpm-<repokey>-<pnpmMajor>`. Mount path and the corresponding pnpm environment variable were an explicit open question; **resolved 2026-07-22** (see the M2-W1 Amendment below) — a named volume mounted at `/opt/pnpm-store` (config `[cache].pnpm_store_path`) with `npm_config_store_dir` pointing pnpm at it (pnpm 11 reads `pnpm_config_store_dir` instead, so the provider sets both; see the 2026-10-11 Amendment). Repo-scoped only, per the entity-scope rule above.
-- **Externals**: `garm-cache-externals-<imageDigest>`, deliberately **shared across repositories** — its contents are Node.js/runtime binaries tied to the runner image's version, not repository data, so cross-repo sharing carries no isolation risk regardless of entity scope. Following the ARC init-copy pattern: the volume is seeded from the image only when found empty. **Read-only into the runner and seeded by a dedicated privileged step, never by the runner itself** — see the "Externals volume: read-only mount and seeding" subsection below. A new image digest naturally produces a fresh, self-seeding volume.
-- **Diagnostic logs**: a per-repo-scoped volume (same entity-scope rule as toolcache/pnpm — org/enterprise pools get no persistent diagnostic-log volume by default either) with a 7-day retention policy, pruned as described below.
+Caches are never shared across repositories, with two exceptions: the externals volume (no repository data),
+and organization-keyed caches when `allow_org_shared` is set.
 
-Generation salts: `<gen>` bumps on an image-generation change (owner-defined cadence); the pnpm volume salt bumps on a pnpm major-version bump. Cache volumes carry their own label set — `garm.docker/cache=true`, `garm.docker/repo=<repokey>`, `garm.docker/generation=<gen>` — **distinct** from the instance-scoped label set used in ADR-004. Critically, **cache volumes never carry `garm.docker/instance-name`**: ADR-004's teardown and orphan-sweep match predicate is `garm.docker/managed=true AND has garm.docker/instance-name AND NOT garm.docker/cache=true`, so cache volumes (which carry `managed=true` + `cache=true` + repo/generation labels but no `instance-name`) structurally cannot match that predicate. This is what makes it safe for cache volumes to also carry `managed=true` — see ADR-004 for the full reconciliation of this label schema.
+### Volumes
 
-Caches are never shared across repositories, with two deliberate, explicitly documented exceptions: the externals volume (contains no repository-specific data by construction) and, only when an operator has set `allow_org_shared = true`, org/enterprise-keyed toolcache/pnpm caches.
+| Kind | Name | Mount in the runner |
+|---|---|---|
+| toolcache | `garm-cache-toolcache-<repokey>-<oskey>-<generation>` | `/opt/hostedtoolcache` (`RUNNER_TOOL_CACHE`) |
+| pnpm store | `garm-cache-pnpm-<repokey>-<oskey>-<pnpm major>` | `/opt/pnpm-store` |
+| externals | `garm-cache-externals-<image content ID>` | `/actions-runner/externals`, read-only |
+| diagnostic logs | `garm-cache-diag-logs-<repokey>` | `/actions-runner/_diag` |
 
-**Same-repo cache poisoning is an accepted risk.** Within a single repository's own cache, any workflow run against that repository can write into (and therefore poison) that repository's own toolcache or pnpm store — e.g. a malicious PR from a fork, if the pool is configured to run untrusted PR workflows, could plant a poisoned tool binary that a later, trusted run of the same repository then picks up. This is explicitly **accepted**, not mitigated, in this design: the repository is already the trust boundary (same repo = same trust domain), and this mirrors GitHub-hosted Actions' own cache-action behavior, which has the identical same-repo-poisoning property. Operators who run untrusted PR workflows against a repo should be aware their own repo's cache is not a security boundary against that repo's own contributors.
+The paths of the first two are `[cache].toolcache_path` and `pnpm_store_path`. `generation` and `pnpm_major`
+are operator salts: changing one points new jobs at a new, empty volume. The cache volume names omit the
+controller ID, so two controllers on one host that serve the same repository share a volume, which is one
+trust domain. The externals volume is keyed on the runner image's content ID, which exists for both
+digest-pinned and tag references, and it is shared across repositories and controllers.
 
-**Externals volume: read-only mount and seeding.** Because the externals volume is shared across every repository on the host, mounting it read-write into the runner would let any single job's untrusted `run:` steps overwrite shared binaries (e.g. `externals/<ver>/bin/node`) that every other repository's runner subsequently executes — a cross-repo remote-code-execution path via cache poisoning, not merely a same-repo one. To prevent this:
+**OS release key.** One repository can run pools on two Ubuntu releases
+([ADR-002](ADR-002-runner-image-and-jit-delivery.md)). `actions/setup-python` and `setup-node` download builds
+made for one release, and pnpm's side-effects cache keeps native addons linked against that release's glibc,
+so neither cache is portable across releases. The `<oskey>` is read from the runner image's
+`garm.docker/os-release` label (`ubuntu-24.04`, `ubuntu-26.04`, matching `^[a-z0-9][a-z0-9._-]{0,63}$`; a
+malformed value fails the allocation). An image without the label is keyed `image-` plus 32 hex characters of
+its content ID, which is always correct but starts cold on every rebuild. Diagnostic logs are plain text and
+stay shared across releases.
 
-- The externals volume is mounted **read-only** into every runner container, in every mode.
-- Seeding (copying the runner image's `externals/` payload into the volume on first use) happens **once**, via a dedicated, short-lived, privileged init step — either a throwaway init container or a provider-run copy operation — that the job's own workflow code never runs inside or influences. The runner itself never seeds or writes to this volume.
-- A seeding lock / atomic "seeded" marker (e.g. a marker file or label written only after the copy completes, checked-then-set under a lock) ensures exactly one seeder populates the volume even when multiple `CreateInstance` calls race to be the first job against a freshly built image digest; without this, concurrent first-jobs could race to seed the same empty volume redundantly or observe a partially-copied `externals/` tree.
+**Labels.** Every cache volume carries `garm.docker/managed=true`, `controller-id`, `cache=true`,
+`cache-kind`, `last-used` and its identity keys (`repo`, `repo-url-digest`, `generation`, `pnpm-major`,
+`os-release`, `image-digest`, depending on kind). It never carries `instance-name` or `create-nonce`. The
+teardown and sweep predicate of ADR-004 requires an `instance-name`, so no teardown, sweep or rollback path
+can match a cache volume. This is a structural exclusion, not a value check that one call site could get wrong.
 
-This deliberately deviates from ARC's own reference architecture (§3.D), where `externals` lives in a per-pod `emptyDir` that is never shared across pods in the first place — ARC's model has no read-only-sharing story because it has no sharing at all. Making the externals volume genuinely shared **and** safe requires the read-only mount that ARC's isolated-emptyDir design never needed.
+**Same-repository poisoning is an accepted risk.** Any workflow that runs against a repository can write to
+that repository's toolcache and pnpm store. A malicious pull request from a fork, on a pool that runs
+untrusted pull requests, could plant a tool that a later trusted run of the same repository uses. The
+repository is the trust boundary, as it is for GitHub's own cache action. Do not run untrusted workflows
+against a repository whose pool shares a cache with trusted runs.
 
-**Garbage collection without a daemon.** Because external providers run as one-shot subprocesses invoked by GARM, there is no background process to run a GC timer. GC instead runs opportunistically during `CreateInstance` and `ListInstances` calls the provider is invoked for anyway: it enumerates stale cache volumes (aged beyond `stale_cache_eviction_days`, default 30, or superseded generations past a grace period) and logs them for operator visibility *(superseded 2026-07-22 — see Amendment "M2 cache-GC safety" below: GC is non-destructive/log-only, never auto-deletes volumes)*. The 7-day diagnostic-log prune is **provider-side**, not entrypoint-side: although the runner entrypoint has the log volume mounted at job start and could in principle run its own `find /logs -mtime +7 -delete`, retention/pruning logic that runs inside the runner is reachable by the same untrusted job code that writes to that volume — a compromised or malicious job step could tamper with or disable its own retention window. The provider therefore prunes diagnostic logs itself (as an allowlist-label-scoped step during its own opportunistic GC pass, described above), keeping retention policy entirely outside the untrusted execution boundary. This GC pass — like all cleanup in this project (see ADR-004) — is strictly allowlist-label-scoped and **never** `docker system prune` or any other unscoped destructive operation.
+### A cache's identity is its label set, not its name
 
-## Rationale
+A volume name is only a slot. Deleting whatever unlabelled volume sits on a cache's name fails in three
+ways. The daemon creates a missing named mount as an empty, unlabelled volume, and that is indistinguishable
+from a foreign volume, so deletion by name can never be foreign-safe. Refusing such a name instead would
+block creation permanently. And a provider-side "seed before create" step does not guarantee that a runner
+never sees a half-seeded tree. The rules are therefore:
 
-Repo-URL keying is stable across the scale-set `pool_id` gap and matches how operators actually think about caches ("this repo's build cache"), whereas `pool_id` keying would silently break the moment GARM's synthetic pool IDs change shape or a pool is recreated. Separating cache labels from instance labels is a deliberate defense-in-depth measure: even a bug in the instance-teardown label filter cannot reach a cache volume, because the label keys used for allowlisting are disjoint, and (per the reconciliation with ADR-004) cache volumes never carry the `instance-name` label the teardown/sweep predicate requires. Piggybacking GC on invocations the provider already receives avoids introducing any new execution model (a daemon, a cron entry, a sidecar) purely for housekeeping. Defaulting persistent caches off for org/enterprise pools is the only choice consistent with the project's per-repo isolation guarantee: `repo_url` keying is simply the wrong tool for entities where that URL is shared, and silently building an org-wide shared cache without operator awareness would be a covert isolation regression. Making the externals volume read-only, with seeding confined to a privileged step the job cannot reach, is what makes sharing that one volume across repositories safe at all — a read-write shared volume would hand any job the ability to poison every other repository's runner.
+- `EnsureCacheVolume` finds its cache **by label** (kind, repository or image digest, salt, OS key) and reuses
+  it under whatever name it has. If none exists and the preferred name is free, it creates the volume there.
+  If the preferred name is occupied by something that is not a validated cache of ours, it **routes around**
+  it to a deterministic alternate name (`<name>-x<8 hex>`) and never deletes it.
+- After the runner is created and has pinned its volumes, the provider re-inspects each against the full
+  expected identity. If one is not provably ours, the allocation fails closed, only this attempt's resources
+  are rolled back, and the volume is **not** deleted. GARM retries, and the retry routes around the slot. The
+  unprovable volume may remain as disk cruft, which is logged once.
+- The provider never deletes a volume it cannot prove is its own. A `VolumeRemove` is by name with no atomic
+  label-qualified form, so any inspect-then-delete is a race in which a concurrent delete plus a foreign
+  volume taking the freed name could remove the foreign volume.
+- A volume's labels cannot change after creation, so `last-used` records **creation time** and is not
+  refreshed on reuse.
+
+### Externals
+
+The externals volume holds Node runtimes and nothing repository-specific. Because it is shared by every
+repository, a writable mount would let one job overwrite `externals/<ver>/bin/node`, which every other
+repository's runner then executes. So it is mounted **read-only** into every runner, and into the DinD
+sidecar for container jobs (ADR-001). In `privileged-sidecar` mode this boundary is only as strong as the
+host isolation described in ADR-001's residual risk.
+
+A short-lived helper container, which no job runs in or influences, seeds the volume once. It takes `flock`
+on a lock file in the volume and, if the atomic marker `.garm-seeded` is absent, copies the image's externals
+and writes the marker last. Two concurrent first jobs lock the same inode, so one copies and the other finds
+the marker. The provider runs the helper to completion (10 minute limit) before the runner mounts the volume,
+and the runner's entrypoint also waits for the marker before it starts `run.sh`, so a half-seeded start is
+impossible whatever the timing. An image without externals seeds an empty, marked volume.
+
+### pnpm
+
+The pnpm store is a named volume at `/opt/pnpm-store`. The provider sets both `npm_config_store_dir` (read by
+pnpm 10 and earlier) and `pnpm_config_store_dir` (read by pnpm 11). Each version ignores the other's name,
+so setting only one would leave repositories on the other version with a cold store. The environment is used
+rather than an `.npmrc` so a repository's own `.npmrc` cannot redirect it. npm 11 prints a harmless
+`Unknown env config "store-dir"` warning while `npm_config_store_dir` is present. The runner image installs
+a pinned pnpm (default 9.15.9), and its major version must match `[cache].pnpm_major`, because the store
+layout is tied to the major.
+
+The metadata cache (package documents, and on pnpm 11 a record of lockfiles that passed its supply-chain
+check) would be lost with the runner. The provider therefore also sets `npm_config_cache_dir` and
+`pnpm_config_cache_dir` to `<store mount>/metadata-cache`. It is a sub-directory, never the mount root,
+because `pnpm store prune` removes what it finds under `cache-dir` and deleted a whole store in a test when
+`cache-dir` was the root. A job can write a forged `lockfile-verified.jsonl` there, so later jobs of the same
+repository skip pnpm 11's policy check for that lockfile. The frozen install still verifies package
+integrity. This is the same-repository boundary above. Measurements are in
+[`package-store-installs.md`](../package-store-installs.md).
+
+The store and the workspace are separate volumes, so pnpm cannot hardlink between them, and on a filesystem
+without reflink every install copies `node_modules`. This is host guidance, in the same document. pnpm 11
+also installs a pnpm version it switches to inside the store volume, and bootstraps older than 11.22.0 can
+empty the shared binary. The provider cannot move that location with an environment variable, so this too is
+guidance in that document.
+
+### Garbage collection
+
+There is no daemon, so housekeeping runs on `CreateInstance` and `ListInstances`. It never fails the call.
+
+- **Cache volumes are never deleted automatically.** The pass finds stale ones (superseded generation, pnpm
+  major or image digest, each past a 30 minute grace, or older than `stale_cache_eviction_days`, default 30,
+  measured from creation) and logs them with the command an operator can run when no jobs are active:
+  `docker volume prune -a --filter label=garm.docker/cache=true --filter label=garm.docker/controller-id=<id>`.
+  `docker volume prune` skips volumes that a container uses. No GARM command exists for this, and adding it
+  to `RemoveAllInstances` would reintroduce the race. Disk use is therefore bounded by operator maintenance.
+- **Diagnostic logs are pruned by the provider**, never by the runner's entrypoint, which the job can reach.
+  A helper container that mounts one diag volume runs `find <dir> -type f -mmin +<days*1440> -delete`,
+  deleting files and not the volume. Retention is `diagnostic_log_retention_days` (default 7). `-mmin` is used
+  because `-mtime +7` would keep files for 8 days. The prune is gated twice by a strict per-kind identity
+  check: at enumeration and again after the helper pins the volume.
+- **Throttling.** GARM calls `ListInstances` often, once per pool or scale set, each in a fresh process. An
+  unthrottled pass would start one helper per diag volume on every call, which saturates a slow disk. Each
+  pass therefore takes a claim by creating a never-started container with a fixed name per controller, for
+  example `garm-diagprune-stamp-<16 hex of sha256(controller ID)>`, labelled with the round's time. Docker
+  refuses a second container of that name, so exactly one process wins. The diag prune runs at most every
+  6 hours and the cache GC pass at most every 5 minutes. An expired stamp is replaced by ID, an unreadable
+  one is replaced without running, and a container at that name that is not ours is left alone. A daemon
+  error skips the round. A round prunes at most 20 volumes, in random order. Without the runner image locally
+  no stamp can be created, and the pass runs unthrottled. A host-side state file was rejected: the provider
+  often runs in a container with a read-only or private filesystem, and Docker already provides an atomic
+  claim.
+- **Helpers** (seed, prune) carry `managed=true`, `controller-id` and `role=cache-helper`, and no
+  `instance-name`. They are removed in a defer. The pass also reaps a leaked helper by state and age: a
+  running helper is left alone until it exceeds the seed limit plus a margin, so a crashed seeder cannot hold
+  the lock for ever, and a terminal helper after a short grace.
 
 ## Alternatives considered
 
-- **`pool_id` keying**: rejected — unreliable for scale sets due to the synthetic, non-UUID `pool_id` upstream gap (research.md §1).
-- **A single global shared cache** across all repositories: rejected — violates the per-job/per-repo isolation guarantee that is this project's core differentiator (ADR-001).
-- **Size-based eviction** (evict largest volumes first): rejected — per-volume disk usage is not portably queryable across the NAS filesystems this project targets; age-plus-generation eviction is portable and predictable.
-- **Org/enterprise-keyed persistent caches by default**: rejected — would silently pool every member repository's toolcache/pnpm store into one shared, cross-repo-writable volume the moment a pool was org- or enterprise-scoped, without the operator ever having made that trade-off explicitly. Available only behind the `allow_org_shared` opt-in.
-- **Read-write externals volume** (simpler mount, no init-step indirection): rejected — a job's untrusted `run:` steps could overwrite shared runtime binaries (e.g. `externals/<ver>/bin/node`) that every other repository's runner subsequently executes, turning a convenience shortcut into a cross-repo RCE path.
-- **Entrypoint-side diagnostic-log pruning** (simpler, no provider-side GC pass needed): rejected — retention logic reachable by the same untrusted job code writing to the volume is retention logic a malicious job can disable or tamper with.
+- Keying on `pool_id`: unstable for scale sets.
+- One global cache: breaks isolation.
+- Size-based eviction: per-volume size cannot be queried portably.
+- Organization-keyed caches by default: silently pools every member repository.
+- A writable externals volume: a cross-repository execution path.
+- Pruning diagnostic logs from the entrypoint: retention logic a job can reach is retention a job can disable.
+- Deleting stale cache volumes automatically: see "Garbage collection".
 
 ## Consequences
 
-- Disk usage is bounded only by operator maintenance: the provider logs stale caches for visibility, and operators reclaim them via manual `docker volume prune -a --filter label=garm.docker/cache=true --filter label=garm.docker/controller-id=<id>` at a quiescent moment *(amended 2026-07-22 — cache volumes persist until explicit operator purge, not automatic eviction; see Amendment "M2 cache-GC safety" below)*, which must be documented clearly for NAS operators who may have limited storage.
-- The first job to run against a newly built image generation pays the one-time cost of populating the externals volume from the image, now via a dedicated privileged seeding step rather than the runner itself.
-- Org- and enterprise-scoped pools get no persistent toolcache/pnpm benefit by default, trading some cache-hit-rate for isolation; this is a deliberate, documented trade-off that operators can override per-deployment via `allow_org_shared`, with the org-as-single-trust-domain caveat clearly stated wherever that flag is documented.
-- The read-only externals mount adds one more moving part to the create path (a seeding lock/marker and a privileged init step) in exchange for closing a cross-repo cache-poisoning path.
+- Caches accumulate until an operator prunes them. Plan disk space for it, especially on hosts with limited storage.
+- Organization and enterprise pools get no persistent cache by default.
+- The first job on a new image generation pays for seeding the externals volume.
+- Upgrading from a release that did not key caches on the OS release leaves the old toolcache and pnpm volumes
+  in place, logged as superseded, and each repository starts one cold cache.
+- The externals supersession check compares with the config-wide `runner_image` only, so the externals volume
+  of a flavor's image is logged as superseded once past the grace window. Nothing is removed, and pruning it
+  between jobs just means it is seeded again.
 
 ## Open questions
 
-- ~~Final pnpm store mount path and environment-variable convention (must be resolved before M2).~~ **RESOLVED 2026-07-22 — see the M2-W1 Amendment below.**
-- Whether toolcache generation should track image-generation bumps only, or also runner minor-version bumps.
-- Whether an optional diagnostic-log shipping path (e.g. syslog or Loki) is worth adding, versus relying solely on the local retention window.
-- **Robustness of the entity-scope detection heuristic** across forges: the `repo_url` path-depth heuristic (owner/repo = repo-scoped; single segment = org/enterprise-scoped) is verified against GitHub's URL shape; its behavior against Gitea or GitHub Enterprise Server URL conventions has not yet been validated and should be confirmed before those forges are supported (see ADR-002's Gitea deferral).
-- Whether the truncated cache-key hash (12 hex chars) warrants an explicit collision-detection log warning, given the probability is low but non-zero.
-- ~~The exact implementation of the externals-volume seeding lock (a Docker label written under a compare-and-swap-style check, versus a lock file inside the volume itself).~~ **RESOLVED 2026-07-22:** a LOCK FILE inside the volume — `flock` on an in-volume `.garm-seed.lock` — plus an atomic `.garm-seeded` marker written LAST (only after the copy fsyncs), so exactly one of N racing first-jobs seeds and the rest no-op on the marker. It is backed by a **consumer-side seed gate**: the runner entrypoint blocks on the marker before launching `run.sh`, making a half-seeded start impossible at the point of use regardless of provider-side pin timing. See the M2-W2 amendment point 2 and the structural-redesign point 3.
-
-See research.md §1.B for the `repo_url` entity-scope ambiguity and the `pool_id`/`GARM_POOL_EXTRASPECS` upstream gap this decision routes around, and §2 for the ARC init-copy pattern the externals volume borrows. See ADR-001 for the job-scoped resources caches deliberately sit outside of, ADR-004 for the exact teardown/orphan-sweep match predicate that cache volumes are structurally excluded from, and ADR-005 for the `[cache]` config block (`generation`, `pnpm_major`, `stale_cache_eviction_days`, `diagnostic_log_retention_days`, `allow_org_shared`).
-
-## Amendment (2026-07-22) — M2-W1: pnpm store mechanism resolved; last-used is creation-time-only; cache label set; repokey hashing
-
-M2 Wave 1 implemented repo-scoped cache keying plus the toolcache and pnpm store volumes (externals, diagnostic logs, and GC remain W2). Four points settle or refine the Decision above.
-
-**1. pnpm store mount path + environment convention (RESOLVES the open question).** The pnpm store is a named volume mounted at a fixed in-runner path — `/opt/pnpm-store` by default (config `[cache].pnpm_store_path`) — and the provider sets `npm_config_store_dir=<that path>` on the runner, which pnpm honors as its `store-dir`. The environment variable is chosen over a written `.npmrc` because it is fully provider-controlled, repo-agnostic, and cannot be silently overridden by a job's own workspace `.npmrc`. **Verified on Docker Engine 29.6.1 (arm64):** with `npm_config_store_dir=/opt/pnpm-store` and the volume mounted there, `pnpm config get store-dir` returns `/opt/pnpm-store` and `pnpm store path` returns `/opt/pnpm-store/v3`; a second container sharing the same volume reuses package content from the store (`pnpm install --prefer-offline` reports `reused N, downloaded 0`, `node_modules` populated). The live provider verification (`internal/verify`, `dockerverify` tag) additionally confirms `pnpm config get store-dir` = `/opt/pnpm-store` on the provider-*created* pnpm volume.
-
-Two caveats, flagged rather than silently assumed:
-- **The runner image MUST provide pnpm** (via corepack — Node 20+ ships it — or a preinstalled pnpm). The reference myoung34 base ships Node but not pnpm, so the runner-image milestone must `corepack enable`/ship pnpm; this provider only mounts the store and sets the env, it does not install pnpm.
-- Only pnpm's content-addressed **store** is persisted here, not its separate **metadata cache** (`~/.cache/pnpm`). Store reuse avoids the expensive tarball download+extract (the primary win); a *fully offline* install would additionally need the metadata cache persisted — a possible future/W2 addition, out of W1 scope.
-
-**2. `last-used` records CREATION time and is NOT mutable on reuse.** The GC design above ages caches by a `last-used` label timestamp. A real-daemon fact established in W1: **a local Docker volume's labels are immutable after creation** — verified on Engine 29.6.1, re-issuing `docker volume create <name>` with new labels returns the EXISTING volume and keeps its ORIGINAL labels (the new labels are discarded), and `docker volume update` exists only for cluster volumes. Refreshing `last-used` by remove-and-recreate would destroy the cache. The `last-used` label is therefore set once, at volume creation (RFC3339), and is NOT re-stamped on a cache hit. **Consequence for W2's GC** (resolved in the M2-W2 amendment, point 3 below): it ages a cache by this **creation-time `last-used` label** plus **salt supersession**, NOT by the volume's filesystem mtime. Filesystem-mtime ageing was considered — mtime advances every job, since the cache is mounted read-write into the runner and used there — but **rejected**: the provider cannot portably stat a volume's filesystem mtime from outside the Docker Desktop VM (the Mountpoint lives inside the VM), so a sentinel-mtime LRU is not viable. Because the label records creation and cannot be re-stamped on reuse, ageing is deliberately **coarse and self-healing**: even a still-warm cache is aged from its creation and periodically re-created empty on the next job. The label remains the creation-time record the GC ages on and part of the label set the cache purge selects on.
-
-**3. Full cache-volume label set.** Beyond the `cache=true`, `repo=<repokey>`, `generation=<gen>` named in the Decision, a cache volume also carries `garm.docker/managed=true` and `garm.docker/controller-id` (so a controller-scoped purge can find it), `garm.docker/cache-kind` (`toolcache`|`pnpm`, so a GC/purge pass tells the kinds apart without parsing the name), `garm.docker/pnpm-major` (on pnpm volumes), and `garm.docker/last-used` (per point 2). It still carries **no `garm.docker/instance-name`** — the structural exclusion from ADR-004's teardown/sweep predicate — and no `create-nonce`/`resource` (the job-scoped labels), so no teardown, orphan-sweep, or creation-guard rollback path can ever match it.
-
-**4. repokey hashing and cross-controller naming.** The repokey hash is taken over the **normalized** repo URL (lowercased, scheme-stripped, `.git`/slash-stripped), not the raw `repo_url` string, so case/scheme/`.git`/trailing-slash spellings of one repository map to one cache — the only reading consistent with the normalization's stated purpose (the Decision's literal "`sha256(repo_url)`" is resolved toward that intent). The cache volume **name** deliberately omits the controller-id (`garm-cache-toolcache-<repokey>-<gen>`), so two controllers sharing one host and the same repository share one cache volume — the same repository is one trust domain, consistent with cross-allocation sharing within a controller. The controller-id lives in the label set (point 3) for purge scoping; a minor consequence, noted for W2's cache-purge design, is that a controller-B purge scoped by controller-id will not match a volume first created (and thus labeled) by controller-A.
-
-## Amendment (2026-07-22) — M2-W2: externals seeding+lock, chosen GC freshness mechanism, diagnostic-log prune, runner-image pnpm
-
-M2 Wave 2 implemented the externals cache, the diagnostic-logs volume, the opportunistic GC, and the runner-image pnpm that completes W1's pnpm store. Six points settle or refine the Decision above; each is verified on Docker Engine 29.6.1 (arm64) by the live harness (`internal/verify`, `dockerverify` tag, `TestVerifyM2W2ExternalsGCDiag`).
-
-**1. Externals keyed on the image CONTENT digest; shared across repos AND controllers.** The externals volume name is `garm-cache-externals-<imageDigest>`, where `<imageDigest>` is the runner image's **content-addressable ID** hex (the `sha256:` prefix stripped from `docker image inspect`'s `.Id`), NOT the config-pinned *manifest* digest. This resolves an ADR ambiguity ("keyed by the RUNNER IMAGE digest") toward the content ID because it is the one identity available for BOTH a digest-pinned config reference and an unpinned dev/tag reference, and it keys externals to the exact image bytes either way. The name carries no repokey and no controller-id, so the volume is deliberately shared across every repository AND every controller on the host — its contents are Node runtimes tied to the image version, carrying no repository data. Its label set is the common cache labels (`managed`, `controller-id`, `cache=true`, `last-used`) plus `cache-kind=externals` and a new `garm.docker/image-digest`; it carries **no `repo`** (shared) and **no `instance-name`** (the ADR-004 exclusion). A new image digest naturally produces a fresh, self-seeding volume.
-
-**2. Externals read-only mount + the seeding lock (F4/F15).** The externals volume is mounted **read-only** into every runner at the image's own externals path (`/actions-runner/externals` for the myoung34 base) — verified: a runner `touch` in it is denied ("Read-only file system"). It is populated ONCE by a dedicated, short-lived seed container the job never runs inside or influences: a full entrypoint override runs `flock` on an in-volume lock file, and — only if an atomic `.garm-seeded` marker is absent — copies the image's externals payload into the volume (`cp -a`, preserving perms) and writes the marker **last**. Because two concurrent first-jobs for the same digest both mount the same named volume, they flock the **same underlying inode**, so exactly one seeder copies while the other blocks and then no-ops on the marker (`flock` releases on the holder's fd close, so a crashed seeder cannot deadlock the next). The provider runs this seed container **to completion** (create → start → wait-exit → remove) BEFORE the runner mounts the volume, so the runner never sees a half-seeded tree. The copy is guarded by `[ -d <source> ]`: an image with no externals seeds an empty-but-marked volume rather than failing — such an image does not use externals anyway. The seed runs for EVERY allocation when the cache is enabled (a warm volume is a fast flock+marker-check no-op) and for EVERY entity scope (externals apply regardless of repo/org/enterprise/unknown scope, since they carry no repo data).
-
-**3. Chosen GC freshness mechanism: age-since-creation + salt supersession (NOT sentinel-mtime LRU).** *(Superseded 2026-07-22 by Amendment "M2 cache-GC safety" below — the GC now IDENTIFIES stale/superseded caches (those with `generation` ≠ current, `pnpm-major` ≠ current, or `image-digest` ≠ configured image, each past a 30-min grace; plus age since creation > `stale_cache_eviction_days`, default 30) and LOGS them for operator visibility, but does NOT auto-delete volumes — see Amendment below for the rationale.)*  Given W1's finding that a local volume's `last-used` label is IMMUTABLE (records creation, not reuse) and that the provider cannot stat a volume's filesystem mtime from outside the Docker Desktop VM, the original plan was to evict by **(a)** salt SUPERSESSION and **(b)** AGE — a coarse, self-healing model. That design was superseded: the GC now enumerates stale caches by the same criteria but issues no `VolumeRemove` (the Docker TOCTOU limitation is load-bearing for safety). Sentinel-mtime LRU was **rejected** even originally: it would require the provider (or a helper) to stat volume mtime, which is not portably possible on Docker Desktop where the Mountpoint lives inside the VM.
-
-**4. Diagnostic-logs volume + provider-side prune (F14).** A per-repo `garm-cache-diag-logs-<repokey>` volume (cache-kind=`diag-logs`, `repo`, `cache=true`, no `instance-name`, no salt), subject to the SAME entity-scope eligibility as toolcache/pnpm (org/enterprise pools get none by default), is mounted read-write at the runner's `_diag` dir (`/actions-runner/_diag`). The runner-image entrypoint owns that dir (mkdir+chown to the runner user, gated on a `GARM_DIAG_DIR` env the provider sets only when the volume is mounted) so the unprivileged runner can write into a fresh root-owned volume — this is directory setup, NOT retention. Retention (`diagnostic_log_retention_days`, default 7) is enforced **provider-side**: during the GC pass *(at most one round per 6 hours per controller since 2026-10-26; see that Amendment)* the provider runs a short-lived helper container (the already-present runner image) that mounts only the one diag volume and runs an allowlist-scoped `find <dir> -type f -mmin +N -delete` (minute-precise, with `N` = retention days × 1440) — never `docker system prune` or any unscoped op, and never inside the untrusted runner. The minute form is deliberate: `find -mtime +N` counts only whole 24-hour periods and discards the remainder, so `-mtime +7` would not delete a file until it is 8+ days old, silently widening the retention window by up to a day; `-mmin +<days×1440>` deletes anything strictly older than exactly `N` days (see the L8 fix). Verified: an aged (10-day) file is deleted while a recent file is kept. Age eviction (point 3) applies to diag volumes too, so a dormant repo's diag volume is eventually reclaimed.
-
-**5. Helper containers + controller-scoped GC consequence.** The seed and prune helpers carry `managed=true` + `controller-id` + a new `role=cache-helper`, and — critically — **no `instance-name`**, so ADR-004's teardown/sweep predicate structurally excludes them and `ListInstances` (role=runner) never reports them. Every helper is force-removed in a defer; the GC additionally reaps a leaked helper for this controller by its Docker STATE and creation AGE (so it eventually reclaims a genuinely-stuck helper without ever racing a live peer's in-flight one): a `created`/`running` helper is left alone until older than a wedged-age bound (the externals seed timeout plus a margin) and only then reaped — so a crashed seeder can no longer hold the externals seeding flock indefinitely — while a terminal (`exited`/`dead`) helper is left to its own provider's defer within a short grace and then reaped as a genuine leak (or immediately when its creation age is unknown, since a terminal helper holds no lock). *(This refines the earlier "reap any non-running helper, leave running ones alone" behavior, which both skipped a wedged running seeder forever and reaped a briefly-`created` peer immediately.)* The GC is label-scoped to `cache=true` volumes for THIS controller-id; the documented consequence of the controller-id-omitting cache NAMES (W1 point 4) carries forward — a cache volume first LABELED by another controller is invisible to this controller's GC, so a shared externals/toolcache/pnpm/diag volume is reaped only by whichever controller happens to have created it, not by a peer controller.
-
-**6. Runner-image pnpm completes W1's store.** The reference myoung34 base ships Node but NOT pnpm, npm, or corepack (verified: Node 18 present, npm/corepack absent), so W1's pnpm store (`npm_config_store_dir=/opt/pnpm-store`) was inert against the stock image. The runner image now installs a **pinned** pnpm (`PNPM_VERSION`, default 9.15.9 — its MAJOR must track `[cache].pnpm_major`) lean: the pnpm npm-registry tarball (~20 MB of JS) extracted to `/opt/pnpm` and run by the base image's own Node via a tiny `/usr/local/bin/pnpm` wrapper, no second bundled Node runtime and no apt npm/build-toolchain bloat. Verified in the built image: `pnpm --version`=9.15.9 and, with the env set, `pnpm config get store-dir`=`/opt/pnpm-store`.
-
-See ADR-004 for the teardown/sweep predicate the externals, diag, and helper resources are structurally excluded from, and ADR-005 for the `[cache]` config block (`stale_cache_eviction_days`, `diagnostic_log_retention_days`) these consume.
-
-## Amendment (2026-07-22) — M2 structural redesign: a cache's identity is its LABEL SET, not its name
-
-The M2-W2 cache lifecycle, as first implemented, keyed each cache on a **deterministic volume name** and reconciled name collisions by "inspect the deterministic name; if it lacks our labels (a Moby auto-created orphan), delete it and recreate." Three rounds of coordination patches around that model did not converge, because the model has a structural flaw exposed by three concrete failure modes:
-
-- **B1 (half-seeded start).** The provider-side "seed helper completes before the runner container is created" is *not* an uninterrupted guarantee: an opportunistic GC or a peer can reincarnate the externals volume in the window between the seed's unpin and the runner's pin, so the runner could start on a volume that another seeder has only half-populated.
-- **B2 (name-based deletion can never be foreign-safe).** A Moby **auto-created UNLABELED** volume (the daemon materializes a missing named mount as an empty, unlabeled local volume) and a genuinely **FOREIGN** unlabeled volume are **indistinguishable** — both simply lack `garm.docker/managed=true` and our identity labels. Any "delete the unlabeled volume squatting the deterministic name" rule therefore cannot tell "our own empty orphan" from "someone else's data," so it can never be foreign-safe.
-- **B3 (permanent wedge).** Conversely, *rejecting* an unlabeled deterministic name forever (the old M6 adoption guard's fail-closed) wedges creation: once an unlabeled volume holds the name, every future `CreateInstance` for that repo/image is rejected, permanently.
-
-**The structural principle (applied throughout the cache subsystem):** *A cache's identity is its LABEL SET, not its name. The name is just a slot. The provider NEVER deletes a volume it cannot POSITIVELY prove is ours (`managed=true` + our full identity labels). If the deterministic slot is occupied by something that isn't our validated cache, the provider routes AROUND it (reconciles to an alternate name) — it never deletes it and never wedges.* This mirrors the M1 fix that dissolved the name-based-teardown TOCTOU by making job-volume names generation-unique (ADR-004 amendment 2026-07-21): a whole race/cleanup class is removed by construction rather than patched.
-
-Concretely:
-
-**1. Collision-safe naming / reconciliation (kills B2 and B3; removes the orphan-reap machinery).** `EnsureCacheVolume` now:
-- **Discovers OUR cache primarily BY LABEL** — a filter on the full identity (`managed` + `cache` + `cache-kind` + `repo`/`repo-url-digest` for repo-keyed caches or `image-digest` for externals + `generation`/`pnpm-major`; controller-id and last-used are deliberately excluded so cross-controller shared caches still match). A volume matching our identity is reused **under whatever name it actually lives at**, including an alternate a prior reconcile chose.
-- If none matches by label and the preferred deterministic name is **free**, it creates the cache there.
-- If none matches by label but the preferred name is **occupied by a volume that is not our validated cache** (foreign, unlabeled, or wrong-identity), it does **not** delete it and does **not** fail forever — it **reconciles to a deterministic alternate name** (`<preferred>-x<short-hash>`, `sha256(preferred:attempt)`-derived so two processes converge on one slot and a further-squatted alternate advances deterministically) and re-checks the alternate the same way. Because discovery is by label, the alternate-named volume is found and reused on the next allocation.
-- The idempotent cross-controller/cross-repo **externals sharing** path is unchanged (both controllers `VolumeCreate` the same deterministic name, both validate it as ours); reconciliation triggers **only** on a genuine foreign/unlabeled squatter. The old `bestEffortRemoveOrphanVolumes` — and every path that deleted an unlabeled deterministic-named volume — is **removed**.
-
-**2. Revalidate-after-create fails CLOSED without deletion (B2/B3).** After `ContainerCreate` pins the runner's referenced cache volumes, the provider re-validates each against its full expected identity. If any is not provably ours — an unlabeled auto-created replacement, a foreign squatter, or a wrong-digest externals volume — the allocation **fails closed** (only this attempt's own runner/allocation is rolled back) and the mismatched volume is **NOT deleted** (it cannot be proven ours). GARM retries; the retry's `EnsureCacheVolume` reconciles around the unlabeled slot, so there is no permanent wedge and no foreign deletion. The unprovable auto-created volume may **linger as disk cruft** — the correct safe trade — and is logged once for operator visibility, never auto-deleted. The externals-seed and diag-prune pin-then-validate helpers follow the same rule: on an identity mismatch they abort the helper closed **without** deleting the pinned volume.
-
-**3. Consumer-side externals seed gate (kills B1).** Because provider-side seed-before-create is not an uninterrupted guarantee, the robust backstop is enforced **at the consumer**: the runner-image entrypoint (`runner-images/noble/entrypoint.sh`), before launching `run.sh`, **waits for the `.garm-seeded` marker** to exist in the read-only externals mount (bounded timeout; fails closed with a clear message if absent). The provider passes `GARM_EXTERNALS_SEEDED_MARKER=/actions-runner/externals/.garm-seeded` only when an externals cache is mounted, so the wait runs exactly when externals seeding is expected. The provider still performs the actual seed copy (under the in-volume flock + atomic marker written last); the entrypoint gate is the guarantee that makes a half-seeded start impossible **at the point of use**, regardless of provider-side seed/pin timing.
-
-**4. GC only ever removes full-identity volumes; unprovable cruft is logged, never deleted.** *(Superseded 2026-07-22 by the cache-GC-safety amendment below — NEW-H1/H2: cache-volume eviction is now NON-DESTRUCTIVE/log-only, and the only destructive cache action, the diag file-prune, is strict-full-identity-gated.)* The opportunistic GC no longer auto-deletes any cache **volume**: Docker's `VolumeRemove` is by NAME with no atomic label-qualified variant and a referencing container blocks removal, so a client-side inspect-then-delete-by-name is inherently TOCTOU (a concurrent delete plus a foreign volume taking the freed name could delete a foreign volume) — another inspection only narrows the race. `EvictCaches` is therefore replaced by `ListStaleCaches`, which enumerates stale/superseded/aged cache volumes (each strict-identity-validated) and **logs** them for operator visibility with the exact `docker volume prune` purge command; it removes nothing. The one remaining destructive cache action — the diagnostic-log file prune (`find -delete` **inside** the diag volume, deleting files not the volume) — is gated by strict kind-aware full-identity validation both at enumeration and again at the pin re-inspect (kind + repo + repo-url-digest + controller vs the snapshot). Cache-name-prefixed volumes lacking our cache labels are still logged, never deleted.
-
-**Consequence.** Disk cruft — unlabeled Moby auto-created replacements and foreign volumes squatting cache-shaped names — can accumulate and is deliberately **never** auto-deleted; it is surfaced in the GC log for operators to reclaim by hand. This is the correct trade for the guarantee that the provider never deletes a volume it cannot prove is its own. The cache subsystem no longer has any path that deletes a volume without positive `managed`+identity provenance.
-
-## Amendment (2026-07-22) — M2 cache-GC safety: non-destructive log-only eviction; strict kind-aware identity before the diag file-prune
-
-This amendment SUPERSEDES every prior "the GC **evicts**/removes cache volumes" description in this ADR (the Decision's "Garbage collection without a daemon" paragraph, the M2-W2 amendment point 3, and the structural-redesign point 4): cache-volume garbage collection is now **non-destructive (log-only)**. The two final cache-GC blockers both lived in destructive deletion and shared one Docker limitation.
-
-**The shared Docker limitation.** `VolumeRemove` is BY NAME with no atomic label-qualified variant, and you cannot pin-then-delete a volume (a referencing container blocks removal). So any client-side inspect-then-delete-by-name is inherently a **TOCTOU**: between the inspect and the by-name delete, a concurrent delete plus a foreign volume taking the freed name would make the delete remove a FOREIGN volume — a red-line violation. Another inspection only narrows the race; it cannot close it. There is therefore **no safe client-side atomic destructive path for a cache volume.**
-
-**NEW-H1 — cache-volume eviction is now LOG-ONLY (non-destructive).** The opportunistic GC no longer auto-evicts cache volumes. `topology.EvictCaches` is replaced by `topology.ListStaleCaches`, which enumerates this controller's stale/superseded/aged cache volumes (each strict-identity-validated per NEW-H2) and returns them; it issues **no `VolumeRemove`**. The provider LOGS them in one consolidated, bounded operator-visibility line naming the exact, deliberate purge an operator can run at a quiescent moment:
-
-```
-docker volume prune -a --filter label=garm.docker/cache=true --filter label=garm.docker/controller-id=<id>
-```
-
-This is the sanctioned destructive path: an explicit operator maintenance action has no concurrent-create race in practice and is operator-accepted, and `docker volume prune` itself skips any in-use volume (so a warm cache held by a live job is never reclaimed even by the manual purge). Opportunistic auto-GC has neither property. **No new GARM command verb is added** — the external-provider command surface is fixed, and folding cache purge into the `RemoveAllInstances` rescue would reintroduce the concurrent-create race for shared caches (`RemoveAllInstances` can run while other pools/controllers are active) — so the purge is the documented operator `docker volume prune` above, out of the opportunistic path.
-
-**Consequence for NAS operators.** Stale/superseded cache volumes now persist until an explicit operator purge; disk usage is bounded by operator maintenance rather than automatic eviction. This strengthens (does not replace) the age-window disk-usage caveat in Consequences above and must be documented wherever NAS disk usage is tracked: caches are reclaimed by the operator `docker volume prune` above, not on a timer.
-
-**NEW-H2 — strict kind-aware full-identity validation before any destructive cache work.** The one remaining destructive cache action is the diagnostic-log file prune, which runs `find <dir> -type f -mmin +N -delete` **inside** the diag volume (it deletes FILES, not the volume). It must never run against a foreign or incomplete-identity volume. `spec.ValidateCacheVolumeKind` adds a STRICT, kind-aware schema requiring the FULL identity per kind (a volume missing any required key for its kind is not ours):
-
-- **toolcache**: `managed`+`cache` + `cache-kind=toolcache` + `repo` + `repo-url-digest` + `generation`
-- **pnpm**: + `cache-kind=pnpm` + `repo` + `repo-url-digest` + `pnpm-major`
-- **diag-logs**: + `cache-kind=diag-logs` + `repo` + `repo-url-digest`
-- **externals**: + `cache-kind=externals` + `image-digest`
-
-This is applied (a) when enumerating cache volumes for the log-only eviction (so the operator log is accurate) and for the diag prune (`ListDiagVolumes` skips a diag volume missing `repo`/`repo-url-digest`), and (b) AGAIN immediately before the destructive prune: after the helper pins the volume, the provider re-inspects it and requires `spec.ValidateDiagPruneTarget` — the full diag-logs identity, this controller, AND a match with the enumeration snapshot's `repo`+`repo-url-digest` — before `find -delete`. Any mismatch (a same-name replacement of a different repo, an unlabeled Moby auto-created volume, or a foreign volume) aborts the prune WITHOUT deleting/pruning anything (never touch an unprovable volume — B2). This supersedes the earlier `ValidateAdoptedCacheVolume`-based diag check, which skipped any identity key the snapshot did not set.
-
-**Verified on Docker Engine 29.6.1 (arm64)** by the live harness (`internal/verify`, `TestVerifyM2W2ExternalsGCDiag`): a superseded-generation cache SURVIVES a GC pass and is logged for operator pruning with the `docker volume prune` command; the diag prune deletes an aged file in a genuinely-ours (full-identity) diag volume while a same-shaped diag volume of INCOMPLETE identity is left untouched. The cache subsystem now performs NO destructive volume operation, and its one destructive FILE operation (the diag prune) is strict-full-identity-gated both at enumeration and at the pin boundary.
-
-## Amendment (2026-10-11) — pnpm 11 reads `pnpm_config_store_dir`: the provider sets both store envs
-
-The M2-W1 amendment above settled the pnpm store on the environment variable `npm_config_store_dir`. That holds for pnpm 10 and earlier but not for pnpm 11, which reads the store location from a differently named variable.
-
-**Observed (Docker Engine 29.9.0, linux/amd64, runner image run as uid 1001, Node 22, store volume mounted at `/opt/pnpm-store`):**
-
-| Env set | `pnpm store path`, pnpm 10.16.1 | `pnpm store path`, pnpm 11.28.5 |
-|---|---|---|
-| `npm_config_store_dir` only | `/opt/pnpm-store/v10` | `$PNPM_HOME/store/v11` (**ignored**) |
-| `pnpm_config_store_dir` only | `$PNPM_HOME/store/v10` (**ignored**) | `/opt/pnpm-store/v11` |
-| both | `/opt/pnpm-store/v10` | `/opt/pnpm-store/v11` |
-
-Each pnpm generation ignores the other's name, so a repository on pnpm 11 silently bypassed the persistent store (a cold store every job) while the provider believed it was wired.
-
-**Decision.** `spec.BuildRunnerEnv` emits both `npm_config_store_dir=<path>` and `pnpm_config_store_dir=<path>` whenever a persistent pnpm store volume is mounted (and neither otherwise), in JIT and non-JIT modes. `npm_config_store_dir` stays authoritative for the runner-image entrypoint's `prepare_cache_dirs` ownership prep; both names carry the same path. Both are provider-injected names, so an `extra_specs.extra_env` entry that collides with either is dropped in favor of the provider's value (ADR-005 H2).
-
-**Known cosmetic cost.** npm 11 prints `npm warn Unknown env config "store-dir". This will stop working in the next major version of npm.` on each npm/npx invocation while `npm_config_store_dir` is present; npm 10 is silent, and `pnpm_config_store_dir` never warns on either. Alternatives were tried against real binaries and rejected: `PNPM_STORE_DIR` is not read by pnpm 10 or 11; the hyphenated spelling `npm_config_store-dir` works for pnpm 10 but npm 11 warns on it identically; a pnpm-specific rc file under `$XDG_CONFIG_HOME/pnpm/rc` is read by pnpm 10 and is silent in npm 11 but needs a file written into the runner's config tree and, unlike an env var, a workspace `.npmrc` can override it, which is the property the M2-W1 decision chose the environment to avoid. Since pnpm 10 still has to work, `npm_config_store_dir` is kept and the npm 11 warning is documented as cosmetic; it can be dropped once pnpm 10 is out of support.
-
-## Amendment (2026-10-12) — toolcache and pnpm store volumes are keyed on the runner image's OS release
-
-With a second runner image (Ubuntu 26.04 next to 24.04, ADR-002 2026-10-12 Amendment), one repository can run pools on two Ubuntu releases on the same host. The keys above would hand both the same toolcache and pnpm store, and neither is portable across releases: `actions/setup-python` and `actions/setup-node` download builds made for one Ubuntu release into the toolcache (a Python built against 26.04's glibc does not start on 24.04), and pnpm's side-effects cache keeps built native addons keyed only by platform, architecture and Node major, so an addon linked against the newer glibc would be reused on the older one. The externals volume is already safe (keyed on the image digest) and diag logs are plain text, so only the toolcache and the pnpm store change.
-
-**Decision.** Both names gain an OS key between the repokey and the salt, and both label sets carry it as `garm.docker/os-release`:
-
-- toolcache: `garm-cache-toolcache-<repokey>-<oskey>-<gen>`
-- pnpm store: `garm-cache-pnpm-<repokey>-<oskey>-<pnpmMajor>`
-
-The OS key comes from the runner image itself (`spec.RunnerOSKey`), read with an image inspect after the image is pulled (so `CreateInstance` now pulls the runner image before it resolves the caches, rather than after the credential fetch):
-
-1. the image's `garm.docker/os-release` label when present. Both published images set it (`ubuntu-24.04`, `ubuntu-26.04`) and derived images inherit it, so an image rebuilt on the same release keeps its warm caches. A value outside `^[a-z0-9][a-z0-9._-]{0,63}$`, or one starting with `image-`, fails the allocation: the label is in this provider's namespace, so a malformed value is a broken image, not something to guess around;
-2. otherwise `image-` plus the first 32 hex characters of the image content ID. That is always correct, since two OS releases cannot share a content ID, but such caches start cold whenever the image is rebuilt, and the stranded volumes are only reported by the age rule; the provider logs the fallback at info level, and operators building images from other bases set the label to avoid it.
-
-Because the OS key and the salts may both contain `-`, two different (OS key, salt) pairs can in principle spell the same volume name (`a-b` + `c` and `a` + `b-c`). That cannot mix caches: the name's existing volume carries the other pair's labels, so adoption is refused on the `os-release` (or salt) mismatch and `EnsureCacheVolume` reconciles to a deterministic alternate name (the label-as-identity redesign above), keeping the two caches separate.
-
-Alternatives considered: keying on the image digest alone is correct but throws the toolcache away on every image release, which defeats the cache; reading `org.opencontainers.image.version` (the Ubuntu base sets `24.04`/`26.04`) relies on a label any intermediate image may overwrite with its own version, so an explicit label in this provider's namespace is used instead; running the image to read `/etc/os-release` would add a container start to every allocation.
-
-`garm.docker/os-release` joins the adoption identity keys (`cacheIdentityLabelKeys`), so a volume created for one release is never adopted for another even under a name collision. It is deliberately not added to the strict per-kind schema (`requiredCacheIdentityKeys`): toolcache and pnpm volumes created before this amendment have no OS label, and they must stay provably ours so the log-only GC reports them instead of treating them as foreign. The GC now flags such a volume as superseded once it is past the grace window ("created before toolcache/pnpm volumes were keyed on the OS release"), because no allocation resolves to its old name any more. Upgrading therefore costs each repository one cold toolcache and pnpm store; the old volumes are left in place, logged, for the operator's `docker volume prune`, as for any other superseded cache.
-
-The diag-logs volume keeps its per-repository key and is shared by a repository's pools on both releases. The externals volume is unchanged: one per image digest, so each image already has its own.
-
-Known limitation, unchanged by this amendment: the GC's externals supersession compares against the config-wide `runner_image` only, so the externals volume of an image selected through a flavor (for example the Ubuntu 26.04 image) is logged as superseded once past the grace window. Nothing is removed (the GC is log-only); if an operator prunes it between jobs, the next allocation re-seeds it.
-
-Tests: `internal/spec/osrelease_test.go` (key derivation, names, labels, adoption across releases, legacy validity), `internal/spec/gc_test.go` (pre-OS-key supersession), and `internal/provider/cache_osrelease_test.go` (one repository with a 24.04 pool and a 26.04 flavor pool gets two toolcache and two pnpm volumes, one shared diag volume, and each runner mounts its own release's toolcache; an unlabelled image keys on its content ID; a malformed label fails the create before any cache volume or runner exists).
-
-## Amendment (2026-10-17) — the store and the workspace on separate volumes: host filesystem guidance
-
-The pnpm store volume and the job workspace volume are separate mounts, so pnpm cannot hardlink between them (`EXDEV`), and on ext4 there is no reflink to fall back on: every install copies the whole `node_modules` tree. Measurements on two volumes of one filesystem (pnpm 10.16.1 and 11.28.6, a 36.8k-file workload with a warm store) found about 610 MiB written per install on ext4 against a few MiB on XFS (`reflink=1`) or btrfs with a kernel of 5.18 or newer, where pnpm's default import method clones across the two mounts with no configuration. No provider setting was found that improves on this, so the layout is unchanged and the outcome is operator guidance: [`docs/package-store-installs.md`](../package-store-installs.md). pnpm's global virtual store would remove the copy on ext4 too but failed under concurrent installs into one shared store, so it is documented only as an opt-in with that caveat.
-
-## Amendment (2026-10-26) — the diagnostic-log prune runs at most once per interval
-
-The GC pass above runs on every `CreateInstance` and `ListInstances`, and each pass ran the diag prune (M2-W2 point 4): one helper container per diagnostic-logs volume of the controller, up to 20 per pass. GARM calls `ListInstances` often, and once per pool or scale set, each call a fresh provider process. On the reference deployment (6 diag volumes, about 8 scale sets) one burst of calls created about 25 to 30 prune helpers. With the disk already slow after a reboot, IO pressure (PSI `some`) stayed at 85 to 90% for about 8 minutes, and one helper sat in `Created` until the leaked-helper reaper took it. Retention is counted in days, so a second prune within hours deletes nothing the next one would not.
-
-**Decision.** A diag-prune round runs at most once per `diagPruneInterval` (6 hours) per controller, across provider processes. The time of the last round is kept in Docker, in a stamp: one container per controller, named `garm-diagprune-stamp-<first 16 hex of sha256(controller-id)>`, created and never started, labelled `managed=true`, `controller-id`, `role=diag-prune-stamp` and the `created-at` of the round it records. Before pruning, a pass that has diag volumes to prune and the runner image present claims the round:
-
-- no stamp: create it and prune;
-- a stamp younger than the interval: skip (the normal case for almost every pass);
-- an expired stamp: remove it by ID, create a new one, and prune;
-- a stamp whose `created-at` is missing, unparseable, or in the future: replace it **without** pruning, so the next round comes one interval later.
-
-The create is the claim. Docker refuses a second container of the same name with a 409 Conflict, so when several processes find the stamp missing or expired, exactly one creates the new stamp and prunes; the others skip. This also covers a peer that is already pruning: its stamp is fresh. The old stamp is removed by its ID, not its name, so a slow peer cannot delete the winner's new stamp. A container at the stamp's name that is not this controller's stamp (other controller-id, other role, an `instance-name`, or no labels) is never removed: the round is skipped and the container logged, following the never-touch-unprovable rule of the structural redesign above. A daemon error at any step skips the round. Every failure mode therefore delays pruning by at most an interval and never multiplies it. The strict identity re-validation before each `find -delete` (NEW-H2) and the never-fail-the-caller contract are unchanged. A round still prunes at most 20 volumes; it now visits them in random order, so with more than 20 volumes each one is reached over successive rounds.
-
-**Why 6 hours, as a constant.** The window is `diagnostic_log_retention_days` (default 7, at least 1), and a file can now outlive it by up to the interval: under 4% of the default 7 days, and 25% at the 1-day minimum. A file written just before a prune is never deleted early, because each prune is still `-mmin +<days×1440>`. Six hours caps the work at four rounds a day, however often GARM calls the provider. The other GC tunables (grace, caps, timeouts) are constants in `internal/provider/gc.go`, so this one is too, and there is no config key.
-
-**Both hooks keep running the GC.** Running the diag prune only from `CreateInstance` was considered. It does not bound the work: a burst of creates is also a burst of prunes. It also leaves a host that is only listing (an idle pool, a paused scale set) without retention. With the throttle, the hook that triggers a round no longer matters, and the reaping, stale-cache logging and cruft logging steps of the pass keep their current behaviour.
-
-**Alternatives considered.**
-
-- A timestamp or lock file on the host: the provider has no state directory in its config, and it often runs inside the GARM container with a filesystem that is ephemeral, read-only, or private to the service. A directory that cannot be written leaves two bad outcomes: a prune on every call or no prune at all. Docker access is already required, and the daemon makes the claim atomic across processes and across GARM hosts that share it.
-- Docker labels as the stamp on the diag volume itself: volume labels cannot be changed after creation.
-- A stamp file inside the diag volume: reading it needs a container per volume, which is the cost being removed.
-- A stamp volume: a volume create with an existing name returns that volume instead of failing, and a volume can only be removed by name. Two processes could then both see an expired stamp and both prune.
-- The history of prune helpers: every helper is removed as soon as it exits.
-
-**Consequences.** Each controller with at least one diag volume keeps one `Created` container (`docker ps -a` shows it). It mounts nothing, so it never blocks an operator's `docker volume prune`. It references the runner image, so after a `runner_image` change the old image stays in use for at most one interval, until the stamp is next replaced. Its role keeps it out of the leaked-helper reaper and of `ListInstances`, and without an `instance-name` the ADR-004 teardown and sweep predicate never matches it. Removing it by hand, or a `docker container prune`, is harmless: the next pass runs one round early and creates a new stamp.
-
-Tests: `internal/provider/diag_prune_throttle_test.go` (first round prunes and stamps; a burst inside the interval prunes nothing; an expired stamp prunes again; eight concurrent processes run exactly one round; a peer that creates the stamp first wins; a missing, unparseable or future `created-at` resets the stamp without pruning; a foreign container at the stamp name is left alone; daemon errors skip the round; the reaper leaves the stamp) and `internal/spec/diag_test.go` (stamp name and container shape). The live harness (`TestVerifyM2W2ExternalsGCDiag`) expires the stamp before each prune check and adds step (4c): a pass inside the interval leaves an aged file in place and keeps the same stamp.
-
-## Amendment (2026-10-26) — pnpm's metadata cache is persisted in a sub-directory of the store volume
-
-The pnpm store holds package contents. pnpm's metadata cache (package documents, and on pnpm 11 a record of lockfiles that passed its supply-chain policy check) lives under `cache-dir`, which defaults to `$XDG_CACHE_HOME/pnpm` inside the runner container and was therefore discarded with every runner. pnpm 11 reads that metadata for every lockfile entry before a frozen install, so each job re-fetched it.
-
-**Measured (lab, Docker Desktop, pnpm 11.28.8 and 10.34.9, frozen install, warm store, a public monorepo with about 1,300 lockfile entries):** pnpm 11 took 10.3 s and received 72 MB with an empty metadata cache, 3.9 s and 1.1 MB (all `304`) with a persisted cache and a lockfile not seen before, and 1.6 s with no network when the same lockfile had been verified before. pnpm 10 makes no registry request on a frozen install and took 1.3 to 2.0 s either way. 72 concurrent installs on one volume produced no errors or corrupt files (temporary file plus rename; an unreadable file is a cache miss). A lockfile change resolved identically to an empty cache. The cache is about 250 MiB per 1,100 package names and grows with distinct packages, not with jobs.
-
-**Decision.** Whenever `spec.BuildRunnerEnv` emits the store variables, that is, whenever a persistent pnpm store volume is mounted, it also emits `npm_config_cache_dir` (pnpm 10 and earlier) and `pnpm_config_cache_dir` (pnpm 11), both set to `<store mount>/metadata-cache`, in JIT and non-JIT modes. Neither is emitted otherwise. They are provider-injected names, so an `extra_specs.extra_env` entry that collides with them is dropped (ADR-005 H2). No new volume is created: the metadata has the store's repository scope, its lifecycle and its manual cleanup, and the provider still never prunes inside a volume.
-
-**Sub-directory, never the mount root.** `pnpm store prune` removes what it finds under `cache-dir`. With `cache-dir` at the store mount, pnpm 11's prune deleted the whole store in a lab run. A sub-directory confines prune to the metadata, which is re-fetched on demand; a unit test asserts the path is strictly beneath the mount. The directory is created by pnpm on first use, as the runner user, inside the store mount the entrypoint already owns (`prepare_cache_dirs` is unchanged); the live harness confirms an install as the runner user (uid 1001) creates and fills it.
-
-**Trust.** The directory is as writable by a job as the store is. A job can write a forged `lockfile-verified.jsonl` record, so later jobs of the same repository skip pnpm 11's policy check for that exact lockfile; the frozen install still verifies package integrity against the lockfile. This is the same-repository boundary this ADR already accepts for the store. Nothing crosses repositories: the volume is repo-scoped and org or enterprise sharing stays opt-in.
-
-**Staleness.** pnpm revalidates with conditional requests, so a persisted cache cannot pin a job to an old resolution. Older metadata is served only with `--prefer-offline` or, on pnpm 11, from a cache file younger than its release-age window (24 hours by default), so a `pnpm add` may see a dist-tag up to a day behind.
-
-**Known cosmetic cost.** Like `npm_config_store_dir`, `npm_config_cache_dir` makes npm 11 print an `Unknown env config "cache-dir"` warning on each npm or npx call; it can go when pnpm 10 is out of support.
-
-Guidance and numbers for operators: [`docs/package-store-installs.md`](../package-store-installs.md#the-pnpm-metadata-cache). Tests: `internal/spec/cache_wiring_test.go` (both spellings, present only with a store mount, strictly beneath it) and the `dockerverify` harness (`TestVerifyM2H4NonRootPnpmInstall`, `TestVerifyM2W1CacheHit`).
-
-## Amendment (2026-11-02) — pnpm 11 keeps its own version switches in the store volume; no provider change
-
-pnpm 11 installs a pnpm version it switches to (`pnpm self-update`, and the automatic switch to a `packageManager` or `devEngines.packageManager` pin) into its global virtual store, `<store-dir>/v11/links`, and registers the install under `<store-dir>/v11/projects`. `pnpm/action-setup` does this on every job whose requested version differs from its bootstrap. With the persistent store, both directories are on the repository's pnpm volume.
-
-**Observed (lab, Docker Desktop; the Ubuntu 24.04 runner image as linux/amd64 and a Node 24 image as linux/arm64; the provider's store and metadata-cache environment; bootstrap `@pnpm/exe` switching to pnpm 10.16.1; two consecutive jobs with fresh home directories on one store volume).** With a bootstrap older than 11.22.0 (11.5.0, 11.15.0, 11.19.0, 11.20.0 and 11.21.0 tested) the second job reuses the stored `@pnpm/exe` entry and writes the package's empty placeholder over its `pnpm` binary. That file shares an inode with the platform package's binary in `v11/links/@pnpm/linux-<arch>/...` and with its content-addressable file in `v11/files` (link count 3), so all three become 0 bytes. Every later job then runs an empty `pnpm`: `pnpm --version` prints nothing and exits 0, and `pnpm store path` returns nothing, which `actions/setup-node`'s `cache: pnpm` reports as "Could not get pnpm cache folder path". Bootstraps 11.22.0, 11.25.0 and 11.28.10 left the binary intact across jobs (11.19.0 and 11.25.0 were run on both architectures, the other versions on linux/arm64). No version repairs a damaged store, including 11.28.10 and a run after the `links` entries were deleted, because pnpm links the emptied file in `v11/files` again. `pnpm/action-setup` v6.0.10 bootstraps 11.19.0; v6.1.0 bootstraps 11.25.0.
-
-**Why the provider cannot move it with an environment variable.** pnpm 11 builds both paths from the store directory (`path.join(storeDir, 'links')` in its self-updater; the project registry under the same directory) and has no setting for either. `pnpm_config_global_virtual_store_dir` and `pnpm_config_virtual_store_dir` were set in the repro and changed nothing. The only input is `store-dir`, and the provider must keep that on the volume for the store to persist at all (M2-W1 and the 2026-10-11 amendment above).
-
-**Decision.** No change to the runner environment, the mounts or the runner image. Guidance in [`docs/package-store-installs.md`](../package-store-installs.md#pnpm-switching-its-own-version-pnpm-11-before-1122): repositories use a setup whose bootstrap is pnpm 11.22.0 or newer (`pnpm/action-setup` v6.1.0 or newer) or point the store at a job-local directory for the setup step only; operators find damaged volumes with a read-only `find` for 0-byte `pnpm` files under `v11/links/@pnpm` and remove those volumes with `docker volume rm` while the repository has no runner up. The content-addressable store, its index and the metadata cache keep being reused as before.
-
-**Alternatives considered.**
-
-- *Nested ephemeral mounts over `<store>/v11/links` and `<store>/v11/projects`.* This keeps the switch out of the volume, and since a hardlink cannot cross mounts, the switched binary would be a copy rather than a link into `v11/files`, so a defect like the one above could not damage the shared store. It is not done now. Docker creates a missing `v11` parent inside a fresh store volume as root-owned 0755 (checked: `root:root 755 /opt/pnpm-store/v11` under a tmpfs at `v11/links`), so the runner user could not create `v11/files`. Fixing that needs an entrypoint change, which means a new runner image, and makes the provider depend on the image version. It also makes the opt-in global virtual store for installs (2026-10-17 amendment) a per-job copy. Worth revisiting if another pnpm defect of this kind appears.
-- *Persisting pnpm's global directory (`pnpm_config_global_dir`) on the volume.* A later job would find the earlier install and skip the reinstall, and the `projects` links would stop dangling. It would also persist every job's `pnpm add -g`, a new kind of state on the volume beyond package content, and put pnpm's global-install bookkeeping (per-package hash links, cleanup of install directories it considers orphaned) under concurrent runners of one repository, which was not tested. It does not repair a store that is already damaged. Rejected.
-- *Having the cache GC remove `@pnpm/exe` entries with a 0-byte binary.* That alone does not repair a store (see above), and the provider does not delete inside cache volumes (2026-07-22 cache-GC safety amendment).
-
-**Consequences.** Each switching job leaves one symlink in `v11/projects` pointing into its own, discarded home directory; these do not affect installs. A repository on an old setup can still damage its own store; the damage stays within that repository's volume, as the trust boundary of this ADR already assumes.
+- Whether the toolcache generation should also follow runner minor-version bumps.
+- Whether a diagnostic-log shipping path (syslog, Loki) is worth adding.
+- The entity-scope heuristic is tested against GitHub URLs only. Other forges need their own check.
