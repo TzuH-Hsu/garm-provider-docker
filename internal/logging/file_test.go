@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -276,5 +277,36 @@ func TestConcurrentProcessesDoNotInterleaveLines(t *testing.T) {
 		if m[2] != strings.Repeat(m[1], helperPayloadN) {
 			t.Fatalf("line %d mixes writers: id=%s payload len %d", n+1, m[1], len(m[2]))
 		}
+	}
+}
+
+// TestNewWithFileAtHonoursTheGivenLevel: the detached status watcher starts
+// with an empty environment, so its level arrives as an argument. The file
+// gets exactly the records that level allows, whatever the environment says.
+func TestNewWithFileAtHonoursTheGivenLevel(t *testing.T) {
+	captureStderr(t)
+	t.Setenv(LevelEnvVar, "error")
+	path := filepath.Join(t.TempDir(), "provider.log")
+
+	l, closer := NewWithFileAt(path, slog.LevelWarn)
+	l.Info("quiet-info")
+	l.Warn("loud-warn")
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got := readFile(t, path)
+	if strings.Contains(got, "quiet-info") || !strings.Contains(got, "msg=loud-warn") {
+		t.Errorf("file = %q, want the warn record only", got)
+	}
+}
+
+func TestNewWithFileAtFallsBackToStderrOnlyAtTheGivenLevel(t *testing.T) {
+	stderr := captureStderr(t)
+	l, closer := NewWithFileAt(filepath.Join(t.TempDir(), "missing-dir", "provider.log"), slog.LevelDebug)
+	defer closer.Close()
+	l.Debug("still-here")
+	if got := stderr(); !strings.Contains(got, "msg=still-here") {
+		t.Errorf("stderr = %q, want the debug record after the file failed to open", got)
 	}
 }

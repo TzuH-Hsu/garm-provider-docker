@@ -32,7 +32,14 @@ const logFileMode os.FileMode = 0o640
 // The returned closer releases the file; it is never nil and is safe to call
 // more than once.
 func NewWithFile(path string) (*slog.Logger, io.Closer) {
-	stderrOnly := New()
+	return NewWithFileAt(path, LevelFromEnv())
+}
+
+// NewWithFileAt is NewWithFile with an explicit level instead of the
+// environment's, for a process (the detached status watcher) that does not
+// inherit the provider's environment. Everything else is identical.
+func NewWithFileAt(path string, level slog.Level) (*slog.Logger, io.Closer) {
+	stderrOnly := NewAt(level)
 
 	f, err := openLogFile(path)
 	if err != nil {
@@ -43,7 +50,7 @@ func NewWithFile(path string) (*slog.Logger, io.Closer) {
 
 	sink := &fileSink{f: f, path: path, warn: stderrOnly}
 	w := &teeWriter{primary: os.Stderr, secondary: sink}
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: LevelFromEnv()})), sink
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})), sink
 }
 
 // openLogFile opens path for appending, creating it if needed. A relative

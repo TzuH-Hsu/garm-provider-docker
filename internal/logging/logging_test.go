@@ -92,3 +92,24 @@ func TestNewIsStderrBacked(t *testing.T) {
 		t.Fatal("os.Stderr is nil in this environment")
 	}
 }
+
+func TestParseLevelMatchesLevelFromEnvAndRoundTrips(t *testing.T) {
+	for _, l := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		if got := ParseLevel(l.String()); got != l {
+			t.Errorf("ParseLevel(%q) = %v, want %v", l.String(), got, l)
+		}
+	}
+	for _, in := range []string{"", "not-a-level", "DEBUG+2"} {
+		if got := ParseLevel(in); got != slog.LevelInfo {
+			t.Errorf("ParseLevel(%q) = %v, want the info default", in, got)
+		}
+	}
+}
+
+func TestNewAtUsesTheGivenLevelNotTheEnvironment(t *testing.T) {
+	t.Setenv(LevelEnvVar, "error")
+	l := NewAt(slog.LevelDebug)
+	if !l.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("NewAt(debug) is not debug-enabled; it must ignore " + LevelEnvVar)
+	}
+}

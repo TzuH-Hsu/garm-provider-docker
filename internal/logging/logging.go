@@ -46,8 +46,15 @@ const LevelEnvVar = "GARM_PROVIDER_DOCKER_LOG_LEVEL"
 // internal/provider and internal/topology is already correctly leveled and
 // routed to stderr.
 func New() *slog.Logger {
+	return NewAt(LevelFromEnv())
+}
+
+// NewAt is New with an explicit level instead of the environment's. The
+// detached status watcher uses it: it starts with an empty environment, so the
+// level the provider resolved travels in its request.
+func NewAt(level slog.Level) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: LevelFromEnv(),
+		Level: level,
 	}))
 }
 
@@ -56,7 +63,15 @@ func New() *slog.Logger {
 // soft: a typo in an operator's env knob should not silence useful output
 // entirely, nor should it crash the provider).
 func LevelFromEnv() slog.Level {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(LevelEnvVar))) {
+	return ParseLevel(os.Getenv(LevelEnvVar))
+}
+
+// ParseLevel maps a level name (debug|info|warn|warning|error, any case,
+// surrounding space ignored) to a slog.Level, defaulting to LevelInfo for
+// anything else. slog.Level.String() output for the four standard levels
+// round-trips through it.
+func ParseLevel(name string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "debug":
 		return slog.LevelDebug
 	case "warn", "warning":

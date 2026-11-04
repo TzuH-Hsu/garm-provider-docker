@@ -326,9 +326,11 @@ logs a warning (token redacted) and still succeeds. If the `installing` report
 fails, the watcher does not wait for the runner. A watcher that gives up
 (timeout, or the runner container stopped) reports `installing` once more with
 a message saying why, so the outcome is visible in GARM's instance events
-(`garm-cli runner show`). The watcher's own output goes nowhere (its stdout and
-stderr are `/dev/null`, so it never holds GARM's pipes open); GARM's events and
-the runner status are where its result shows.
+(`garm-cli runner show`). The watcher's stdout and stderr are `/dev/null`, so it
+never holds GARM's pipes open. Its warnings (a failed status report, for
+example) go to the [`[logging]` file](#logging-persistent-log-file) when one is
+set; otherwise they are discarded, and GARM's events and the runner status are
+where its result shows.
 
 **Interaction with GARM's provider timeouts.** GARM v0.2.1 puts no deadline on
 a provider's `CreateInstance` call. Newer GARM (from
@@ -437,9 +439,15 @@ How it behaves:
   line and any failure to read GARM's environment or to load the config are
   logged before that point and go to stderr only. Every line after the config
   loads, including `command completed`, goes to both.
-- **The status watcher is not covered.** The detached watcher (see
-  `[status_report]`) never loads this config and keeps its output on
-  `/dev/null`; its results appear in GARM's instance events instead.
+- **The status watcher logs here too.** The detached watcher (see
+  `[status_report]`) never loads this config and has no environment, so
+  `CreateInstance` hands it the `file` path and the log level over the same
+  private pipe as the rest of its request. It appends to the file like any other
+  provider process (same format, same `O_APPEND` writes, safe with
+  `copytruncate`), at the level the creating call used. It never logs the
+  instance token or the callback URL. If the file cannot be opened the watcher
+  carries on without logging, and its results still appear in GARM's instance
+  events. With `file` unset its output stays on `/dev/null`.
 - **Concurrent calls.** GARM may run several provider processes at once. Each
   record is written with a single `write(2)` on an `O_APPEND` descriptor, which
   local Linux filesystems apply atomically, so lines from different processes do

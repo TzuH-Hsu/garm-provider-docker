@@ -99,7 +99,8 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 	}
 
 	// Validate the callback URL here (no network I/O) so a bad URL is logged
-	// by CreateInstance instead of by a watcher whose output is discarded.
+	// by CreateInstance, with the call's own logger, rather than by the
+	// watcher (whose output is discarded unless [logging] file is set).
 	if _, err := metadata.NewStatusReporter(b.CallbackURL, b.InstanceToken, b.CACertBundle); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: cannot report runner status: invalid callback URL (continuing)",
 			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
@@ -115,6 +116,10 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		CACertBundle:  b.CACertBundle,
 		Deadline:      time.Now().Add(sr.Timeout()),
 		ProxyEnv:      currentProxyEnv(),
+	}
+	if file := p.cfg.Logging.File; file != "" {
+		req.LogFile = file
+		req.LogLevel = logging.LevelFromEnv().String()
 	}
 	if err := p.spawnStatusWatcher(ctx, req); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: could not start the runner status watcher; the runner stays installing (continuing)",
