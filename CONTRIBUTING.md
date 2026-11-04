@@ -93,7 +93,9 @@ or `copilot/...`.
 - Explain the problem and how you tested the fix.
 - Add tests for behaviour changes. Update the docs when behaviour or
   configuration changes.
-- CI must pass. Pull requests are merged by rebase, so keep the commits clean.
+- CI must pass, and review threads must be resolved.
+- Pull requests are squash-merged. The PR title and description become the
+  commit, so write the title in the commit form above.
 
 ## AI tools
 
