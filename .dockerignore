@@ -1,6 +1,6 @@
-# Build-context filter for the root Dockerfile (M4-W1 provider image).
-# Keeps .git, docs, and non-Go tooling out of the `COPY . .` layer so the
-# image build doesn't needlessly pull in or cache-bust on unrelated changes.
+# Build-context filter for the root Dockerfile. Keeps .git, docs and non-Go
+# tooling out of the `COPY . .` layer so unrelated changes do not bust the
+# build cache.
 
 .git
 .github
@@ -19,25 +19,15 @@ coverage.*
 
 # --- Credential deny patterns ---------------------------------------------
 #
-# The Dockerfile's `COPY . .` copies the WORKING TREE, not what git tracks.
-# An operator building this image from their own checkout may have untracked
-# local secrets sitting beside the module — a .env, a private key, a client
-# certificate, a kubeconfig — and every one of them would otherwise land in
-# the builder stage's layer and in the local BuildKit cache (which
-# `docker buildx build --cache-to` exports wholesale). The final distroless
-# stage copies only the compiled binary, so nothing reaches the published
-# image, but the builder layer and the build cache are real exposure.
+# `COPY . .` copies the working tree, not what git tracks, so untracked local
+# secrets (.env, keys, certificates, kubeconfig) would land in the builder
+# layer and the BuildKit cache. The final distroless stage copies only the
+# binary, so the published image is unaffected.
 #
-# These are a fail-safe, not a licence to keep secrets in the repo directory.
-#
-# NOTE ON MATCHING: .dockerignore patterns are matched against the path
-# relative to the context root and are NOT recursive unless the pattern says
-# so — `*.pem` excludes `./key.pem` but not `./certs/key.pem`. Hence the
-# explicit `**/` variants below for extensions that can only ever be
-# credential material. Patterns that could plausibly collide with Go source
-# (`credentials*`, `secrets*` — cf. the tracked internal/metadata/
-# credentials.go) are deliberately left ROOT-ONLY. Do not blindly add `**/`
-# to those; it would exclude source files and break the build.
+# Patterns are not recursive unless they say so: `*.pem` excludes `./key.pem`
+# but not `./certs/key.pem`, hence the `**/` variants below. `credentials*`
+# and `secrets*` stay root-only because they would match Go source such as
+# internal/metadata/credentials.go. Do not add `**/` to them.
 .env
 .env.*
 **/.env
