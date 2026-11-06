@@ -38,7 +38,7 @@
 
 GARM handles GitHub authentication, scale sets and scheduling. This provider
 is the small executable GARM runs to create and remove runners. Give it a
-machine with Docker and you have self-hosted runners that start clean for
+machine with Docker and you have self-hosted runners with fresh resources for
 every job.
 
 ## Highlights
@@ -60,15 +60,21 @@ every job.
 ## Why Docker?
 
 Pick this provider when you have one machine with Docker, you run jobs from
-your own repositories, and you want clean runners without operating a
-hypervisor or a cluster.
+your own repositories, and you want fresh resources for every job without
+operating a hypervisor or a cluster.
 
-| If you need | Consider |
-|---|---|
-| Clean runners on one Docker host, for repositories you control | **This provider** |
-| Stronger isolation between job code and the host | A provider that can run VMs, such as [LXD](https://github.com/cloudbase/garm-provider-lxd), [Incus](https://github.com/cloudbase/garm-provider-incus) or a cloud provider |
-| Runners inside an existing Kubernetes cluster | [garm-provider-k8s](https://github.com/mercedes-benz/garm-provider-k8s) |
-| Capacity beyond one machine | A [cloud or multi-host provider](https://github.com/cloudbase/garm/blob/main/doc/providers.md) |
+> [!WARNING]
+> **Containers are not a security boundary against malicious job code.**
+> Runners share the host's kernel, unlike VM-based providers. With
+> `privileged-sidecar`, any job can get root on the host. Use this provider only
+> for repositories whose workflows you trust, and never for public repositories
+> or fork pull requests. See [Security and trust boundary](#security-and-trust-boundary).
+
+| Provider type | What separates a job from the host | Good fit |
+|---|---|---|
+| **Docker container (this provider)** | Shares the host's kernel. `privileged-sidecar` gives jobs a route to the host | One machine, repositories you control |
+| Kubernetes pod ([garm-provider-k8s](https://github.com/mercedes-benz/garm-provider-k8s)) | Shares the node's kernel, unless the cluster uses a sandboxed runtime | An existing Kubernetes cluster |
+| VM ([LXD](https://github.com/cloudbase/garm-provider-lxd) or [Incus](https://github.com/cloudbase/garm-provider-incus) VMs, [cloud providers](https://github.com/cloudbase/garm/blob/main/doc/providers.md)) | Its own kernel, behind a hypervisor | Stronger isolation, or capacity beyond one machine |
 
 ## Quick start
 
