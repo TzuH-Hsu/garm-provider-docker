@@ -1,20 +1,17 @@
 //go:build dockerverify
 
-// Package verify holds the M1-WP2 real-daemon verification harness. It is
-// gated behind the `dockerverify` build tag so it never runs in the normal
-// `go test ./...` gate: it requires a live Docker daemon and builds/pulls
-// images, and (since the 2026-07-21 internal=false default, ADR-001's
-// Amendment) outbound internet access from the Docker host, since it
-// verifies real egress to api.github.com rather than merely asserting a
-// network's Internal flag. Run it explicitly against a real daemon with:
+// Package verify is the live-daemon integration suite. It sits behind the
+// `dockerverify` build tag, so `go test ./...` skips it: it needs a real Docker
+// daemon, builds and pulls images, and needs outbound internet access from the
+// Docker host, because it checks real egress to api.github.com instead of
+// reading a network's Internal flag. Run it explicitly:
 //
 //	go test -tags dockerverify -v -run TestVerifyM1WP2Allocation ./internal/verify/
 //
-// It drives the REAL provider binary (built here) through a full none-mode
-// allocation, with a local fake metadata HTTPS server and a tiny sleep-
-// entrypoint runner image, and asserts the ADR-001/ADR-004 topology on the live
-// daemon. Every resource it creates is scoped to a unique controller-id and
-// torn down at the end; it never touches foreign resources.
+// The tests drive the real provider binary, built here, against a local fake
+// metadata HTTPS server and a small sleep-entrypoint runner image. Each test
+// scopes what it creates to a unique controller ID, tears it down at the end, and
+// checks that containers it did not create are untouched.
 package verify
 
 import (
@@ -49,11 +46,10 @@ const (
 // jobNetworkName must match internal/spec's stable claim-marker network name.
 func jobNetworkName() string { return instanceName + "-net" }
 
-// volumeNameByResource discovers a managed volume's ACTUAL name by its
-// controller-id + resource labels. As of F4 the workspace/socket/dind-state
-// volume names embed the allocation's create-nonce (<instance>-<nonce>-<kind>),
-// which the harness does not know up front, so it must resolve the name by label
-// rather than reconstruct it. It fails unless exactly one volume matches.
+// volumeNameByResource returns the name of the one managed volume with the given
+// controller-id and resource labels, and fails unless exactly one matches. Volume
+// names embed the allocation's create nonce (<instance>-<nonce>-<kind>), which the
+// test cannot know in advance.
 func volumeNameByResource(t *testing.T, controllerID, resource string) string {
 	t.Helper()
 	out := dockerOut(t, "volume", "ls",
@@ -89,8 +85,8 @@ func randControllerID(t *testing.T) string {
 	return "wp2-verify-" + hex.EncodeToString(b[:])
 }
 
-// dockerOut runs `docker <args...>` and returns trimmed stdout, failing on
-// error. It is the read-mostly inspection channel that produces the evidence.
+// dockerOut runs `docker <args...>` and returns trimmed stdout, failing the test
+// on error.
 func dockerOut(t *testing.T, args ...string) string {
 	t.Helper()
 	out, err := dockerTry(args...)
@@ -141,22 +137,11 @@ func caBundlePEM(t *testing.T, srv *httptest.Server) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 }
 
-// hostOSArch maps the harness process's own GOARCH onto the params.OSArch
-// value GARM would carry in a BootstrapInstance for this host, and is what
-// every bootstrap payload in this package uses.
-//
-// It is deliberately NOT a hardcoded params.Amd64: this harness drives the
-// REAL provider binary against the LOCAL Docker daemon, so a hardcoded arch
-// meant that on an arm64 host the live suite asserted an amd64 allocation
-// while the daemon actually ran arm64 containers — the linux/arm64 support
-// the project advertises was never proven end to end by any live run. Using
-// the runtime arch makes each host's suite exercise that host's real
-// platform.
-//
-// An unrecognised GOARCH panics rather than falling back to amd64: a silent
-// fallback here would be a false PASS claiming a platform was verified when
-// it was not. Only the two platforms this project ships binaries and images
-// for are accepted.
+// hostOSArch maps the test process's GOARCH to the params.OSArch that GARM would
+// put in a BootstrapInstance for this host. The suite runs the provider against
+// the local daemon, so a fixed arch would test a platform the daemon is not
+// running. Any GOARCH other than amd64 and arm64 panics: falling back to amd64
+// would report a platform as verified when it was not.
 func hostOSArch() params.OSArch {
 	switch runtime.GOARCH {
 	case "amd64":
@@ -183,18 +168,16 @@ func bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	}
 }
 
-// runProvider execs the REAL provider binary with the GARM execution
-// environment and (for CreateInstance) a stdin bootstrap payload, returning the
-// stdout and the process exit code (which the provider maps from its error via
-// execution.ResolveErrorToExitCode: duplicate=31, not-found=30).
+// runProvider runs the provider binary with the GARM execution environment and,
+// for CreateInstance, a bootstrap payload on stdin. It returns stdout and the
+// exit code: 31 for a duplicate instance and 30 for a missing one, as mapped by
+// execution.ResolveErrorToExitCode.
 func runProvider(t *testing.T, bin, configFile, controllerID, command, instanceID string, b *params.BootstrapInstance) (string, int) {
 	stdout, _, code := runProviderIO(t, bin, configFile, controllerID, command, instanceID, b)
 	return stdout, code
 }
 
-// runProviderIO is runProvider but also returns the provider's STDERR, where its
-// log.Printf lines (e.g. the log-only GC's stale-cache operator-visibility line)
-// go — so a live test can assert on them.
+// runProviderIO is runProvider plus the provider's stderr, where its log lines go.
 func runProviderIO(t *testing.T, bin, configFile, controllerID, command, instanceID string, b *params.BootstrapInstance) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(bin)
@@ -232,22 +215,24 @@ func runProviderIO(t *testing.T, bin, configFile, controllerID, command, instanc
 	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), exitCode
 }
 
+// TestVerifyM1WP2Allocation runs the full create, duplicate-create, delete,
+// repeat-delete and failed-create sequence against a real daemon. It proves the
+// job network, workspace volume, runner security properties, exit codes and
+// zero-orphan teardown, and that unrelated containers stay untouched. Only a real
+// daemon can show the actual network, mount and sysctl state, and real egress.
 func TestVerifyM1WP2Allocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
 
-	// --- foreign-resource snapshot (must be untouched throughout) ------------
 	foreignBefore := dockerOut(t, "ps", "-a", "--format", "{{.Names}}")
 	t.Logf("[snapshot] containers before:\n%s", foreignBefore)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
 
-	// --- build the sleep runner image ----------------------------------------
 	imageTag := "garm-wp2-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
 
-	// --- build the REAL provider binary --------------------------------------
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = root
@@ -255,18 +240,14 @@ func TestVerifyM1WP2Allocation(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// --- provider config (unpinned local sleep image) ------------------------
 	configDir := t.TempDir()
 	configFile := filepath.Join(configDir, "config.toml")
-	// [network] is deliberately omitted so this run exercises config.Load's
-	// actual defaults (ADR-001, amended 2026-07-21): enable_job_network=true,
-	// internal=false. See TestVerifyOwnerRulingEgressAndIsolation for the
-	// internal=true opt-in path and the cross-allocation isolation check.
-	// [cache] enabled = false: this test verifies the M1 allocation topology and
-	// teardown in isolation. The M2 persistent cache defaults ON, and its
-	// repo-scoped cache volumes deliberately SURVIVE DeleteInstance, so leaving it
-	// on would make them show up in the post-delete "zero managed resources"
-	// assertions below (those caches are covered by TestVerifyM2W1CacheHit).
+	// [network] is omitted so the run uses config.Load's defaults:
+	// enable_job_network=true, internal=false (ADR-001). The internal=true opt-in
+	// is covered by TestVerifyOwnerRulingEgressAndIsolation.
+	// The cache is off because repo-scoped cache volumes survive DeleteInstance and
+	// would break the zero-managed-resources assertions below.
+	// TestVerifyM2W1CacheHit covers the cache.
 	writeFile(t, configFile, fmt.Sprintf(`docker_host = "unix:///var/run/docker.sock"
 runner_image = %q
 allow_unpinned_runner_image = true
@@ -275,22 +256,17 @@ allow_unpinned_runner_image = true
 enabled = false
 `, imageTag))
 
-	// --- fake metadata HTTPS server ------------------------------------------
 	srv := newMetadataServer(t)
 	defer srv.Close()
 	caBundle := caBundlePEM(t, srv)
 
-	// Cleanup: label-scoped teardown of everything for THIS controller-id, plus
-	// a leftover assertion. Never touches foreign resources.
 	defer func() {
 		cleanupController(t, controllerID)
 		assertForeignPresent(t, canaries[0])
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	// =========================================================================
 	// CreateInstance
-	// =========================================================================
 	b := bootstrap(srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
@@ -320,16 +296,14 @@ enabled = false
 		t.Errorf("(a) job network labels incorrect: %s", netLabels)
 	}
 
-	// (f) network is internal:false (no [network] block => config.Load's
-	// default, ADR-001 amended 2026-07-21) — the job network has a normal
+	// (f) With no [network] block the job network is internal=false, so it has a
 	// route to the external network.
 	if netInternal != "false" {
 		t.Errorf("(f) job network Internal=%s, want false (2026-07-21 owner ruling default)", netInternal)
 	}
-	// Stronger proof: the runner must actually be able to reach the public
-	// internet — this is the whole point of the default flip (a real runner
-	// needs this to register with GitHub; DinD needs it for registry pulls).
-	// Bounded so it cannot hang.
+	// A runner needs real egress to register with GitHub, and DinD needs it for
+	// registry pulls, so check reachability, not just the flag. The wget timeout
+	// keeps it from hanging.
 	egressOut, egressErr := dockerTry("exec", containerID, "sh", "-c", "wget -qO- -T 5 https://api.github.com/zen")
 	if egressErr != nil {
 		t.Errorf("(f) runner could NOT reach the external network on an internal=false job network: %v\n%s", egressErr, egressOut)
@@ -337,8 +311,8 @@ enabled = false
 		t.Logf("[f] outbound egress works on the default internal=false network; api.github.com/zen replied: %q", strings.TrimSpace(egressOut))
 	}
 
-	// (b) workspace volume exists, labeled, mounted at the runner workdir. Its
-	// name is generation-nonce-embedded (F4), so discover it by label.
+	// (b) The workspace volume exists, is labeled, and is mounted at the runner
+	// workdir. Its name embeds the create nonce, so look it up by label.
 	wsVol := volumeNameByResource(t, controllerID, "workspace")
 	volLabels := dockerOut(t, "volume", "inspect", wsVol, "-f",
 		"managed={{index .Labels \"garm.docker/managed\"}} resource={{index .Labels \"garm.docker/resource\"}} instance={{index .Labels \"garm.docker/instance-name\"}}")
@@ -353,17 +327,15 @@ enabled = false
 		t.Errorf("(b) workspace volume labels incorrect: %s", volLabels)
 	}
 
-	// ::1 is never usable as `localhost` in the runner, so a server bound to
-	// localhost lands on 127.0.0.1, which clients that skip ::1 can reach.
-	// Normally the runner carries the IPv6 sysctl and lo has IPv6 disabled. On
-	// a Docker host whose kernel has no IPv6 the daemon cannot apply the
-	// sysctl, the provider recreates the runner without it, and
-	// /proc/sys/net/ipv6 is absent: ::1 cannot exist, so that is reported, not
-	// failed. If the daemon refused the sysctl for another reason, the provider
-	// also retries without it but warns that IPv6 may remain enabled; that
-	// degraded case fails here by name. /etc/hosts is only logged: Engine 25
-	// and earlier keep a dead `::1 localhost` line even with the sysctl, while
-	// 26+ omits it.
+	// ::1 must not be usable as `localhost` in the runner, so a server bound to
+	// localhost lands on 127.0.0.1, which clients that skip ::1 can reach. Normally
+	// the runner carries the IPv6 sysctl and lo has IPv6 disabled. On a host whose
+	// kernel has no IPv6 the daemon cannot apply the sysctl, the provider recreates
+	// the runner without it, and /proc/sys/net/ipv6 is absent: ::1 cannot exist, so
+	// that is reported, not failed. If the daemon refused the sysctl for another
+	// reason, the provider also retries without it and warns that IPv6 may stay
+	// enabled; that case fails here. /etc/hosts is only logged: Engine 25 and
+	// earlier keep a dead `::1 localhost` line even with the sysctl, and 26+ omits it.
 	ipv6Sysctl := dockerOut(t, "inspect", containerID, "-f", "{{index .HostConfig.Sysctls \"net.ipv6.conf.all.disable_ipv6\"}}")
 	loOut, loErr := dockerTry("exec", containerID, "sh", "-c", "if [ -d /proc/sys/net/ipv6 ]; then cat /proc/sys/net/ipv6/conf/lo/disable_ipv6; else echo absent; fi")
 	loIPv6 := strings.TrimSpace(loOut)
@@ -386,7 +358,7 @@ enabled = false
 	hostsFile, _ := dockerTry("exec", containerID, "cat", "/etc/hosts")
 	t.Logf("[ipv6] sysctl=%q lo.disable_ipv6=%s; /etc/hosts (informational):\n%s", ipv6Sysctl, loIPv6, hostsFile)
 
-	// M0 security: no host docker.sock mount, no token/metadata in env.
+	// The runner has no host docker.sock mount and no token or metadata URL in its env.
 	mounts := dockerOut(t, "inspect", containerID, "-f", "{{json .Mounts}}")
 	if strings.Contains(mounts, "/var/run/docker.sock") {
 		t.Errorf("[security] runner has a host docker.sock mount: %s", mounts)
@@ -397,7 +369,8 @@ enabled = false
 	}
 	t.Logf("[security] no host socket mount; no token/metadata-url in env (M0 property preserved)")
 
-	// credential delivery landed in the tmpfs (files present, contents not printed).
+	// The credential files landed in the tmpfs. Only their presence is checked,
+	// so the contents never reach the log.
 	credLs, _ := dockerTry("exec", containerID, "ls", "-la", "/run/garm")
 	t.Logf("[creds] /run/garm listing:\n%s", credLs)
 	for _, f := range []string{"runner", "credentials", "credentials_rsaparams", ".delivered"} {
@@ -406,9 +379,7 @@ enabled = false
 		}
 	}
 
-	// =========================================================================
-	// (c) duplicate create → exit 31, first allocation intact
-	// =========================================================================
+	// (c) A duplicate create exits 31 and leaves the first allocation intact.
 	b2 := bootstrap(srv.URL, caBundle)
 	dupOut, dupCode := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b2)
 	if dupCode != 31 {
@@ -416,7 +387,6 @@ enabled = false
 	} else {
 		t.Logf("[c] duplicate CreateInstance correctly returned exit 31")
 	}
-	// The first allocation is intact.
 	if _, err := dockerTry("inspect", containerID); err != nil {
 		t.Errorf("(c) first runner container removed by the duplicate attempt: %v", err)
 	}
@@ -424,24 +394,19 @@ enabled = false
 		t.Errorf("(c) first job network removed by the duplicate attempt: %v", err)
 	}
 
-	// =========================================================================
-	// (d) DeleteInstance removes container+network+volume; repeat → exit 30
-	// =========================================================================
+	// (d) DeleteInstance removes the container, network and volume; a repeat exits 30.
 	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", instanceName, nil)
 	if delCode != 0 {
 		t.Errorf("(d) DeleteInstance exit=%d, want 0", delCode)
 	}
 	assertGone(t, "container", "inspect", containerID)
 	assertGone(t, "network", "network", "inspect", jobNetworkName())
-	// wsVol was discovered above (its generation-nonce name), so assert that
-	// exact volume is gone.
 	assertGone(t, "volume", "volume", "inspect", wsVol)
 	t.Logf("[d] DeleteInstance removed container + network + volume")
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("(d) %d managed resources remain for this controller after delete, want 0", n)
 	}
 
-	// Idempotent repeat → exit 30.
 	_, del2Code := runProvider(t, bin, configFile, controllerID, "DeleteInstance", instanceName, nil)
 	if del2Code != 30 {
 		t.Errorf("(d) repeat DeleteInstance exit=%d, want 30 (already gone)", del2Code)
@@ -449,9 +414,7 @@ enabled = false
 		t.Logf("[d] repeat DeleteInstance correctly returned exit 30")
 	}
 
-	// =========================================================================
-	// (e) creation guard: a bad-metadata create leaves zero orphans
-	// =========================================================================
+	// (e) A create whose metadata fetch fails leaves zero orphans.
 	badBundle := bootstrap(srv.URL, caBundle)
 	badBundle.InstanceToken = "wrong-token" // metadata server returns 401 → fetch fails
 	guardOut, guardCode := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &badBundle)
@@ -460,16 +423,14 @@ enabled = false
 	} else {
 		t.Logf("[e] bad-metadata CreateInstance failed as expected (exit=%d)", guardCode)
 	}
-	// The creation guard must have rolled back the claim network + workspace
-	// volume it created before the failed fetch.
+	// The failed create must have rolled back the claim network and workspace
+	// volume it made before the fetch.
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("(e) creation guard left %d orphaned resources, want 0", n)
 	} else {
 		t.Logf("[e] creation guard left zero orphaned resources of any kind")
 	}
 }
-
-// --- helpers -----------------------------------------------------------------
 
 func buildSleepImage(t *testing.T, tag string) {
 	t.Helper()
@@ -495,57 +456,31 @@ func assertForeignPresent(t *testing.T, name string) {
 	}
 }
 
-// foreignCanaryImage is the image ensureForeignCanaries runs its canaries
-// from. alpine:3.20 is already a hard dependency of this suite
-// (buildSleepImage's Dockerfile is `FROM alpine:3.20`), so this introduces no
-// new external image for the harness to pull.
+// foreignCanaryImage is already a dependency of the suite: buildSleepImage's
+// Dockerfile starts from it.
 const foreignCanaryImage = "alpine:3.20"
 
-// foreignCanaryPrefix names every canary ensureForeignCanaries ever creates.
-// The helper itself never deletes anything by name or by this prefix (see
-// below) — it exists purely so a leftover canary from an aborted run can
-// still be FOUND for manual removal: `docker ps -a --filter
-// name=garm-verify-foreign-canary-`.
+// foreignCanaryPrefix names every canary. Nothing is ever deleted by name or by
+// this prefix; it only lets a canary left by an aborted run be found with
+// `docker ps -a --filter name=garm-verify-foreign-canary-` and removed by hand.
 const foreignCanaryPrefix = "garm-verify-foreign-canary-"
 
-// ensureForeignCanaries creates two long-lived containers that this suite
-// itself owns, standing in for the "foreign" (pre-existing, unrelated)
-// resources every test in this package must prove it never touches.
+// ensureForeignCanaries creates two long-lived containers owned by the suite. They
+// stand in for the unrelated containers that every test must prove it never
+// touches, so the suite does not depend on what else runs on the host.
 //
-// Previously the suite depended on pre-existing, host-specific containers,
-// which made every test fail on any host that lacked them — a contributor's
-// machine, a fresh Docker Desktop install, or CI's manual dockerverify job
-// (.github/workflows/ci.yml). Owning the canaries makes the suite
-// self-contained instead.
+// The canaries carry no garm.docker/* labels, so no label-keyed filter used by the
+// provider or by cleanupController can match them. Names are unique per call,
+// because the suite does not promise that only one run uses a host at a time, and
+// a fixed name could not tell this call's canary from another run's.
 //
-// The canaries carry NO garm.docker/* labels of any kind, so no filter this
-// provider or cleanupController (below) uses — every one keyed on some
-// garm.docker/* label, see internal/spec/labels.go — can ever match them.
+// t.Cleanup removes each canary by the container ID that `docker run` printed,
+// never by name, so only a container this call created is deleted. The cleanup is
+// registered before the first create, so a failure partway through still removes
+// what exists. A failed removal is logged, not fatal.
 //
-// Names are unique PER CALL (garm-verify-foreign-canary-<8 hex>-a/-b, the hex
-// from crypto/rand, one value shared by the pair), not fixed: this suite
-// makes no promise that only one dockerverify invocation runs against a host
-// at a time, and a fixed name cannot distinguish "the canary this call
-// created" from a foreign container squatting the same name, or a concurrent
-// run's own canary.
-//
-// t.Cleanup removes each canary strictly by the container ID captured from
-// `docker run`'s own output — never by name — so this helper only ever
-// deletes a container it has proven, by ID, to have created itself. Cleanup
-// is registered BEFORE any container is created, over a slice that
-// accumulates an ID as each create succeeds, so a failure partway through the
-// pair still reaps whatever was already created rather than leaking it; a
-// removal failure is logged (t.Logf) rather than silently dropped or failing
-// the test. A canary abandoned by a run killed before its own t.Cleanup could
-// fire is therefore not auto-reclaimed, but stays discoverable by its
-// garm-verify-foreign-canary- name prefix for manual removal (`docker ps -a
-// --filter name=garm-verify-foreign-canary-` then `docker rm -f`).
-//
-// Cleanup ordering: t.Cleanup only runs after the test function itself (and
-// every `defer` it registered) has returned — a guarantee of the testing
-// package, not something coordinated here — so every teardown `defer` in
-// this package's tests that asserts the canaries are still present always
-// runs before this removal.
+// t.Cleanup runs after the test and all its defers, so the teardown defers that
+// assert the canaries are present run before they are removed.
 func ensureForeignCanaries(t *testing.T) []string {
 	t.Helper()
 	var suffixBytes [4]byte
@@ -580,16 +515,9 @@ func ensureForeignCanaries(t *testing.T) []string {
 // runForeignCanary runs `docker run -d --name name <foreignCanaryImage> sleep
 // infinity` and returns the container ID docker printed on success.
 //
-// It deliberately does NOT use dockerTry, which merges stdout and stderr into
-// one buffer: `docker run` writes an "Unable to find image ... Pulling from
-// ..." progress trace to STDERR whenever the image is not already cached — a
-// fresh Docker Desktop, a CI runner, exactly the hosts self-owned canaries
-// are meant to work on, and several callers of ensureForeignCanaries run
-// before buildSleepImage has pulled anything — while the container ID is the
-// ONLY thing `docker run` ever prints to STDOUT. Merging the two would
-// corrupt the captured "ID" with that pull trace and fail the hex-ID check
-// below on exactly the hosts this change targets, so stdout and stderr are
-// captured into separate buffers here and only stdout is parsed as the ID.
+// It does not use dockerTry, which merges stdout and stderr: when the image is not
+// cached, `docker run` writes a pull trace to stderr, and merging it would corrupt
+// the ID that is the only thing printed to stdout. Only stdout is parsed as the ID.
 func runForeignCanary(name string) (string, error) {
 	cmd := exec.Command("docker", "run", "-d", "--name", name, foreignCanaryImage, "sleep", "infinity")
 	var stderr bytes.Buffer
@@ -615,8 +543,8 @@ func assertGone(t *testing.T, kind string, args ...string) {
 	}
 }
 
-// controllerResourceCount counts every managed container/network/volume for a
-// controller-id, used to assert zero leftovers.
+// controllerResourceCount counts the managed containers, networks and volumes
+// labeled with controllerID, to assert nothing is left over.
 func controllerResourceCount(t *testing.T, controllerID string) int {
 	t.Helper()
 	label := "label=garm.docker/controller-id=" + controllerID
@@ -627,9 +555,9 @@ func controllerResourceCount(t *testing.T, controllerID string) int {
 		}
 		return len(strings.Split(out, "\n"))
 	}
-	// The throttle stamps (never-started containers kept on purpose so the sweep,
-	// the GC and the diag prune run at most once per interval) are not allocation
-	// resources and do not count.
+	// The throttle stamps are never-started containers kept on purpose so the
+	// sweep, the GC and the diagnostics prune run at most once per interval. They
+	// are not allocation resources and are not counted.
 	c := 0
 	for _, role := range lines(dockerOut(t, "ps", "-a", "--filter", label, "--format", `{{.Label "garm.docker/role"}}`)) {
 		if role != spec.RoleThrottleStamp && role != spec.RoleDiagPruneStamp {
@@ -641,8 +569,8 @@ func controllerResourceCount(t *testing.T, controllerID string) int {
 	return c + n + v
 }
 
-// cleanupController removes every resource for a controller-id, label-scoped, so
-// the harness never leaves anything behind and never touches foreign resources.
+// cleanupController removes every resource labeled with controllerID and nothing
+// else.
 func cleanupController(t *testing.T, controllerID string) {
 	t.Helper()
 	label := "label=garm.docker/controller-id=" + controllerID

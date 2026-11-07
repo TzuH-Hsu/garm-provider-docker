@@ -1,35 +1,26 @@
 //go:build dockerverify
 
-// This file adds the M2 codex round-2 cross-family real-daemon verification for
-// the cache ensure/seed/mount/GC coordination fixes:
+// Cache ensure, seed, mount and GC coordination against a real daemon.
 //
-//   - NEW-H1 (happy path): normal cache-enabled allocations create-then-REUSE
-//     their warm caches; a valid warm cache is never spuriously deleted by the
-//     post-create revalidation (the error-injection fail-closed path is unit
-//     verified — a transient inspect cannot be injected through the CLI binary).
+//   - A cache-enabled allocation reuses its warm caches, and a valid warm cache is
+//     not deleted by the post-create revalidation. Failing closed on a transient
+//     inspect error is unit-tested, because the CLI binary cannot inject one.
 //
-//   - H3b: the externals volume is fully SEEDED BEFORE THE RUNNER STARTS — the
-//     running runner can execute a Node binary THROUGH the read-only externals
-//     mount (a half-populated tree would fail), proving the provider seeds to
-//     completion before ContainerCreate; and the always-run flocked seed is
-//     IDEMPOTENT — a second same-digest allocation's seeder is a fast
-//     flock+marker no-op that does NOT re-copy (the .garm-seeded marker's mtime
-//     is byte-identical across the two allocations, and exactly one externals
-//     volume exists).
+//   - The externals volume is fully seeded before the runner starts: the running
+//     runner executes a Node binary through the read-only externals mount, which a
+//     half-populated tree would fail. The flocked seed is idempotent: a second
+//     allocation with the same digest does not re-copy, so the .garm-seeded
+//     marker's mtime is unchanged and exactly one externals volume exists.
 //
-//   - H3c: the diag-prune helper's pin-then-validate discipline does not wedge
-//     the deterministic diag name on a real daemon — after a GC pass runs the
-//     prune helper, the diag volume STILL carries its full identity labels (it is
-//     the labeled cache, not an unlabeled auto-created orphan), and a subsequent
-//     allocation for the same repo gets a diag cache HIT (the name remains
-//     adoptable, never wedged). The auto-create-during-helper-create RACE reap is
-//     unit verified (it cannot be injected deterministically through the binary).
+//   - The diagnostics prune helper does not wedge the deterministic diag volume
+//     name: after a GC pass the diag volume still carries its identity labels, and
+//     the next allocation for the repo gets a cache hit. The race with a volume
+//     auto-created during the helper's create is unit-tested, because it cannot be
+//     injected deterministically through the binary.
 //
-// Isolation: a unique controller-id + unique repo_url; cleanup is label-scoped
-// plus explicit removal of this run's cache volumes, asserted by a before/after
-// volume snapshot. It NEVER touches this suite's self-owned foreign-canary
-// containers (see ensureForeignCanaries in verify_test.go) or any other
-// foreign resource.
+// Each run uses a unique controller ID and repo URL, cleans up by label plus
+// explicit removal of its own cache volumes, and compares a before/after volume
+// snapshot, so it never touches foreign volumes or containers.
 //
 // Run with: go test -tags dockerverify -v -run TestVerifyRound2 ./internal/verify/
 package verify
@@ -110,10 +101,7 @@ stale_cache_eviction_days = 30
 		}
 	}()
 
-	// =========================================================================
-	// (H3b) seeded BEFORE the runner starts: run a1 and prove the RUNNING runner
-	// executes Node THROUGH the read-only externals mount.
-	// =========================================================================
+	// The runner must execute Node through the read-only externals mount.
 	b1 := cacheBootstrapPayload("r2-job-a1", repoURL, srv.URL, caBundle)
 	if out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b1); code != 0 {
 		t.Fatalf("job a1 CreateInstance exit=%d, want 0; stdout=%s", code, out)
@@ -123,9 +111,9 @@ stale_cache_eviction_days = 30
 	if src := mountSource(t, "r2-job-a1", spec.RunnerExternalsDir); src != extVol {
 		t.Fatalf("(H3b) r2-job-a1 externals mount = %q, want the seeded %q", src, extVol)
 	}
-	// A Node binary is executable THROUGH the read-only externals mount inside the
-	// LIVE runner — proof the volume was fully seeded (perms preserved by cp -a)
-	// BEFORE the runner started; a half-populated mount would have no node binary.
+	// Node must run through the read-only externals mount in the live runner. That
+	// shows the volume was fully seeded before the runner started, since a
+	// half-populated mount would have no node binary (cp -a keeps permissions).
 	nodeVer, err := dockerTry("exec", "r2-job-a1", "/actions-runner/externals/node20/bin/node", "--version")
 	if err != nil {
 		t.Errorf("(H3b) the running runner could NOT execute node through the RO externals mount (a half-populated tree?): %v\n%s", err, nodeVer)
@@ -137,21 +125,19 @@ stale_cache_eviction_days = 30
 	if !strings.Contains(seeded, ".garm-seeded") || !strings.Contains(seeded, "node20") {
 		t.Errorf("(H3b) externals volume not fully seeded: %s", seeded)
 	}
-	// Capture the seeded marker's mtime (epoch seconds) — the "was it re-seeded"
-	// signal: the warm-path seeder never touches the marker.
+	// The marker's mtime (epoch seconds) shows whether the volume was re-seeded: the
+	// warm-path seeder never touches the marker.
 	markerMtimeAfterA1 := strings.TrimSpace(dockerOut(t, "run", "--rm", "-v", extVol+":/x:ro", "alpine:3.20", "stat", "-c", "%Y", "/x/.garm-seeded"))
 	t.Logf("[H3b] .garm-seeded mtime after a1 = %s", markerMtimeAfterA1)
 
-	// =========================================================================
-	// (H3b) idempotent second seed: a2 for the SAME digest reuses the externals
-	// volume; its seeder is a fast flock+marker no-op that does NOT re-copy.
-	// =========================================================================
+	// Idempotent second seed: a2 with the same digest reuses the externals volume, and
+	// its seeder is a fast flock+marker no-op that does not re-copy.
 	b2 := cacheBootstrapPayload("r2-job-a2", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b2); code != 0 {
 		t.Fatalf("job a2 CreateInstance exit=%d, want 0", code)
 	}
-	// (NEW-H1 happy path) the warm caches were REUSED, not spuriously deleted: a2
-	// mounts the SAME externals + toolcache volumes a1 created.
+	// The warm caches were reused, not deleted: a2 mounts the same externals and
+	// toolcache volumes as a1.
 	if src := mountSource(t, "r2-job-a2", spec.RunnerExternalsDir); src != extVol {
 		t.Errorf("(NEW-H1) a2 externals mount = %q, want the shared warm %q (warm cache must survive)", src, extVol)
 	}
@@ -170,11 +156,9 @@ stale_cache_eviction_days = 30
 		t.Logf("[H3b] second same-digest seeder was a fast no-op: .garm-seeded mtime unchanged (%s), one externals volume", markerMtimeAfterA2)
 	}
 
-	// =========================================================================
-	// (H3c) the diag-prune pin-then-validate does not wedge the diag name: after
-	// a GC pass runs the prune helper, the diag volume STILL carries its full
-	// identity labels, and a later allocation gets a diag cache HIT.
-	// =========================================================================
+	// The diag prune helper must not wedge the diag name: after a GC pass that runs it,
+	// the diag volume still carries its identity labels, and a later allocation gets a
+	// diag cache hit.
 	expireCacheGCStamp(controllerID) // an earlier create claimed this interval's GC pass
 	if _, code := runProvider(t, bin, cfg, controllerID, "ListInstances", "", nil); code != 0 {
 		t.Fatalf("(H3c) ListInstances exit=%d, want 0", code)
@@ -188,8 +172,8 @@ stale_cache_eviction_days = 30
 		!strings.Contains(diagLabels, "ctrl="+controllerID) {
 		t.Errorf("(H3c) after the pin-then-validate prune the diag volume is NOT the labeled cache (an unlabeled orphan would wedge M6 adoption): %s", diagLabels)
 	}
-	// A third allocation for the same repo gets a diag HIT — the deterministic
-	// diag name is still adoptable, never wedged by an unlabeled auto-created orphan.
+	// A third allocation for the same repo gets a diag hit: the deterministic name is
+	// still adoptable, not wedged by an unlabeled auto-created orphan.
 	b3 := cacheBootstrapPayload("r2-job-a3", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b3); code != 0 {
 		t.Fatalf("(H3c) job a3 CreateInstance exit=%d, want 0 — the diag/externals names must not be wedged", code)

@@ -1,25 +1,23 @@
 //go:build dockerverify
 
-// This file adds the M2 cross-family cache-safety real-daemon verification:
+// Cache-safety behavior that needs a real daemon:
 //
-//   - H1: an org-scoped SCHEME-LESS repo_url gets NO persistent cache (fail safe);
+//   - An org-scoped repo_url without a scheme gets no persistent cache (fail safe).
 //
-//   - H2: a non-canonical/reserved cache path is rejected at config load;
+//   - A non-canonical or reserved cache path is rejected at config load.
 //
-//   - RECONCILE (structural redesign 2026-07-22): a FOREIGN volume squatting a
-//     deterministic cache name is NEITHER adopted NOR deleted — CreateInstance
-//     reconciles AROUND it to an alternate name and succeeds, and an UNLABELED
-//     reincarnation of the name does NOT wedge a subsequent create;
+//   - A foreign volume squatting a deterministic cache name is neither adopted nor
+//     deleted: CreateInstance reconciles around it to an alternate name and
+//     succeeds. An unlabeled recreation of the name does not wedge a later create.
 //
-//   - the real-daemon FACT the H3 fail-closed premise rests on: ContainerCreate
-//     AUTO-CREATES a missing named volume UNLABELED (so the provider can detect
-//     an evicted-and-auto-recreated cache and refuse to run against it).
+//   - ContainerCreate auto-creates a missing named volume without labels. The
+//     provider's fail-closed handling of evicted caches depends on this (ADR-003,
+//     "A cache's identity is its label set, not its name").
 //
 //     go test -tags dockerverify -v -run TestVerifyM2CacheSafety ./internal/verify/
 //
-// Everything is scoped to a unique controller-id and torn down by label; it never
-// touches this suite's self-owned foreign-canary containers (see
-// ensureForeignCanaries in verify_test.go) or any other foreign resource.
+// Everything is scoped to a unique controller ID and torn down by label, and the
+// suite's foreign canary containers are checked to be untouched.
 package verify
 
 import (
@@ -68,9 +66,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		return f
 	}
 
-	// =========================================================================
-	// FACT (H3 premise): the daemon auto-creates a missing named volume UNLABELED.
-	// =========================================================================
+	// The daemon auto-creates a missing named volume without labels. The provider's
+	// cache identity rests on labels, so this is what lets it detect an evicted and
+	// auto-recreated cache.
 	t.Run("daemon_autocreates_missing_named_volume_unlabeled", func(t *testing.T) {
 		vol := "garm-m2safety-missing-" + randHex(t)
 		cname := "garm-m2safety-ac-" + randHex(t)
@@ -89,9 +87,7 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
-	// =========================================================================
-	// H2: a bad cache path is rejected at config load (any command fails).
-	// =========================================================================
+	// A bad cache path is rejected at config load, so any command fails.
 	t.Run("bad_cache_path_rejected_at_load", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		bad := filepath.Join(t.TempDir(), "config.toml")
@@ -101,7 +97,7 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 			`allow_unpinned_runner_image = true`,
 			`[cache]`,
 			`enabled = true`,
-			`pnpm_store_path = "/var/run"`, // aliases onto /run — must be rejected (H2)
+			`pnpm_store_path = "/var/run"`, // aliases onto /run, so it must be rejected
 			"",
 		}, "\n"))
 		out, code := runProvider(t, bin, bad, controllerID, "ListInstances", "", nil)
@@ -112,9 +108,7 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
-	// =========================================================================
-	// H1: an org-scoped SCHEME-LESS repo_url gets NO persistent cache.
-	// =========================================================================
+	// An org-scoped repo_url without a scheme gets no persistent cache.
 	t.Run("schemeless_org_url_gets_no_cache", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		cfg := cacheConfig(t)
@@ -144,9 +138,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
-	// reconciledExternalsByLabel returns this controller's externals cache volume
-	// names discovered BY LABEL (cache-kind=externals + image-digest) — the same
-	// discovery EnsureCacheVolume uses, so a reconciled alternate name is found.
+	// reconciledExternalsByLabel returns this controller's externals cache volumes
+	// found by label (cache-kind=externals and image-digest), as EnsureCacheVolume
+	// finds them, so a reconciled alternate name is included.
 	reconciledExternalsByLabel := func(t *testing.T, controllerID, digest string) []string {
 		return lines(dockerOut(t, "volume", "ls", "-q",
 			"--filter", "label=garm.docker/controller-id="+controllerID,
@@ -154,11 +148,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 			"--filter", "label=garm.docker/image-digest="+digest))
 	}
 
-	// =========================================================================
-	// RECONCILE: a FOREIGN volume squatting the deterministic externals name is
-	// NEITHER adopted NOR deleted — CreateInstance reconciles AROUND it to an
-	// alternate name and SUCCEEDS; the foreign volume is left untouched (B2).
-	// =========================================================================
+	// A foreign volume squatting the deterministic externals name is neither adopted
+	// nor deleted: CreateInstance reconciles around it to an alternate name and
+	// succeeds, leaving the foreign volume untouched.
 	t.Run("foreign_externals_squatter_reconciled_not_deleted", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		cfg := cacheConfig(t)
@@ -182,8 +174,7 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 		t.Logf("[reconcile] CreateInstance succeeded by reconciling around the foreign squatter (exit=%d)", code)
 
-		// The foreign volume is PRESERVED and still UNLABELED (never adopted, never
-		// deleted — it is not ours to touch, B2).
+		// The foreign volume must be preserved and still unlabeled: it is not ours to touch.
 		if _, err := dockerTry("volume", "inspect", extName); err != nil {
 			t.Fatalf("[reconcile] the foreign externals volume %q was DELETED — never delete a volume we cannot prove is ours", extName)
 		}
@@ -206,11 +197,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 	})
 
-	// =========================================================================
-	// NO WEDGE: an UNLABELED reincarnation of the deterministic externals name
-	// (as Moby auto-creates after an evict) does NOT permanently block a
-	// subsequent create — it reconciles around it and succeeds (B3).
-	// =========================================================================
+	// An unlabeled recreation of the deterministic externals name, as Moby makes after
+	// an eviction, must not block a later create: the provider reconciles around it
+	// and succeeds.
 	t.Run("unlabeled_reincarnation_does_not_wedge", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		cfg := cacheConfig(t)

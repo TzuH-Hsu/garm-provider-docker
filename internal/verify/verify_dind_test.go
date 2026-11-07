@@ -1,24 +1,23 @@
 //go:build dockerverify
 
-// This file adds the M1-WP3 real-daemon verification harness (privileged-sidecar
-// DinD), gated behind the same `dockerverify` build tag as the WP2 harness so it
-// never runs in the normal `go test ./...` gate: it requires a live Docker
-// daemon, builds/pulls images, and needs outbound internet (the DinD daemon
-// pulls a nested image). Run it explicitly with:
+// The privileged-sidecar DinD allocation against a real daemon. It needs a live
+// Docker daemon, builds and pulls images, and needs outbound internet because the
+// DinD daemon pulls a nested image. Run with:
 //
 //	go test -tags dockerverify -v -run TestVerifyM1WP3DindAllocation ./internal/verify/
 //
-// It drives the REAL provider binary through a full privileged-sidecar DinD
-// allocation and asserts, with actual command output, the WP3 evidence points
-// W3-a..f: the sidecar's daemon comes up; the runner reaches THAT daemon (not
-// the host); a nested workload started via the runner is visible only inside the
-// sidecar and invisible to the host (the core isolation red line); no host
-// docker.sock is mounted; teardown removes everything (repeat delete → exit 30);
-// and the storage driver dockerd actually used is reported.
+// The test drives the real provider binary through a full privileged-sidecar
+// allocation and checks, with real command output, that: the sidecar's daemon comes
+// up; the runner reaches that daemon, not the host's; a nested workload started
+// through the runner is visible inside the sidecar and invisible to the host (the
+// core isolation guarantee); no host docker.sock is mounted; a port the inner
+// daemon publishes is reachable on the runner's localhost; teardown removes
+// everything and a repeat delete exits 30; and the storage driver dockerd used is
+// reported.
 //
-// Everything it creates is scoped to a unique controller-id and torn down at the
-// end; it snapshots host containers/networks/volumes before and after and
-// asserts they are identical, so it never touches foreign resources.
+// Everything it creates is scoped to a unique controller ID and torn down at the
+// end. It snapshots host containers, networks and volumes before and after and
+// requires them to match, so it never touches foreign resources.
 package verify
 
 import (
@@ -33,17 +32,15 @@ import (
 	"github.com/cloudbase/garm-provider-common/params"
 )
 
-// dindImageDigest is a working, digest-pinned docker:dind reference (the
-// multi-arch index the real-job gate pins, Docker Engine 29.9.0 inside).
-// The shipped default dind_image is an M4 release concern (ADR-001 open
-// question); this is only the reference the live harness runs against.
+// dindImageDigest is the digest-pinned docker:dind multi-arch index (Docker Engine
+// 29.9.0 inside) that this suite runs against.
 const dindImageDigest = "docker:dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470"
 
 const wp3Instance = "wp3-verify-01"
 
-// WP3 derived resource names must match internal/spec's name builders. The
-// network/sidecar names are stable per instance; the volume names are
-// generation-nonce-embedded (F4) and discovered by label at runtime.
+// The derived names must match internal/spec's name builders. The network and
+// sidecar names are stable per instance; the volume names embed a create nonce and
+// are looked up by label at runtime.
 func wp3Net() string      { return wp3Instance + "-net" }
 func wp3DindName() string { return wp3Instance + "-dind" }
 
@@ -52,20 +49,20 @@ func wp3Bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance 
 		Name:             wp3Instance,
 		RepoURL:          "https://github.com/example-org/example-repo",
 		MetadataURL:      metadataURL,
-		InstanceToken:    instanceToken, // shared WP2 const
+		InstanceToken:    instanceToken,
 		CACertBundle:     caBundle,
 		OSType:           params.Linux,
 		OSArch:           hostOSArch(),
-		PoolID:           poolID, // shared WP2 const
+		PoolID:           poolID,
 		JitConfigEnabled: true,
 	}
 }
 
-// buildCliRunnerImage builds a tiny runner image that has a docker CLI (so
-// `docker info`/`docker run` can be exec'd inside it) and a sleep entrypoint
-// (so the provider's credential-delivery exec + running-verification succeed
-// without a real runner). docker:cli is alpine-based, so busybox tar handles
-// the provider's `tar -x -p -C /run/garm` delivery.
+// buildCliRunnerImage builds a runner image with a docker CLI, so `docker info` and
+// `docker run` can be exec'd inside it, and a sleep entrypoint, so credential
+// delivery and the running check succeed without a real runner. docker:cli is
+// alpine-based, so busybox tar handles the provider's `tar -x -p -C /run/garm`
+// delivery.
 func buildCliRunnerImage(t *testing.T, tag string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -76,8 +73,8 @@ func buildCliRunnerImage(t *testing.T, tag string) {
 	}
 }
 
-// snapshotIDs returns the sorted set of ids from a `docker ... -q`-style query,
-// for the identical-before/after foreign-resource guarantee.
+// snapshotIDs returns the sorted lines of a docker query, for the before/after
+// foreign-resource snapshot.
 func snapshotIDs(t *testing.T, args ...string) []string {
 	t.Helper()
 	ids := lines(dockerOut(t, args...))
@@ -95,10 +92,9 @@ func assertSnapshotIdentical(t *testing.T, label string, before []string, args .
 	}
 }
 
-// waitForDindReady polls `docker exec <dind> docker info` until the sidecar's
-// daemon answers (it is running the instant CreateInstance returns, but the
-// daemon takes a moment to come up; the real runner entrypoint's own
-// `until docker info` wait handles this in production).
+// waitForDindReady polls `docker info` in the sidecar until its daemon answers. The
+// sidecar is running as soon as CreateInstance returns, but dockerd takes a moment;
+// in production the runner entrypoint does this wait.
 func waitForDindReady(t *testing.T, dindName string) bool {
 	t.Helper()
 	for i := 0; i < 60; i++ {
@@ -115,21 +111,18 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
-	// --- foreign snapshot (must be identical after) --------------------------
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
-	// Snapshot by NAME, not id: Docker Desktop rotates the DEFAULT bridge
-	// network's internal id when its network stack reinitializes (e.g. after the
-	// last user network is removed), independent of this provider — the set of
-	// resource NAMES is the stable, meaningful "no foreign resource touched"
-	// invariant, and the provider is label-scoped so it never touches the bridge.
+	// Snapshot by name, not ID: Docker Desktop rotates the default bridge network's ID
+	// when its network stack reinitializes (for example after the last user network is
+	// removed), independent of this provider. The provider is label-scoped and never
+	// touches the bridge, so the set of names is the meaningful invariant.
 	beforeC := snapshotIDs(t, "ps", "-a", "--format", "{{.Names}}")
 	beforeN := snapshotIDs(t, "network", "ls", "--format", "{{.Name}}")
 	beforeV := snapshotIDs(t, "volume", "ls", "--format", "{{.Name}}")
 	t.Logf("[snapshot] before: %d containers, %d networks, %d volumes", len(beforeC), len(beforeN), len(beforeV))
 
-	// --- build the docker-cli runner image + the real provider binary --------
 	runnerTag := "garm-wp3-verify-cli:latest"
 	buildCliRunnerImage(t, runnerTag)
 
@@ -140,26 +133,23 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// --- provider config: privileged-sidecar, pinned dind digest -------------
+	// Provider config: privileged-sidecar with a pinned dind digest.
 	configDir := t.TempDir()
 	configFile := filepath.Join(configDir, "config.toml")
 	writeFile(t, configFile, strings.Join([]string{
 		`docker_host = "unix:///var/run/docker.sock"`,
 		`runner_image = "` + runnerTag + `"`,
 		`allow_unpinned_runner_image = true`,
-		// The ceiling defaults to ["none"] (fail-closed, ADR-001 2026-07-26
-		// Amendment), so a DinD mode must be widened in explicitly or the
-		// config would not load at all.
+		// The ceiling defaults to ["none"] (fail-closed, ADR-001), so a DinD mode must
+		// be widened explicitly or the config would not load.
 		`allowed_dind_modes = ["none", "privileged-sidecar"]`,
 		`dind_mode = "privileged-sidecar"`,
 		`dind_image = "` + dindImageDigest + `"`,
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
-		// M2 persistent cache off: this test verifies DinD topology/teardown in
-		// isolation, and cache volumes deliberately survive DeleteInstance
-		// (covered by TestVerifyM2W1CacheHit), so leaving it on would break the
-		// post-delete zero-managed-resources assertion.
+		// The cache is off: cache volumes survive DeleteInstance (TestVerifyM2W1CacheHit
+		// covers them) and would break the zero-managed-resources check after delete.
 		`[cache]`,
 		`enabled = false`,
 		"",
@@ -169,8 +159,8 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	defer srv.Close()
 	caBundle := caBundlePEM(t, srv)
 
-	// Cleanup: label-scoped teardown for THIS controller-id (removes the sidecar
-	// too, which kills its nested workload), then the foreign + snapshot checks.
+	// Remove this controller's resources by label (the sidecar too, which kills its
+	// nested workload), then check the foreign containers and the snapshots.
 	defer func() {
 		cleanupController(t, controllerID)
 		assertForeignPresent(t, canaries[0])
@@ -180,9 +170,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		assertSnapshotIdentical(t, "volumes", beforeV, "volume", "ls", "--format", "{{.Name}}")
 	}()
 
-	// =========================================================================
-	// CreateInstance — the full DinD topology
-	// =========================================================================
+	// CreateInstance builds the full DinD topology.
 	b := wp3Bootstrap(srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
@@ -198,8 +186,8 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	runnerID := created.ProviderID
 	t.Logf("[create] runner provider_id=%s; sidecar=%s", runnerID, wp3DindName())
 
-	// F4: the three job-scoped volumes carry generation-nonce names, discovered
-	// by resource label rather than reconstructed.
+	// The three job-scoped volumes embed a create nonce in their names, so look them
+	// up by resource label.
 	wp3Workspace := volumeNameByResource(t, controllerID, "workspace")
 	wp3Socket := volumeNameByResource(t, controllerID, "socket")
 	wp3DindState := volumeNameByResource(t, controllerID, "dind-state")
@@ -225,17 +213,15 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	if m := dockerOut(t, "inspect", wp3DindName(), "-f", "{{json .Mounts}}"); strings.Contains(m, "/var/run/docker.sock") {
 		t.Errorf("[topology] sidecar has a host docker.sock bind: %s", m)
 	}
-	// Shared network namespace (ADR-001 amendment): the sidecar joins the
-	// runner's namespace, and only the runner is attached to the job network.
+	// Shared network namespace (ADR-001): the sidecar joins the runner's namespace,
+	// and only the runner is attached to the job network.
 	assertDindSharesRunnerNetns(t, runnerID, wp3DindName(), wp3Net())
 
 	if !waitForDindReady(t, wp3DindName()) {
 		t.Fatalf("(W3-a) dind daemon never became ready")
 	}
 
-	// =========================================================================
-	// (W3-a) sidecar daemon up; capture the storage driver it actually used
-	// =========================================================================
+	// The sidecar daemon is up; record the storage driver it used.
 	dindInfo := dockerOut(t, "exec", wp3DindName(), "docker", "info",
 		"--format", "Driver={{.Driver}} ServerVersion={{.ServerVersion}} Name={{.Name}} Root={{.DockerRootDir}}")
 	t.Logf("[W3-a] dind `docker info`: %s", dindInfo)
@@ -245,9 +231,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	}
 	dindName := infoField(dindInfo, "Name=")
 
-	// =========================================================================
-	// (W3-b) runner reaches the DIND daemon, not the host
-	// =========================================================================
+	// The runner reaches the DinD daemon, not the host's.
 	runnerDockerHost := strings.TrimSpace(dockerOut(t, "exec", runnerID, "sh", "-c", "echo $DOCKER_HOST"))
 	t.Logf("[W3-b] runner DOCKER_HOST=%s", runnerDockerHost)
 	if runnerDockerHost != "unix:///run/docker.sock" {
@@ -264,9 +248,8 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Errorf("(W3-b) runner is talking to the HOST daemon (Name=%q), not the sidecar", hostName)
 	}
 
-	// =========================================================================
-	// (W3-c) nesting isolation — the core red line
-	// =========================================================================
+	// Nesting isolation, the core guarantee: a nested workload is visible inside the
+	// sidecar and invisible to the host.
 	nestedName := "wp3-nested-busybox"
 	if out, err := dockerTry("exec", runnerID, "docker", "run", "-d", "--name", nestedName, "busybox", "sleep", "300"); err != nil {
 		t.Errorf("(W3-c) could not start a nested container via the runner: %v\n%s", err, out)
@@ -283,9 +266,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Logf("[W3-c] nested workload is INVISIBLE to the host daemon — fully isolated inside the sidecar")
 	}
 
-	// =========================================================================
-	// (W3-d) no host socket; the runner cannot reach the host daemon
-	// =========================================================================
+	// No host socket is mounted, so the runner cannot reach the host daemon.
 	runnerMounts := dockerOut(t, "inspect", runnerID, "-f", "{{json .Mounts}}")
 	if strings.Contains(runnerMounts, "/var/run/docker.sock") {
 		t.Errorf("(W3-d) runner has a host docker.sock bind: %s", runnerMounts)
@@ -293,16 +274,12 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Logf("[W3-d] runner mounts carry NO host docker.sock (only the named socket volume): %s", runnerMounts)
 	}
 
-	// =========================================================================
-	// (W3-g) a port the inner daemon publishes is reachable on the runner's
-	// 127.0.0.1 and localhost (shared network namespace, ADR-001 amendment)
-	// =========================================================================
+	// A port the inner daemon publishes is reachable on the runner's 127.0.0.1 and
+	// localhost (shared network namespace, ADR-001).
 	assertInnerPublishedPortReachable(t, runnerID, "", "wp3-published-httpd")
 
-	// =========================================================================
-	// (W3-e) teardown removes runner->dind->volumes->network (network LAST, F4);
-	// repeat → exit 30
-	// =========================================================================
+	// Teardown removes the runner, the sidecar, the volumes, then the network last
+	// (ADR-004); a repeat delete exits 30.
 	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", wp3Instance, nil)
 	if delCode != 0 {
 		t.Errorf("(W3-e) DeleteInstance exit=%d, want 0", delCode)
@@ -326,9 +303,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Logf("[W3-e] repeat DeleteInstance correctly returned exit 30")
 	}
 
-	// =========================================================================
-	// (W3-f) storage driver report
-	// =========================================================================
+	// Report the storage driver dockerd used.
 	t.Logf("[W3-f] dockerd inside the privileged sidecar used storage driver %q (requested overlay2); host daemon driver is %q",
 		storageDriver, dockerOut(t, "info", "--format", "{{.Driver}}"))
 	if storageDriver != "overlay2" {
@@ -348,11 +323,10 @@ func infoField(line, key string) string {
 }
 
 // assertDindSharesRunnerNetns checks the privileged-sidecar network topology
-// (ADR-001, shared network namespace amendment) on the live daemon: the
-// sidecar's NetworkMode is container:<runner's full ID> and it has no network
-// attachment of its own, the runner is attached to exactly the job network,
-// and both containers really are in one network namespace (same
-// /proc/self/ns/net inode).
+// (ADR-001) on the live daemon: the sidecar's NetworkMode is container:<runner's
+// full ID> and it has no network attachment of its own, the runner is attached to
+// exactly the job network, and both containers are in one network namespace (the
+// same /proc/self/ns/net inode).
 func assertDindSharesRunnerNetns(t *testing.T, runner, dind, jobNet string) {
 	t.Helper()
 	runnerFullID := dockerOut(t, "inspect", runner, "-f", "{{.Id}}")

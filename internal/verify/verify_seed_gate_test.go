@@ -1,27 +1,23 @@
 //go:build dockerverify
 
-// This file adds the M2 consumer-side externals seed-gate real-daemon
-// verification (ADR-003 W2 structural redesign, 2026-07-22). It exercises the
-// gate VERBATIM against the production runner entrypoint by SOURCING the REAL
-// runner-images/common/entrypoint.sh (whose main is guarded not to run when
-// sourced) and invoking the REAL wait_for_externals_seeded under that file's own
-// `set -euo pipefail` — the same source-the-real-entrypoint discipline the H4
-// non-root tests use — so the behavior proven here is the production code, not a
-// re-implementation.
+// Tests the consumer-side externals seed gate (ADR-003, Externals) against the
+// production runner entrypoint. The image copies runner-images/common/entrypoint.sh,
+// sources it (its main does not run when sourced) and calls the real
+// wait_for_externals_seeded under that file's own `set -euo pipefail`, so the
+// behavior shown is the production code, not a reimplementation, as in the non-root
+// tests.
 //
-// It proves:
+//   - Marker present: the gate returns immediately and the runner proceeds.
 //
-//   - marker PRESENT  → the gate returns immediately and the runner proceeds;
+//   - Marker absent: the gate fails closed after its bounded timeout with a clear
+//     message, so the runner never starts against a half-seeded externals tree.
 //
-//   - marker ABSENT   → the gate FAILS CLOSED after its bounded timeout with a
-//     clear message (the runner never starts against a half-seeded externals tree);
-//
-//   - env UNSET       → the gate is a no-op (cache disabled / no externals mount).
+//   - Env unset: the gate is a no-op (cache disabled, no externals mount).
 //
 //     go test -tags dockerverify -v -run TestVerifyM2SeedGate ./internal/verify/
 //
-// It builds a tiny bash image (no GitHub, no 380MB copy) and touches no foreign
-// resource.
+// It builds a small bash image, so it needs no GitHub access and no copy of the
+// full externals tree, and it touches no foreign resource.
 package verify
 
 import (
@@ -31,11 +27,9 @@ import (
 	"testing"
 )
 
-// buildSeedGateImage layers a wrapper on a minimal bash image that COPIES the
-// REAL production entrypoint.sh, SOURCES it, and invokes the REAL
-// wait_for_externals_seeded — so the gate is exercised verbatim. It prints a
-// GATE_PASSED sentinel only if the gate returns (the marker-present / unset paths);
-// on the marker-absent path the entrypoint's `fail` exits non-zero before it.
+// buildSeedGateImage builds a bash image that copies the production entrypoint.sh,
+// sources it and calls wait_for_externals_seeded. It prints GATE_PASSED only if the
+// gate returns: with the marker absent, the entrypoint's fail exits non-zero first.
 func buildSeedGateImage(t *testing.T, root, tag string) {
 	t.Helper()
 	dir := t.TempDir()

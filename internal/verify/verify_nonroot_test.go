@@ -1,31 +1,29 @@
 //go:build dockerverify
 
-// This file adds the M1 cross-family (F1/F2/F4/F6) real-daemon verification
-// harness, exercised as the NON-ROOT runner user over a real workspace
-// bind-mount — the two conditions the earlier root-run harness masked. It is
-// gated behind the same `dockerverify` build tag as the WP2/WP3 harnesses (a
-// live daemon, image builds, and outbound internet for the nested pulls). Run
-// it explicitly with:
+// A DinD allocation exercised as the non-root runner user (uid/gid 1001) over a real
+// workspace bind mount. A test run as root, or without that bind mount, would hide
+// the permission gaps checked here. It needs a live daemon, image builds, and
+// outbound internet for the nested pulls. Run with:
 //
 //	go test -tags dockerverify -v -run TestVerifyM1NonRootDindAllocation ./internal/verify/
 //
-// It drives the REAL provider binary through a full privileged-sidecar DinD
-// allocation and asserts, with actual command output executed AS THE RUNNER
-// USER (uid/gid 1001, not root):
-//   - F1: `docker info` AND `docker run --rm hello-world` succeed as the runner
-//     user over the shared dind socket (the root-run test hid the permission gap);
-//   - F2: a file written in the runner workspace is visible AND modifiable
-//     through a nested `docker run -v <workspacepath>:/w …` (and vice-versa),
-//     proving the workspace is shared into the daemon;
-//   - the W3 red lines still hold (nested workload invisible to the host; no
-//     host docker.sock; creds tmpfs-only; no token in env);
-//   - F4/F6 teardown: DeleteInstance reaps runner+dind+volumes+network (repeat
-//     -> exit 30), AND delete-by-provider_id after the runner is removed out of
-//     band still reaps the privileged sidecar + volumes (no leak).
+// The test drives the real provider binary through a full privileged-sidecar DinD
+// allocation and checks, with real command output run as the runner user:
+//   - `docker info` and `docker run --rm hello-world` succeed over the shared dind
+//     socket, which needs the runner user to be in the socket's group;
+//   - a file written in the runner workspace is visible and modifiable through a
+//     nested `docker run -v <workspace path>:/w ...`, and the reverse, so the
+//     workspace is shared into the daemon;
+//   - the isolation properties still hold: the nested workload is invisible to the
+//     host, no host docker.sock is mounted, credentials are tmpfs-only, and no token
+//     is in the env;
+//   - DeleteInstance removes the runner, sidecar, volumes and network (a repeat
+//     exits 30), and deleting by provider_id after the runner was removed out of
+//     band still removes the privileged sidecar and volumes, so nothing leaks.
 //
-// Everything is scoped to a unique controller-id and torn down by label; it
-// snapshots host containers/networks/volumes before/after and asserts they are
-// identical, so it never touches foreign resources.
+// Everything is scoped to a unique controller ID and torn down by label. It
+// snapshots host containers, networks and volumes before and after and requires
+// them to match, so it never touches foreign resources.
 package verify
 
 import (
@@ -66,31 +64,26 @@ func nrBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	}
 }
 
-// buildNonRootRunnerImage builds the runner image the F1 harness runs, layered
-// on the REAL production runner image (runner-images/noble — its real Dockerfile
-// and real entrypoint.sh) so F1 is proven against the production code VERBATIM,
-// not a re-implementation with softened error handling (N3). The base ships the
-// genuine `runner` user, gosu, the docker CLI, and getent/groupadd/usermod, and
-// its /entrypoint.sh is the ACTUAL runner-images/common/entrypoint.sh whose
-// ensure_docker_socket_group carries the F1 fix.
+// buildNonRootRunnerImage builds the runner image for this test on the production
+// runner image (runner-images/noble: its real Dockerfile and entrypoint.sh), so the
+// entrypoint code is tested verbatim and not reimplemented with softer error
+// handling. The base ships the runner user, gosu, the docker CLI and
+// getent/groupadd/usermod, and its ensure_docker_socket_group is the production
+// function.
 //
-// The ONLY deviation from production is the wrapper entrypoint: it SOURCES the
-// real /entrypoint.sh (whose main is guarded to run only when EXECUTED directly,
-// never when sourced) and invokes the REAL ensure_docker_socket_group under that
-// file's own `set -euo pipefail`, then sleeps as PID 1 (root) so the harness can
-// `docker exec -u runner` in. Production would `exec ./run.sh` here, but the fake
-// JIT credentials cannot drive the real .NET runner, so we sleep instead. This is
-// load-bearing: were the F1 bug present (the un-guarded getent probe aborting
-// under set -e on a clean image with no GID 2000), sourcing + calling the real
-// ensure_docker_socket_group would abort HERE, the container would exit, and
-// every `docker exec -u runner` below would fail — so the harness would have
-// caught F1 rather than masking it behind an Alpine `|| true` re-implementation.
+// The only deviation is the wrapper entrypoint. It sources the real /entrypoint.sh
+// (whose main runs only when executed directly) and calls the real
+// ensure_docker_socket_group under that file's own `set -euo pipefail`, then sleeps
+// as PID 1 (root) so the test can `docker exec -u runner` in. Production would
+// `exec ./run.sh`, but the fake JIT credentials cannot drive the real runner. This
+// matters: if ensure_docker_socket_group aborted under set -e on an image with no
+// GID 2000, the call would abort here, the container would exit, and every exec
+// below would fail.
 func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 	t.Helper()
 
-	// 1. Build the REAL production runner image (real Dockerfile + entrypoint),
-	//    or, when runnerBaseImageEnv names one, use that already-built runner
-	//    image (a released, digest-pinned ghcr.io image) as the base instead.
+	// 1. Build the production runner image, or use the already-built image that
+	//    runnerBaseImageEnv names (for example a released, digest-pinned image).
 	nobleTag := os.Getenv(runnerBaseImageEnv)
 	if nobleTag != "" {
 		if _, err := dockerTry("image", "inspect", nobleTag); err != nil {
@@ -106,9 +99,9 @@ func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 		}
 	}
 
-	// 2. Layer a wrapper that runs ONLY the real ensure_docker_socket_group
-	//    (sourced from the real entrypoint) then sleeps, so the harness can exec
-	//    as the non-root runner and prove F1 over the shared dind socket.
+	// 2. Layer a wrapper that runs only the real ensure_docker_socket_group, sourced
+	//    from the real entrypoint, then sleeps, so the test can exec as the non-root
+	//    runner over the shared dind socket.
 	dir := t.TempDir()
 	wrapper := "#!/usr/bin/env bash\n" +
 		"set -euo pipefail\n" +
@@ -132,9 +125,9 @@ func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 	}
 }
 
-// execRunner runs `docker exec -u runner <container> <args...>` — i.e. AS THE
-// NON-ROOT runner user (1001), with its /etc/group memberships (including the
-// dockersock group the entrypoint added), which is what makes F1 meaningful.
+// execRunner runs `docker exec -u runner` in container: as the non-root runner
+// user (1001) with its /etc/group memberships, including the dockersock group the
+// entrypoint added. That is what makes the socket-permission check meaningful.
 func execRunner(container string, args ...string) (string, error) {
 	full := append([]string{"exec", "-u", "runner", container}, args...)
 	return dockerTry(full...)
@@ -144,7 +137,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
-	// --- foreign snapshot (must be identical after) --------------------------
+	// Foreign snapshot, compared after the run.
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
@@ -153,19 +146,14 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	beforeV := snapshotIDs(t, "volume", "ls", "--format", "{{.Name}}")
 	t.Logf("[snapshot] before: %d containers, %d networks, %d volumes", len(beforeC), len(beforeN), len(beforeV))
 
-	// --- build the non-root runner image + the real provider binary ----------
 	runnerTag := "garm-nr-verify-cli:latest"
 	buildNonRootRunnerImage(t, root, runnerTag)
 
-	// N3: GID 2000 (spec.DindSocketGID) must be ABSENT in the freshly built image
-	// BEFORE the entrypoint runs. The F1 regression relies on the base image NOT
-	// pre-declaring this group — ensure_docker_socket_group must CREATE it, and
-	// the F1 bug was exactly that create path aborting under `set -e` on a clean
-	// image with no GID 2000. If a future base-image change pre-created GID 2000,
-	// F1 would go green without ever exercising the group-create path this harness
-	// guards; assert its absence so that silent weakening fails loudly here.
-	// `getent group 2000` exits non-zero when the group is absent (the wanted
-	// state); a zero exit means it already exists.
+	// GID 2000 (spec.DindSocketGID) must be absent in the freshly built image before
+	// the entrypoint runs. The group-create path in ensure_docker_socket_group is only
+	// exercised if the base image does not already declare it; if a base-image change
+	// added GID 2000, the test would pass without exercising that path. `getent group
+	// 2000` exits non-zero when the group is absent, which is the wanted state.
 	if out, err := dockerTry("run", "--rm", "--entrypoint", "getent", runnerTag, "group", spec.DindSocketGID); err == nil {
 		t.Fatalf("[N3] GID %s already exists in the freshly built image before the entrypoint runs (getent: %q); the F1 group-create path would be silently skipped", spec.DindSocketGID, strings.TrimSpace(out))
 	}
@@ -178,26 +166,23 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// --- provider config: privileged-sidecar, pinned dind digest -------------
+	// Provider config: privileged-sidecar with a pinned dind digest.
 	configDir := t.TempDir()
 	configFile := filepath.Join(configDir, "config.toml")
 	writeFile(t, configFile, strings.Join([]string{
 		`docker_host = "unix:///var/run/docker.sock"`,
 		`runner_image = "` + runnerTag + `"`,
 		`allow_unpinned_runner_image = true`,
-		// The ceiling defaults to ["none"] (fail-closed, ADR-001 2026-07-26
-		// Amendment), so a DinD mode must be widened in explicitly or the
-		// config would not load at all.
+		// The ceiling defaults to ["none"] (fail-closed, ADR-001), so a DinD mode must
+		// be widened explicitly or the config would not load.
 		`allowed_dind_modes = ["none", "privileged-sidecar"]`,
 		`dind_mode = "privileged-sidecar"`,
 		`dind_image = "` + dindImageDigest + `"`,
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
-		// M2 persistent cache off: this test verifies the non-root DinD topology
-		// and teardown in isolation, and cache volumes deliberately survive
-		// DeleteInstance (covered by TestVerifyM2W1CacheHit), so leaving it on
-		// would break the post-delete zero-managed-resources assertions.
+		// The cache is off: cache volumes survive DeleteInstance (TestVerifyM2W1CacheHit
+		// covers them) and would break the zero-managed-resources assertions after delete.
 		`[cache]`,
 		`enabled = false`,
 		"",
@@ -216,9 +201,6 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		assertSnapshotIdentical(t, "volumes", beforeV, "volume", "ls", "--format", "{{.Name}}")
 	}()
 
-	// =========================================================================
-	// CreateInstance
-	// =========================================================================
 	b := nrBootstrap(srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
@@ -231,22 +213,22 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	if created.Status != params.InstanceRunning {
 		t.Fatalf("CreateInstance status=%q, want running", created.Status)
 	}
-	// F6: provider_id is the stable instance NAME, not a container id.
+	// provider_id is the stable instance name, not a container ID.
 	if created.ProviderID != nrInstance {
 		t.Errorf("[F6] provider_id=%q, want the instance name %q", created.ProviderID, nrInstance)
 	}
 	runnerName := spec.RunnerContainerName(nrInstance)
 	t.Logf("[create] provider_id=%s; runner container=%s; sidecar=%s", created.ProviderID, runnerName, nrDindName())
 
-	// F4: the three job-scoped volumes carry generation-nonce names the harness
-	// does not know up front, so discover their ACTUAL names by resource label.
+	// The three job-scoped volumes embed a create nonce, so look them up by resource
+	// label.
 	nrWorkspace := volumeNameByResource(t, controllerID, "workspace")
 	nrSocket := volumeNameByResource(t, controllerID, "socket")
 	nrDindState := volumeNameByResource(t, controllerID, "dind-state")
 	t.Logf("[create] generation-nonce volume names: workspace=%s socket=%s dind-state=%s", nrWorkspace, nrSocket, nrDindState)
 
-	// F1 topology: the runner carries the DinD socket GID as a supplementary
-	// group, and dockerd was launched with the matching --group.
+	// The runner carries the DinD socket GID as a supplementary group, and dockerd was
+	// started with the matching --group.
 	groupAdd := dockerOut(t, "inspect", runnerName, "-f", "{{json .HostConfig.GroupAdd}}")
 	t.Logf("[F1] runner HostConfig.GroupAdd=%s (want to include %s)", groupAdd, spec.DindSocketGID)
 	if !strings.Contains(groupAdd, spec.DindSocketGID) {
@@ -261,9 +243,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Fatalf("dind daemon never became ready")
 	}
 
-	// =========================================================================
-	// F1 — as the NON-ROOT runner user: `docker info` and `docker run hello-world`
-	// =========================================================================
+	// As the non-root runner user: `docker info` and `docker run hello-world` work.
 	whoami, _ := execRunner(runnerName, "id")
 	t.Logf("[F1] runner-user identity: %s", strings.TrimSpace(whoami))
 	if info, err := execRunner(runnerName, "docker", "info", "--format", "{{.ServerVersion}}"); err != nil {
@@ -277,9 +257,8 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Logf("[F1] `docker run --rm hello-world` as the runner user OK: %s", firstLine(hw))
 	}
 
-	// =========================================================================
-	// F2 — workspace is shared with the daemon: runner<->nested-container both ways
-	// =========================================================================
+	// The workspace is shared with the daemon, both ways between the runner and a
+	// nested container.
 	// Pre-pull busybox into the dind daemon so the nested `docker run` output is
 	// just the bind-mounted file content, not interleaved pull progress.
 	if out, err := execRunner(runnerName, "docker", "pull", "busybox"); err != nil {
@@ -310,9 +289,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Logf("[F2] runner read back the nested-container-written file — workspace is shared both ways")
 	}
 
-	// =========================================================================
-	// W3 red lines still hold
-	// =========================================================================
+	// The isolation properties still hold.
 	nested := "nr-nested-busybox"
 	if out, err := execRunner(runnerName, "docker", "run", "-d", "--name", nested, "busybox", "sleep", "300"); err != nil {
 		t.Errorf("could not start a nested container via the runner: %v\n%s", err, out)
@@ -340,18 +317,14 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	}
 	t.Logf("[W3] no host socket on runner/sidecar; no token/metadata in env; creds present on the tmpfs")
 
-	// =========================================================================
-	// Shared network namespace (ADR-001 amendment): as the NON-ROOT runner
-	// user, a port the inner daemon publishes is reachable on 127.0.0.1 and
-	// localhost — the testcontainers/compose case that failed with ECONNREFUSED
-	// while the sidecar had its own namespace.
-	// =========================================================================
+	// Shared network namespace (ADR-001): as the non-root runner user, a port the
+	// inner daemon publishes is reachable on 127.0.0.1 and localhost. This is the
+	// testcontainers and compose case that failed with ECONNREFUSED when the sidecar
+	// had its own namespace.
 	assertDindSharesRunnerNetns(t, runnerName, nrDindName(), nrNet())
 	assertInnerPublishedPortReachable(t, runnerName, "runner", "nr-published-httpd")
 
-	// =========================================================================
-	// F4/F6 (part 1) — DeleteInstance reaps everything; repeat -> exit 30
-	// =========================================================================
+	// DeleteInstance removes everything; a repeat exits 30.
 	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", nrInstance, nil)
 	if delCode != 0 {
 		t.Errorf("[F4] DeleteInstance exit=%d, want 0", delCode)
@@ -373,10 +346,8 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Logf("[F4] repeat DeleteInstance correctly returned exit 30")
 	}
 
-	// =========================================================================
-	// F6 (part 2) — remove ONLY the runner out of band, then delete-by-provider_id
-	// must still reap the PRIVILEGED sidecar + volumes (no leak)
-	// =========================================================================
+	// Remove only the runner out of band. Deleting by provider_id must still remove
+	// the privileged sidecar and volumes, so nothing leaks.
 	b2 := nrBootstrap(srv.URL, caBundle)
 	stdout2, code2 := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b2)
 	if code2 != 0 {
@@ -389,13 +360,13 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	if !waitForDindReady(t, nrDindName()) {
 		t.Fatalf("[F6] dind daemon never became ready on re-create")
 	}
-	// The re-create is a NEW generation with a NEW nonce, so re-discover the
-	// (differently-named) volumes by label before asserting they are reaped.
+	// The re-create is a new generation with a new nonce, so look up the differently
+	// named volumes by label before asserting they are removed.
 	nrWorkspace2 := volumeNameByResource(t, controllerID, "workspace")
 	nrSocket2 := volumeNameByResource(t, controllerID, "socket")
 	nrDindState2 := volumeNameByResource(t, controllerID, "dind-state")
-	// Remove ONLY the runner container out of band, leaving the privileged
-	// sidecar + network + volumes behind — exactly the leak F6 closes.
+	// Remove only the runner container out of band, leaving the privileged sidecar,
+	// network and volumes behind.
 	if out, err := dockerTry("rm", "-f", runnerName); err != nil {
 		t.Fatalf("[F6] out-of-band runner removal failed: %v\n%s", err, out)
 	}
