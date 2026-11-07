@@ -15,13 +15,11 @@ import (
 	"github.com/docker/docker/errdefs"
 )
 
-// TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID is the regression
-// guard for defect 1: the real Docker daemon does NOT implement the uid/gid
-// tmpfs options for the Mounts long syntax and rejects such a create with
-// `invalid mount config for type "tmpfs": invalid option: uid`. The fake must
-// reject it identically, so any future revert from the supported
-// HostConfig.Tmpfs short syntax back to the long syntax fails here instead of
-// only on a real daemon.
+// TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID checks that the fake
+// rejects, as the real daemon does, a Mounts long-syntax tmpfs with uid or gid
+// options (`invalid mount config for type "tmpfs": invalid option: uid`). A
+// revert from the HostConfig.Tmpfs short syntax then fails here instead of only
+// on a real daemon.
 func TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -241,8 +239,7 @@ func TestFakeClientExecStream(t *testing.T) {
 		t.Fatalf("ContainerCreate returned unexpected error: %v", err)
 	}
 
-	// Exec into a not-yet-started container fails (exec requires a running
-	// container, matching the real daemon).
+	// Exec into a not-yet-started container fails, as on the real daemon.
 	if _, err := f.ExecStream(ctx, created.ID, []string{"tar", "-x"}, strings.NewReader("x")); err == nil {
 		t.Fatal("expected ExecStream into a stopped container to fail")
 	}
@@ -268,7 +265,7 @@ func TestFakeClientExecStream(t *testing.T) {
 	if f.Execs[0].ContainerID != created.ID || strings.Join(f.Execs[0].Cmd, " ") != strings.Join(cmd, " ") {
 		t.Errorf("unexpected exec record: %+v", f.Execs[0])
 	}
-	// Exec writes ARE visible in the tmpfs (the F1 regression model).
+	// Exec writes are visible in the tmpfs.
 	tmpfs := f.Tmpfs(created.ID)
 	if tmpfs["runner"] != "R" {
 		t.Errorf("tmpfs[runner] = %q, want R (exec write must be visible)", tmpfs["runner"])
@@ -298,10 +295,9 @@ func TestFakeClientExecStream(t *testing.T) {
 	}
 }
 
-// TestFakeClientContainerCreateNameConflict proves the fake models the
-// daemon's Docker-name uniqueness: a second create with an in-use name is
-// rejected with an errdefs.IsConflict error, and no second container is
-// recorded (NEW-5).
+// TestFakeClientContainerCreateNameConflict checks that a second create with an
+// in-use name is rejected with an errdefs.IsConflict error and no second
+// container is recorded.
 func TestFakeClientContainerCreateNameConflict(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -333,9 +329,8 @@ func TestFakeClientContainerCreateNameConflict(t *testing.T) {
 	}
 }
 
-// TestFakeClientExecStreamMalformedTar proves a malformed archive reports a
-// non-zero exit (like `tar -x` failing) rather than silently succeeding, and
-// writes nothing into the tmpfs (NEW-5).
+// TestFakeClientExecStreamMalformedTar checks that a malformed archive reports a
+// non-zero exit, like `tar -x` failing, and writes nothing into the tmpfs.
 func TestFakeClientExecStreamMalformedTar(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -361,12 +356,10 @@ func TestFakeClientExecStreamMalformedTar(t *testing.T) {
 	}
 }
 
-// TestFakeClientExecStreamRejectsWrongCommand proves the fake only models the
-// EXACT credential-delivery argv (`tar -x -p -C /run/garm`) and surfaces any
-// other command shape as an error rather than pretending to run it (NEW-5).
-// This includes degenerate shapes a looser "-x and -C <dir> appear somewhere"
-// scan would have wrongly accepted: isCredentialTarExtract requires an exact
-// argv match, not a scan.
+// TestFakeClientExecStreamRejectsWrongCommand checks that the fake models only the
+// exact credential-delivery argv (`tar -x -p -C /run/garm`) and returns an error
+// for any other command shape, including ones a looser "-x and -C <dir> appear
+// somewhere" scan would accept.
 func TestFakeClientExecStreamRejectsWrongCommand(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()

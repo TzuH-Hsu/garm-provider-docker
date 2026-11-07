@@ -9,11 +9,10 @@ import (
 	"github.com/docker/docker/api/types/mount"
 )
 
-// TestFakeModelsDindSidecarFields asserts the fake faithfully records and
-// surfaces the container.Config.Cmd and the HostConfig.Privileged/Runtime
-// fields the DinD sidecar sets (ADR-001), so provider/topology unit tests can
-// assert the sidecar was built with the right dockerd argv, privilege, and
-// runtime — the same real-daemon contract WP3's live verification checks.
+// TestFakeModelsDindSidecarFields asserts the fake records and surfaces the
+// container.Config.Cmd and the HostConfig.Privileged/Runtime fields the DinD
+// sidecar sets (ADR-001), so unit tests can assert the sidecar was built with the
+// right dockerd argv, privilege and runtime.
 func TestFakeModelsDindSidecarFields(t *testing.T) {
 	f := NewFakeClient()
 
@@ -49,9 +48,8 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 	if got.HostConfig == nil || !got.HostConfig.Privileged {
 		t.Errorf("HostConfig.Privileged = %v, want true", got.HostConfig)
 	}
-	// F13: the RAW create request set no explicit runtime (privileged-sidecar),
-	// while ContainerInspect NORMALIZES that to the daemon default, exactly like
-	// the real daemon reports it.
+	// The create request set no explicit runtime (privileged-sidecar), while
+	// ContainerInspect reports the daemon default, like the real daemon.
 	if raw := f.RawRuntime(resp.ID); raw != "" {
 		t.Errorf("RawRuntime = %q, want empty (privileged-sidecar sets no explicit runtime)", raw)
 	}
@@ -73,9 +71,8 @@ func TestFakeModelsDindSidecarFields(t *testing.T) {
 	}
 }
 
-// TestFakeRecordsRuntimeForSysbox confirms a non-empty runtime (WP4's
-// sysbox-runc) is recorded and surfaced, so the same fake serves both DinD
-// modes unchanged.
+// TestFakeRecordsRuntimeForSysbox confirms a non-empty runtime (sysbox-runc) is
+// recorded and surfaced, so the same fake serves both DinD modes.
 func TestFakeRecordsRuntimeForSysbox(t *testing.T) {
 	f := NewFakeClient()
 	resp, err := f.ContainerCreate(context.Background(),
