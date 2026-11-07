@@ -1,33 +1,14 @@
-// Package garmenv reads the GARM external-provider execution environment.
+// Package garmenv reads the GARM external provider environment. It wraps
+// garm-provider-common's execution.GetEnvironment and differs in one rule.
 //
-// It is a thin wrapper over garm-provider-common's execution.GetEnvironment
-// that differs in exactly one rule, for exactly one interface version:
+// Under interface v0.1.1, garm-provider-common v0.1.9 rejects DeleteInstance,
+// GetInstance, StartInstance and StopInstance when GARM_POOL_ID is empty, yet GARM
+// v0.2.1 sends it empty for those commands on a scale-set instance. A scale-set
+// runner could then never be deleted: GARM retries forever in pending_delete.
 //
-// Under interface v0.1.1, garm-provider-common v0.1.9 (the version GARM v0.2.1
-// itself pins, and the latest release) rejects DeleteInstance, GetInstance,
-// StartInstance and StopInstance when GARM_POOL_ID is empty
-// (execution/v0.1.1/execution.go, EnvironmentV011.Validate). GARM v0.2.1 sends
-// an EMPTY GARM_POOL_ID for every one of those commands on a scale-set
-// instance: runner/providers/v0.1.1/external.go fills GARM_POOL_ID from
-// PoolInfo.ID, and the scale-set callers (workers/provider/instance_manager.go
-// getProviderBaseParams, workers/scaleset/scaleset.go consolidateRunnerState)
-// populate only ControllerInfo, leaving PoolInfo zero. The library's
-// validation therefore makes a scale-set runner impossible to delete — GARM
-// retries the delete forever and the instance is stuck in pending_delete.
-//
-// This package relaxes that single check: for those four commands an empty
-// pool ID is accepted. Every other check is still delegated to the library's
-// own Validate, unchanged. None of the four commands consumes the pool ID —
-// EnvironmentV011.Run passes only GARM_INSTANCE_ID to the provider, and this
-// provider resolves instances by the controller-scoped instance-name label
-// (ADR-004), never by pool — so the relaxation loses no information.
-// CreateInstance and ListInstances keep requiring a pool ID: GARM always sends
-// one for them (the real pool UUID, or the scale-set pseudo pool ID), and the
-// pool-ID label is what scopes a list to one pool/scale set.
-//
-// Interface v0.1.0 (and an unset GARM_INTERFACE_VERSION) is delegated to the
-// library verbatim: its validation never required a pool ID for these
-// commands.
+// This package accepts an empty pool ID for those four commands, none of which
+// reads it: instances are resolved by name label (ADR-004). Every other check, and
+// all of interface v0.1.0, goes to the library unchanged.
 package garmenv
 
 import (
@@ -40,9 +21,6 @@ import (
 	executionv011 "github.com/cloudbase/garm-provider-common/execution/v0.1.1"
 )
 
-// poolIDOptionalCommands are the v0.1.1 commands for which GARM v0.2.x sends
-// an empty GARM_POOL_ID on scale-set instances and whose dispatch never reads
-// the pool ID.
 var poolIDOptionalCommands = []execcommon.ExecutionCommand{
 	execcommon.DeleteInstanceCommand,
 	execcommon.GetInstanceCommand,
@@ -50,15 +28,12 @@ var poolIDOptionalCommands = []execcommon.ExecutionCommand{
 	execcommon.StopInstanceCommand,
 }
 
-// validationPoolIDPlaceholder stands in for an absent pool ID ONLY on the
-// throwaway copy handed to the library's Validate, so every other library
-// check still runs. It never reaches the returned environment.
+// validationPoolIDPlaceholder fills an empty pool ID on the copy passed to the
+// library's Validate, so its other checks still run. It is never returned.
 const validationPoolIDPlaceholder = "scale-set-instance-without-pool-id"
 
-// GetEnvironment reads and validates the execution environment GARM set for
-// this invocation (env vars, plus the BootstrapInstance on stdin for
-// CreateInstance). The returned execution.Environment is the library's own
-// type, so its Run dispatches exactly as before.
+// GetEnvironment reads and validates the environment GARM set for this invocation,
+// including the BootstrapInstance on stdin for CreateInstance.
 func GetEnvironment() (execution.Environment, error) {
 	if os.Getenv("GARM_INTERFACE_VERSION") != execcommon.Version011 {
 		return execution.GetEnvironment()
@@ -76,8 +51,8 @@ func GetEnvironment() (execution.Environment, error) {
 	}, nil
 }
 
-// getEnvironmentV011 mirrors executionv011.GetEnvironment (garm-provider-common
-// v0.1.9) field for field, swapping only the validation step.
+// getEnvironmentV011 mirrors executionv011.GetEnvironment from garm-provider-common
+// v0.1.9, replacing only the validation step. Recheck it when that dependency moves.
 func getEnvironmentV011() (executionv011.EnvironmentV011, error) {
 	env := executionv011.EnvironmentV011{
 		Command:            execcommon.ExecutionCommand(os.Getenv("GARM_COMMAND")),
@@ -100,9 +75,8 @@ func getEnvironmentV011() (executionv011.EnvironmentV011, error) {
 	return env, nil
 }
 
-// validateV011 runs the library's EnvironmentV011.Validate, except that an
-// empty pool ID is tolerated for poolIDOptionalCommands. It validates a copy
-// (env is passed by value), so the caller's environment is never altered.
+// validateV011 runs the library's Validate, tolerating an empty pool ID for
+// poolIDOptionalCommands. env is a copy, so the placeholder stays in this function.
 func validateV011(env executionv011.EnvironmentV011) error {
 	if env.PoolID == "" && slices.Contains(poolIDOptionalCommands, env.Command) {
 		env.PoolID = validationPoolIDPlaceholder
