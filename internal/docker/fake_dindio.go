@@ -21,9 +21,9 @@ func (f *FakeClient) SetStats(containerID, body string) {
 	}
 }
 
-// ContainerStatsOneShot returns the SetStats body for a running container. A missing
-// container is NotFound. A stopped one is a Conflict here, though the daemon answers 200
-// with an empty sample (name and ID, no blkio counters).
+// ContainerStatsOneShot returns the SetStats body for a running or paused container. A
+// missing container is NotFound. In any other state the daemon has no cgroup to sample
+// and answers with an empty sample (name and ID, no blkio counters).
 //
 // For a container that joined another's network namespace ("container:<ref>") the
 // daemon looks up the owner's sandbox to add network stats, and the whole sample
@@ -45,14 +45,14 @@ func (f *FakeClient) ContainerStatsOneShot(ctx context.Context, containerID stri
 	if c == nil {
 		return container.StatsResponseReader{}, notFoundf("No such container: %s", containerID)
 	}
-	if c.state != "running" {
-		return container.StatsResponseReader{}, conflictf("container %s is not running", c.id)
-	}
+	emptySample := fmt.Sprintf(`{"name":%q,"id":%q}`, "/"+c.name, c.id)
 	body := c.statsBody
-	if ref, ok := joinedNetnsOwner(c.networkMode); ok {
+	if c.state != "running" && c.state != "paused" {
+		body = emptySample
+	} else if ref, ok := joinedNetnsOwner(c.networkMode); ok {
 		switch owner := f.find(ref); {
 		case owner == nil:
-			body = fmt.Sprintf(`{"name":%q,"id":%q}`, "/"+c.name, c.id)
+			body = emptySample
 		case owner.state != "running":
 			return container.StatsResponseReader{}, errdefs.InvalidParameter(errors.New("invalid id: id is empty"))
 		}

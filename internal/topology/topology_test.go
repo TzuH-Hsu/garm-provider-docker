@@ -1181,17 +1181,17 @@ func TestSweepSkipsAllocationWithUnparseableCreatedAt(t *testing.T) {
 	}
 }
 
-func TestSweepStaleTargetsOnlyOneInstance(t *testing.T) {
+func TestSweepInstanceTargetsOnlyOneInstance(t *testing.T) {
 	m, fake := newManager(t)
 	seedAllocation(t, fake, "job-stale", time.Now().Add(-time.Hour), "n1", "exited")
 	seedAllocation(t, fake, "job-live", time.Now(), "n2", "running")
 
-	if err := m.SweepStale(context.Background(), "job-stale"); err != nil {
-		t.Fatalf("SweepStale returned unexpected error: %v", err)
+	if _, err := m.sweepInstance(context.Background(), "job-stale"); err != nil {
+		t.Fatalf("sweepInstance returned unexpected error: %v", err)
 	}
 	// job-stale gone; job-live intact.
 	if countContainers(t, fake) != 1 || countNetworks(t, fake) != 1 || countVolumes(t, fake) != 1 {
-		t.Errorf("SweepStale should have removed only job-stale: %d/%d/%d",
+		t.Errorf("sweepInstance should have removed only job-stale: %d/%d/%d",
 			countContainers(t, fake), countNetworks(t, fake), countVolumes(t, fake))
 	}
 	findNetwork(t, fake, spec.JobNetworkName("job-live")) // must still exist
