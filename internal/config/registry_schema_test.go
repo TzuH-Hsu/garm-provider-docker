@@ -23,9 +23,8 @@ type registryParityCase struct {
 
 // TestRegistrySchemaLoaderParity pins that the published schema and the loader
 // agree on registry_mirrors and insecure_registries for every rule JSON Schema
-// can express, and documents (loaderOnly) the ones it cannot. It exists because
-// the schema is hand-maintained and once accepted an uppercase scheme the
-// loader rejects.
+// can express, and documents (loaderOnly) the ones it cannot. The schema is
+// maintained by hand, so it can drift from the loader.
 func TestRegistrySchemaLoaderParity(t *testing.T) {
 	schema, err := gojsonschema.NewSchema(gojsonschema.NewStringLoader(JSONSchema()))
 	if err != nil {

@@ -17,12 +17,8 @@ var examplePaths = []struct {
 	{name: "config.full.toml", path: "../../examples/config.full.toml"},
 }
 
-// TestExamplesLoadAndValidate is the anti-drift pin for the two example
-// configs (docs/plan.md M4 item 4). It loads each one through the REAL Load
-// entry point - the same one main.go calls - so if either example ever
-// drifts out of sync with internal/config (a renamed key, a changed
-// default, a newly-required field), this test fails rather than the
-// example silently going stale.
+// TestExamplesLoadAndValidate loads each example through Load, the entry point
+// main.go uses, so an example fails the build when it drifts from this package.
 func TestExamplesLoadAndValidate(t *testing.T) {
 	for _, tt := range examplePaths {
 		t.Run(tt.name, func(t *testing.T) {
@@ -37,21 +33,11 @@ func TestExamplesLoadAndValidate(t *testing.T) {
 	}
 }
 
-// TestExamplesHaveNoUnknownKeys is the half of the anti-drift claim that
-// Load alone cannot make. Load DELIBERATELY tolerates unknown TOML keys
-// (forward/backward compatibility - see Config's doc comment), so a
-// misspelled key in an example - `dind_mod`, `runner_iamge`, a table
-// renamed in code but not in the example - is silently ignored and the
-// example still "loads and validates" while documenting a key that does
-// nothing. That made the anti-drift guarantee vacuous for precisely the
-// most likely kind of drift.
-//
-// This test decodes each example with toml.MetaData and asserts
-// Undecoded() is empty: every key in the file must map onto a real field
-// of Config. The strictness lives HERE, in the test, and deliberately NOT
-// in the production loader - an operator's real config must keep
-// tolerating unknown keys, but a file this repo ships as documentation
-// must not contain a single key the code does not understand.
+// TestExamplesHaveNoUnknownKeys covers what Load cannot: Load ignores unknown
+// keys, so a misspelled key in an example (`dind_mod`) or one renamed in code
+// would still load. This test requires every key to map onto a Config field.
+// The strictness is in the test, not the loader, because an operator's real
+// config must keep tolerating unknown keys.
 func TestExamplesHaveNoUnknownKeys(t *testing.T) {
 	for _, tt := range examplePaths {
 		t.Run(tt.name, func(t *testing.T) {
@@ -69,11 +55,8 @@ func TestExamplesHaveNoUnknownKeys(t *testing.T) {
 	}
 }
 
-// TestExampleMinimalUsesDocumentedDefaults asserts config.minimal.toml
-// actually exercises the "smallest working config" claim made in its own
-// header comment and the root README: every field left unset resolves to
-// its documented default, not to some other value that merely happens to
-// validate.
+// TestExampleMinimalUsesDocumentedDefaults asserts that every field left unset
+// in config.minimal.toml resolves to its documented default.
 func TestExampleMinimalUsesDocumentedDefaults(t *testing.T) {
 	cfg, err := Load("../../examples/config.minimal.toml")
 	if err != nil {
@@ -100,14 +83,10 @@ func TestExampleMinimalUsesDocumentedDefaults(t *testing.T) {
 	}
 }
 
-// TestExampleFullMatchesDocumentedDefaults asserts every default-valued
-// field config.full.toml claims to set "to its default" in its own
-// comments actually IS that default in code, per field group. A value the
-// example deliberately overrides away from the default (runner_memory,
-// dind_image, flavors, extra_specs.allowed_env) is intentionally NOT
-// asserted here as a default - only the fields the file's own comments
-// claim equal the default are checked, so this test fails the moment
-// either side (the example's comment or the code) drifts from the other.
+// TestExampleFullMatchesDocumentedDefaults asserts that each field
+// config.full.toml marks as its default equals the default in code. Values the
+// example overrides on purpose (runner_memory, dind_image, flavors,
+// extra_specs.allowed_env) are not checked.
 func TestExampleFullMatchesDocumentedDefaults(t *testing.T) {
 	cfg, err := Load("../../examples/config.full.toml")
 	if err != nil {
@@ -151,11 +130,9 @@ func TestExampleFullMatchesDocumentedDefaults(t *testing.T) {
 	}
 }
 
-// TestExampleFullShowsRegistrySettings pins the illustrative registry values
-// in config.full.toml (their defaults are empty, so they are deliberately NOT
-// part of the defaults test above): the example must keep exercising both keys
-// through the real loader, so a rename or a stricter validation rule cannot
-// leave it documenting a value the code rejects.
+// TestExampleFullShowsRegistrySettings checks that config.full.toml keeps an
+// illustrative value for both registry keys that the loader accepts. Their
+// defaults are empty, so the defaults test above does not cover them.
 func TestExampleFullShowsRegistrySettings(t *testing.T) {
 	cfg, err := Load("../../examples/config.full.toml")
 	if err != nil {

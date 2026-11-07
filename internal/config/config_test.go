@@ -9,9 +9,8 @@ import (
 	"github.com/xeipuuv/gojsonschema"
 )
 
-// TestJSONSchemaIsValidDraft07 asserts the embedded provider-config schema
-// (returned by the v0.1.1 GetConfigJSONSchema command) is valid, parseable JSON
-// declaring draft-07 and describing the top-level config keys.
+// TestJSONSchemaIsValidDraft07 asserts the embedded provider-config schema is
+// parseable JSON, declares draft-07 and describes the top-level config keys.
 func TestJSONSchemaIsValidDraft07(t *testing.T) {
 	var m map[string]any
 	if err := json.Unmarshal([]byte(JSONSchema()), &m); err != nil {
@@ -30,10 +29,9 @@ func TestJSONSchemaIsValidDraft07(t *testing.T) {
 		}
 	}
 
-	// The schema must state the constraints the loader actually enforces, not
-	// merely list the key names: a self-describing schema that accepts `{}`
-	// while Load rejects it is worse than none, because a consumer validating
-	// against it gets a false PASS.
+	// The schema must state the constraints the loader enforces, not just list
+	// key names: a schema that accepts `{}` while Load rejects it gives a
+	// consumer a false pass.
 	req, ok := m["required"].([]any)
 	if !ok || len(req) == 0 {
 		t.Fatalf("config schema declares no top-level required keys, but Load requires runner_image: required=%v", m["required"])
@@ -49,15 +47,11 @@ func TestJSONSchemaIsValidDraft07(t *testing.T) {
 	}
 }
 
-// TestJSONSchemaMatchesLoaderOnRequiredKeys compiles the published schema and
-// runs real instance documents through it, asserting the schema AGREES with
-// the loader on which configs are acceptable. Structural assertions alone
-// (does an "if" key exist?) would not catch a conditional that is present but
-// wrong, which is exactly how the schema drifted into accepting `{}`.
-//
-// gojsonschema is the same validator internal/extraspecs uses for the
-// extra_specs contract, so compiling successfully here also proves the schema
-// is well-formed draft-07 rather than merely well-formed JSON.
+// TestJSONSchemaMatchesLoaderOnRequiredKeys runs real instance documents
+// through the published schema and checks that it agrees with the loader on
+// which configs are acceptable. Checking only that an "if" key exists would miss
+// a conditional that is present but wrong. Compiling the schema with
+// gojsonschema also proves it is well-formed draft-07.
 func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 	schema, err := gojsonschema.NewSchema(gojsonschema.NewStringLoader(JSONSchema()))
 	if err != nil {
@@ -71,11 +65,9 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 	tests := []struct {
 		name     string
 		instance string
-		// toml, when non-empty, is a TOML-equivalent of instance: it is also run
-		// through the real Load(), and the resulting success/failure is asserted
-		// to AGREE with wantOK — so this table isn't just testing the schema in
-		// isolation, it is a truth table both the schema and the loader must
-		// satisfy identically (the whole point of a self-describing schema).
+		// toml, when non-empty, is the TOML form of instance. It also goes through
+		// Load, whose result must agree with wantOK, so the table is a truth table
+		// that both the schema and the loader must satisfy.
 		toml   string
 		wantOK bool
 	}{
@@ -90,9 +82,8 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			wantOK:   false,
 		},
 		{
-			// omitted dind_mode + omitted allowed_dind_modes: both default
-			// ("none" / ["none"]), and "none" is trivially a member of its own
-			// default ceiling.
+			// dind_mode and allowed_dind_modes both omitted: they default to "none"
+			// and ["none"], and "none" is a member of its own default ceiling.
 			name:     "runner_image alone is a complete minimal config",
 			instance: `{"runner_image": "` + runnerRef + `"}`,
 			toml:     runnerTOML,
@@ -115,10 +106,8 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			wantOK:   false,
 		},
 		{
-			// R4(b): a non-"none" dind_mode with an OMITTED allowed_dind_modes
-			// must now FAIL schema validation, matching the loader's fail-closed
-			// ceiling (allowed_dind_modes defaults to ["none"], M4-W1) — this is
-			// the case that used to pass the schema while the loader rejected it.
+			// A non-"none" dind_mode with allowed_dind_modes omitted must fail the
+			// schema too, matching the loader's fail-closed ["none"] default.
 			name:     "privileged-sidecar with dind_image but no allowed_dind_modes ceiling rejected",
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "privileged-sidecar", "dind_image": "` + dindRef + `"}`,
 			wantOK:   false,
@@ -153,13 +142,10 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "bogus"}`,
 			wantOK:   false,
 		},
-		// H2/M4-W1: the loader's membership check (dind_mode must be a member of
-		// allowed_dind_modes) is UNCONDITIONAL — it applies just as much to the
-		// "none"/omitted default as to privileged-sidecar/sysbox-runc above. The
-		// schema used to omit this for the "none" case (no allOf conditional
-		// covered it), a false PASS the loader itself rejects. These cases pin
-		// the full truth table down, with a real Load() cross-check where
-		// practical.
+		// The loader's membership check (dind_mode must be in allowed_dind_modes)
+		// is unconditional: it applies to the "none" or omitted default as much as
+		// to the other modes. The schema must say so too, and these cases check
+		// it against Load where they can.
 		{
 			name:     "none mode with an EMPTY allowed_dind_modes ceiling rejected (empty ceiling denies every mode)",
 			instance: `{"runner_image": "` + runnerRef + `", "dind_mode": "none", "allowed_dind_modes": []}`,
@@ -185,19 +171,16 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			wantOK:   true,
 		},
 		{
-			// dind_mode omitted (defaults to "none") but the ceiling is
-			// explicitly widened to include privileged-sidecar too: "none" is
-			// still a member, so this is a PASS despite the wider ceiling —
-			// widening the ceiling only ever adds permission, never removes it.
+			// dind_mode omitted (defaults to "none") and the ceiling widened: "none"
+			// is still a member, so this passes. Widening only adds permission.
 			name:     "omitted dind_mode with a ceiling containing none plus another mode accepted",
 			instance: `{"runner_image": "` + runnerRef + `", "allowed_dind_modes": ["none", "privileged-sidecar"]}`,
 			toml:     runnerTOML + "allowed_dind_modes = [\"none\", \"privileged-sidecar\"]\n",
 			wantOK:   true,
 		},
 		{
-			// additionalProperties stays true at the top level on purpose:
-			// the loader tolerates unknown TOML keys for forward/backward
-			// compatibility, and the schema must not claim otherwise.
+			// additionalProperties stays true at the top level because the loader
+			// ignores unknown TOML keys, and the schema must not claim otherwise.
 			name:     "unknown top-level key tolerated, matching the loader",
 			instance: `{"runner_image": "` + runnerRef + `", "some_future_key": 1}`,
 			wantOK:   true,
@@ -218,10 +201,7 @@ func TestJSONSchemaMatchesLoaderOnRequiredKeys(t *testing.T) {
 			if tt.toml == "" {
 				return
 			}
-			// Cross-check: the same instance, as TOML, run through the REAL
-			// loader. The schema and the loader must agree — that is the whole
-			// point of a self-describing schema (see the package doc comment on
-			// JSONSchema()).
+			// Cross-check: the same instance as TOML through the real loader.
 			dir := t.TempDir()
 			path := filepath.Join(dir, "config.toml")
 			if err := os.WriteFile(path, []byte(tt.toml), 0o600); err != nil {
@@ -364,17 +344,11 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
-// validBaseConfig returns a Config that passes every M0+M1 Validate check.
-// dind_mode and storage_driver match the same defaults Load() applies, but
-// allowed_dind_modes is DELIBERATELY WIDENED to all three modes here rather
-// than matching Load()'s real fail-closed ["none"] default (M4-W1), so a test
-// focused on one field (e.g. RunnerImage here, or a single M1 field in
-// config_m1_test.go) can freely combine any dind_mode without also having to
-// override the ceiling just to reach the check it actually cares about. Tests
-// that hand-build a Config directly (bypassing Load(), which applies the real
-// ["none"] ceiling default from a bare TOML file) must start from this
-// baseline rather than a bare Config{} literal, or they fail on fields
-// unrelated to what they're testing.
+// validBaseConfig returns a Config that passes Validate. dind_mode and
+// storage_driver match Load's defaults, but allowed_dind_modes is widened to all
+// three modes instead of Load's ["none"], so a test can combine any dind_mode
+// without overriding the ceiling. Tests that build a Config by hand should start
+// from this and not from a bare Config{}.
 func validBaseConfig(runnerImage string, allowUnpinnedRunnerImage bool) Config {
 	return Config{
 		DockerHost:               defaultDockerHost,

@@ -2,9 +2,9 @@ package config
 
 import "testing"
 
-// TestLoadM1 covers Load's new M1 validation branches (dind_mode,
-// allowed_dind_modes, dind_image, storage_driver, [resources], [flavors.*])
-// via testdata fixtures, mirroring TestLoad's structure in config_test.go.
+// TestLoadM1 covers Load's validation of dind_mode, allowed_dind_modes,
+// dind_image, storage_driver, [resources] and [flavors.*] through testdata
+// fixtures.
 func TestLoadM1(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -15,10 +15,8 @@ func TestLoadM1(t *testing.T) {
 		{name: "unknown dind_mode is rejected", path: "testdata/m1_dind_mode_invalid.toml", wantErr: true},
 		{name: "dind_mode outside allowed_dind_modes is rejected", path: "testdata/m1_dind_mode_not_allowed.toml", wantErr: true},
 		{name: "unknown entry in allowed_dind_modes is rejected", path: "testdata/m1_allowed_dind_modes_invalid.toml", wantErr: true},
-		// The fail-closed ceiling default in action: an otherwise entirely
-		// valid DinD config that never widens allowed_dind_modes is rejected
-		// at LOAD time, so the operator finds out from a startup error
-		// instead of from a create that fails halfway through.
+		// A valid DinD config that never widens allowed_dind_modes is rejected at
+		// load, so the operator sees a startup error and not a failed create.
 		{name: "dind_mode is denied by the default ceiling when not widened", path: "testdata/m1_allowed_dind_modes_default_denies_dind.toml", wantErr: true},
 		{name: "dind_image required when dind_mode != none", path: "testdata/m1_dind_image_missing.toml", wantErr: true},
 		{name: "tag-only dind_image rejected by default", path: "testdata/m1_dind_image_unpinned.toml", wantErr: true},
@@ -45,14 +43,10 @@ func TestLoadM1(t *testing.T) {
 	}
 }
 
-// TestLoadM1Defaults confirms an M0-shaped config (no M1 keys at all, e.g.
-// testdata/valid.toml) still loads with ADR-001's documented M1 defaults
-// applied: dind_mode=none, the FAIL-CLOSED ["none"] ceiling (an operator who
-// never touches the config gets no DinD mode available at all — see
-// defaultAllowedDindModes), storage_driver=overlay2, enable_job_network=true,
-// and internal=false (the 2026-07-21 owner ruling, ADR-001 Amendment — job
-// networks default to open egress; per-allocation network separation, not
-// this flag, provides job-to-job isolation).
+// TestLoadM1Defaults confirms a config with no DinD, storage or network keys
+// (testdata/valid.toml) loads with the documented defaults: dind_mode none, the
+// fail-closed ["none"] ceiling, overlay2, enable_job_network true and internal
+// false (ADR-001, "Job network").
 func TestLoadM1Defaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
@@ -292,13 +286,10 @@ func TestConfigValidateFlavors(t *testing.T) {
 	}
 }
 
-// TestConfigEffectiveDindMode covers EffectiveDindMode's ceiling enforcement
-// (ADR-001 F7): a mode within allowed_dind_modes resolves cleanly, and a
-// mode outside it — whether the config-wide default or a (future M3)
-// poolMode override — is rejected with a clear error, exactly as
-// validateDindMode already enforces at Load time (config_test.go /
-// TestConfigValidateDindMode above), but re-checked here since this is the
-// method WP4's provider create path calls defensively.
+// TestConfigEffectiveDindMode covers the operator ceiling: a mode within
+// allowed_dind_modes resolves, and a mode outside it, whether the config default
+// or a pool's request, is rejected. Validate enforces the same rule at load; the
+// create path re-checks it here.
 func TestConfigEffectiveDindMode(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -347,11 +338,9 @@ func TestConfigEffectiveDindMode(t *testing.T) {
 			wantErr:          true,
 		},
 		{
-			// F10: an empty AllowedDindModes must FAIL CLOSED (deny every mode),
-			// never be treated as fail-open "unrestricted". A loaded config
-			// always carries at least the fail-closed ["none"] default (M4-W1),
-			// so an empty slice only ever reaches here from a hand-built Config
-			// that bypassed Load.
+			// An empty ceiling denies every mode and is never "unrestricted". A
+			// loaded config always has at least ["none"], so an empty slice means
+			// a hand-built Config that bypassed Load.
 			name:             "an empty AllowedDindModes fails closed (denies every mode)",
 			dindMode:         DindModePrivilegedSidecar,
 			allowedDindModes: nil,
@@ -379,11 +368,9 @@ func TestConfigEffectiveDindMode(t *testing.T) {
 	}
 }
 
-// TestConfigValidateAllowedDindModes covers the provider-construction ceiling
-// check (F10): an empty ceiling is rejected (never fail-open), an invalid entry
-// is rejected, and a well-formed non-empty ceiling passes — deliberately
-// WITHOUT requiring dind_mode to be a member (that relationship is Load's and
-// EffectiveDindMode's job).
+// TestConfigValidateAllowedDindModes covers the provider-construction check on
+// the ceiling: empty or invalid is rejected, and a well-formed one passes without
+// dind_mode being a member (Load and EffectiveDindMode check that).
 func TestConfigValidateAllowedDindModes(t *testing.T) {
 	tests := []struct {
 		name    string

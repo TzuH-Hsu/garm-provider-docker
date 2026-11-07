@@ -2,8 +2,7 @@ package config
 
 import "testing"
 
-// TestLoadM2Cache covers Load's new [cache] validation branches (M2-W1) via
-// testdata fixtures, mirroring TestLoadM1's structure in config_m1_test.go.
+// TestLoadM2Cache covers Load's [cache] validation through testdata fixtures.
 func TestLoadM2Cache(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -35,8 +34,8 @@ func TestLoadM2Cache(t *testing.T) {
 	}
 }
 
-// TestLoadM2CacheDefaults confirms a config with no [cache] table at all still
-// loads with ADR-003/ADR-005's documented cache defaults applied.
+// TestLoadM2CacheDefaults confirms a config with no [cache] table loads with the
+// documented cache defaults.
 func TestLoadM2CacheDefaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
@@ -70,8 +69,7 @@ func TestLoadM2CacheDefaults(t *testing.T) {
 }
 
 // TestLoadM2CacheEnabledFalseOverridesDefault confirms an explicit
-// enabled = false in the file overrides the true default (the same
-// set-default-then-decode pattern Network.EnableJobNetwork relies on).
+// enabled = false overrides the true default.
 func TestLoadM2CacheEnabledFalseOverridesDefault(t *testing.T) {
 	cfg, err := Load("testdata/m2_cache_disabled.toml")
 	if err != nil {
@@ -108,9 +106,9 @@ func TestCacheValidate(t *testing.T) {
 		{name: "negative stale days rejected", mutate: func(c *Cache) { c.StaleCacheEvictionDays = -5 }, wantErr: true},
 		{name: "negative log retention rejected", mutate: func(c *Cache) { c.DiagnosticLogRetentionDays = -1 }, wantErr: true},
 
-		// H2: canonical-alias bypasses. Each of these would canonicalize onto a
-		// reserved in-runner mount (the runner install dir or the /run socket dir)
-		// but slip past the old raw-string ancestor check.
+		// Canonical-alias bypasses: each of these resolves onto a reserved in-runner
+		// mount, the runner install dir or the /run socket dir, and would slip past
+		// a check on the raw string.
 		{name: "dot-segment onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/." }, wantErr: true},
 		{name: "/opt/../ traversal onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/opt/../actions-runner" }, wantErr: true},
 		{name: "repeated slashes are non-canonical, rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "//opt//hostedtoolcache" }, wantErr: true},

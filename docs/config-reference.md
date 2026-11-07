@@ -182,7 +182,7 @@ in a real config. `GetConfigJSONSchema` emits the machine-readable schema.
 | `dind_image` | unset | Required when `dind_mode` is not `none`, and checked at load whenever it is set. Digest-pinned. |
 | `storage_driver` | `overlay2` | `overlay2` or `vfs`. |
 | `registry_mirrors`, `insecure_registries` | empty | See the next section. |
-| `[resources]` `runner_memory`, `dind_memory` | unset (unlimited) | Byte sizes such as `8GiB` or `512MiB`. They are the ceilings for `extra_specs`. There are no CPU or PID limits. |
+| `[resources]` `runner_memory`, `dind_memory` | unset (unlimited) | Byte sizes such as `8GiB` or `512MiB`: a whole number with an optional `B`, `KB`, `MB`, `GB` (decimal) or `KiB`, `MiB`, `GiB` (binary) suffix, in any case. `8GB` and `8GiB` are different sizes, and fractions such as `1.5GiB` are rejected. They are the ceilings for `extra_specs`. There are no CPU or PID limits. |
 | `[network]` `internal` | `false` | Docker's `internal` flag on each job network. `true` gives a job no egress at all. |
 | `[network]` `enable_job_network` | `true` | Reserved. The network is always created, and a warning is logged if this is `false`. |
 | `[cache]` `enabled` | `true` | Turns the persistent caches off, including the externals volume. JavaScript actions then cannot run in container jobs in DinD modes. |

@@ -13,44 +13,26 @@ import (
 	"github.com/distribution/reference"
 )
 
-// Registry settings for the DinD sidecar's daemon (ADR-001 amendment, issue
-// #26): registry_mirrors and insecure_registries are emitted as the typed
-// dockerd flags --registry-mirror / --insecure-registry (spec.DindCommand).
-// They are operator config only: no extra_specs key, and no per-flavor
-// override (a provider config describes one Docker host, and a mirror is a
-// property of that host's network).
-//
-// The accepted forms follow dockerd's own registry configuration
-// (daemon/pkg/registry/config.go in moby), deliberately a little STRICTER where
-// dockerd is lenient, so that a mistake fails at load with a message instead of
-// being silently normalised or surfacing later as a sidecar that cannot start:
-//
-//   - a mirror must be a bare origin (scheme://host[:port][/]) with a
-//     lowercase scheme; dockerd also tolerates a path, which this provider does
-//     not allow, and mishandles an uppercase scheme;
-//   - an insecure registry must not carry a scheme; dockerd strips an http://
-//     or https:// prefix with a warning;
-//   - duplicates are rejected; dockerd drops them silently;
-//   - ports are 1-65535; dockerd accepts 0.
-//
-// Entries are validated regardless of dind_mode, so a typo is caught at load
-// rather than when DinD is later enabled (the same stance as dind_image).
+// registry_mirrors and insecure_registries become dockerd's --registry-mirror
+// and --insecure-registry flags for the DinD sidecar (ADR-001, "Registry
+// mirrors"; issue #26). The rules follow dockerd's but are stricter where it is
+// lenient, so a mistake fails at load instead of as a sidecar that cannot start:
+// a mirror has a lowercase scheme and no path, an insecure registry has no
+// scheme, duplicates are rejected, and ports are 1-65535.
 
 const (
 	maxPort = 65535
 
-	// registryMirrorsKey and insecureRegistriesKey name the TOML keys in
-	// errors.
+	// registryMirrorsKey and insecureRegistriesKey name the TOML keys in errors.
 	registryMirrorsKey    = "registry_mirrors"
 	insecureRegistriesKey = "insecure_registries"
 )
 
-// hostPortPattern is the reference grammar for a registry domain with an
-// optional port, anchored (dockerd's validHostPortRegex).
+// hostPortPattern is dockerd's validHostPortRegex, anchored.
 var hostPortPattern = regexp.MustCompile("^" + reference.DomainRegexp.String() + "$")
 
-// validateRegistryMirrors checks every registry_mirrors entry and rejects
-// duplicates (compared case-insensitively, ignoring one trailing slash).
+// validateRegistryMirrors checks every entry and rejects duplicates, compared
+// case-insensitively and ignoring one trailing slash.
 func (c Config) validateRegistryMirrors() error {
 	seen := make(map[string]struct{}, len(c.RegistryMirrors))
 	for i, raw := range c.RegistryMirrors {
@@ -66,15 +48,15 @@ func (c Config) validateRegistryMirrors() error {
 	return nil
 }
 
-// validateInsecureRegistries checks every insecure_registries entry and
-// rejects duplicates (hosts case-insensitively, CIDRs by their masked form).
+// validateInsecureRegistries checks every entry and rejects duplicates: hosts
+// case-insensitively, CIDRs by their masked form.
 func (c Config) validateInsecureRegistries() error {
 	seen := make(map[string]struct{}, len(c.InsecureRegistries))
 	for i, raw := range c.InsecureRegistries {
 		key, err := validateInsecureRegistry(raw)
 		if err != nil {
-			// Errors from validateInsecureRegistry never embed the value;
-			// the wrapper echoes it only when it cannot hold credentials.
+			// validateInsecureRegistry shows no part of a value containing '@' or
+			// '%', so echo it here only when it cannot hold credentials.
 			if strings.ContainsAny(raw, "@%") {
 				return fmt.Errorf("%s[%d]: %w", insecureRegistriesKey, i, err)
 			}
@@ -89,13 +71,10 @@ func (c Config) validateInsecureRegistries() error {
 }
 
 // validateRegistryMirror accepts scheme://host[:port][/] with an http or https
-// scheme and nothing else. The offending value is echoed back in the error
-// except where it could carry credentials.
+// scheme. Its errors echo the value except where it could carry credentials.
 func validateRegistryMirror(raw string) error {
-	// Credentials first, before any other check can echo the value: a mirror
-	// URL with userinfo (user:token@host) must never reach an error string,
-	// whatever else is wrong with it. '%' is treated the same way, since it
-	// can percent-encode an '@'.
+	// Check for credentials first so that no later error can echo them. '%' is
+	// treated the same way because it can percent-encode an '@'.
 	if strings.ContainsAny(raw, "@%") {
 		return errors.New("a mirror URL must not contain userinfo (user:password@) or percent-encoding; the value is not shown")
 	}
@@ -108,9 +87,8 @@ func validateRegistryMirror(raw string) error {
 	if !ok || scheme == "" {
 		return fmt.Errorf("%s must be an absolute URL with an http:// or https:// scheme", shown)
 	}
-	// Lowercase only: dockerd's classic pull path checks the configured string
-	// for a literal "http://" / "https://" prefix and would otherwise prepend
-	// "https://" to an "HTTPS://..." mirror.
+	// Lowercase only: dockerd's classic pull path looks for a literal "http://"
+	// or "https://" prefix and would prepend "https://" to "HTTPS://...".
 	if scheme != "http" && scheme != "https" {
 		return fmt.Errorf("%s has unsupported scheme %s: must be lowercase http or https", shown, strconv.Quote(scheme))
 	}
@@ -142,8 +120,8 @@ func validateRegistryMirror(raw string) error {
 	return nil
 }
 
-// validateInsecureRegistry accepts host[:port] or a CIDR, as dockerd does, and
-// returns the normalised duplicate-detection key.
+// validateInsecureRegistry accepts host[:port] or a CIDR and returns the key
+// used to detect duplicates.
 func validateInsecureRegistry(raw string) (string, error) {
 	if strings.ContainsAny(raw, "@%") {
 		return "", errors.New("must be host[:port] or a CIDR and must not contain userinfo ('@') or '%'; the value is not shown")
@@ -169,9 +147,8 @@ func validateInsecureRegistry(raw string) (string, error) {
 	return strings.ToLower(raw), nil
 }
 
-// validateHostPort mirrors moby's validateHostPort: s is a registry domain
-// (optionally with a numeric port) or an IP address, bracketed when it
-// carries a port.
+// validateHostPort mirrors moby's check: s is a registry domain with an optional
+// numeric port, or an IP address, bracketed when it carries a port.
 func validateHostPort(s string) error {
 	host, port, err := net.SplitHostPort(s)
 	if err != nil {
