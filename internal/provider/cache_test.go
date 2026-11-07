@@ -123,21 +123,14 @@ func cacheVolsByKind(t *testing.T, fake *docker.FakeClient, kind spec.CacheKind)
 
 const cacheRepoURL = "https://github.com/example-org/example-repo"
 
-// TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate is the
-// ensure→mount-window guard under the structural redesign: an operator-run
-// manual `docker volume prune` (or some other external actor — never the
-// provider's own GC, which is log-only and never removes a cache volume
-// itself, ADR-003's cache-GC-safety amendment) removes the (already
-// ensured+seeded) externals cache in the gap before the
-// runner container pins it in use; real Moby then AUTO-CREATES the missing named
-// volume UNLABELED when the runner references it (modeled by the fake). The
-// provider revalidates the referenced caches after ContainerCreate, detects the
-// empty unlabeled replacement, and FAILS the allocation CLOSED — no runner is left
-// against an empty externals tree. Critically, under ADR-003's
-// never-delete-unprovable rule the unlabeled auto-created volume is NOT deleted (a
-// Moby auto-created unlabeled volume and a genuinely foreign one are
-// indistinguishable): it is left in place as cruft, and GARM's retry reconciles
-// around the slot by label.
+// TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate covers the window
+// between ensure and mount: an operator's `docker volume prune` or another external
+// actor removes the ensured and seeded externals cache before the runner pins it, and
+// the daemon then recreates the named volume empty and unlabelled when the runner
+// references it (modeled by the fake). The provider revalidates after ContainerCreate
+// and fails the allocation closed, so no runner is left against an empty externals
+// tree. The unlabelled volume is indistinguishable from a foreign one, so it is not
+// deleted: it stays as cruft and GARM's retry routes around it by label.
 func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -149,8 +142,8 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 	)}
 
 	// Evict the externals cache exactly once, at the first ContainerCreate AFTER
-	// planExternals has ensured it (the seed helper) — modeling a peer's
-	// opportunistic GC deleting it in the ensure→mount window.
+	// planExternals has ensured it (the seed helper), modeling an external removal in
+	// the ensure→mount window.
 	var once sync.Once
 	fake.CreateHook = func() {
 		out, _ := fake.VolumeList(context.Background(), externalsFilter)
@@ -196,12 +189,10 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 	}
 }
 
-// TestRevalidateReferencedCachesClassification proves the structural-redesign rule
-// at the classification boundary: revalidate fails CLOSED on BOTH a transient
-// inspect failure AND a proven identity mismatch (an unlabeled auto-created
-// replacement), and in NEITHER case does it delete the volume — never delete a
-// volume we cannot prove is ours (B2). The mismatched volume is left in place as
-// cruft; GARM's retry reconciles around the slot.
+// TestRevalidateReferencedCachesClassification proves that revalidation fails closed on
+// both a transient inspect failure and a proven identity mismatch (an unlabelled
+// auto-created replacement), and in neither case deletes the volume. The mismatched
+// volume stays as cruft; GARM's retry routes around the slot.
 func TestRevalidateReferencedCachesClassification(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 	ctx := context.Background()
@@ -248,14 +239,10 @@ func TestRevalidateReferencedCachesClassification(t *testing.T) {
 	}
 }
 
-// TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache is the NEW-H1 guard:
-// during the post-create cache revalidation, a TRANSIENT VolumeInspect failure (a
-// context cancellation or a transient daemon error — NOT a genuine "gone") on a
-// referenced warm cache must fail the allocation CLOSED WITHOUT authorizing any
-// deletion of that cache. The old revalidation classified EVERY inspect error as
-// an "orphan auto-created replacement" and reaped it under a detached context, so
-// a cancelled/transient post-create inspect could DELETE a valid warm
-// toolcache/pnpm/diag/externals volume. This proves the warm toolcache SURVIVES.
+// TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache: during post-create
+// revalidation, a transient VolumeInspect failure on a warm cache (a context
+// cancellation or daemon error, not a genuine "gone") must fail the allocation closed
+// without deleting that cache.
 func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -268,7 +255,7 @@ func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 	// The toolcache is VolumeInspect'd ONLY during the post-create revalidation
 	// (planCaches ensures it via VolumeCreate/VolumeList, never Inspect; the
 	// externals seed's own re-inspect targets the externals name, not this one), so
-	// this fires exactly at the revalidation boundary NEW-H1 is about. The volume
+	// this fires exactly at the revalidation boundary. The volume
 	// stays PRESENT in the store — this models a transient daemon error, not a
 	// removal (which would be a NotFound, i.e. genuinely gone).
 	var once sync.Once
@@ -440,7 +427,7 @@ func TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete(t *testing.T) {
 // repo-scoped mounts, but RUNNER_TOOL_CACHE is still set (ephemeral, in-container)
 // and npm_config_store_dir is absent. The shared, image-digest-keyed externals
 // volume IS still provisioned and mounted read-only, because it carries no repo
-// data and applies to EVERY allocation regardless of entity scope (ADR-003 W2).
+// data and applies to EVERY allocation regardless of entity scope (ADR-003).
 func TestCreateInstanceOrgScopeWithholdsCaches(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -514,9 +501,8 @@ func TestCreateInstanceOrgScopeOptInGetsCaches(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes: with the cache feature
-// off (the default in newTestProvider), no cache volumes and no cache env — the
-// M1 behavior is preserved.
+// TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes: with the cache feature off (the
+// default in newTestProvider), no cache volumes and no cache env.
 func TestCreateInstanceCacheDisabledNoCacheEnvOrVolumes(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()

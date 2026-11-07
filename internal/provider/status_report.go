@@ -20,10 +20,8 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/metadata"
 )
 
-// runnerListeningMarker is the line actions/runner prints on STDOUT once its
-// listener session is open and it can be assigned a job (observed in a live
-// runner container's `docker logs`: "2026-10-10 17:45:14Z: Listening for
-// Jobs"). It is the provider's signal that the runner is truly online.
+// runnerListeningMarker is the line actions/runner prints on stdout once its listener
+// session is open and it can be assigned a job.
 const runnerListeningMarker = "Listening for Jobs"
 
 // statusPostTimeout bounds one status POST by the watcher, retries included.
@@ -40,38 +38,12 @@ const (
 	statusMessageIdle       = "runner is listening for jobs"
 )
 
-// reportRunnerStatus performs provider-side runner status reporting through
-// GARM's instance callback (ADR-002 amendment), the step GARM's userdata
-// templates perform from inside a VM. CreateInstance only checks that
-// reporting applies and starts a detached watcher process (status_watch.go),
-// handing it the request over a private pipe; the watcher then
-//
-//  1. reports "installing" (credentials are delivered and the runner is
-//     starting);
-//  2. waits, bounded by [status_report].timeout_seconds, for the runner to
-//     print runnerListeningMarker on stdout and confirms it is still running;
-//  3. reports "idle" — or, if the runner never got there, "installing" again
-//     with the reason.
-//
-// No network I/O to GARM happens inside CreateInstance: GARM bounds the
-// provider call (since cloudbase/garm#817, by runner_bootstrap_timeout and the
-// optional exec_timeout_seconds) and kills it on expiry, so neither a slow
-// callback nor a slow runner may delay it. The added latency is the watcher
-// handoff alone (bounded by watcherHandoffTimeout).
-//
-// GARM v0.2.1 scale sets move a runner to "active" with a CHECKED transition
-// that "pending" and "installing" may not take, so without this a scale-set
-// runner that picks up a job wedges GARM's scale-set listener. "idle" is
-// deliberately never reported early: GARM's bootstrap-timeout reaper only
-// collects runners still pending/installing, so a runner reported idle before
-// it was listening — and that then failed to come up — would never be reaped.
-// On a timeout the runner is therefore left "installing".
-//
-// Everything here is best-effort and only logs: status reporting must never
-// fail or roll back an otherwise-healthy allocation. The instance token and
-// the callback URL stay in provider memory (this process, then the watcher,
-// which receives them over a private pipe); the runner container never sees
-// either.
+// reportRunnerStatus starts the watcher that reports the runner through GARM's instance
+// callback: installing, then idle once it is listening, or installing again with the
+// reason if it never is (status_watch.go, ADR-002, Status reporting). The watcher is
+// detached because GARM can kill a slow CreateInstance; only where orphans would not be
+// reaped does it run inside this call (startStatusWatcher). This only logs: status
+// reporting never fails an allocation.
 func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapInstance, containerID string) {
 	sr := p.cfg.StatusReport
 	if !sr.Enabled() {
@@ -80,14 +52,10 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		return
 	}
 	if !b.JitConfigEnabled {
-		// Non-JIT runners register through config.sh inside the container, so
-		// GARM has no agent ID on the row; GARM's own bootstrap reports idle
-		// together with the agent_id read from .runner, which this provider
-		// cannot see. An ID-less idle would leave the row without an agent ID,
-		// and GARM skips removing the GitHub registration of a runner whose
-		// agent ID is 0 (runner/pool/pool.go DeleteRunner). Non-JIT only occurs
-		// on pools (scale sets always use JIT), and pools move runners to
-		// active with forced updates, so they do not need these reports.
+		// GARM has no agent ID for a non-JIT runner, and an ID-less idle would leave it
+		// unable to remove the GitHub registration (runner/pool/pool.go DeleteRunner).
+		// Non-JIT runners exist only on pools, which move runners to active with forced
+		// updates and need no reports.
 		slog.DebugContext(ctx, "CreateInstance: runner status reporting skipped for a non-JIT runner",
 			"instance", b.Name)
 		return
@@ -98,9 +66,8 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		return
 	}
 
-	// Validate the callback URL here (no network I/O) so a bad URL is logged
-	// by CreateInstance, with the call's own logger, rather than by the
-	// watcher (whose output is discarded unless [logging] file is set).
+	// Validate here so a bad URL reaches this call's logger. The watcher's output is
+	// discarded unless [logging] file is set.
 	if _, err := metadata.NewStatusReporter(b.CallbackURL, b.InstanceToken, b.CACertBundle); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: cannot report runner status: invalid callback URL (continuing)",
 			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
@@ -207,11 +174,9 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 	return false, false, errLogStreamEnded
 }
 
-// confirmRunning checks, after a readiness signal, that the runner container
-// is still running. A runner that printed "Listening for Jobs" (or whose
-// listener process was seen) and then exited must not be reported idle:
-// GARM's bootstrap reaper only collects pending/installing runners, so an
-// idle report would strand it.
+// confirmRunning reports whether the runner is still running after a readiness signal.
+// A runner that exited must not be reported idle: GARM's scale-set reaper only collects
+// pending and installing runners, so that report would strand it.
 func (p *Provider) confirmRunning(ctx context.Context, containerID string) (bool, error) {
 	info, err := p.cli.ContainerInspect(ctx, containerID)
 	if err != nil {

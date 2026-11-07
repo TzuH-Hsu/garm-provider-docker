@@ -75,10 +75,11 @@ the diagnostic-log volume to `diagnostic_log_retention_days`, at most once every
 
 ## Credentials
 
-The instance token, `.runner`, `.credentials` and `.credentials_rsaparams` reach
-the runner only through a memory-backed `tmpfs` at `/run/garm`, streamed in with
-`docker exec` after the container is created. They are not in the environment,
-on host disk or in the container's writable layer. See
+The instance token stays with the provider and never enters the container. The
+provider uses it to fetch `.runner`, `.credentials` and `.credentials_rsaparams`,
+which reach the runner only through a memory-backed `tmpfs` at `/run/garm`,
+streamed in with `docker exec` after the container is created. They are not in the
+environment, on host disk or in the container's writable layer. See
 [ADR-002](adr/ADR-002-runner-image-and-jit-delivery.md).
 
 ## IPv4-only localhost

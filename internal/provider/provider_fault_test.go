@@ -8,12 +8,10 @@ import (
 	"github.com/cloudbase/garm-provider-common/params"
 )
 
-// TestGetInstanceErrorStatusPopulatesProviderFault is the M3-W2 provider_fault
-// audit's positive proof: GetInstance is the one command whose ProviderFault
-// field can actually reach GARM (taxonomy.go explains why CreateInstance's own
-// failures cannot — execution.Run discards the ProviderInstance entirely on a
-// non-nil Go error). A container in InstanceError status (OOM-killed, or the
-// daemon's "dead" state) must carry a non-empty, descriptive ProviderFault.
+// TestGetInstanceErrorStatusPopulatesProviderFault: GetInstance is a command whose
+// ProviderFault can reach GARM (taxonomy.go explains why CreateInstance's own failures
+// cannot). A container in InstanceError status (OOM-killed, or the daemon's "dead"
+// state) must carry a non-empty, descriptive ProviderFault.
 func TestGetInstanceErrorStatusPopulatesProviderFault(t *testing.T) {
 	tests := []struct {
 		name          string

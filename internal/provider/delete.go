@@ -7,35 +7,19 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// DeleteInstance tears down the WHOLE per-allocation topology for instanceID —
-// the runner container, the job-scoped volumes, and the job network — in the
-// ADR-004 (network-last) delete order (container(s) → volumes → network,
-// removed LAST so the claim marker is held for the entire teardown). It is
-// idempotent at every step (NotFound tolerated); an instance whose entire
-// allocation is already gone returns the not-found error, which maps to exit
-// code 30 (GARM treats that as success).
+// DeleteInstance tears down the whole allocation of instanceID, the instance name, even
+// when the runner is already gone (ADR-004, Teardown order). It returns the not-found
+// error (exit 30, which GARM treats as success) when nothing is left.
 //
-// instanceID is the GARM instance NAME — provider_id is the instance name (F6),
-// and GARM falls back to the instance Name when provider_id is empty
-// (research.md §1.E); both equal the instance name, resolved by the
-// instance-name label (NEW-H1: there is no raw container-ID resolution).
-// resolveInstanceName maps it to the instance-name label that scopes the
-// teardown; if the runner container is already gone but a network, volume, or
-// lingering DinD sidecar remains (a crashed/partial allocation), the label
-// fallback still finds and sweeps the leftovers (ADR-004 F6).
-//
-// For a DinD allocation the teardown also logs one best-effort line with the
-// sidecar's block-device writes and image footprint before the sidecar stops
-// (ADR-006 rollout step 0), and for a runner that is not running one best-effort
-// line with its exit details, phase and screened log tail before it is removed
-// (ADR-004 amendment 2026-11-04); neither affects the result.
+// It also logs, best-effort, a DinD sidecar's block-device writes and image footprint
+// (ADR-006, Rollout) and why a stopped runner ended (ADR-004, Recording why a runner
+// died).
 func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error {
 	instanceName, found, err := p.resolveInstanceName(ctx, instanceID)
 	if err != nil {
 		return err
 	}
 	if !found {
-		// Nothing anywhere for this ID/name: the whole allocation is gone.
 		return notFoundError(instanceID)
 	}
 
@@ -44,23 +28,15 @@ func (p *Provider) DeleteInstance(ctx context.Context, instanceID string) error 
 		return fmt.Errorf("failed to delete instance %q: %w", instanceID, err)
 	}
 	if !torn {
-		// Raced with a concurrent delete/sweep between resolution and teardown:
-		// treat as already gone (exit 30) rather than an error.
+		// A concurrent delete or sweep got there first.
 		return notFoundError(instanceID)
 	}
 	return nil
 }
 
-// resolveInstanceName maps a GARM_INSTANCE_ID (always the instance NAME — F6,
-// NEW-H1) to the instance-name label that scopes an allocation's teardown
-// (ADR-004). It first resolves the owned runner container by the instance-name
-// label (validating ownership, so a foreign container is never acted on); if no
-// runner is found, it treats instanceID as the instance-name and checks for any
-// lingering managed container/network/volume under that name — so a
-// DeleteInstance for an allocation whose runner container already exited (or was
-// removed out of band, leaving only the DinD sidecar) still reaps its sidecar,
-// network, and volumes (F6). found=false means nothing managed exists for this
-// name at all.
+// resolveInstanceName returns the instance-name label that scopes a teardown. With no
+// owned runner, instanceID still counts if any managed resource lingers under that
+// name. found=false means nothing managed exists for it.
 func (p *Provider) resolveInstanceName(ctx context.Context, instanceID string) (string, bool, error) {
 	c, found, err := p.resolve(ctx, instanceID)
 	if err != nil {
@@ -72,17 +48,13 @@ func (p *Provider) resolveInstanceName(ctx context.Context, instanceID string) (
 			name = c.Config.Labels[spec.LabelInstanceName]
 		}
 		if name == "" {
-			// A managed runner missing its instance-name label should be
-			// impossible (baseLabels always sets it), but fall back to the
-			// GARM instance Name rather than tearing down nothing.
+			// baseLabels always sets the label, but tearing down nothing would be the
+			// worse outcome.
 			name = instanceID
 		}
 		return name, true, nil
 	}
 
-	// No owned runner container. The instanceID may be a GARM instance Name
-	// whose runner already exited, leaving a lingering network/volume — look
-	// for any managed job-scoped resource under that name.
 	lingering, err := p.hasManagedAllocationResources(ctx, instanceID)
 	if err != nil {
 		return "", false, err

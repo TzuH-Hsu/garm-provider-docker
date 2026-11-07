@@ -46,8 +46,8 @@ Cleartext is forbidden because the token is a Bearer credential.
 The sequence is fetch first, then create, start and deliver, because a tmpfs exists only once its container
 runs and because fetching first removes the race between a slow fetch and the entrypoint's credential wait.
 
-1. **Fetch** the files before creating anything, within a 60 second budget and with bounded retries. A
-   failure leaves nothing to clean up. Build an in-memory tar whose last entry is the marker `.delivered`.
+1. **Fetch** the files before creating the runner, within a 60 second budget and with bounded retries. A
+   failure rolls back the network and volumes made so far. Build an in-memory tar whose last entry is the marker `.delivered`.
 2. **Create** the runner with a memory-backed tmpfs at `/run/garm` (`mode=0700`, 16 MiB, owned by uid and
    gid 1001, the runner user). Pull the image first if it is missing.
 3. **Start** it. The entrypoint's first action is to wait for `/run/garm/.delivered`, for up to 120 seconds
@@ -113,7 +113,7 @@ The provider therefore reports status itself, from the provider process, using t
 It posts `installing` to `{callback-url}/status` once the credentials are delivered and the runner is
 running, then `idle` once the runner's own stdout shows `Listening for Jobs`, read through the Docker logs
 API, within `[status_report].timeout_seconds` (default 90, `0` disables). `idle` is never sent early,
-because GARM's bootstrap-timeout reaper collects only `pending` and `installing` runners, and a runner
+because GARM's scale-set bootstrap-timeout reaper collects only `pending` and `installing` runners, and a runner
 reported `idle` that then failed to start would never be reaped. On timeout the runner stays `installing`.
 If the daemon cannot return logs (log driver `none`), readiness falls back to `Runner.Listener` appearing in
 `docker top` and staying up for 5 seconds. That is weaker evidence, so the provider warns. It never changes

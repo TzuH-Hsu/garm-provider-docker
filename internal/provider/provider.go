@@ -14,41 +14,25 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
 
-// Provider implements executionv010.ExternalProvider against one Docker
-// host. Its dependencies are injected (rather than constructed internally)
-// so the lifecycle methods can be table-tested against docker.FakeClient.
-//
-// The one-shot subprocess model (ADR-004) means a Provider holds no
-// cross-call state: controllerID and cfg come from the process's
-// environment/config at construction, and every "what do I own" question is
-// answered by a Docker label query at call time.
+// Provider implements executionv011.ExternalProvider against one Docker host. It holds
+// no state across calls (ADR-004): every "what do I own" question is a Docker label
+// query.
 type Provider struct {
 	cli          docker.Client
 	cfg          config.Config
 	controllerID string
 
-	// topo owns the per-allocation network/volume lifecycle, teardown, and
-	// orphan sweep (ADR-001/ADR-004). It is derived from the same cli and
-	// controllerID, so it shares the Provider's stateless label-driven view.
+	// topo owns the allocation network and volume lifecycle, teardown and orphan sweep.
 	topo *topology.Manager
 
-	// spawnStatusWatcher starts idle detection for a runner once CreateInstance
-	// applies (status_watch.go). It defaults to startStatusWatcher (a detached
-	// watcher process, or in-process when orphans would not be reaped);
-	// WithInProcessStatusWatcher replaces it.
+	// spawnStatusWatcher starts idle detection for a runner. It defaults to
+	// startStatusWatcher; WithInProcessStatusWatcher replaces it.
 	spawnStatusWatcher statusWatcherFunc
 }
 
-// New constructs a Provider from its injected dependencies: the Docker
-// client, the parsed provider config, and the GARM controller ID (from
-// GARM_CONTROLLER_ID) that scopes every managed resource.
-//
-// It validates that the operator's dind_mode ceiling is well-formed at
-// construction (F10): a Config that reached the provider with an empty or
-// malformed allowed_dind_modes — a hand-built or Load-bypassing caller — is
-// rejected here rather than silently permitting every mode. main.go's real
-// path already runs config.Load's full Validate; this is the defensive
-// construction-time guard for any other caller.
+// New returns a Provider scoped to controllerID, the GARM controller that owns its
+// managed resources. It rejects an empty or malformed allowed_dind_modes, so a Config
+// that bypassed config.Load cannot silently permit every mode.
 func New(cli docker.Client, cfg config.Config, controllerID string, opts ...Option) (*Provider, error) {
 	if err := cfg.ValidateAllowedDindModes(); err != nil {
 		return nil, fmt.Errorf("invalid provider config: %w", err)
@@ -66,22 +50,13 @@ func New(cli docker.Client, cfg config.Config, controllerID string, opts ...Opti
 	return p, nil
 }
 
-// Compile-time assertion that *Provider satisfies the FULL v0.1.1
-// ExternalProvider interface main.go wires into the top-level execution.Run.
-// executionv011.ExternalProvider embeds the common (v0.1.0) eight methods and
-// adds the four self-description methods (GetSupportedInterfaceVersions,
-// ValidatePoolInfo, GetConfigJSONSchema, GetExtraSpecsJSONSchema — see v011.go,
-// M3-W1). Satisfying v0.1.1 also satisfies the v0.1.0 assertion the execution
-// dispatch makes by default, so the one binary serves BOTH: v0.1.1 when
-// GARM_INTERFACE_VERSION=v0.1.1 is set, v0.1.0 (current GARM's default) otherwise.
+// One binary serves both interface versions: v0.1.1 embeds the v0.1.0 methods, and
+// GARM_INTERFACE_VERSION selects the dispatch.
 var _ executionv011.ExternalProvider = (*Provider)(nil)
 
-// managedByInstanceNameFilter builds the Docker label filter that selects ALL
-// of this controller's managed, job-scoped resources for a given instance name,
-// regardless of role. It deliberately does NOT filter on role, so
-// hasManagedAllocationResources can see a lingering DinD sidecar (role=dind)
-// under the instance name after the runner is gone (F6); the runner-specific
-// resolver uses managedRunnerByInstanceNameFilter below instead.
+// managedByInstanceNameFilter selects this controller's job-scoped resources for an
+// instance name, in any role, so hasManagedAllocationResources can see a lingering
+// sidecar.
 func (p *Provider) managedByInstanceNameFilter(instanceName string) filters.Args {
 	return filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
@@ -90,12 +65,8 @@ func (p *Provider) managedByInstanceNameFilter(instanceName string) filters.Args
 	)
 }
 
-// managedRunnerByInstanceNameFilter narrows managedByInstanceNameFilter to the
-// RUNNER container specifically (garm.docker/role=runner). The ID-or-name
-// resolver keys off this so a by-name lookup selects the owned runner and never
-// the DinD sidecar that shares the same instance-name label (F6/N1): without the
-// role conjunct, ContainerList returns both the runner and the sidecar, and a
-// resolver that trusted list[0] could return the sidecar for a live runner.
+// managedRunnerByInstanceNameFilter narrows managedByInstanceNameFilter to the runner:
+// the sidecar shares the instance-name label, and a list could return it first.
 func (p *Provider) managedRunnerByInstanceNameFilter(instanceName string) filters.Args {
 	f := p.managedByInstanceNameFilter(instanceName)
 	f.Add("label", spec.LabelRole+"="+spec.RoleRunner)

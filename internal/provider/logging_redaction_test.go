@@ -11,8 +11,8 @@ import (
 	"testing"
 )
 
-// TestCreateInstanceCredentialPathFailureLogsNoToken is the CRITICAL
-// redaction proof (M3-W2): a CreateInstance failure on a credential-bearing
+// TestCreateInstanceCredentialPathFailureLogsNoToken is the redaction
+// proof: a CreateInstance failure on a credential-bearing
 // path — a metadata fetch rejected for a bad instance token, immediately
 // followed by a creation-guard rollback failure so at least one slog line is
 // actually emitted while the real instance token is in scope on the call

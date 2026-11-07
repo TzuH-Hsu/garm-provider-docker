@@ -116,8 +116,7 @@ func TestRunStatusWatcherRejectsBadRequests(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceDoesNotWaitForRunner is the core of the GARM exec-timeout
-// fix: CreateInstance makes no callback request at all, hands everything to
+// TestCreateInstanceDoesNotWaitForRunner: CreateInstance makes no callback request at all, hands everything to
 // the watcher, and returns at once even with the largest timeout and a runner that never comes
 // online. The handoff carries the token, callback URL, container and deadline.
 func TestCreateInstanceDoesNotWaitForRunner(t *testing.T) {

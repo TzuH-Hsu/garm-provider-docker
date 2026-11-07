@@ -73,7 +73,7 @@ func TestGetConfigJSONSchemaIsParseable(t *testing.T) {
 }
 
 func TestValidatePoolInfoAcceptsGood(t *testing.T) {
-	// H2: extra_env is fail-closed, so a "good" payload's env NAME must be on the
+	// extra_env is fail-closed, so a "good" payload's env NAME must be on the
 	// operator's allowed_env allowlist. FOO is benign and opted in here.
 	cfg := config.Config{
 		DockerHost:       "unix:///var/run/docker.sock",

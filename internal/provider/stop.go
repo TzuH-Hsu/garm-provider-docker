@@ -7,10 +7,8 @@ import (
 	"github.com/docker/docker/api/types/container"
 )
 
-// Stop stops the runner container for instanceID (resolved by ID or name).
-// GARM does not currently invoke Stop (research.md §1.G); it is kept thin to
-// satisfy the interface. When force is set, the container is stopped with a
-// zero grace period (immediate SIGKILL).
+// Stop stops instanceID's runner container, with no grace period when force is set.
+// GARM v0.2.1 does not call it.
 func (p *Provider) Stop(ctx context.Context, instanceID string, force bool) error {
 	c, found, err := p.resolve(ctx, instanceID)
 	if err != nil {

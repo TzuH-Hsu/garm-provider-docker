@@ -14,7 +14,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// These tests cover the diag-prune throttle (ADR-003 amendment 2026-10-26): the
+// These tests cover the diag-prune throttle (ADR-003, Garbage collection): the
 // GC runs on every CreateInstance and ListInstances, but a diag-prune round runs
 // at most once per diagPruneInterval per controller, across provider processes,
 // claimed through a never-started stamp container.

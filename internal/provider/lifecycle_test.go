@@ -39,7 +39,7 @@ func seedRunner(t *testing.T, fake *docker.FakeClient, instanceName, poolID, con
 
 // seedDindSidecar creates a managed DinD sidecar container (role=dind) for the
 // given instance name, so tests can exercise the runner-vs-sidecar resolution
-// (F6/N1) with both present under the same instance-name label.
+// with both present under the same instance-name label.
 func seedDindSidecar(t *testing.T, fake *docker.FakeClient, instanceName, poolID, controllerID, state string) string {
 	t.Helper()
 	labels := map[string]string{
@@ -57,7 +57,7 @@ func seedDindSidecar(t *testing.T, fake *docker.FakeClient, instanceName, poolID
 	return resp.ID
 }
 
-// TestResolveSelectsRunnerNotSidecar is the F6/N1 guard: with a DinD sidecar
+// TestResolveSelectsRunnerNotSidecar: with a DinD sidecar
 // present under the same instance name, a by-name Get resolves the RUNNER
 // (never the sidecar, whatever order the daemon lists them in), and Delete
 // reaps the whole allocation — runner AND the lingering privileged sidecar.
@@ -91,7 +91,7 @@ func TestResolveSelectsRunnerNotSidecar(t *testing.T) {
 	}
 }
 
-// TestResolveByInstanceNameCollidingWithAnotherRunnerID is the N2 guard: an
+// TestResolveByInstanceNameCollidingWithAnotherRunnerID: an
 // instance name that equals ANOTHER runner's container ID must resolve to the
 // runner that OWNS that instance name, not the id-colliding one — the exact
 // mis-resolution an inspect-by-ID-first resolver would produce.
@@ -153,13 +153,10 @@ func TestMapContainerStatus(t *testing.T) {
 	}
 }
 
-// TestResolveRawContainerIDNoLongerResolves is the NEW-H1 regression guard: the
-// raw inspect-by-ID fallback was DROPPED (2026-07-21). A GARM_INSTANCE_ID that
-// is a bare container ID (never a legitimate value — provider_id has always been
-// the instance name in this pre-release provider) must NOT resolve the runner by
-// that id; only the instance-name label resolves. This closes the residual
-// ambiguity where a foreign/other-generation container could be reached by a raw
-// id inspect.
+// TestResolveRawContainerIDNoLongerResolves: a GARM_INSTANCE_ID that is a bare
+// container ID, never a legitimate value, must not resolve the runner by that ID; only
+// the instance-name label resolves (ADR-004, Identity). A raw ID inspect could reach a
+// foreign or other-generation container.
 func TestResolveRawContainerIDNoLongerResolves(t *testing.T) {
 	p, fake := newTestProvider(t)
 	id := seedRunner(t, fake, "runner-a", "p1", "controller-abc", "running")
@@ -177,7 +174,7 @@ func TestResolveRawContainerIDNoLongerResolves(t *testing.T) {
 func TestResolveByName(t *testing.T) {
 	p, fake := newTestProvider(t)
 	// The fake's ContainerInspect matches by ID only, so passing the GARM
-	// instance Name exercises the label-filter fallback path.
+	// instance Name exercises the label lookup.
 	id := seedRunner(t, fake, "Runner-B", "p1", "controller-abc", "running")
 
 	c, found, err := p.resolve(context.Background(), "Runner-B")
@@ -233,7 +230,7 @@ func assertGetStopStartNotFound(t *testing.T, p *Provider, ref string) {
 func TestResolveRejectsForeignController(t *testing.T) {
 	p, fake := newTestProvider(t)
 	// A managed runner owned by a DIFFERENT controller, whose Docker name and
-	// container ID both collide with what a lookup might resolve (ADR-004 F3).
+	// container ID both collide with what a lookup might resolve (ADR-004).
 	foreignID := seedRunner(t, fake, "runner-foreign", "p1", "different-controller", "running")
 
 	// By GARM Name and by container ID: both must be not-found and untouched.
@@ -266,7 +263,7 @@ func TestResolveRejectsWrongRole(t *testing.T) {
 	// By the allocation's instance NAME, the runner-scoped ops still reject the
 	// wrong-role container...
 	assertGetStopStartNotFound(t, p, "sidecar-1")
-	// ...but DeleteInstance MUST reap the lingering sidecar (F6): a managed DinD
+	// ...but DeleteInstance MUST reap the lingering sidecar: a managed DinD
 	// sidecar under this instance-name is part of an allocation whose runner is
 	// gone, and the privileged sidecar must never be left behind.
 	if err := p.DeleteInstance(context.Background(), "sidecar-1"); err != nil {
@@ -310,8 +307,8 @@ func TestGetInstanceStatusMapping(t *testing.T) {
 			id := seedRunner(t, fake, "runner-x", "p1", "controller-abc", tt.state)
 			fake.SetState(id, tt.state, tt.oomKilled)
 
-			// GARM_INSTANCE_ID is the instance NAME (F6), resolved by the
-			// instance-name label — never the raw container id (NEW-H1).
+			// GARM_INSTANCE_ID is the instance NAME, resolved by the
+			// instance-name label — never the raw container id.
 			inst, err := p.GetInstance(context.Background(), "runner-x")
 			if err != nil {
 				t.Fatalf("GetInstance returned unexpected error: %v", err)
@@ -319,7 +316,7 @@ func TestGetInstanceStatusMapping(t *testing.T) {
 			if inst.Status != tt.want {
 				t.Errorf("Status = %q, want %q", inst.Status, tt.want)
 			}
-			// provider_id is the stable instance NAME (F6), not the container id.
+			// provider_id is the stable instance NAME, not the container id.
 			if inst.ProviderID != "runner-x" || inst.Name != "runner-x" {
 				t.Errorf("ProviderID/Name = %q/%q, want runner-x/runner-x (F6)", inst.ProviderID, inst.Name)
 			}
@@ -360,13 +357,10 @@ func TestDeleteInstanceIdempotentAndExit30(t *testing.T) {
 	}
 }
 
-// TestDeleteInstanceByRawContainerIDNoLongerResolves is the NEW-H1 guard for the
-// delete path: DeleteInstance with a raw container ID (never a legitimate
-// GARM_INSTANCE_ID — provider_id is always the instance name) must NOT resolve
-// the runner by that id and must leave the allocation untouched, returning
-// not-found (exit 30). The raw inspect-by-ID fallback was dropped, so a stray
-// container-id value can no longer trigger a delete of a container it happens to
-// id-match. Deleting by the instance NAME still works (covered elsewhere).
+// TestDeleteInstanceByRawContainerIDNoLongerResolves: DeleteInstance with a raw
+// container ID, never a legitimate GARM_INSTANCE_ID, must not resolve the runner by
+// that ID and must leave the allocation untouched, returning not-found (exit 30).
+// Deleting by the instance name still works (covered elsewhere).
 func TestDeleteInstanceByRawContainerIDNoLongerResolves(t *testing.T) {
 	p, fake := newTestProvider(t)
 	id := seedRunner(t, fake, "runner-byid", "p1", "controller-abc", "running")
@@ -507,9 +501,9 @@ func TestRemoveAllInstancesSurfacesRemoveErrorButDoesNotFailFast(t *testing.T) {
 	fake.RemoveErr = errors.New("remove failed")
 
 	// Best-effort (does not fail fast: BOTH containers are still attempted,
-	// not just the first), but no longer silent: the aggregated error is now
-	// surfaced to the caller instead of only logged, so an operator running
-	// this rescue command can tell an incomplete sweep apart from a clean one.
+	// not just the first), but not silent: the aggregated error is surfaced to the
+	// caller, so an operator running this rescue command can tell an incomplete sweep
+	// apart from a clean one.
 	err := p.RemoveAllInstances(context.Background())
 	if err == nil {
 		t.Fatal("expected RemoveAllInstances to surface the removal error, got nil")

@@ -14,15 +14,9 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// newSysboxTestProvider builds a Provider configured for sysbox-runc DinD
-// (ADR-001), backed by a FakeClient. It mirrors newDindTestProvider
-// (create_dind_test.go) exactly except for DindMode, so the two modes'
-// allocations can be compared directly: the topology built for sysbox-runc
-// should differ from privileged-sidecar's in ONLY the two HostConfig fields
-// DindRuntimeSelection derives (Privileged, Runtime) — everything else
-// (network, three volumes, dockerd Cmd, TLS-off env, mounts, storage driver)
-// is the same shared code path (ADR-001: "identical topology to
-// privileged-sidecar").
+// newSysboxTestProvider builds a Provider configured for sysbox-runc DinD (ADR-001),
+// backed by a FakeClient. It mirrors newDindTestProvider (create_dind_test.go) except
+// for DindMode, so the two modes' allocations can be compared directly.
 func newSysboxTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	t.Helper()
 	fake := docker.NewFakeClient()
@@ -43,13 +37,12 @@ func newSysboxTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 	return p, fake
 }
 
-// TestCreateInstanceSysboxRuncFullTopology proves WP4's "thin flip" claim
-// end to end through the real provider allocation path: a full sysbox-runc
-// CreateInstance builds the identical topology TestCreateInstanceDinDFullTopology
-// (create_dind_test.go) asserts for privileged-sidecar — job network, three
-// job-scoped volumes, dockerd Cmd/TLS-off, socket+dind-state mounts, runner
-// DOCKER_HOST/socket mount, both containers running — differing ONLY in the
-// sidecar's Privileged/Runtime pair (ADR-001).
+// TestCreateInstanceSysboxRuncFullTopology proves end to end that a sysbox-runc
+// CreateInstance builds the topology TestCreateInstanceDinDFullTopology asserts for
+// privileged-sidecar: job network, three job-scoped volumes, dockerd Cmd/TLS-off,
+// socket+dind-state mounts, runner DOCKER_HOST/socket mount, both containers running.
+// The sidecar differs only in its Privileged/Runtime pair and in keeping its own
+// namespace on the job network (ADR-001).
 func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -91,7 +84,7 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 		}
 	}
 
-	// --- DinD sidecar container: ONLY Privileged/Runtime differ from privileged-sidecar ---
+	// --- DinD sidecar container: Privileged/Runtime and network placement differ from privileged-sidecar ---
 	dind, err := fake.ContainerInspect(context.Background(), spec.DindContainerName(name))
 	if err != nil {
 		t.Fatalf("DinD sidecar %q was not created: %v", spec.DindContainerName(name), err)
@@ -102,9 +95,8 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	if dind.HostConfig.Runtime != "sysbox-runc" {
 		t.Errorf("sidecar Runtime = %q, want sysbox-runc", dind.HostConfig.Runtime)
 	}
-	// Everything else about the sidecar is the SAME shared-code shape as
-	// privileged-sidecar: dockerd Cmd (with the config storage driver), TLS
-	// off, same job network, same two named-volume mounts, no host socket.
+	// Otherwise the same shape as privileged-sidecar: dockerd Cmd (with the config
+	// storage driver), TLS off, the same two named-volume mounts, no host socket.
 	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + spec.DindSocketGID}
 	if !slices.Equal([]string(dind.Config.Cmd), wantCmd) {
 		t.Errorf("sidecar Cmd = %v, want %v", dind.Config.Cmd, wantCmd)
@@ -136,15 +128,11 @@ func TestCreateInstanceSysboxRuncFullTopology(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceSysboxRuncRuntimeUnavailableCleansUp exercises the
-// graceful-failure path this WP adds: a daemon with no sysbox-runc runtime
-// registered (the expected state on any host without Sysbox installed —
-// this project's own dev daemon included, mirroring the Synology DSM/Unraid
-// gap ADR-001 documents) rejects the sidecar's ContainerCreate. The provider
-// must surface a CLEAR, actionable error naming dind_mode and the missing
-// runtime rather than the raw daemon message, and the creation guard must
-// still roll back the runner, network and volumes created before the
-// sidecar — zero leftovers of any kind.
+// TestCreateInstanceSysboxRuncRuntimeUnavailableCleansUp: a daemon with no sysbox-runc
+// runtime registered, the expected state on a host without Sysbox, rejects the
+// sidecar's ContainerCreate. The provider must surface a clear error naming dind_mode
+// and the missing runtime rather than the raw daemon message, and the creation guard
+// must still roll back the runner, network and volumes created before the sidecar.
 func TestCreateInstanceSysboxRuncRuntimeUnavailableCleansUp(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -218,11 +206,10 @@ func TestCreateInstanceSysboxRuncOtherCreateFailureKeepsGenericMessage(t *testin
 	assertNoLeftovers(t, fake)
 }
 
-// TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed is the F12
-// tightening guard: an unrelated OCI failure that happens to mention "runtime"
-// and "not found" — the container entrypoint binary missing, NOT the sysbox-runc
-// runtime — must NOT be relabeled as a missing runtime. The classifier now
-// requires both the configured runtime name AND the canonical "unknown runtime"
+// TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed: an unrelated OCI
+// failure that mentions "runtime" and "not found" (the container entrypoint binary
+// missing, not the sysbox-runc runtime) must not be relabelled as a missing runtime.
+// The classifier requires both the configured runtime name and the "unknown runtime"
 // phrase, and this message carries neither.
 func TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed(t *testing.T) {
 	srv := newJITMetadataServer(t)

@@ -17,85 +17,49 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
 )
 
-// Opportunistic cache-GC tuning (ADR-003 W2). The pass is bounded so a large
-// backlog can never make a single CreateInstance/ListInstances do unbounded
-// housekeeping work; the remainder is caught over successive passes.
+// Cache-GC limits (ADR-003, Garbage collection). Each pass is bounded, so a large
+// backlog is worked through over successive passes.
 const (
-	// cacheEvictionGrace protects a very-recently-created SUPERSEDED cache volume
-	// from eviction, so an in-flight older-generation/older-image job that just
-	// created its cache but has not yet started the runner that would in-use-pin
-	// it is not reaped out from under it. It comfortably exceeds GARM's ~20-min
-	// bootstrap timeout, the outer bound on how long a create can be in flight.
+	// cacheEvictionGrace keeps a just-created superseded cache volume out of the stale
+	// log, since an older job may still be starting on it. It exceeds GARM's default
+	// 20-minute bootstrap timeout, the bound on how long a create can be in flight.
 	cacheEvictionGrace = 30 * time.Minute
 
-	// cacheGCStaleLogMax / cacheGCMaxDiagPrunes / helperReapMax bound one GC
-	// pass's stale-cache log entries, prune-helper runs, and leaked-helper reaps
-	// respectively. (Cache eviction is non-destructive/log-only — NEW-H1 — so
-	// there is no removal cap; the cap bounds the operator-visibility log line.)
+	// cacheGCStaleLogMax, cacheGCMaxDiagPrunes and helperReapMax cap one pass's
+	// stale-cache log entries, prune helpers and reaped helpers.
 	cacheGCStaleLogMax   = 50
 	cacheGCMaxDiagPrunes = 20
 	helperReapMax        = 50
 
-	// cacheGCCruftLogMax caps how many unprovable cache-named volumes one GC pass
-	// names in its operator-visibility log line, so a large backlog of cruft cannot
-	// produce an unbounded log entry.
+	// cacheGCCruftLogMax caps the unprovable volumes named in one pass's log line.
 	cacheGCCruftLogMax = 50
 
-	// diagPruneTimeout bounds one diagnostic-log prune helper (a `find -delete`
-	// over one volume — fast; this is generous headroom).
+	// diagPruneTimeout bounds one prune helper, a `find -delete` over one volume.
 	diagPruneTimeout = 2 * time.Minute
 
 	// diagPruneInterval is the least time between two diag-prune rounds of one
-	// controller, across all provider processes (ADR-003 amendment 2026-10-26).
-	// The GC runs on every CreateInstance and ListInstances, which GARM calls
-	// often and once per pool or scale set, so without it every call started one
-	// prune helper per diag volume. Retention is measured in days (default 7,
-	// minimum 1), so pruning more often removes nothing a later prune would not:
-	// six hours keeps a file at most 6h past its window (under 4% of the default
-	// 7 days) while cutting the helpers to four rounds a day.
+	// controller, across provider processes. Retention is in whole days, so a file
+	// outlives its window by at most 6 hours, while the helpers are cut to four rounds
+	// a day.
 	diagPruneInterval = 6 * time.Hour
 
-	// helperTerminalGrace and helperRunningMaxAge tune the leaked-helper reaper
-	// by container state (H5), so it never races a live peer's helper yet still
-	// eventually reclaims a genuinely stuck one:
-	//
-	//   - helperTerminalGrace leaves a freshly-TERMINAL (exited/dead) helper alone:
-	//     a helper that just finished is about to be force-removed by its own
-	//     provider's defer, so reaping it inside this grace only races that defer.
-	//     It exceeds the create→start→wait handoff; a terminal helper older than it
-	//     whose provider clearly died is reaped.
-	//   - helperRunningMaxAge is the age past which a still-CREATED-or-RUNNING helper
-	//     is treated as WEDGED and reaped. Below it a peer's in-flight seed/prune is
-	//     never touched — a legit helper is briefly `created` between ContainerCreate
-	//     and ContainerStart, and `running` while it copies/prunes. Above it a crashed
-	//     running seeder is reaped so it can no longer hold the externals seeding
-	//     flock indefinitely. It comfortably exceeds the externals seed timeout.
+	// helperTerminalGrace leaves a just-exited helper to its own provider's deferred
+	// removal. helperRunningMaxAge is the age at which a created or running helper
+	// counts as wedged. It exceeds the seed timeout, so a peer's live seed is left
+	// alone, while a crashed seeder cannot hold the externals flock for ever.
 	helperTerminalGrace = 2 * time.Minute
 	helperRunningMaxAge = externalsSeedTimeout + 5*time.Minute
 )
 
-// runCacheGC is the opportunistic, best-effort cache housekeeping pass ADR-003
-// piggybacks on CreateInstance and ListInstances (there is no background daemon,
-// ADR-004). It NEVER hard-fails the caller: every step logs and continues. It:
-//
-//  1. reaps any leaked cache-helper containers (a prior seed/prune whose provider
-//     process died before its own defer removed it);
-//  2. LOGS (never removes — NEW-H1) superseded/aged cache volumes for THIS
-//     controller so an operator can reclaim disk with a deliberate purge. Cache-
-//     volume auto-eviction is non-destructive because Docker has no atomic
-//     label-qualified volume delete, making an opportunistic by-name delete
-//     inherently TOCTOU/foreign-unsafe (see ListStaleCaches / logStaleCaches);
-//  3. prunes each diagnostic-logs volume to its retention window via a
-//     provider-run helper (the one remaining destructive cache action — it
-//     deletes FILES, strict-identity-gated; retention stays OUT of the untrusted
-//     runner, F14), at most once per diagPruneInterval per controller across
-//     provider processes (claimStamp) — every other pass skips it.
+// runCacheGC is the opportunistic housekeeping pass (ADR-003, Garbage collection). It
+// reaps leaked helpers, logs stale and unprovable cache volumes, and prunes diagnostic
+// logs at most once per diagPruneInterval. It never removes a cache volume and never
+// fails the caller.
 func (p *Provider) runCacheGC(ctx context.Context) {
 	p.reapLeakedHelpers(ctx)
 
-	// Resolve the current runner-image digest best-effort: if the image is not
-	// present this pass (e.g. a ListInstances GC before any create), externals
-	// supersession is simply skipped this pass and caught later — self-healing.
+	// Without the image, this pass skips the externals supersession check; a later one
+	// catches it.
 	runnerImage := p.cfg.EffectiveRunnerImage("")
 	digest := ""
 	if d, err := p.imageDigestHex(ctx, runnerImage); err == nil {
@@ -122,25 +86,13 @@ func (p *Provider) runCacheGC(ctx context.Context) {
 
 	p.pruneDiagVolumes(ctx, runnerImage)
 
-	// Cruft visibility (ADR-003 never-delete-unprovable): surface any
-	// cache-name-prefixed volumes that lack our managed cache labels — unlabeled
-	// Moby auto-created replacements or foreign squatters the provider will NOT
-	// delete (a Moby auto-created unlabeled volume and a foreign one are
-	// indistinguishable), so an operator can reclaim genuinely-stale disk manually.
 	p.logUnprovableCacheCruft(ctx)
 }
 
-// logStaleCaches surfaces (best-effort, bounded, in ONE consolidated line) the
-// cache volumes the GC found stale/superseded/aged, so an operator can reclaim
-// disk with a DELIBERATE purge. It removes nothing: ADR-003's cache-volume GC is
-// non-destructive (NEW-H1) because Docker has no atomic label-qualified volume
-// delete, so an opportunistic auto-delete of a volume is inherently TOCTOU and
-// cannot be made foreign-safe. The line names the exact controller-scoped,
-// label-filtered `docker volume prune` an operator can run at a quiet moment —
-// which, being operator-invoked (no concurrent-create race in practice) and
-// operator-accepted, is the sanctioned destructive path opportunistic auto-GC is
-// not. `docker volume prune` itself skips any in-use volume, so a warm cache held
-// by a live job is never reclaimed even by the manual purge.
+// logStaleCaches logs one bounded line naming the stale cache volumes and the `docker
+// volume prune` command that reclaims them. It removes nothing: a volume delete is by
+// name with no atomic label check, so an automatic one could hit a foreign volume
+// (ADR-003). The prune skips volumes in use.
 func (p *Provider) logStaleCaches(ctx context.Context, stale []topology.StaleCache) {
 	if len(stale) == 0 {
 		return
@@ -159,10 +111,8 @@ func (p *Provider) logStaleCaches(ctx context.Context, stale []topology.StaleCac
 		"resource", "cache-volume", "count", len(stale), "purge_command", purgeCmd, "stale_caches", strings.Join(parts, ", "))
 }
 
-// logUnprovableCacheCruft logs (best-effort, bounded) the cache-named volumes that
-// carry no managed cache labels, for operator visibility. It never deletes
-// anything — under ADR-003's label-as-identity rule the provider only ever removes
-// volumes it can POSITIVELY prove are ours (managed + full identity).
+// logUnprovableCacheCruft logs one bounded line naming the cache-named volumes that
+// carry no managed cache labels. The provider never deletes them.
 func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 	cruft, err := p.topo.ListUnprovableCacheCruft(ctx)
 	if err != nil {
@@ -180,17 +130,11 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 		"resource", "cache-volume", "count", len(cruft), "cruft_volumes", strings.Join(shown, ", "))
 }
 
-// pruneDiagVolumes runs the retention prune helper against each of this
-// controller's diagnostic-logs volumes (ADR-003 F14, provider-side). It needs an
-// image with `find`; it reuses the runner image but does NOT pull it — if the
-// image is not present locally this pass, the prune is skipped (best-effort) and
-// runs on a later pass once the image is present.
-//
-// A round runs at most once per diagPruneInterval per controller, across
-// provider processes: the pass first claims the controller's diag-prune stamp
-// (claimStamp) and does nothing more when the claim fails. Bounded per
-// round; the volumes are visited in random order so that, past the cap, every
-// volume is still reached over successive rounds.
+// pruneDiagVolumes prunes this controller's diagnostic-log volumes to their retention
+// window, at most once per diagPruneInterval across provider processes. It uses the
+// runner image without pulling it, skipping the round if the image is absent. Volumes
+// are visited in random order, so past cacheGCMaxDiagPrunes every one is still reached
+// over time.
 func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 	refs, err := p.topo.ListDiagVolumes(ctx)
 	if err != nil {
@@ -219,27 +163,8 @@ func (p *Provider) pruneDiagVolumes(ctx context.Context, runnerImage string) {
 	}
 }
 
-// pruneDiagVolume runs one diagnostic-log prune helper to completion against a
-// single diag volume (best-effort: a prune failure is logged, never fatal).
-//
-// Pin-then-validate (ADR-003 W2 structural redesign): the volume NAME and its
-// IDENTITY LABELS came from a ListDiagVolumes snapshot; an operator-run manual
-// `docker volume prune` (or some other external actor — the provider's own GC
-// never removes a cache volume itself, only logs it as stale) could still
-// remove the volume in the gap before this runs, and the OLD inspect-then-create
-// flow left a wedge window (the removed volume would be Moby-AUTO-CREATED UNLABELED
-// and the deterministic name rejected forever by the retired M6 guard). Instead we
-// create the helper FIRST (pinning the volume, or the unlabeled auto-created
-// replacement), then re-validate the pinned volume's FULL identity in the
-// afterCreate hook BEFORE the prune runs — the whole managed+cache+controller+
-// cache-kind+repo+repo-url-digest tuple against the snapshot, so a reincarnated or
-// foreign same-name diag volume of a DIFFERENT repo is not pruned as if it were
-// ours (the earlier check compared only controller/kind, not repo/repo-url-digest).
-// If the pinned volume is not provably the snapshot's identity, the prune is
-// aborted WITHOUT deleting it — a Moby auto-created unlabeled volume and a foreign
-// one are indistinguishable, so name-based deletion can never be foreign-safe (B2);
-// the volume is left as cruft (logged) and GARM's next EnsureCacheVolume reconciles
-// around the slot. An inspect FAILURE aborts closed WITHOUT any delete.
+// pruneDiagVolume runs one prune helper to completion against ref. A failure is only
+// logged.
 func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref topology.DiagVolumeRef) {
 	volumeName := ref.Name
 	nonce, err := newCreateNonce()
@@ -254,22 +179,16 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 		Labels:        p.helperLabels(),
 	})
 
+	// Creating the helper pins the volume. It may have been replaced since the listing,
+	// by an empty unlabelled volume or another repository's, so check its full identity
+	// against the listing before `find -delete` runs. A volume that fails is left in
+	// place (ADR-003).
 	afterCreate := func(vctx context.Context) error {
 		v, err := p.cli.VolumeInspect(vctx, volumeName)
 		if err != nil {
-			// inspect failed → don't know → don't prune, abort closed.
 			return fmt.Errorf("diag prune target %q could not be re-inspected: %w", volumeName, err)
 		}
-		// STRICT kind-aware full-identity re-validation of the PINNED volume before
-		// the destructive `find -delete` (NEW-H2): it must carry the FULL diag-logs
-		// identity (managed+cache+cache-kind=diag-logs+repo+repo-url-digest), be
-		// THIS controller's, and match the enumeration snapshot's repo +
-		// repo-url-digest. A same-name replacement of a DIFFERENT repo, an unlabeled
-		// Moby auto-created volume, or a foreign volume fails here.
 		if verr := spec.ValidateDiagPruneTarget(v.Labels, ref.Labels, p.controllerID); verr != nil {
-			// Do NOT delete/prune it (never touch an unprovable volume — B2): leave
-			// it in place and skip the prune; the next EnsureCacheVolume reconciles
-			// around the slot.
 			slog.WarnContext(vctx, "cache GC: diag prune target failed strict identity re-validation; leaving it in place and skipping the prune",
 				"resource", "cache-volume", "volume", volumeName, "error", verr)
 			return fmt.Errorf("diag prune target %q failed strict identity re-validation: %w", volumeName, verr)
@@ -289,24 +208,9 @@ func (p *Provider) pruneDiagVolume(ctx context.Context, runnerImage string, ref 
 	slog.InfoContext(ctx, "cache GC: pruned diag volume", "resource", "cache-volume", "volume", volumeName, "retention_days", p.cfg.Cache.DiagnosticLogRetentionDays)
 }
 
-// reapLeakedHelpers force-removes a LEAKED cache-helper container for THIS
-// controller — a seed/prune helper whose provider process died before its own
-// defer removed it — while NEVER racing a live peer's in-flight helper (H5). It
-// only touches containers labeled role=cache-helper for this controller and
-// carrying NO instance-name (defense-in-depth: a helper is never a job
-// allocation), and it gates the removal on the helper's Docker STATE and its
-// creation AGE (the created-at label helperLabels stamps):
-//
-//   - `created`/`running`: a peer's seed/prune is briefly `created` between
-//     ContainerCreate and ContainerStart, and `running` while it copies/prunes —
-//     both are LEFT ALONE until older than helperRunningMaxAge, at which point a
-//     WEDGED/crashed one is reaped so it can no longer hold the externals seeding
-//     flock indefinitely (the old reaper skipped every `running` helper forever,
-//     leaking the lock, AND reaped every `created` one immediately, racing a peer);
-//   - terminal (exited/dead): left to its own provider's defer within
-//     helperTerminalGrace, then reaped as a genuine leak.
-//
-// Bounded and best-effort.
+// reapLeakedHelpers force-removes this controller's cache helpers whose provider died
+// before its deferred removal, up to helperReapMax per pass. helperReapable decides by
+// state and age, so a live peer's helper is never raced.
 func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 	f := filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
@@ -324,8 +228,7 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 		if reaped >= helperReapMax {
 			break
 		}
-		// Defense-in-depth: only THIS controller's cache-helpers, never a job
-		// allocation (which would carry an instance-name).
+		// On top of the filter: a job allocation would carry an instance name.
 		if c.Labels[spec.LabelRole] != spec.RoleCacheHelper || c.Labels[spec.LabelControllerID] != p.controllerID {
 			continue
 		}
@@ -347,13 +250,10 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 	}
 }
 
-// helperReapable decides whether a leaked cache-helper in Docker state `state`,
-// aged `age` (known=false when its created-at label was missing/unparseable),
-// should be reaped now (H5). A non-terminal helper is reaped only once it is
-// clearly WEDGED (older than helperRunningMaxAge, and only when its age is known,
-// so a live peer is never guessed at); a terminal helper is reaped once past
-// helperTerminalGrace, or immediately when its age is unknown (it holds no lock,
-// so reaping it is always safe).
+// helperReapable reports whether a helper in the given Docker state should be reaped.
+// known is false when its age could not be determined. A created or running helper may
+// be a live peer's, so it needs a known age past helperRunningMaxAge. A terminal helper
+// holds no lock, so it goes past helperTerminalGrace or when its age is unknown.
 func helperReapable(state string, age time.Duration, known bool) bool {
 	switch state {
 	case "created", "running":
@@ -363,10 +263,8 @@ func helperReapable(state string, age time.Duration, known bool) bool {
 	}
 }
 
-// helperAge parses a helper's created-at label (RFC3339, stamped by helperLabels)
-// into an age relative to now. known is false when the label is missing or
-// unparseable, which the reaper treats conservatively (never reaping a
-// non-terminal helper it cannot age).
+// helperAge returns a helper's age from its RFC3339 created-at label. known is false
+// when the label is missing or unparseable.
 func helperAge(now time.Time, createdAt string) (age time.Duration, known bool) {
 	if createdAt == "" {
 		return 0, false
@@ -378,21 +276,15 @@ func helperAge(now time.Time, createdAt string) (age time.Duration, known bool) 
 	return now.Sub(t), true
 }
 
-// helperLabels returns the labels every short-lived cache-helper container (the
-// externals seeder / diag pruner) carries: managed + controller-id +
-// role=cache-helper + a CREATION-time created-at (H5). It carries NO
-// instance-name, so ADR-004's teardown/sweep predicate structurally excludes it
-// and ListInstances (role=runner) never reports it; the role label lets
-// reapLeakedHelpers find a crash-leaked helper and the created-at label lets it
-// age one by state without ever racing a live peer's in-flight helper.
+// helperLabels returns a cache helper's labels. With no instance name, teardown and the
+// sweep cannot match it and ListInstances never reports it. The role and created-at
+// labels let reapLeakedHelpers find and age it.
 func (p *Provider) helperLabels() map[string]string {
 	return p.ownedHelperLabels(spec.RoleCacheHelper)
 }
 
-// ownedHelperLabels returns managed + controller-id + the given role + a
-// creation-time created-at, with no instance-name: the label set of every
-// provider-owned container that is not a job allocation (the cache helpers and
-// the diag-prune stamp).
+// ownedHelperLabels returns the labels of a provider-owned container that is not a job
+// allocation: a cache helper or a throttle stamp.
 func (p *Provider) ownedHelperLabels(role string) map[string]string {
 	return map[string]string{
 		spec.LabelManaged:      "true",
@@ -402,25 +294,13 @@ func (p *Provider) ownedHelperLabels(role string) map[string]string {
 	}
 }
 
-// runHelperContainer creates, starts, and waits for a short-lived helper
-// container to run to COMPLETION, then force-removes it, returning its exit
-// code. It is the shared run-to-completion primitive behind the externals seeder
-// and the diag pruner. The removal runs in a defer under a context detached from
-// the caller's (so a caller cancellation cannot strand the helper), and NotFound
-// on removal is tolerated. A per-helper timeout bounds the run.
+// runHelperContainer creates, starts and waits for a helper container within timeout,
+// then force-removes it and returns its exit code. The removal uses a detached context,
+// so a cancellation cannot strand the helper.
 //
-// Pin-then-validate (H3c): the ContainerCreate PINS every named volume the helper
-// references — or, if an operator-run manual `docker volume prune` (or some
-// other external actor; the provider's own GC never removes a cache volume,
-// only logs it as stale) removed a referenced cache volume since the caller's
-// snapshot, real Moby AUTO-CREATES it UNLABELED and the helper pins THAT
-// empty replacement. afterCreate, when non-nil, runs AFTER the create but BEFORE
-// the start: it inspects the now-pinned target and returns an error to abort the
-// run WITHOUT executing the helper's payload (the seed's copy, the prune's
-// `find -delete`). On that abort the deferred removal still runs, UNPINNING the
-// orphan so the caller can reap it by name — never leaving a wedging, GC-invisible
-// unlabeled volume behind. A nil afterCreate keeps the plain create→start→wait
-// behavior.
+// afterCreate, if non-nil, runs after the create has pinned the helper's named volumes
+// and before the start. An error from it aborts the run before the helper's payload
+// executes; the removal then unpins the volume, which is left in place.
 func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, name string, timeout time.Duration, afterCreate func(ctx context.Context) error) (int, error) {
 	runCtx := ctx
 	if timeout > 0 {
