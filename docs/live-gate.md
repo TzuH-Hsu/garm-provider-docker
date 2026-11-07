@@ -1,59 +1,49 @@
-# End-to-end runbook: real GARM job
+# Live gate: a real job through a real GARM
 
-This is the runbook for `scripts/live-gate.sh`: point the built (or
-downloaded) provider at a real GARM instance and a throwaway test
-repository running a trivial echo workflow, and drive the full lifecycle —
-`CreateInstance` → JIT registration → job runs → `DeleteInstance` → runner
-confirmed gone from GitHub. By default jobs are dispatched through a GARM
-**scale set** (GARM long-polls GitHub's message queue — no inbound webhook,
-so the GARM host can sit behind a NAT); a webhook-driven **pool** is
-available with `--pool`. An optional **DinD variant** (`--dind`) exercises
-`privileged-sidecar` as well.
+This is the runbook for `scripts/live-gate.sh`. The gate points the built (or
+downloaded) provider at a real GARM instance and a throwaway test repository
+running a trivial echo workflow, and drives the full lifecycle: `CreateInstance`
+→ JIT registration → job runs → `DeleteInstance` → runner confirmed gone from
+GitHub.
 
 Passing this gate means: the script passes, **and** `docker inspect` of the
 runner container shows no host Docker socket, no GARM credentials, and no
-GitHub App key, in either its environment or its mounts (`docs/plan.md`
-§4's headline acceptance criterion). This started as the M0 go/no-go gate
-(`docs/plan.md` §3 M0: pool mode, `dind_mode=none`, `linux/amd64` only);
-M1–M4 have since shipped the full per-job topology (job network, named
-workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
-self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see [recorded runs](live-gate-runs.md)). A local build of `main` at 4146fa1,
-built with Go 1.27.3, passes the current gate on the Ubuntu 26.04 runner image,
-for `none` and `--dind` with a registry mirror (28 and 59 PASS); no release
-asset has been gated at this revision. `main` at 0540477, the code for `v0.2.9`,
-passed with the same counts on an earlier local build. `main` at 1b9320c added the container-job
-acceptance test and passed with the same counts. The `v0.2.5` release asset passed the revision before
-the container job (28 and 58 PASS, script at e4a37fd).
-`v0.2.4` passed the revision before the registry mirror check, on the same
-image (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
-before the shared network namespace and published-port checks, for both runner
-images (28 and 50 PASS, script at 92d6c85); `v0.2.2` the one before
-`--runner-image` existed (28 and 50 PASS, script at efe5014), and `v0.2.1` an
-earlier one (26 and 48 PASS, script at fa4351c); `v0.2.1` fails the IPv6 checks
-added for `v0.2.2`. The Ubuntu 24.04 image has not been gated since `v0.2.3`.
-The runbook keeps `dind_mode=none` as its own
-default (the smallest, most portable slice) and treats the DinD modes as
-out of scope for this particular gate (see "What this demo does not cover"
-below), but everything else it exercises is the CURRENT provider, not the
-original M0 slice. The file keeps its original `demo-m0` name to avoid
-breaking existing links to it (this repo's own `docs/upstream/` submission
-kit references it by path); only the framing has changed.
+GitHub App key, in either its environment or its mounts.
+
+Results of past runs, and what has not been verified, are in
+[live-gate-runs.md](live-gate-runs.md).
 
 This document does not reproduce GARM's own installation or credential-setup
-instructions — it links to the official docs for those and focuses on what
-is specific to this provider and this demo.
+instructions. It links to the official docs for those and focuses on what is
+specific to this provider and this gate.
+
+## Quick start
+
+You need a running GARM with `garm-cli` authenticated against it, a throwaway
+test repository registered with GARM, and a Docker host. See
+[Prerequisites](#prerequisites) for what each one has to provide.
+
+```sh
+export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
+scripts/live-gate.sh                       # scale set, dind_mode=none, v0.2.5 release
+scripts/live-gate.sh --dind                # same, plus the privileged-sidecar variant
+scripts/live-gate.sh --pool                # webhook-driven pool instead of a scale set
+```
+
+Run one of these. It walks through every step and stops wherever you have to
+act. On macOS, or to test uncommitted changes, add `--from-source`.
+[Running the gate](#running-the-gate) explains each step.
 
 <!-- TOC -->
 - [Prerequisites](#prerequisites)
-- [Running the demo](#running-the-demo)
+- [Running the gate](#running-the-gate)
 - [Release mode vs. source mode](#release-mode-vs-source-mode)
 - [Scale set (default) vs. pool](#scale-set-default-vs-pool)
 - [The DinD variant](#the-dind-variant)
   - [Registry mirror check (opt-in)](#registry-mirror-check-opt-in)
-- [What this demo proves](#what-this-demo-proves)
+- [What this gate proves](#what-this-gate-proves)
 - [What each verification item proves](#what-each-verification-item-proves)
-- [What this demo does not cover](#what-this-demo-does-not-cover)
+- [What this gate does not cover](#what-this-gate-does-not-cover)
 - [Troubleshooting](#troubleshooting)
 - [Recording a result](#recording-a-result)
 - [Recorded runs](live-gate-runs.md)
@@ -68,16 +58,16 @@ is specific to this provider and this demo.
      to install and start GARM itself.
    - [First Steps](https://github.com/cloudbase/garm/blob/main/doc/first-steps.md)
      for the `garm-cli init`/`garm-cli profile add` authentication flow this
-     demo's preflight check (`garm-cli controller show`) depends on.
+     gate's preflight check (`garm-cli controller show`) depends on.
 2. **GitHub credentials registered with GARM** — a GitHub App or a PAT with
    the permissions GARM needs to manage runners and webhooks. See
    [Credentials](https://github.com/cloudbase/garm/blob/main/doc/credentials.md)
    for the exact scopes/permissions and the `garm-cli github credentials add`
-   command. This demo never touches this credential directly — GARM's own
+   command. This gate never touches this credential directly — GARM's own
    metadata service is what the provider talks to (`ADR-002`).
 3. **A throwaway test repository** registered with GARM
    (see [First Steps §3](https://github.com/cloudbase/garm/blob/main/doc/first-steps.md#3-add-a-repository)).
-   Never point this demo at a production repository: it creates a real,
+   Never point this gate at a production repository: it creates a real,
    if trivial, workflow run and a real self-hosted-runner registration.
    - **Scale-set mode (default): no webhook.** Register the repo without
      `--install-webhook`, e.g. `garm-cli repo add --owner ... --name ...
@@ -141,16 +131,9 @@ is specific to this provider and this demo.
    export GARM_URL=http://127.0.0.1:<port>   # must match the API's bind address
    ```
 
-## Running the demo
+## Running the gate
 
-```sh
-export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
-scripts/live-gate.sh                         # scale set, dind_mode=none, v0.2.5 release
-scripts/live-gate.sh --dind                  # same, plus the privileged-sidecar variant
-scripts/live-gate.sh --pool                  # webhook-driven pool instead of a scale set
-```
-
-Release mode first checks that the release is published (an HTTP HEAD
+Start with the commands in [Quick start](#quick-start). Release mode first checks that the release is published (an HTTP HEAD
 request for its `SHA256SUMS`) and fails early, before any download, if it
 is not: "release vX.Y.Z not published yet - use --from-source to build
 from this checkout".
@@ -158,7 +141,7 @@ from this checkout".
 passing `--version` below `v0.2.1` with a scale-set target prints a warning
 (it does not block; older GARM or `--pool` may still work).
 
-This downloads and verifies the `v0.2.5` release (default), then runs every
+The default command downloads and verifies the `v0.2.5` release, then runs every
 step below in order, pausing for a confirmed manual action wherever one is
 needed (adding the `[[provider]]` section to GARM's config, creating the
 pool, confirming the GitHub UI). Pass `-y`/`--yes` to auto-confirm every
@@ -239,7 +222,7 @@ new files; re-run `preflight` to bring them back in line.
 ### Step 1 — register the provider with GARM
 
 Prints the exact `[[provider]]` section to add to GARM's own `config.toml`
-(commonly `/etc/garm/config.toml`, see `docs/research.md` §1.H and
+(commonly `/etc/garm/config.toml`, see
 [Providers](https://github.com/cloudbase/garm/blob/main/doc/providers.md)):
 the provider executable's absolute path, the generated config file's
 absolute path, and `interface_version = "v0.1.0"` by default
@@ -275,7 +258,7 @@ slated for GARM 0.2.2). This gate never sends `null`.
 Prints the exact `garm-cli scaleset add` command (`garm-cli pool add` with
 `--pool`) against your `REPO`, with the generated scale set `--name` (the
 workflow's `runs-on`), `--enabled`, `--min-idle-runners 0 --max-runners 1`
-(fixed by design — this demo only ever needs one runner to exist at a
+(fixed by design — this gate only ever needs one runner to exist at a
 time), `--extra-specs` in the `--dind` variant, `--os-arch` set to this host's
 auto-detected architecture (`amd64` or `arm64`; `OS_ARCH` may only restate it),
 and placeholder `--image`/`--flavor` values (required by `garm-cli`, but
@@ -360,8 +343,7 @@ Run once the workflow has finished. Asks you to confirm in the GitHub UI
 that the runner is gone (this script never asks for a GitHub token, so it
 cannot check this itself), then polls for the runner container to
 disappear (bounded by `POST_JOB_WAIT_SECONDS`, default 300s — GARM's own
-reaper/polling cadence governs how quickly this happens, `docs/research.md`
-§1.F) and checks for any leftover `garm.docker/managed=true` container,
+reaper/polling cadence governs how quickly this happens) and checks for any leftover `garm.docker/managed=true` container,
 **network**, or volume. All of this is scoped to the gate's own
 `garm.docker/instance-name` values: every instance `watch` and `verify`
 recorded, any runner GARM still lists for the gate, and any names in
@@ -382,7 +364,7 @@ leftover even if it also carries `cache=true`. The throttle stamps
 for the orphan sweep and the cache GC: never-started containers kept on purpose)
 are likewise excluded by label and listed; every other managed
 container, and every `role=runner` one, must be gone. The per-job network and the named workspace volume
-both carry `garm.docker/managed=true` (as of M1 — `ADR-001`/`ADR-004`), so
+both carry `garm.docker/managed=true` (`ADR-001`/`ADR-004`), so
 `DeleteInstance`'s teardown removes both explicitly; a leftover one is a
 real failure this check catches. This is distinct from the persistent,
 repo-scoped cache volumes (`ADR-003`), which carry `garm.docker/cache=true`
@@ -394,7 +376,7 @@ Prints, but never runs, the manual cleanup commands: disable and delete the
 scale set (`garm-cli scaleset update <id> --enabled=false`, `garm-cli
 scaleset delete <id>`; the pool equivalents with `--pool`),
 confirm no managed Docker resources (containers, networks, volumes) remain,
-remove the demo-local binary/config, and remove the `[[provider]]` section
+remove the gate's local binary and config, and remove the `[[provider]]` section
 from GARM's config. It also reminds you that persistent cache volumes are
 never touched by cleanup and shows the manual `docker volume prune` command
 to reclaim them.
@@ -424,7 +406,7 @@ built binary (see below):
   4. Smoke-tests the binary (`GARM_COMMAND=GetVersion`) against the
      generated config, so a bad download or a config the current loader
      rejects fails here, immediately, with a clear message.
-- **`source`** (`--from-source`) — the original, M0-era local-dev flow:
+- **`source`** (`--from-source`) — the local-dev flow:
   builds the provider binary from this checkout (`go build`, version
   stamped from `git describe`) and the runner image locally (`docker build
   -f runner-images/noble/Dockerfile runner-images`, tagged
@@ -477,7 +459,7 @@ instead: `runner-images/resolute` in source mode, `garm-runner-resolute` in
 release mode (published from v0.2.3 on). Like the other modes it is remembered
 by preflight for the later steps.
 
-Every combination ends with a generated demo provider `config.toml` (path printed
+Every combination ends with a generated provider `config.toml` (path printed
 by the script) and a verified, runnable provider binary; everything after
 Step 0 (registration, pool, workflow, verification) is identical regardless
 of mode.
@@ -506,7 +488,7 @@ upstream GARM v0.2.1 `cmd/garm-cli/cmd/scalesets.go` (`--repo`,
 `--provider-name`, `--name`, `--image` and `--flavor` are required).
 Scale-set JIT delivery is forced on by GARM, and `GARM_POOL_EXTRASPECS` is
 empty for scale sets — this provider reads `extra_specs` from the stdin
-bootstrap payload, so it works unchanged (`docs/research.md` §1.D).
+bootstrap payload, so it works unchanged.
 
 ## The DinD variant
 
@@ -639,15 +621,15 @@ log before suspecting the provider. Overriding the nested bridge range (for
 example `--bip` or `default-address-pools` through a custom `dind_image`) is
 outside this gate.
 
-## What this demo proves
+## What this gate proves
 
-| # | Demo verification item | Maps to |
+| # | Verification item | Maps to |
 |---|---|---|
 | (a) | The runner container, the per-job network, and the named workspace volume all carry the expected `garm.docker/*` ownership labels | `ADR-004`'s label schema (`ADR-001`'s per-job topology) |
-| (b) | `docker inspect` shows no `BEARER_TOKEN`/`METADATA_URL`/`CALLBACK_URL`-like env var, no bind mount (hence no host `docker.sock`) and no `Privileged` flag on the runner; in the `none` variant no DinD sidecar exists, in the `--dind` variant the `role=dind` sidecar has the expected labels, `Privileged=true`, no bind mounts, and the flavor's memory limits | `docs/plan.md` §4's headline acceptance criterion; `ADR-001` |
+| (b) | `docker inspect` shows no `BEARER_TOKEN`/`METADATA_URL`/`CALLBACK_URL`-like env var, no bind mount (hence no host `docker.sock`) and no `Privileged` flag on the runner; in the `none` variant no DinD sidecar exists, in the `--dind` variant the `role=dind` sidecar has the expected labels, `Privileged=true`, no bind mounts, and the flavor's memory limits | The headline safety property above; `ADR-001` |
 | (c) | The credential files (plus the `.delivered` marker) actually land in `/run/garm` inside the running container | `ADR-002`'s **exec-tar-into-tmpfs** verification item — proves `docker exec`-streamed delivery works against a real Docker daemon, not just the fake client used in unit tests |
 | (d) | `/actions-runner/.runner` is a working symlink into `/run/garm`, and the runner process is actually running | `ADR-002`'s **actions/runner symlink-compat** verification item — proves the real `.NET` runner accepts a symlinked config file instead of falling back to a writable-layer copy |
-| (e) | After the job completes: the runner container (and DinD sidecar, socket and `dind-state` volumes in the `--dind` variant), its per-job network, and its named workspace volume are all gone; the runner is gone from GitHub; and no other `garm.docker/managed=true` resource is left over | `docs/plan.md` §4's "job end results in the runner being auto-removed... and the runner... [is] gone" criterion, for the variant that was run |
+| (e) | After the job completes: the runner container (and DinD sidecar, socket and `dind-state` volumes in the `--dind` variant), its per-job network, and its named workspace volume are all gone; the runner is gone from GitHub; and no other `garm.docker/managed=true` resource is left over | The end of the runner lifecycle, for the variant that was run |
 
 ## What each verification item proves
 
@@ -656,7 +638,7 @@ outside this gate.
 | (c) exec-tar-into-tmpfs delivery | `docker exec <runner> test -e /run/garm/<file>` for each credential file plus `.delivered` | `internal/docker/fake.go`'s fake client cannot reproduce moby's real tmpfs/mount-namespace semantics that made the original `docker cp` design unbuildable (`ADR-002`'s amendment) — only a real daemon proves the `docker exec`-streamed tar actually lands in a real memory-backed tmpfs |
 | (d) actions/runner symlink-compat | `docker exec <runner> ls -la /actions-runner/.runner` shows `-> /run/garm/runner`, plus `docker top` shows the runner process running | Whether the real, unmodified `.NET` `actions/runner` binary accepts a symlinked `.runner`/`.credentials`/`.credentials_rsaparams` instead of requiring a real file is an external-binary behavior this repo's own tests cannot exercise (`ADR-002`'s open questions) |
 
-## What this demo does not cover
+## What this gate does not cover
 
 This gate runs with `dind_mode = "none"` by default — the smallest, most
 portable slice, needing no Sysbox or privileged-container support on the
@@ -689,20 +671,19 @@ It does **not** exercise:
 | `--dind` Step 4(b) reports the sidecar missing or the runner cannot reach its daemon | `allowed_dind_modes`/`extra_specs` not applied, the sidecar failed to start, or `docker:dind` could not be pulled | `docker ps -a --filter label=garm.docker/role=dind`; `docker logs <sidecar>`; confirm the scale set was created with the printed `--extra-specs`. |
 | `--dind` Step 4(b) reports the sidecar not in the runner's network namespace, or a published port not reachable at `127.0.0.1` | A provider older than the 2026-10-12 shared network namespace change (ADR-001), or a runner image without `curl` | Check the provider version; `docker inspect -f '{{.HostConfig.NetworkMode}}' <sidecar>` must print `container:<runner id>`. |
 | Runner container never appears after `garm-cli scaleset add` / `pool add` | The provider failed silently from GARM's point of view, or the pool/provider isn't wired up correctly | Check GARM's own log output (`docker logs garm` if run via Docker, `journalctl -u garm` if run via systemd) for lines mentioning this provider's executable or name — GARM logs a provider subprocess's stderr on failure. Confirm `garm-cli provider list` shows the provider and `garm-cli pool show <POOL_ID>` shows it `enabled`. This provider logs structured key=value lines (`internal/logging`); look for `level=ERROR` entries. |
-| Step 4(a)'s job-network or workspace-volume check fails | An older provider build predating M1's per-job network/named volume, or a config/topology bug | Confirm you are validating the intended `PROVIDER_VERSION`/build; check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` directly for what actually exists. |
+| Step 4(a)'s job-network or workspace-volume check fails | A provider build older than the per-job network and named volume, or a config/topology bug | Confirm you are validating the intended `PROVIDER_VERSION`/build; check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` directly for what actually exists. |
 | Step 4(c) times out or reports missing credential files | The provider's fetch-first `docker exec`-streamed tar delivery didn't complete before the entrypoint's `GARM_CRED_WAIT_SECONDS` (120s default) expired, or the exec itself failed | Check the provider's own stderr (surfaced via GARM's logs, see above) for a `failed to deliver credentials` error; check `docker logs <runner>` for the entrypoint's `waiting up to ...s for the delivery marker` message and whether it timed out. A slow/overloaded Docker daemon or a metadata-service fetch that ran close to the 60s aggregate deadline are the two likely causes (`ADR-002`). |
 | Step 4(d) reports `/actions-runner/.runner` is NOT a symlink with `ls: cannot access`, but the runner then starts and the job runs | `verify` ran while the runner was still `installing`, before the entrypoint had linked the credential files | Re-run the whole gate and start `verify` once the runner is `idle`; the link is in place a few seconds after the container starts. |
-| Step 4(d) reports `/actions-runner/.runner` is NOT a symlink, or the runner process never starts | `actions/runner`'s `run.sh` (or the JIT/non-JIT path in `myoung34/github-runner`) rejected the symlinked config file, or replaced it with a real file | This is exactly the open question `ADR-002` flags as a verification item. If confirmed, the documented fallback is a container-scoped writable-layer copy destroyed at teardown (never host-backed shared storage) — see `ADR-002`'s "symlink compatibility" note for the fallback design; this repo's entrypoint (`runner-images/noble/entrypoint.sh`) would need updating to implement it before this gate could be considered passing. |
+| Step 4(d) reports `/actions-runner/.runner` is NOT a symlink, or the runner process never starts | `actions/runner`'s `run.sh` (or the JIT/non-JIT path in `myoung34/github-runner`) rejected the symlinked config file, or replaced it with a real file | This is exactly the open question `ADR-002` flags as a verification item. If confirmed, the documented fallback is a container-scoped writable-layer copy destroyed at teardown (never host-backed shared storage) — see `ADR-002`'s "symlink compatibility" note for the fallback design; this repo's entrypoint (`runner-images/common/entrypoint.sh`) would need updating to implement it before this gate could be considered passing. |
 | Step 4(e) times out waiting for the container to disappear | GARM hasn't yet noticed (via its own GitHub-runner-list polling) that the ephemeral runner finished, or `DeleteInstance` itself is failing | Runner callbacks are not implemented in this provider (deferred, `ADR-002`) — there is no config field or code path for them — so GARM always learns a job finished by polling, and there is no fixed upper bound faster than GARM's own reap cycle. If it never resolves, check GARM's logs for a `DeleteInstance` error against this provider, and try `garm-cli runner list --repo <REPO>` to see GARM's own view of runner state. |
-| Step 4(e) reports a leftover managed network or volume (persistent cache volumes — `garm.docker/cache=true` with no instance-name — are excluded) | The named job network/workspace volume (M1) failed to tear down — a real bug, not the old "anonymous volume" behavior | Check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` for what's left, and the provider's stderr (via GARM's logs) for a teardown error (`internal/topology/teardown.go`). |
+| Step 4(e) reports a leftover managed network or volume (persistent cache volumes — `garm.docker/cache=true` with no instance-name — are excluded) | The named job network/workspace volume failed to tear down — a real bug | Check `docker network ls`/`docker volume ls --filter label=garm.docker/managed=true` for what's left, and the provider's stderr (via GARM's logs) for a teardown error (`internal/topology/teardown.go`). |
 | `garm-cli pool add` rejects `--image`/`--flavor` as invalid | Confusing these with a real cloud image/flavor | For this provider these two flags are placeholders only — any non-empty value satisfies `garm-cli`; see Step 2 above. |
 
 ## Recording a result
 
-Once this gate has actually been run against a real GARM instance, record
-the following somewhere durable (e.g. a PR description, an issue, or a
-note alongside the release) so the result can be cited later without
-re-running it:
+Once this gate has actually been run against a real GARM instance, add a
+section at the top of [live-gate-runs.md](live-gate-runs.md), and a row to its
+table, so the result can be cited later without re-running it. Record:
 
 - **Versions**: the GARM version (`garm-cli controller show` prints the
   controller's GARM version), this provider's `PROVIDER_VERSION` (or the
