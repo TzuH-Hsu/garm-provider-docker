@@ -146,7 +146,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	// Returned ProviderInstance. provider_id is the stable instance NAME,
 	// resolvable by label independently of the runner container.
 	if inst.ProviderID != "Test-Instance-01" {
-		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01 (F6)", inst.ProviderID)
+		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01", inst.ProviderID)
 	}
 	if inst.Name != "Test-Instance-01" {
 		t.Errorf("Name = %q, want Test-Instance-01", inst.Name)

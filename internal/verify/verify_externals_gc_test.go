@@ -13,7 +13,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyM2W2ExternalsGCDiag proves the ADR-003 externals, GC and diagnostics
+// TestVerifyExternalsGCDiag proves the ADR-003 externals, GC and diagnostics
 // contract on a real daemon, using the real provider binary:
 //
 //   - The externals volume is seeded once (Node runtimes present) from the runner
@@ -37,12 +37,12 @@ import (
 // removal of this run's cache volumes, and a before/after volume snapshot checks
 // that no foreign volume was removed.
 //
-// Run with: go test -tags dockerverify -v -run TestVerifyM2W2ExternalsGCDiag ./internal/verify/
-func TestVerifyM2W2ExternalsGCDiag(t *testing.T) {
+// Run with: go test -tags dockerverify -v -run TestVerifyExternalsGCDiag ./internal/verify/
+func TestVerifyExternalsGCDiag(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 	token := randHex(t)
-	repoURL := "https://github.com/garm-w2-verify/repo-" + token
+	repoURL := "https://github.com/garm-externals-verify/repo-" + token
 	repoKey := spec.RepoKey(repoURL)
 
 	// Foreign snapshot.
@@ -55,12 +55,12 @@ func TestVerifyM2W2ExternalsGCDiag(t *testing.T) {
 	// variants, so the runner stays up for inspection while still carrying the real
 	// /actions-runner/externals payload. Variant B has an extra label, so its content
 	// digest differs from A's and it gets a distinct externals key.
-	nobleTag := "garm-w2-noble:" + token
+	nobleTag := "garm-externals-noble:" + token
 	buildNobleRunnerImage(t, root, nobleTag)
-	imageA := "garm-w2-runner-a:" + token
-	imageB := "garm-w2-runner-b:" + token
+	imageA := "garm-externals-runner-a:" + token
+	imageB := "garm-externals-runner-b:" + token
 	buildSleepVariant(t, nobleTag, imageA, "")
-	buildSleepVariant(t, nobleTag, imageB, "LABEL garm.w2.variant=b")
+	buildSleepVariant(t, nobleTag, imageB, "LABEL garm.externals.variant=b")
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
@@ -120,11 +120,11 @@ stale_cache_eviction_days = 30
 
 	// (1) Externals are seeded once, read-only, and shared across two allocations with
 	// the same digest.
-	bA1 := cacheBootstrapPayload("w2-job-a1", repoURL, srv.URL, caBundle)
+	bA1 := cacheBootstrapPayload("externals-job-a1", repoURL, srv.URL, caBundle)
 	if out, code := runProvider(t, bin, configA, controllerID, "CreateInstance", "", &bA1); code != 0 {
 		t.Fatalf("job a1 CreateInstance exit=%d, want 0; stdout=%s", code, out)
 	}
-	bA2 := cacheBootstrapPayload("w2-job-a2", repoURL, srv.URL, caBundle)
+	bA2 := cacheBootstrapPayload("externals-job-a2", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configA, controllerID, "CreateInstance", "", &bA2); code != 0 {
 		t.Fatalf("job a2 CreateInstance exit=%d, want 0", code)
 	}
@@ -138,7 +138,7 @@ stale_cache_eviction_days = 30
 	if !strings.Contains(extLabels, "cache=true") || !strings.Contains(extLabels, "kind=externals") || !strings.Contains(extLabels, "digest="+digestA) {
 		t.Errorf("(1) externals volume labels missing/incorrect: %s", extLabels)
 	}
-	for _, forbidden := range []string{"inst=w2-job", "repo=" + repoKey} {
+	for _, forbidden := range []string{"inst=externals-job", "repo=" + repoKey} {
 		if strings.Contains(extLabels, forbidden) {
 			t.Errorf("(1) externals volume must not carry %q: %s", forbidden, extLabels)
 		}
@@ -153,13 +153,13 @@ stale_cache_eviction_days = 30
 	}
 
 	// Both allocations mount the SAME externals volume, READ-ONLY.
-	for _, runner := range []string{"w2-job-a1", "w2-job-a2"} {
+	for _, runner := range []string{"externals-job-a1", "externals-job-a2"} {
 		if src := mountSource(t, runner, spec.RunnerExternalsDir); src != extVolA {
 			t.Errorf("(1) %s externals mount = %q, want the shared %q", runner, src, extVolA)
 		}
 	}
 	// The runner must not be able to write the externals: a touch fails.
-	if out, err := dockerTry("exec", "w2-job-a1", "sh", "-c", "touch "+spec.RunnerExternalsDir+"/evil 2>&1"); err == nil {
+	if out, err := dockerTry("exec", "externals-job-a1", "sh", "-c", "touch "+spec.RunnerExternalsDir+"/evil 2>&1"); err == nil {
 		t.Errorf("(1) runner WROTE to the read-only externals mount — cross-repo RCE guard breached: %s", out)
 	} else {
 		t.Logf("[1] runner write to externals correctly denied (read-only): %s", strings.TrimSpace(out))
@@ -171,7 +171,7 @@ stale_cache_eviction_days = 30
 	}
 
 	// (2) A different image digest gets a separate externals volume.
-	bB1 := cacheBootstrapPayload("w2-job-b1", repoURL, srv.URL, caBundle)
+	bB1 := cacheBootstrapPayload("externals-job-b1", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configB, controllerID, "CreateInstance", "", &bB1); code != 0 {
 		t.Fatalf("job b1 CreateInstance exit=%d, want 0", code)
 	}
@@ -183,7 +183,7 @@ stale_cache_eviction_days = 30
 	} else {
 		t.Logf("[2] distinct digest B got a separate externals volume %s", extVolB)
 	}
-	if src := mountSource(t, "w2-job-b1", spec.RunnerExternalsDir); src != extVolB {
+	if src := mountSource(t, "externals-job-b1", spec.RunnerExternalsDir); src != extVolB {
 		t.Errorf("(2) job b1 externals mount = %q, want its own %q", src, extVolB)
 	}
 
@@ -218,7 +218,7 @@ stale_cache_eviction_days = 30
 	}
 	// The superseded cache SURVIVES the GC pass (log-only, never evicted).
 	if _, err := dockerTry("volume", "inspect", supersededVol); err != nil {
-		t.Errorf("(3) the log-only GC REMOVED the superseded-generation volume %q — cache GC must be non-destructive (NEW-H1): %v", supersededVol, err)
+		t.Errorf("(3) the log-only GC REMOVED the superseded-generation volume %q — cache GC must be non-destructive: %v", supersededVol, err)
 	} else {
 		t.Logf("[3] the superseded-generation cache %s SURVIVED the GC pass (log-only)", supersededVol)
 	}
@@ -297,7 +297,7 @@ stale_cache_eviction_days = 30
 	incompleteLs := dockerOut(t, "run", "--rm", "-v", incompleteDiagVol+":/logs", "alpine:3.20", "ls", "-A", "/logs")
 	t.Logf("[4b] incomplete-identity diag volume after GC: %s", strings.ReplaceAll(incompleteLs, "\n", " "))
 	if !strings.Contains(incompleteLs, "old-incomplete.log") {
-		t.Errorf("(4b) the diag prune deleted a file in an INCOMPLETE-identity volume %q — strict validation must exclude it from the destructive prune (NEW-H2): %s", incompleteDiagVol, incompleteLs)
+		t.Errorf("(4b) the diag prune deleted a file in an INCOMPLETE-identity volume %q — strict validation must exclude it from the destructive prune: %s", incompleteDiagVol, incompleteLs)
 	} else {
 		t.Logf("[4b] the incomplete-identity diag volume's aged file SURVIVED — strict validation excluded it from the destructive prune")
 	}
@@ -346,7 +346,7 @@ stale_cache_eviction_days = 30
 
 	// Tear the allocations down (their caches survive; the deferred cleanup
 	// removes this run's cache volumes explicitly).
-	for _, name := range []string{"w2-job-a1", "w2-job-a2", "w2-job-b1"} {
+	for _, name := range []string{"externals-job-a1", "externals-job-a2", "externals-job-b1"} {
 		if _, code := runProvider(t, bin, configA, controllerID, "DeleteInstance", name, nil); code != 0 {
 			t.Errorf("DeleteInstance %s exit=%d, want 0", name, code)
 		}

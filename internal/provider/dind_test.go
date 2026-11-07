@@ -21,7 +21,7 @@ func TestNewRejectsEmptyOrMalformedCeiling(t *testing.T) {
 	fake := docker.NewFakeClient()
 
 	if _, err := New(fake, config.Config{AllowedDindModes: nil}, "controller-abc"); err == nil {
-		t.Error("New with an empty allowed_dind_modes must fail closed (F10), got nil")
+		t.Error("New with an empty allowed_dind_modes must fail closed, got nil")
 	}
 	if _, err := New(fake, config.Config{AllowedDindModes: []string{"bogus"}}, "controller-abc"); err == nil {
 		t.Error("New with an invalid allowed_dind_modes entry must fail, got nil")

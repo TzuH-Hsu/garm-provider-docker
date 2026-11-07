@@ -224,7 +224,7 @@ func TestCreateInstanceSysboxRuncExecutableNotFoundNotMisdiagnosed(t *testing.T)
 		t.Fatal("expected CreateInstance to fail, got nil")
 	}
 	if strings.Contains(err.Error(), "requires the") && strings.Contains(err.Error(), "runtime to be registered") {
-		t.Errorf("error = %q, an unrelated OCI executable-not-found must not be mislabeled as a missing runtime (F12)", err.Error())
+		t.Errorf("error = %q, an unrelated OCI executable-not-found must not be mislabeled as a missing runtime", err.Error())
 	}
 	assertNoLeftovers(t, fake)
 }

@@ -4,7 +4,7 @@
 // Docker daemon, builds and pulls images, and needs outbound internet because the
 // DinD daemon pulls a nested image. Run with:
 //
-//	go test -tags dockerverify -v -run TestVerifyM1WP3DindAllocation ./internal/verify/
+//	go test -tags dockerverify -v -run TestVerifyDindAllocation ./internal/verify/
 //
 // The test drives the real provider binary through a full privileged-sidecar
 // allocation and checks, with real command output, that: the sidecar's daemon comes
@@ -36,17 +36,17 @@ import (
 // 29.9.0 inside) that this suite runs against.
 const dindImageDigest = "docker:dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470"
 
-const wp3Instance = "wp3-verify-01"
+const dindInstance = "dind-verify-01"
 
 // The derived names must match internal/spec's name builders. The network and
 // sidecar names are stable per instance; the volume names embed a create nonce and
 // are looked up by label at runtime.
-func wp3Net() string      { return wp3Instance + "-net" }
-func wp3DindName() string { return wp3Instance + "-dind" }
+func dindJobNetName() string  { return dindInstance + "-net" }
+func dindSidecarName() string { return dindInstance + "-dind" }
 
-func wp3Bootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
+func dindBootstrap(metadataURL string, caBundle []byte) params.BootstrapInstance {
 	return params.BootstrapInstance{
-		Name:             wp3Instance,
+		Name:             dindInstance,
 		RepoURL:          "https://github.com/example-org/example-repo",
 		MetadataURL:      metadataURL,
 		InstanceToken:    instanceToken,
@@ -99,7 +99,7 @@ func waitForDindReady(t *testing.T, dindName string) bool {
 	t.Helper()
 	for i := 0; i < 60; i++ {
 		if _, err := dockerTry("exec", dindName, "docker", "info"); err == nil {
-			t.Logf("[a] dind daemon ready after ~%ds", i)
+			t.Logf("[daemon] dind daemon ready after ~%ds", i)
 			return true
 		}
 		time.Sleep(time.Second)
@@ -107,7 +107,7 @@ func waitForDindReady(t *testing.T, dindName string) bool {
 	return false
 }
 
-func TestVerifyM1WP3DindAllocation(t *testing.T) {
+func TestVerifyDindAllocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
@@ -123,7 +123,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	beforeV := snapshotIDs(t, "volume", "ls", "--format", "{{.Name}}")
 	t.Logf("[snapshot] before: %d containers, %d networks, %d volumes", len(beforeC), len(beforeN), len(beforeV))
 
-	runnerTag := "garm-wp3-verify-cli:latest"
+	runnerTag := "garm-dind-verify-cli:latest"
 	buildCliRunnerImage(t, runnerTag)
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
@@ -148,7 +148,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
-		// The cache is off: cache volumes survive DeleteInstance (TestVerifyM2W1CacheHit
+		// The cache is off: cache volumes survive DeleteInstance (TestVerifyCacheHit
 		// covers them) and would break the zero-managed-resources check after delete.
 		`[cache]`,
 		`enabled = false`,
@@ -171,7 +171,7 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	}()
 
 	// CreateInstance builds the full DinD topology.
-	b := wp3Bootstrap(srv.URL, caBundle)
+	b := dindBootstrap(srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
 		t.Fatalf("CreateInstance exit=%d, want 0; stdout=%s", code, stdout)
@@ -184,19 +184,19 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 		t.Fatalf("CreateInstance status=%q, want running", created.Status)
 	}
 	runnerID := created.ProviderID
-	t.Logf("[create] runner provider_id=%s; sidecar=%s", runnerID, wp3DindName())
+	t.Logf("[create] runner provider_id=%s; sidecar=%s", runnerID, dindSidecarName())
 
 	// The three job-scoped volumes embed a create nonce in their names, so look them
 	// up by resource label.
-	wp3Workspace := volumeNameByResource(t, controllerID, "workspace")
-	wp3Socket := volumeNameByResource(t, controllerID, "socket")
-	wp3DindState := volumeNameByResource(t, controllerID, "dind-state")
-	t.Logf("[create] generation-nonce volume names: workspace=%s socket=%s dind-state=%s", wp3Workspace, wp3Socket, wp3DindState)
+	workspaceVol := volumeNameByResource(t, controllerID, "workspace")
+	socketVol := volumeNameByResource(t, controllerID, "socket")
+	dindStateVol := volumeNameByResource(t, controllerID, "dind-state")
+	t.Logf("[create] generation-nonce volume names: workspace=%s socket=%s dind-state=%s", workspaceVol, socketVol, dindStateVol)
 
 	// Topology sanity: sidecar + both DinD volumes exist and are labeled.
-	dindPriv := dockerOut(t, "inspect", wp3DindName(), "-f", "{{.HostConfig.Privileged}}")
-	dindCmd := dockerOut(t, "inspect", wp3DindName(), "-f", "{{json .Config.Cmd}}")
-	dindRole := dockerOut(t, "inspect", wp3DindName(), "-f", "{{index .Config.Labels \"garm.docker/role\"}}")
+	dindPriv := dockerOut(t, "inspect", dindSidecarName(), "-f", "{{.HostConfig.Privileged}}")
+	dindCmd := dockerOut(t, "inspect", dindSidecarName(), "-f", "{{json .Config.Cmd}}")
+	dindRole := dockerOut(t, "inspect", dindSidecarName(), "-f", "{{index .Config.Labels \"garm.docker/role\"}}")
 	t.Logf("[topology] sidecar Privileged=%s role=%s cmd=%s", dindPriv, dindRole, dindCmd)
 	if dindPriv != "true" {
 		t.Errorf("sidecar Privileged=%s, want true (privileged-sidecar)", dindPriv)
@@ -204,110 +204,110 @@ func TestVerifyM1WP3DindAllocation(t *testing.T) {
 	if !strings.Contains(dindCmd, "--storage-driver=overlay2") {
 		t.Errorf("sidecar dockerd cmd missing --storage-driver=overlay2: %s", dindCmd)
 	}
-	for _, v := range []string{wp3Workspace, wp3Socket, wp3DindState} {
+	for _, v := range []string{workspaceVol, socketVol, dindStateVol} {
 		if _, err := dockerTry("volume", "inspect", v); err != nil {
 			t.Errorf("[topology] job volume %q missing: %v", v, err)
 		}
 	}
 	// No host docker.sock on the sidecar either.
-	if m := dockerOut(t, "inspect", wp3DindName(), "-f", "{{json .Mounts}}"); strings.Contains(m, "/var/run/docker.sock") {
+	if m := dockerOut(t, "inspect", dindSidecarName(), "-f", "{{json .Mounts}}"); strings.Contains(m, "/var/run/docker.sock") {
 		t.Errorf("[topology] sidecar has a host docker.sock bind: %s", m)
 	}
 	// Shared network namespace (ADR-001): the sidecar joins the runner's namespace,
 	// and only the runner is attached to the job network.
-	assertDindSharesRunnerNetns(t, runnerID, wp3DindName(), wp3Net())
+	assertDindSharesRunnerNetns(t, runnerID, dindSidecarName(), dindJobNetName())
 
-	if !waitForDindReady(t, wp3DindName()) {
-		t.Fatalf("(W3-a) dind daemon never became ready")
+	if !waitForDindReady(t, dindSidecarName()) {
+		t.Fatalf("[daemon] dind daemon never became ready")
 	}
 
 	// The sidecar daemon is up; record the storage driver it used.
-	dindInfo := dockerOut(t, "exec", wp3DindName(), "docker", "info",
+	dindInfo := dockerOut(t, "exec", dindSidecarName(), "docker", "info",
 		"--format", "Driver={{.Driver}} ServerVersion={{.ServerVersion}} Name={{.Name}} Root={{.DockerRootDir}}")
-	t.Logf("[W3-a] dind `docker info`: %s", dindInfo)
+	t.Logf("[daemon] dind `docker info`: %s", dindInfo)
 	storageDriver := infoField(dindInfo, "Driver=")
 	if storageDriver == "" {
-		t.Errorf("(W3-a) could not read the dind storage driver from: %s", dindInfo)
+		t.Errorf("[daemon] could not read the dind storage driver from: %s", dindInfo)
 	}
 	dindName := infoField(dindInfo, "Name=")
 
 	// The runner reaches the DinD daemon, not the host's.
 	runnerDockerHost := strings.TrimSpace(dockerOut(t, "exec", runnerID, "sh", "-c", "echo $DOCKER_HOST"))
-	t.Logf("[W3-b] runner DOCKER_HOST=%s", runnerDockerHost)
+	t.Logf("[runner] runner DOCKER_HOST=%s", runnerDockerHost)
 	if runnerDockerHost != "unix:///run/docker.sock" {
-		t.Errorf("(W3-b) runner DOCKER_HOST=%q, want unix:///run/docker.sock", runnerDockerHost)
+		t.Errorf("[runner] runner DOCKER_HOST=%q, want unix:///run/docker.sock", runnerDockerHost)
 	}
 	runnerInfo := dockerOut(t, "exec", runnerID, "docker", "info", "--format", "Name={{.Name}} ServerVersion={{.ServerVersion}}")
 	runnerSeesName := infoField(runnerInfo, "Name=")
 	hostName := dockerOut(t, "info", "--format", "{{.Name}}")
-	t.Logf("[W3-b] runner `docker info` -> %s ; dind Name=%s ; host Name=%s", runnerInfo, dindName, hostName)
+	t.Logf("[runner] runner `docker info` -> %s ; dind Name=%s ; host Name=%s", runnerInfo, dindName, hostName)
 	if runnerSeesName != dindName {
-		t.Errorf("(W3-b) runner sees daemon Name=%q, want the dind Name=%q", runnerSeesName, dindName)
+		t.Errorf("[runner] runner sees daemon Name=%q, want the dind Name=%q", runnerSeesName, dindName)
 	}
 	if runnerSeesName == hostName {
-		t.Errorf("(W3-b) runner is talking to the HOST daemon (Name=%q), not the sidecar", hostName)
+		t.Errorf("[runner] runner is talking to the HOST daemon (Name=%q), not the sidecar", hostName)
 	}
 
 	// Nesting isolation, the core guarantee: a nested workload is visible inside the
 	// sidecar and invisible to the host.
-	nestedName := "wp3-nested-busybox"
+	nestedName := "dind-nested-busybox"
 	if out, err := dockerTry("exec", runnerID, "docker", "run", "-d", "--name", nestedName, "busybox", "sleep", "300"); err != nil {
-		t.Errorf("(W3-c) could not start a nested container via the runner: %v\n%s", err, out)
+		t.Errorf("[isolation] could not start a nested container via the runner: %v\n%s", err, out)
 	}
-	dindPS := dockerOut(t, "exec", wp3DindName(), "docker", "ps", "--format", "{{.Names}}")
-	t.Logf("[W3-c] nested workload seen INSIDE the sidecar: %q", dindPS)
+	dindPS := dockerOut(t, "exec", dindSidecarName(), "docker", "ps", "--format", "{{.Names}}")
+	t.Logf("[isolation] nested workload seen INSIDE the sidecar: %q", dindPS)
 	if !strings.Contains(dindPS, nestedName) {
-		t.Errorf("(W3-c) nested container %q not visible inside the sidecar (dind ps: %q)", nestedName, dindPS)
+		t.Errorf("[isolation] nested container %q not visible inside the sidecar (dind ps: %q)", nestedName, dindPS)
 	}
 	hostPS := dockerOut(t, "ps", "-a", "--format", "{{.Names}}")
 	if strings.Contains(hostPS, nestedName) {
-		t.Errorf("(W3-c) ISOLATION BREACH: nested container %q is visible on the HOST daemon", nestedName)
+		t.Errorf("[isolation] ISOLATION BREACH: nested container %q is visible on the HOST daemon", nestedName)
 	} else {
-		t.Logf("[W3-c] nested workload is INVISIBLE to the host daemon — fully isolated inside the sidecar")
+		t.Logf("[isolation] nested workload is INVISIBLE to the host daemon — fully isolated inside the sidecar")
 	}
 
 	// No host socket is mounted, so the runner cannot reach the host daemon.
 	runnerMounts := dockerOut(t, "inspect", runnerID, "-f", "{{json .Mounts}}")
 	if strings.Contains(runnerMounts, "/var/run/docker.sock") {
-		t.Errorf("(W3-d) runner has a host docker.sock bind: %s", runnerMounts)
+		t.Errorf("[socket] runner has a host docker.sock bind: %s", runnerMounts)
 	} else {
-		t.Logf("[W3-d] runner mounts carry NO host docker.sock (only the named socket volume): %s", runnerMounts)
+		t.Logf("[socket] runner mounts carry NO host docker.sock (only the named socket volume): %s", runnerMounts)
 	}
 
 	// A port the inner daemon publishes is reachable on the runner's 127.0.0.1 and
 	// localhost (shared network namespace, ADR-001).
-	assertInnerPublishedPortReachable(t, runnerID, "", "wp3-published-httpd")
+	assertInnerPublishedPortReachable(t, runnerID, "", "dind-published-httpd")
 
 	// Teardown removes the runner, the sidecar, the volumes, then the network last
 	// (ADR-004); a repeat delete exits 30.
-	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", wp3Instance, nil)
+	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", dindInstance, nil)
 	if delCode != 0 {
-		t.Errorf("(W3-e) DeleteInstance exit=%d, want 0", delCode)
+		t.Errorf("[teardown] DeleteInstance exit=%d, want 0", delCode)
 	}
 	assertGone(t, "runner", "inspect", runnerID)
-	assertGone(t, "sidecar", "inspect", wp3DindName())
-	assertGone(t, "network", "network", "inspect", wp3Net())
-	assertGone(t, "workspace volume", "volume", "inspect", wp3Workspace)
-	assertGone(t, "socket volume", "volume", "inspect", wp3Socket)
-	assertGone(t, "dind-state volume", "volume", "inspect", wp3DindState)
+	assertGone(t, "sidecar", "inspect", dindSidecarName())
+	assertGone(t, "network", "network", "inspect", dindJobNetName())
+	assertGone(t, "workspace volume", "volume", "inspect", workspaceVol)
+	assertGone(t, "socket volume", "volume", "inspect", socketVol)
+	assertGone(t, "dind-state volume", "volume", "inspect", dindStateVol)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
-		t.Errorf("(W3-e) %d managed resources remain after delete, want 0", n)
+		t.Errorf("[teardown] %d managed resources remain after delete, want 0", n)
 	} else {
-		t.Logf("[W3-e] DeleteInstance removed runner + sidecar + network + all 3 volumes (incl. dind-state); the nested workload died with the sidecar")
+		t.Logf("[teardown] DeleteInstance removed runner + sidecar + network + all 3 volumes (incl. dind-state); the nested workload died with the sidecar")
 	}
 
-	_, del2 := runProvider(t, bin, configFile, controllerID, "DeleteInstance", wp3Instance, nil)
+	_, del2 := runProvider(t, bin, configFile, controllerID, "DeleteInstance", dindInstance, nil)
 	if del2 != 30 {
-		t.Errorf("(W3-e) repeat DeleteInstance exit=%d, want 30 (already gone)", del2)
+		t.Errorf("[teardown] repeat DeleteInstance exit=%d, want 30 (already gone)", del2)
 	} else {
-		t.Logf("[W3-e] repeat DeleteInstance correctly returned exit 30")
+		t.Logf("[teardown] repeat DeleteInstance correctly returned exit 30")
 	}
 
 	// Report the storage driver dockerd used.
-	t.Logf("[W3-f] dockerd inside the privileged sidecar used storage driver %q (requested overlay2); host daemon driver is %q",
+	t.Logf("[storage] dockerd inside the privileged sidecar used storage driver %q (requested overlay2); host daemon driver is %q",
 		storageDriver, dockerOut(t, "info", "--format", "{{.Driver}}"))
 	if storageDriver != "overlay2" {
-		t.Logf("[W3-f] NOTE: overlay2 was requested but dockerd fell back to %q on this nested/emulated daemon", storageDriver)
+		t.Logf("[storage] NOTE: overlay2 was requested but dockerd fell back to %q on this nested/emulated daemon", storageDriver)
 	}
 }
 
@@ -371,24 +371,24 @@ func assertInnerPublishedPortReachable(t *testing.T, runner, user, name string) 
 	const body = "garm-published-port-ok"
 	script := "mkdir -p /w && echo " + body + " > /w/index.html && exec httpd -f -p 80 -h /w"
 	if out, err := dockerTry(execIn(runner, user, "docker", "run", "-d", "--name", name, "-p", "80", "busybox:1.36", "sh", "-c", script)...); err != nil {
-		t.Errorf("(W3-g) could not start a nested httpd with a published port via the runner: %v\n%s", err, out)
+		t.Errorf("[published-port] could not start a nested httpd with a published port via the runner: %v\n%s", err, out)
 		return
 	}
 	mapping := dockerOut(t, execIn(runner, user, "docker", "port", name, "80/tcp")...)
 	port := publishedHostPort(mapping)
 	if port == "" {
-		t.Errorf("(W3-g) could not read the published host port from `docker port`: %q", mapping)
+		t.Errorf("[published-port] could not read the published host port from `docker port`: %q", mapping)
 		return
 	}
-	t.Logf("[W3-g] nested httpd published 80/tcp as %q", mapping)
+	t.Logf("[published-port] nested httpd published 80/tcp as %q", mapping)
 	for _, host := range []string{"127.0.0.1", "localhost"} {
 		url := "http://" + host + ":" + port + "/"
 		got, err := fetchFromContainer(runner, user, url, publishedPortWait)
 		if err != nil || got != body {
-			t.Errorf("(W3-g) runner GET %s = %q, %v; want %q (a port the inner daemon publishes must be reachable on the runner's %s)", url, got, err, body, host)
+			t.Errorf("[published-port] runner GET %s = %q, %v; want %q (a port the inner daemon publishes must be reachable on the runner's %s)", url, got, err, body, host)
 			continue
 		}
-		t.Logf("[W3-g] runner GET %s -> %q", url, got)
+		t.Logf("[published-port] runner GET %s -> %q", url, got)
 	}
 }
 

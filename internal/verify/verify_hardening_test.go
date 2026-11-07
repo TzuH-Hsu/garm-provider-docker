@@ -3,7 +3,7 @@
 // Hardening of the extra_specs privilege channel and of metadata redirects, against
 // a real daemon. Run with:
 //
-//	go test -tags dockerverify -v -run TestVerifyM3Hardening ./internal/verify/
+//	go test -tags dockerverify -v -run TestVerifyHardening ./internal/verify/
 //
 // The extra_specs channel must fail closed, creating zero resources, for each of:
 //
@@ -54,12 +54,12 @@ allowed_env = ["MY_BENIGN_VAR", "DISABLE_RUNNER_UPDATE"]
 	return f
 }
 
-func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
+func TestVerifyHardening(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-hardening-sleep:latest"
+	imageTag := "garm-hardening-sleep:latest"
 	buildSleepImage(t, imageTag)
 	cfg := hardeningConfig(t, imageTag)
 
@@ -78,14 +78,14 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		name       string
 		extraSpecs string
 	}{
-		{"H2 RUN_AS_ROOT (hard-reserved, privilege escalation)", `{"extra_env": {"RUN_AS_ROOT": "true"}}`},
-		{"H2 GARM_CRED_WAIT_SECONDS (hard-reserved, arith-injection RCE)", `{"extra_env": {"GARM_CRED_WAIT_SECONDS": "a[$(touch /tmp/pwned)]"}}`},
-		{"H2 non-allowlisted benign var (fail-closed default)", `{"extra_env": {"NOT_ALLOWLISTED": "x"}}`},
-		{"H3 env key containing '=' (charset bypass)", `{"extra_env": {"JIT_CONFIG_ENABLED=false": "x"}}`},
-		{"H1 zero memory override 0GiB", `{"runner_memory": "0GiB"}`},
+		{"RUN_AS_ROOT (hard-reserved, privilege escalation)", `{"extra_env": {"RUN_AS_ROOT": "true"}}`},
+		{"GARM_CRED_WAIT_SECONDS (hard-reserved, arith-injection RCE)", `{"extra_env": {"GARM_CRED_WAIT_SECONDS": "a[$(touch /tmp/pwned)]"}}`},
+		{"non-allowlisted benign var (fail-closed default)", `{"extra_env": {"NOT_ALLOWLISTED": "x"}}`},
+		{"env key containing '=' (charset bypass)", `{"extra_env": {"JIT_CONFIG_ENABLED=false": "x"}}`},
+		{"zero memory override 0GiB", `{"runner_memory": "0GiB"}`},
 	}
 	for _, tc := range reject {
-		b := bootstrapFor("m3-harden-reject", srv.URL, caBundle)
+		b := bootstrapFor("harden-reject", srv.URL, caBundle)
 		b.ExtraSpecs = json.RawMessage(tc.extraSpecs)
 		out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 		if code == 0 {
@@ -96,14 +96,14 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		if n := controllerResourceCount(t, controllerID); n != 0 {
 			t.Errorf("[reject] %s left %d resources, want 0 (must fail before any Docker op)", tc.name, n)
 		}
-		if _, err := dockerTry("inspect", spec.JobNetworkName("m3-harden-reject")); err == nil {
+		if _, err := dockerTry("inspect", spec.JobNetworkName("harden-reject")); err == nil {
 			t.Errorf("[reject] %s created a job network despite failing closed", tc.name)
 		}
 	}
 
 	// An operator-allowlisted variable reaches the runner env, and a provider-injected
 	// collision still wins the merge.
-	b := bootstrapFor("m3-harden-accept", srv.URL, caBundle)
+	b := bootstrapFor("harden-accept", srv.URL, caBundle)
 	// MY_BENIGN_VAR is allowlisted and does not collide, so it merges through.
 	// DISABLE_RUNNER_UPDATE is allowlisted too, but the provider injects it as
 	// =true, so the pool's =false must be dropped (provider wins).
@@ -112,7 +112,7 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("[accept] allowlisted extra_env CreateInstance exit=%d, want 0; out=%s", code, out)
 	}
-	runnerName := spec.RunnerContainerName("m3-harden-accept")
+	runnerName := spec.RunnerContainerName("harden-accept")
 	env := dockerOut(t, "inspect", runnerName, "-f", "{{range .Config.Env}}{{println .}}{{end}}")
 	if !strings.Contains(env, "MY_BENIGN_VAR=hello") {
 		t.Errorf("[accept] runner env missing the operator-allowlisted MY_BENIGN_VAR=hello:\n%s", env)
@@ -132,7 +132,7 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		t.Errorf("[accept] runner env leaks the instance token or metadata URL")
 	}
 
-	if _, delCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-harden-accept", nil); delCode != 0 {
+	if _, delCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "harden-accept", nil); delCode != 0 {
 		t.Errorf("[accept] DeleteInstance exit=%d, want 0", delCode)
 	}
 	if n := controllerResourceCount(t, controllerID); n != 0 {
@@ -148,17 +148,17 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 	}))
 	defer hostile.Close()
 
-	hb := bootstrapFor("m3-harden-h4", hostile.URL, caBundlePEM(t, hostile))
+	hb := bootstrapFor("harden-redirect", hostile.URL, caBundlePEM(t, hostile))
 	hout, hstderr, hcode := runProviderIO(t, bin, cfg, controllerID, "CreateInstance", "", &hb)
 	if hcode == 0 {
-		t.Errorf("[h4] CreateInstance against a hostile-redirect metadata server unexpectedly succeeded: %s", hout)
+		t.Errorf("[redirect] CreateInstance against a hostile-redirect metadata server unexpectedly succeeded: %s", hout)
 	}
 	if strings.Contains(hstderr, instanceToken) {
-		t.Errorf("[h4] TOKEN LEAK: the provider's logs (stderr) contain the instance token:\n%s", hstderr)
+		t.Errorf("[redirect] TOKEN LEAK: the provider's logs (stderr) contain the instance token:\n%s", hstderr)
 	} else {
-		t.Logf("[h4] hostile-redirect create failed and the provider's logs are token-free")
+		t.Logf("[redirect] hostile-redirect create failed and the provider's logs are token-free")
 	}
 	if n := controllerResourceCount(t, controllerID); n != 0 {
-		t.Errorf("[h4] hostile-redirect create left %d resources, want 0", n)
+		t.Errorf("[redirect] hostile-redirect create left %d resources, want 0", n)
 	}
 }

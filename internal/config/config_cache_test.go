@@ -2,21 +2,21 @@ package config
 
 import "testing"
 
-// TestLoadM2Cache covers Load's [cache] validation through testdata fixtures.
-func TestLoadM2Cache(t *testing.T) {
+// TestLoadCache covers Load's [cache] validation through testdata fixtures.
+func TestLoadCache(t *testing.T) {
 	tests := []struct {
 		name    string
 		path    string
 		wantErr bool
 	}{
-		{name: "full valid [cache] block", path: "testdata/m2_cache_valid.toml"},
-		{name: "cache disabled is valid", path: "testdata/m2_cache_disabled.toml"},
-		{name: "empty generation is rejected", path: "testdata/m2_cache_generation_empty.toml", wantErr: true},
-		{name: "generation with a slash is rejected", path: "testdata/m2_cache_generation_invalid.toml", wantErr: true},
-		{name: "relative toolcache_path is rejected", path: "testdata/m2_cache_path_relative.toml", wantErr: true},
-		{name: "colliding cache paths are rejected", path: "testdata/m2_cache_paths_collide.toml", wantErr: true},
-		{name: "cache path shadowing a reserved mount is rejected", path: "testdata/m2_cache_path_reserved.toml", wantErr: true},
-		{name: "negative retention window is rejected", path: "testdata/m2_cache_days_negative.toml", wantErr: true},
+		{name: "full valid [cache] block", path: "testdata/cache_valid.toml"},
+		{name: "cache disabled is valid", path: "testdata/cache_disabled.toml"},
+		{name: "empty generation is rejected", path: "testdata/cache_generation_empty.toml", wantErr: true},
+		{name: "generation with a slash is rejected", path: "testdata/cache_generation_invalid.toml", wantErr: true},
+		{name: "relative toolcache_path is rejected", path: "testdata/cache_path_relative.toml", wantErr: true},
+		{name: "colliding cache paths are rejected", path: "testdata/cache_paths_collide.toml", wantErr: true},
+		{name: "cache path shadowing a reserved mount is rejected", path: "testdata/cache_path_reserved.toml", wantErr: true},
+		{name: "negative retention window is rejected", path: "testdata/cache_days_negative.toml", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -34,9 +34,9 @@ func TestLoadM2Cache(t *testing.T) {
 	}
 }
 
-// TestLoadM2CacheDefaults confirms a config with no [cache] table loads with the
+// TestLoadCacheDefaults confirms a config with no [cache] table loads with the
 // documented cache defaults.
-func TestLoadM2CacheDefaults(t *testing.T) {
+func TestLoadCacheDefaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
 		t.Fatalf("Load returned unexpected error: %v", err)
@@ -68,10 +68,10 @@ func TestLoadM2CacheDefaults(t *testing.T) {
 	}
 }
 
-// TestLoadM2CacheEnabledFalseOverridesDefault confirms an explicit
+// TestLoadCacheEnabledFalseOverridesDefault confirms an explicit
 // enabled = false overrides the true default.
-func TestLoadM2CacheEnabledFalseOverridesDefault(t *testing.T) {
-	cfg, err := Load("testdata/m2_cache_disabled.toml")
+func TestLoadCacheEnabledFalseOverridesDefault(t *testing.T) {
+	cfg, err := Load("testdata/cache_disabled.toml")
 	if err != nil {
 		t.Fatalf("Load returned unexpected error: %v", err)
 	}
@@ -100,24 +100,24 @@ func TestCacheValidate(t *testing.T) {
 		{name: "relative pnpm_store_path rejected", mutate: func(c *Cache) { c.PnpmStorePath = "opt/pnpm" }, wantErr: true},
 		{name: "identical paths rejected", mutate: func(c *Cache) { c.PnpmStorePath = c.ToolcachePath }, wantErr: true},
 		{name: "toolcache under /run rejected", mutate: func(c *Cache) { c.ToolcachePath = "/run/x" }, wantErr: true},
-		{name: "toolcache shadowing the externals mount rejected (W2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals" }, wantErr: true},
-		{name: "pnpm store shadowing the diag mount rejected (W2)", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/_diag" }, wantErr: true},
-		{name: "toolcache nested under the externals mount rejected (W2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals/node20" }, wantErr: true},
+		{name: "toolcache shadowing the externals mount rejected", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals" }, wantErr: true},
+		{name: "pnpm store shadowing the diag mount rejected", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/_diag" }, wantErr: true},
+		{name: "toolcache nested under the externals mount rejected", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/externals/node20" }, wantErr: true},
 		{name: "negative stale days rejected", mutate: func(c *Cache) { c.StaleCacheEvictionDays = -5 }, wantErr: true},
 		{name: "negative log retention rejected", mutate: func(c *Cache) { c.DiagnosticLogRetentionDays = -1 }, wantErr: true},
 
 		// Canonical-alias bypasses: each of these resolves onto a reserved in-runner
 		// mount, the runner install dir or the /run socket dir, and would slip past
 		// a check on the raw string.
-		{name: "dot-segment onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/." }, wantErr: true},
-		{name: "/opt/../ traversal onto the runner install dir rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/opt/../actions-runner" }, wantErr: true},
-		{name: "repeated slashes are non-canonical, rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "//opt//hostedtoolcache" }, wantErr: true},
-		{name: "trailing slash is non-canonical, rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/opt/pnpm-store/" }, wantErr: true},
-		{name: "filesystem root rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/" }, wantErr: true},
-		{name: "/var/run aliases onto the /run socket dir, rejected (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/var/run" }, wantErr: true},
-		{name: "/var/run/garm aliases onto the credential tmpfs, rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/var/run/garm" }, wantErr: true},
-		{name: "the bare runner install dir is reserved (H2)", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner" }, wantErr: true},
-		{name: "traversal that canonicalizes onto the runner dir rejected (H2)", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/x/.." }, wantErr: true},
+		{name: "dot-segment onto the runner install dir rejected", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner/." }, wantErr: true},
+		{name: "/opt/../ traversal onto the runner install dir rejected", mutate: func(c *Cache) { c.ToolcachePath = "/opt/../actions-runner" }, wantErr: true},
+		{name: "repeated slashes are non-canonical, rejected", mutate: func(c *Cache) { c.ToolcachePath = "//opt//hostedtoolcache" }, wantErr: true},
+		{name: "trailing slash is non-canonical, rejected", mutate: func(c *Cache) { c.PnpmStorePath = "/opt/pnpm-store/" }, wantErr: true},
+		{name: "filesystem root rejected", mutate: func(c *Cache) { c.ToolcachePath = "/" }, wantErr: true},
+		{name: "/var/run aliases onto the /run socket dir, rejected", mutate: func(c *Cache) { c.ToolcachePath = "/var/run" }, wantErr: true},
+		{name: "/var/run/garm aliases onto the credential tmpfs, rejected", mutate: func(c *Cache) { c.PnpmStorePath = "/var/run/garm" }, wantErr: true},
+		{name: "the bare runner install dir is reserved", mutate: func(c *Cache) { c.ToolcachePath = "/actions-runner" }, wantErr: true},
+		{name: "traversal that canonicalizes onto the runner dir rejected", mutate: func(c *Cache) { c.PnpmStorePath = "/actions-runner/x/.." }, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

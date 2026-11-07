@@ -5,7 +5,7 @@
 # entrypoint entirely (ADR-002). This script never fetches JIT config or a
 # registration token itself: the provider fetches those out-of-band and
 # streams them into this container's memory-backed tmpfs (/run/garm) via a
-# `docker exec`-run `tar -x` after start (ADR-002 F1). The contract
+# `docker exec`-run `tar -x` after start (ADR-002). The contract
 # implemented here is:
 #
 #   1. Wait for the provider's atomic delivery marker (/run/garm/.delivered).
@@ -30,7 +30,7 @@
 #
 # Credentials never land on the container's disk-backed writable layer: they
 # stay resident on the memory-backed tmpfs, reached from the install dir only
-# through symlinks (ADR-002 F2). Never echo/log credential file contents.
+# through symlinks (ADR-002). Never echo/log credential file contents.
 
 set -euo pipefail
 
@@ -40,7 +40,7 @@ readonly RUNNER_USER="runner"
 
 # ReadyMarker: the provider writes this file as the LAST entry of the
 # credential tar, so it appears only once every credential file is fully
-# delivered (ADR-002 F1). Waiting for it — instead of the individual files —
+# delivered (ADR-002). Waiting for it — instead of the individual files —
 # means this entrypoint never observes a partial credential set.
 readonly READY_MARKER=".delivered"
 
@@ -101,14 +101,14 @@ wait_for_docker_ready() {
 }
 
 # require_gosu fails CLOSED: if gosu is not on PATH we cannot drop privileges,
-# so we refuse to run rather than silently continue as root (ADR-002 F11).
+# so we refuse to run rather than silently continue as root (ADR-002).
 require_gosu() {
   command -v gosu >/dev/null 2>&1 && return 0
   fail "gosu is required to drop privileges to ${RUNNER_USER} but was not found on PATH; refusing to run as root (set RUN_AS_ROOT=true to override deliberately)"
 }
 
 # ensure_docker_socket_group makes the unprivileged runner user able to reach
-# the shared DinD daemon socket (F1). In DinD modes the provider launches the
+# the shared DinD daemon socket. In DinD modes the provider launches the
 # sidecar's dockerd with `--group ${DOCKER_SOCK_GID}`, so /run/docker.sock is
 # group-owned by that GID and group-writable. gosu re-derives the runner's
 # supplementary groups from /etc/group when it drops privileges, so the runner
@@ -125,7 +125,7 @@ ensure_docker_socket_group() {
   # image no group owns this GID (the NORMAL case), so getent exits non-zero.
   # Under `set -euo pipefail` (line 35) an un-guarded `grp="$(getent … | cut …)"`
   # assignment would abort the whole entrypoint here — before the groupadd branch
-  # below ever runs (F1). Suppress getent's diagnostics and neutralize the
+  # below ever runs. Suppress getent's diagnostics and neutralize the
   # pipeline's exit status with `|| true`, so a missing group yields an empty
   # `grp` and we fall through to CREATE it, while a pre-existing group (custom
   # image already owning this GID) is REUSED by name — acceptable for socket
@@ -144,7 +144,7 @@ ensure_docker_socket_group() {
 }
 
 # Step 1: credential wait. Both modes wait for the single atomic delivery
-# marker the provider writes last (ADR-002 F1).
+# marker the provider writes last (ADR-002).
 wait_for_credentials() {
   log "waiting up to ${CRED_WAIT_SECONDS}s for the delivery marker ${CRED_DIR}/${READY_MARKER}"
   wait_for_files "${CRED_WAIT_SECONDS}" "${READY_MARKER}" \
@@ -165,7 +165,7 @@ maybe_wait_for_docker() {
     || fail "timed out waiting for Docker daemon readiness at ${DOCKER_HOST}"
 }
 
-# wait_for_externals_seeded is the CONSUMER-side externals seed gate (ADR-003 W2):
+# wait_for_externals_seeded is the CONSUMER-side externals seed gate (ADR-003):
 # it blocks until the seed-completion marker (GARM_EXTERNALS_SEEDED_MARKER, set by
 # the provider ONLY when an externals cache is mounted) exists in the read-only
 # externals mount, bounded by $EXTERNALS_WAIT_SECONDS. The provider seeds the
@@ -215,12 +215,12 @@ run_concurrent_waits() {
 }
 
 # prepare_diag ensures the mounted diagnostic-logs directory (GARM_DIAG_DIR, set
-# by the provider ONLY when a persistent diag-logs volume is mounted, ADR-003 W2)
+# by the provider ONLY when a persistent diag-logs volume is mounted, ADR-003)
 # exists and is owned by the runner user before privileges are dropped: a fresh
 # named volume mounts root-owned, so without this the unprivileged runner could
 # not write its _diag logs into it. This is DIRECTORY SETUP only — retention and
 # pruning are enforced provider-side, out of band, NEVER in this untrusted
-# entrypoint (ADR-003 F14). The chown is non-recursive: logs from prior jobs are
+# entrypoint (ADR-003). The chown is non-recursive: logs from prior jobs are
 # already runner-owned, and recursing a full log history every job would be
 # needless. No-op when GARM_DIAG_DIR is unset (cache disabled or ineligible).
 prepare_diag() {
@@ -232,7 +232,7 @@ prepare_diag() {
 }
 
 # prepare_cache_dirs ensures the mounted persistent-cache directories exist and
-# are owned by the runner user BEFORE privileges are dropped (ADR-003 W2, H4). A
+# are owned by the runner user BEFORE privileges are dropped (ADR-003). A
 # fresh named volume mounts ROOT-owned 0755 whenever its target path is absent
 # from the image (Moby copies image ownership onto an empty volume only when the
 # path already exists), so without this a real `pnpm install` as the unprivileged
@@ -241,7 +241,7 @@ prepare_diag() {
 # store volume is actually mounted) and RUNNER_TOOL_CACHE (the toolcache) — so it
 # honors the OPERATOR-CONFIGURED store path, not a hardcoded one. This is
 # directory OWNERSHIP setup only; retention/pruning is never done in this
-# untrusted entrypoint (ADR-003 F14). The chown is non-recursive: a fresh volume
+# untrusted entrypoint (ADR-003). The chown is non-recursive: a fresh volume
 # is empty and a warm one's contents are already runner-owned from prior jobs, so
 # recursing a full cache every job would be needless. No-op for any dir whose env
 # is unset (cache disabled or ineligible).
@@ -316,7 +316,7 @@ prepare_workdir() {
 # delivered credential files via SYMLINKS. The credential files themselves
 # stay resident on the memory-backed tmpfs — only the symlinks live on the
 # container's writable layer, so no credential ever lands on host-backed disk
-# (ADR-002 F2). No config.sh, no --jitconfig. run.sh reads .runner /
+# (ADR-002). No config.sh, no --jitconfig. run.sh reads .runner /
 # .credentials / .credentials_rsaparams and follows the symlinks; the tmpfs
 # files are owned by (and readable by) the runner user the provider's delivery
 # exec created them as.
@@ -361,10 +361,10 @@ own_runner_dir_as_runner() {
 }
 
 # run_config_sh runs config.sh with privilege handling that satisfies the base
-# runner's own root guard (ADR-002 F4): by default it drops to the runner user
+# runner's own root guard (ADR-002): by default it drops to the runner user
 # via gosu (config.sh refuses to run as root without RUNNER_ALLOW_RUNASROOT);
 # only when RUN_AS_ROOT=true is set deliberately does it run as root with
-# RUNNER_ALLOW_RUNASROOT=1. Fails CLOSED when gosu is missing (F11).
+# RUNNER_ALLOW_RUNASROOT=1. Fails CLOSED when gosu is missing.
 #
 # config.sh runs BACKGROUNDED, with the function then `wait`-ing on it,
 # rather than as a plain foreground command — deliberately: bash only acts on
@@ -396,7 +396,7 @@ run_config_sh() {
 # layer onto the memory-backed tmpfs, replacing each with a symlink pointing at
 # its tmpfs bare-name target (exactly like install_jit_credentials's steady
 # state). It runs ONLY after config.sh SUCCEEDS, so at steady state the non-JIT
-# credentials live only on tmpfs (ADR-002 F2), reached from the install dir
+# credentials live only on tmpfs (ADR-002), reached from the install dir
 # through symlinks.
 #
 # This is deliberately a post-config move rather than a pre-config symlink: the
@@ -427,7 +427,7 @@ move_non_jit_credentials_to_tmpfs() {
 # scrub_non_jit_credentials unconditionally removes the credential-pattern
 # files — the dotted install-dir names AND their tmpfs bare-name
 # counterparts — so no failure path leaves credentials on the container's
-# disk-backed writable layer (ADR-002 F2). Shared by the EXIT-trap and
+# disk-backed writable layer (ADR-002). Shared by the EXIT-trap and
 # signal-trap handlers below.
 scrub_non_jit_credentials() {
   local f
@@ -440,7 +440,7 @@ scrub_non_jit_credentials() {
 # scrub_non_jit_credentials_on_failure is the EXIT-trap belt-and-braces for the
 # non-JIT config phase: if config.sh fails, it removes any credential-pattern
 # files so no failure path leaves credentials on the container's disk-backed
-# writable layer (ADR-002 F2). It preserves the triggering exit code so a
+# writable layer (ADR-002). It preserves the triggering exit code so a
 # failed config still exits non-zero for GARM.
 #
 # This does NOT cover an unhandled TERM/INT/HUP: bash only runs the EXIT trap
@@ -475,8 +475,8 @@ scrub_non_jit_credentials_on_signal() {
 }
 
 # install_non_jit_registration registers the runner with config.sh (as the
-# runner user via gosu by default, ADR-002 F4), appending --disableupdate
-# unconditionally because the image is digest-managed (ADR-002 F9). config.sh
+# runner user via gosu by default, ADR-002), appending --disableupdate
+# unconditionally because the image is digest-managed (ADR-002). config.sh
 # writes .runner/.credentials/.credentials_rsaparams into the install dir
 # normally; ONLY after it SUCCEEDS are those files moved onto the tmpfs and
 # replaced with symlinks (move_non_jit_credentials_to_tmpfs), so steady-state
@@ -529,7 +529,7 @@ install_non_jit_registration() {
 
 # exec_as_runner drops root via gosu (mirroring the base image's own
 # convention) unless RUN_AS_ROOT=true, then execs the runner in the foreground
-# so it receives signals directly. Fails CLOSED when gosu is missing (F11).
+# so it receives signals directly. Fails CLOSED when gosu is missing.
 exec_as_runner() {
   if [[ "${RUN_AS_ROOT:-false}" == "true" ]]; then
     log "RUN_AS_ROOT=true: running as $(id -un)"
@@ -551,14 +551,14 @@ main() {
   raise_nofile_soft_limit
 
   # DinD modes: make the runner user a member of the DinD socket group before
-  # dropping privileges, so `docker` works as the unprivileged runner (F1).
+  # dropping privileges, so `docker` works as the unprivileged runner.
   ensure_docker_socket_group
 
-  # W2: own the mounted diagnostic-logs dir (if any) so the unprivileged runner
+  # Own the mounted diagnostic-logs dir (if any) so the unprivileged runner
   # can write into the persistent diag volume (ADR-003; no-op when unset).
   prepare_diag
 
-  # H4: own the mounted pnpm store / toolcache dirs (if any) so the unprivileged
+  # Own the mounted pnpm store / toolcache dirs (if any) so the unprivileged
   # runner can write into a fresh, root-owned persistent-cache volume (ADR-003;
   # no-op when the corresponding env is unset).
   prepare_cache_dirs
@@ -569,7 +569,7 @@ main() {
     install_non_jit_registration
   fi
 
-  # W2 consumer-side externals seed gate: block until the read-only externals
+  # Consumer-side externals seed gate: block until the read-only externals
   # cache is fully seeded (ADR-003) before launching run.sh, which executes the
   # Node runtimes THROUGH that mount. No-op when no externals cache is mounted.
   wait_for_externals_seeded
@@ -581,9 +581,9 @@ main() {
 # SOURCED. Sourcing loads the functions without running the full flow, so the
 # live non-root verification harness (internal/verify) can invoke the REAL
 # ensure_docker_socket_group under this file's own `set -euo pipefail` — proving
-# F1 against the production code verbatim rather than a re-implementation. In the
-# production container ${BASH_SOURCE[0]} == ${0} == /entrypoint.sh, so main runs
-# exactly as before.
+# the group setup against the production code verbatim rather than a
+# re-implementation. In the production container ${BASH_SOURCE[0]} == ${0} ==
+# /entrypoint.sh, so main runs exactly as before.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   main "$@"
 fi

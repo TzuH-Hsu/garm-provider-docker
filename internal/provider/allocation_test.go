@@ -362,7 +362,7 @@ func TestCreateInstanceJobNetworkDisabledStillIsolates(t *testing.T) {
 		t.Fatalf("CreateInstance returned unexpected error: %v", err)
 	}
 	if _, ok := netByName(t, fake, spec.JobNetworkName("Test-Instance-01")); !ok {
-		t.Error("enable_job_network=false must still create the isolated per-job network (WP2 keeps it always on)")
+		t.Error("enable_job_network=false must still create the isolated per-job network (the setting is reserved and the network is always created)")
 	}
 	if inst.Status != "running" {
 		t.Errorf("Status = %q, want running", inst.Status)

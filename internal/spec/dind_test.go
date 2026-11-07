@@ -235,7 +235,7 @@ func TestBuildDindContainerExternalsMount(t *testing.T) {
 				t.Errorf("externals mount = %+v, want %+v", *found, want)
 			}
 			if !found.ReadOnly {
-				t.Error("externals mount is read-write; the shared volume must stay read-only (ADR-003 F4)")
+				t.Error("externals mount is read-write; the shared volume must stay read-only (ADR-003)")
 			}
 		})
 	}

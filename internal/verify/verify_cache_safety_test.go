@@ -14,7 +14,7 @@
 //     provider's fail-closed handling of evicted caches depends on this (ADR-003,
 //     "A cache's identity is its label set, not its name").
 //
-//     go test -tags dockerverify -v -run TestVerifyM2CacheSafety ./internal/verify/
+//     go test -tags dockerverify -v -run TestVerifyCacheSafety ./internal/verify/
 //
 // Everything is scoped to a unique controller ID and torn down by label, and the
 // suite's foreign canary containers are checked to be untouched.
@@ -29,7 +29,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-func TestVerifyM2CacheSafety(t *testing.T) {
+func TestVerifyCacheSafety(t *testing.T) {
 	root := repoRoot(t)
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
@@ -81,9 +81,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}
 		labels := strings.TrimSpace(dockerOut(t, "volume", "inspect", vol, "-f", "{{.Labels}}"))
 		if labels != "map[]" && labels != "" && labels != "<no value>" {
-			t.Errorf("[H3-fact] auto-created volume carries labels %q, want none (real Moby copies no labels)", labels)
+			t.Errorf("auto-created volume carries labels %q, want none (real Moby copies no labels)", labels)
 		} else {
-			t.Logf("[H3-fact] the daemon auto-created the missing named volume UNLABELED (%q) — the premise the fail-closed rests on", labels)
+			t.Logf("the daemon auto-created the missing named volume UNLABELED (%q) — the premise the fail-closed rests on", labels)
 		}
 	})
 
@@ -102,9 +102,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 		}, "\n"))
 		out, code := runProvider(t, bin, bad, controllerID, "ListInstances", "", nil)
 		if code == 0 {
-			t.Errorf("[H2] provider accepted a cache path that aliases onto /run; want a config-load failure. stdout=%s", out)
+			t.Errorf("provider accepted a cache path that aliases onto /run; want a config-load failure. stdout=%s", out)
 		} else {
-			t.Logf("[H2] provider rejected the /var/run cache path at config load (exit=%d)", code)
+			t.Logf("provider rejected the /var/run cache path at config load (exit=%d)", code)
 		}
 	})
 
@@ -112,12 +112,12 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 	t.Run("schemeless_org_url_gets_no_cache", func(t *testing.T) {
 		controllerID := randControllerID(t)
 		cfg := cacheConfig(t)
-		schemeless := "github.com/garm-h1-verify-org-" + randHex(t) // scheme-less org
+		schemeless := "github.com/garm-schemeless-verify-org-" + randHex(t) // scheme-less org
 		defer cleanupController(t, controllerID)
 
-		b := cacheBootstrapPayload("h1-schemeless", schemeless, srv.URL, caBundle)
+		b := cacheBootstrapPayload("schemeless-org", schemeless, srv.URL, caBundle)
 		if _, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b); code != 0 {
-			t.Fatalf("[H1] CreateInstance with a scheme-less repo_url should still succeed (JIT), exit=%d", code)
+			t.Fatalf("CreateInstance with a scheme-less repo_url should still succeed (JIT), exit=%d", code)
 		}
 		// No REPO-KEYED cache volume of any kind for this controller (the shared
 		// externals volume carries no repo label and may exist).
@@ -132,9 +132,9 @@ func TestVerifyM2CacheSafety(t *testing.T) {
 			}
 		}
 		if len(withRepo) != 0 {
-			t.Errorf("[H1] scheme-less org repo_url produced repo-keyed cache volumes %v, want none (fail safe)", withRepo)
+			t.Errorf("scheme-less org repo_url produced repo-keyed cache volumes %v, want none (fail safe)", withRepo)
 		} else {
-			t.Logf("[H1] scheme-less org repo_url got NO persistent (repo-keyed) cache — fail safe")
+			t.Logf("scheme-less org repo_url got NO persistent (repo-keyed) cache — fail safe")
 		}
 	})
 

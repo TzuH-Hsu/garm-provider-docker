@@ -362,7 +362,7 @@ func TestCreateWorkspaceVolumePriorGenerationNameDiffers(t *testing.T) {
 		t.Errorf("fresh workspace nonce = %q, want fresh-gen", fresh.Labels[spec.LabelCreateNonce])
 	}
 	if _, residual := fresh.Labels["test.residue"]; residual {
-		t.Error("[F4] fresh generation reused stale content: residue label present on the fresh volume")
+		t.Error("fresh generation reused stale content: residue label present on the fresh volume")
 	}
 	// Both volumes coexist under distinct names — the stale one was NOT
 	// name-collided/replaced by create (it is the sweep's job, not create's).
@@ -737,13 +737,13 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 		t.Fatalf("volume count = %d, want 1 (generation B's fresh volume survives)", countVolumes(t, fake))
 	}
 	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "gen-b")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
-		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — a stale teardown deleted the newer generation's volume", v.Labels[spec.LabelCreateNonce])
+		t.Errorf("surviving volume nonce = %q, want gen-b — a stale teardown deleted the newer generation's volume", v.Labels[spec.LabelCreateNonce])
 	}
 	if countNetworks(t, fake) != 1 {
 		t.Fatalf("network count = %d, want 1 (generation B's fresh network survives)", countNetworks(t, fake))
 	}
 	if n := findNetwork(t, fake, spec.JobNetworkName("job-1")); n.Labels[spec.LabelCreateNonce] != "gen-b" {
-		t.Errorf("[F4] surviving network nonce = %q, want gen-b — a stale teardown deleted the newer generation's claim marker", n.Labels[spec.LabelCreateNonce])
+		t.Errorf("surviving network nonce = %q, want gen-b — a stale teardown deleted the newer generation's claim marker", n.Labels[spec.LabelCreateNonce])
 	}
 }
 
@@ -780,7 +780,7 @@ func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testin
 	// Generation B's volume and network survive: the fallback protected the nonce
 	// the live claim network holds (mayRemove re-read it before removing).
 	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "gen-b")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
-		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — the fallback deleted a newer generation's volume", v.Labels[spec.LabelCreateNonce])
+		t.Errorf("surviving volume nonce = %q, want gen-b — the fallback deleted a newer generation's volume", v.Labels[spec.LabelCreateNonce])
 	}
 	if countNetworks(t, fake) != 1 {
 		t.Errorf("network count = %d, want 1 (generation B's claim network survives the fallback)", countNetworks(t, fake))
@@ -841,12 +841,12 @@ func TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave(t *t
 	}
 	surviving := findVolume(t, fake, genBVol)
 	if surviving.Labels[spec.LabelCreateNonce] != "gen-b" {
-		t.Errorf("[F4] surviving volume = %q nonce=%q, want %q (gen-b) — a stale teardown removed the newer generation's volume", surviving.Name, surviving.Labels[spec.LabelCreateNonce], genBVol)
+		t.Errorf("surviving volume = %q nonce=%q, want %q (gen-b) — a stale teardown removed the newer generation's volume", surviving.Name, surviving.Labels[spec.LabelCreateNonce], genBVol)
 	}
 	// And gen-A's volume really was removed by name.
 	for _, v := range volumesSnapshot(t, fake) {
 		if v.Name == genAVol {
-			t.Errorf("[F4] generation A's volume %q survived teardown, want removed", genAVol)
+			t.Errorf("generation A's volume %q survived teardown, want removed", genAVol)
 		}
 	}
 }

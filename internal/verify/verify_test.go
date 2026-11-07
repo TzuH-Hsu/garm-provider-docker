@@ -6,7 +6,7 @@
 // Docker host, because it checks real egress to api.github.com instead of
 // reading a network's Internal flag. Run it explicitly:
 //
-//	go test -tags dockerverify -v -run TestVerifyM1WP2Allocation ./internal/verify/
+//	go test -tags dockerverify -v -run TestVerifyAllocation ./internal/verify/
 //
 // The tests drive the real provider binary, built here, against a local fake
 // metadata HTTPS server and a small sleep-entrypoint runner image. Each test
@@ -37,9 +37,9 @@ import (
 )
 
 const (
-	instanceName  = "wp2-verify-01"
-	poolID        = "wp2-verify-pool"
-	instanceToken = "wp2-verify-instance-token"
+	instanceName  = "alloc-verify-01"
+	poolID        = "alloc-verify-pool"
+	instanceToken = "alloc-verify-instance-token"
 	bearer        = "Bearer " + instanceToken
 )
 
@@ -82,7 +82,7 @@ func randControllerID(t *testing.T) string {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
-	return "wp2-verify-" + hex.EncodeToString(b[:])
+	return "alloc-verify-" + hex.EncodeToString(b[:])
 }
 
 // dockerOut runs `docker <args...>` and returns trimmed stdout, failing the test
@@ -215,12 +215,12 @@ func runProviderIO(t *testing.T, bin, configFile, controllerID, command, instanc
 	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), exitCode
 }
 
-// TestVerifyM1WP2Allocation runs the full create, duplicate-create, delete,
+// TestVerifyAllocation runs the full create, duplicate-create, delete,
 // repeat-delete and failed-create sequence against a real daemon. It proves the
 // job network, workspace volume, runner security properties, exit codes and
 // zero-orphan teardown, and that unrelated containers stay untouched. Only a real
 // daemon can show the actual network, mount and sysctl state, and real egress.
-func TestVerifyM1WP2Allocation(t *testing.T) {
+func TestVerifyAllocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
@@ -230,7 +230,7 @@ func TestVerifyM1WP2Allocation(t *testing.T) {
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
 
-	imageTag := "garm-wp2-verify-sleep:latest"
+	imageTag := "garm-alloc-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
@@ -244,10 +244,10 @@ func TestVerifyM1WP2Allocation(t *testing.T) {
 	configFile := filepath.Join(configDir, "config.toml")
 	// [network] is omitted so the run uses config.Load's defaults:
 	// enable_job_network=true, internal=false (ADR-001). The internal=true opt-in
-	// is covered by TestVerifyOwnerRulingEgressAndIsolation.
+	// is covered by TestVerifyEgressAndIsolation.
 	// The cache is off because repo-scoped cache volumes survive DeleteInstance and
 	// would break the zero-managed-resources assertions below.
-	// TestVerifyM2W1CacheHit covers the cache.
+	// TestVerifyCacheHit covers the cache.
 	writeFile(t, configFile, fmt.Sprintf(`docker_host = "unix:///var/run/docker.sock"
 runner_image = %q
 allow_unpinned_runner_image = true
@@ -299,7 +299,7 @@ enabled = false
 	// (f) With no [network] block the job network is internal=false, so it has a
 	// route to the external network.
 	if netInternal != "false" {
-		t.Errorf("(f) job network Internal=%s, want false (2026-07-21 owner ruling default)", netInternal)
+		t.Errorf("(f) job network Internal=%s, want false (default)", netInternal)
 	}
 	// A runner needs real egress to register with GitHub, and DinD needs it for
 	// registry pulls, so check reachability, not just the flag. The wget timeout
@@ -367,7 +367,7 @@ enabled = false
 	if strings.Contains(envDump, instanceToken) || strings.Contains(envDump, srv.URL) {
 		t.Errorf("[security] runner env leaks the instance token or metadata URL")
 	}
-	t.Logf("[security] no host socket mount; no token/metadata-url in env (M0 property preserved)")
+	t.Logf("[security] no host socket mount; no token/metadata-url in env")
 
 	// The credential files landed in the tmpfs. Only their presence is checked,
 	// so the contents never reach the log.

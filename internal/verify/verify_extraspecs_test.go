@@ -3,7 +3,7 @@
 // extra_specs and the v0.1.1 self-description commands against a real daemon. Run
 // with:
 //
-//	go test -tags dockerverify -v -run TestVerifyM3W1ExtraSpecs ./internal/verify/
+//	go test -tags dockerverify -v -run TestVerifyExtraSpecs ./internal/verify/
 //
 // The test drives the real provider binary and checks that:
 //
@@ -39,11 +39,11 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-const m3Instance = "m3-verify-01"
+const extraSpecsInstance = "extraspecs-verify-01"
 
-func m3Bootstrap(metadataURL string, caBundle []byte, extraSpecs string) params.BootstrapInstance {
+func extraSpecsBootstrap(metadataURL string, caBundle []byte, extraSpecs string) params.BootstrapInstance {
 	b := params.BootstrapInstance{
-		Name:             m3Instance,
+		Name:             extraSpecsInstance,
 		RepoURL:          "https://github.com/example-org/example-repo",
 		MetadataURL:      metadataURL,
 		InstanceToken:    instanceToken,
@@ -98,7 +98,7 @@ func runProviderSelfDescribe(t *testing.T, bin, configFile, controllerID, comman
 	return strings.TrimSpace(stdout.String()), code
 }
 
-func TestVerifyM3W1ExtraSpecs(t *testing.T) {
+func TestVerifyExtraSpecs(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
@@ -121,8 +121,8 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 	}()
 
 	// Build two distinguishable cli-runner images and the provider binary.
-	baseTag := "garm-m3-verify-base:latest"
-	flavorTag := "garm-m3-verify-flavor:latest"
+	baseTag := "garm-extraspecs-verify-base:latest"
+	flavorTag := "garm-extraspecs-verify-flavor:latest"
 	buildCliRunnerImage(t, baseTag)
 	buildCliRunnerImage(t, flavorTag)
 
@@ -156,12 +156,12 @@ runner_image = "`+flavorTag+`"
 	defer srv.Close()
 	caBundle := caBundlePEM(t, srv)
 
-	runnerName := spec.RunnerContainerName(m3Instance)
-	dindName := spec.DindContainerName(m3Instance)
+	runnerName := spec.RunnerContainerName(extraSpecsInstance)
+	dindName := spec.DindContainerName(extraSpecsInstance)
 
 	// (a) A flavor and a dind_mode within the ceiling give the flavor image and a
 	// privileged sidecar.
-	b := m3Bootstrap(srv.URL, caBundle, `{"flavor": "big", "dind_mode": "privileged-sidecar"}`)
+	b := extraSpecsBootstrap(srv.URL, caBundle, `{"flavor": "big", "dind_mode": "privileged-sidecar"}`)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
 		t.Fatalf("(a) CreateInstance exit=%d, want 0; out=%s", code, stdout)
@@ -216,7 +216,7 @@ runner_image = "`+flavorTag+`"
 	t.Logf("[a] runner DOCKER_HOST=%s + socket mount at %s; no host socket, no creds in env", spec.DindDockerHost, spec.DindSocketDir)
 
 	// Tear (a) down so the resource assertions below start clean.
-	if _, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", m3Instance, nil); delCode != 0 {
+	if _, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", extraSpecsInstance, nil); delCode != 0 {
 		t.Errorf("(a) DeleteInstance exit=%d, want 0", delCode)
 	}
 	if n := controllerResourceCount(t, controllerID); n != 0 {
@@ -224,7 +224,7 @@ runner_image = "`+flavorTag+`"
 	}
 
 	// (b) A dind_mode outside the ceiling fails closed with zero resources.
-	bad := m3Bootstrap(srv.URL, caBundle, `{"dind_mode": "sysbox-runc"}`) // not in allowed_dind_modes
+	bad := extraSpecsBootstrap(srv.URL, caBundle, `{"dind_mode": "sysbox-runc"}`) // not in allowed_dind_modes
 	out, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bad)
 	if code == 0 {
 		t.Errorf("(b) out-of-ceiling dind_mode unexpectedly succeeded: %s", out)
@@ -234,7 +234,7 @@ runner_image = "`+flavorTag+`"
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("(b) ceiling violation left %d resources, want 0 (must fail before any Docker op)", n)
 	}
-	if _, err := dockerTry("inspect", spec.JobNetworkName(m3Instance)); err == nil {
+	if _, err := dockerTry("inspect", spec.JobNetworkName(extraSpecsInstance)); err == nil {
 		t.Errorf("(b) a job network was created despite the ceiling violation")
 	}
 
@@ -243,7 +243,7 @@ runner_image = "`+flavorTag+`"
 		`{"extra_env": {"RUNNER_EPHEMERAL": "false"}}`,
 		`{"image": "attacker/evil:latest"}`,
 	} {
-		bc := m3Bootstrap(srv.URL, caBundle, es)
+		bc := extraSpecsBootstrap(srv.URL, caBundle, es)
 		out, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bc)
 		if code == 0 {
 			t.Errorf("(c) reserved override %s unexpectedly succeeded: %s", es, out)
