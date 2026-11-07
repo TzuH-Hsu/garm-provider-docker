@@ -41,19 +41,6 @@ func (m *Manager) SweepOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// SweepStale applies the orphan decision to one instance name, with the same grace
-// windows as SweepOrphans.
-func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
-	swept, err := m.sweepInstance(ctx, instanceName)
-	if err != nil {
-		return err
-	}
-	if swept {
-		slog.InfoContext(ctx, "pre-create sweep removed a stale allocation", "instance", instanceName)
-	}
-	return nil
-}
-
 // sweepInstance tears instanceName's allocation down if it is abandoned, and reports
 // whether anything was removed:
 //

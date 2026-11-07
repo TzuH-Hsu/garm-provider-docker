@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -105,7 +106,7 @@ func TestBuildDiagPruneContainer(t *testing.T) {
 func TestDiagPruneRetentionInScript(t *testing.T) {
 	for _, days := range []int{1, 7, 30} {
 		cfg, _ := BuildDiagPruneContainer(DiagPruneContainerSpec{RetentionDays: days})
-		if want := "-mmin +" + itoa(days*24*60); !strings.Contains(cfg.Entrypoint[2], want) {
+		if want := "-mmin +" + strconv.Itoa(days*24*60); !strings.Contains(cfg.Entrypoint[2], want) {
 			t.Errorf("retention %d: prune script missing %q", days, want)
 		}
 	}
