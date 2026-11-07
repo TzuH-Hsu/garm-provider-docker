@@ -6,31 +6,28 @@
 # repository running a trivial echo workflow, and walks the full
 # lifecycle - CreateInstance -> JIT registration -> job runs ->
 # DeleteInstance -> runner confirmed gone from GitHub - while checking the
-# headline safety property (docs/plan.md §4: no host Docker socket, no
-# GARM credentials, no GitHub App key visible on the runner) and the two
-# ADR-002 verification items (exec-tar-into-tmpfs credential delivery,
-# actions/runner symlink-compat) along the way.
+# headline safety property (no host Docker socket, no GARM credentials, no
+# GitHub App key visible on the runner) and the two ADR-002 verification
+# items (exec-tar-into-tmpfs credential delivery, actions/runner
+# symlink-compat) along the way.
 #
-# This originated as the M0 go/no-go gate (docs/plan.md §3 M0: pool mode,
-# dind_mode=none, linux/amd64 only). M1-M4 have since shipped the full
-# per-job topology (job network, named workspace volume, DinD modes,
-# persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
-# failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
+# v0.2.0 is the recorded failing baseline against GARM v0.2.x; an end-to-end
+# pass is claimed only for
 # a published release that passes this gate (v0.2.5 does, on the Ubuntu 26.04
 # runner image with both variants; v0.2.4 passed the revision before the
 # registry mirror check; v0.2.3 passed the revision before the
 # shared-network-namespace and published-port checks; v0.2.2 passed the
 # revision before --runner-image was added; v0.2.1 passed an earlier revision
 # but fails the IPv6 checks added for v0.2.2; for an unpublished release use
-# --from-source). The script keeps
-# dind_mode=none as its own default (the smallest, most portable slice -
-# DinD modes are a deliberate operator opt-in and out of scope for this
-# gate, see docs/live-gate.md), but everything else it exercises is the
-# CURRENT provider, not the M0 slice.
+# --from-source). The script keeps dind_mode=none as its own default (the
+# smallest, most portable slice). DinD is a deliberate operator opt-in:
+# privileged-sidecar is the optional --dind variant, and sysbox-runc is not
+# covered (see docs/live-gate.md).
 #
 # See docs/live-gate.md for the full runbook: prerequisites, what each check
-# proves, and a troubleshooting table. This script only prints instructions
-# and runs read-mostly checks; it never modifies GARM's own config or your
+# proves, and a troubleshooting table, and docs/live-gate-runs.md for recorded
+# results. This script only prints instructions and runs read-mostly checks;
+# it never modifies GARM's own config or your
 # GitHub repository for you - those steps are always a manual, confirmed
 # action, by design.
 #
@@ -45,9 +42,9 @@
 #               operator installs, with digest-pin enforcement left ON
 #               (no allow_unpinned_runner_image).
 #   source     Builds the provider binary and the runner image from this
-#               checkout (the original M0-era behavior): a local `go
-#               build`, a local `docker build` of runner-images/noble (or
-#               runner-images/resolute with --runner-image resolute), and
+#               checkout: a local `go build`, a local `docker build` of
+#               runner-images/noble (or runner-images/resolute with
+#               --runner-image resolute), and
 #               allow_unpinned_runner_image=true (required for a mutable
 #               local tag). For development against uncommitted changes.
 #
@@ -64,8 +61,8 @@
 #               message queue for jobs, so NO inbound webhook is needed and
 #               the GARM host can sit behind a NAT. The workflow targets the
 #               scale set by NAME in `runs-on`. Provider JIT delivery is
-#               forced on for scale sets (docs/research.md §1.D).
-#   pool       Creates a webhook-driven pool (the original flow). Needs
+#               forced on for scale sets.
+#   pool       Creates a webhook-driven pool. Needs
 #               GitHub to be able to reach GARM's webhook endpoint.
 #
 # Two topology variants (see GATE_VARIANT below):
@@ -325,7 +322,7 @@ PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_DIR}/config.toml"
 
 # "source" mode only: a mutable local dev tag, which is why "source" mode
 # needs allow_unpinned_runner_image=true in the generated config (ADR-002/
-# ADR-005 F10; internal/config/config.go's validateDigestPinnedImage).
+# ADR-005; internal/config/config.go's validateDigestPinnedImage).
 # "release" mode never uses this - it pins runner_image by digest instead.
 # The runner image to gate: runner-images/<name> in "source" mode,
 # ghcr.io/tzuh-hsu/garm-runner-<name> in "release" mode. RUNNER_IMAGE_TAG's
@@ -397,7 +394,7 @@ POOL_FLAVOR="${POOL_FLAVOR:-default}"
 # Fixed by design, not env-overridable: this gate only needs one runner to
 # ever exist at a time. OS_TYPE is fixed to linux - the only OS this
 # provider supports (internal/provider/create.go's validatePlatform). Both
-# linux/amd64 and linux/arm64 are supported as of M1; OS_ARCH below is
+# linux/amd64 and linux/arm64 are supported; OS_ARCH below is
 # auto-detected from the host (and must match it), not hardcoded to amd64.
 readonly MIN_IDLE_RUNNERS=0
 readonly MAX_RUNNERS=1
@@ -1272,7 +1269,7 @@ EOF
 # config ONLY, do not use in production.
 #
 # allow_unpinned_runner_image=true is a dev-only escape hatch
-# (internal/config/config.go; ADR-002/ADR-005 F10): it lets runner_image be
+# (internal/config/config.go; ADR-002/ADR-005): it lets runner_image be
 # a mutable local tag instead of a sha256-digest-pinned reference. Never set
 # this in a real deployment.
 docker_host = "unix:///var/run/docker.sock"
@@ -2114,10 +2111,10 @@ cache_disabled_in_config() {
 }
 
 # verify_topology checks the two OTHER per-allocation resources every
-# CreateInstance provisions alongside the runner container as of M1
-# (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's F4/
+# CreateInstance provisions alongside the runner container
+# (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's
 # nonce-scoped teardown all hinges on it existing and being labeled) and the
-# named, labeled workspace volume (replacing M0's anonymous one). Both are
+# named, labeled workspace volume. Both are
 # looked up by label rather than by name, since the workspace volume's name
 # embeds a create-nonce this script does not otherwise learn
 # (internal/spec/names.go's WorkspaceVolumeName).
