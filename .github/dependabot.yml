@@ -48,9 +48,10 @@ updates:
         # No `update-types:` filter: digest-only refreshes have no semver
         # type and would escape the group. Grouping is per directory.
     ignore:
-      # go.mod is the single source of truth for the Go version. The
-      # Dockerfile's `golang` tag is the one second copy, so bump it by hand
-      # together with go.mod.
+      # go.mod's `toolchain` line is the single source of truth for the Go
+      # version. The Dockerfile's `golang` tag is the one second copy, so bump
+      # it by hand together with go.mod; CI fails if they differ
+      # (scripts/check-go-version.sh).
       - dependency-name: "golang"
         update-types:
           - "version-update:semver-major"

@@ -119,10 +119,12 @@ is specific to this provider and this demo.
      one runner matches; with several, set `GATE_INSTANCE`. The gate still
      creates real containers and, in the `--dind` variant, a privileged
      sidecar, so a production host remains a deliberate choice.
-   - **`--from-source` additionally needs a Go toolchain** (`go.mod` pins
-     `go 1.25.0`) to build the provider binary, and builds the runner image
-     locally (`docker build -f runner-images/noble/Dockerfile runner-images`,
-     or `resolute` with `--runner-image resolute`).
+   - **`--from-source` additionally needs a Go toolchain** (`go.mod` sets
+     `go 1.25.0` and `toolchain go1.27.3`; the `go` command downloads that
+     toolchain on first use if yours is older) to build the provider binary,
+     and builds the runner image locally
+     (`docker build -f runner-images/noble/Dockerfile runner-images`, or
+     `resolute` with `--runner-image resolute`).
 5. This repository checked out locally, with `scripts/demo-m0.sh`
    executable (`chmod +x scripts/demo-m0.sh` if needed).
 6. **Provider paths readable by GARM's service user.** GARM executes the
