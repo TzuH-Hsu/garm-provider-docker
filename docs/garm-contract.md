@@ -51,7 +51,10 @@ GARM generates the JIT configuration itself and serves it per file, with `Author
 provider calls `GET {metadata-url}/runner-registration-token`. Pools use JIT unless `disable_jit_config` is set.
 Scale sets always use it.
 
-The provider makes these requests itself and never gives the token to the runner container. It requires https
+The provider makes these requests itself and never gives the instance token to the runner container. The
+registration token it fetches without JIT is delivered into the container's tmpfs, and the entrypoint deletes
+it as soon as it has read it, so it is not on the tmpfs while a job runs
+([ADR-002](adr/ADR-002-runner-image-and-jit-delivery.md)). It requires https
 (plain http only to a loopback host), refuses URLs with userinfo, trusts `ca-cert-bundle`, follows no
 cross-origin redirect and removes the token from every error it reports. The fetch has a 60 second budget.
 

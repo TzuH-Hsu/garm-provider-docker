@@ -15,7 +15,8 @@
 #      - JIT: symlink the tmpfs files into the install dir and exec run.sh
 #        directly (no config.sh, no --jitconfig). All JIT files are delivered
 #        up front, so the symlinks are never dangling.
-#      - non-JIT: run config.sh (as the runner user via gosu) to register,
+#      - non-JIT: read the registration token and delete its tmpfs file at once,
+#        then run config.sh (as the runner user via gosu) to register,
 #        letting it write .runner/.credentials/.credentials_rsaparams into the
 #        install dir normally; THEN, only after config.sh SUCCEEDS, move those
 #        files onto the tmpfs and replace them with symlinks, so steady-state
@@ -43,6 +44,11 @@ readonly RUNNER_USER="runner"
 # delivered (ADR-002). Waiting for it — instead of the individual files —
 # means this entrypoint never observes a partial credential set.
 readonly READY_MARKER=".delivered"
+
+# The non-JIT registration token file the provider delivers into CRED_DIR (keep
+# in sync with metadata.RegistrationTokenFile). The entrypoint deletes it as soon
+# as it has read it, so it is never present while a job runs (ADR-002).
+readonly REGISTRATION_TOKEN_FILE="registration-token"
 
 readonly CRED_WAIT_SECONDS="${GARM_CRED_WAIT_SECONDS:-120}"
 readonly DOCKER_WAIT_SECONDS="${WAIT_FOR_DOCKER_SECONDS:-120}"
@@ -427,21 +433,27 @@ move_non_jit_credentials_to_tmpfs() {
 # scrub_non_jit_credentials unconditionally removes the credential-pattern
 # files — the dotted install-dir names AND their tmpfs bare-name
 # counterparts — so no failure path leaves credentials on the container's
-# disk-backed writable layer (ADR-002). Shared by the EXIT-trap and
-# signal-trap handlers below.
+# disk-backed writable layer (ADR-002). It also removes the registration token
+# file. The normal path has already deleted that file right after reading it, so
+# this only matters when a failure or signal arrives before the read completes,
+# or when the removal itself failed. Shared by the EXIT-trap and signal-trap
+# handlers below, which are its only callers and are armed before the token is
+# read.
 scrub_non_jit_credentials() {
   local f
   for f in .runner .credentials .credentials_rsaparams; do
     # ${f#.} strips the leading dot to the tmpfs bare name (runner, etc.).
     rm -f "${RUNNER_DIR}/${f}" "${CRED_DIR}/${f#.}"
   done
+  rm -f "${CRED_DIR}/${REGISTRATION_TOKEN_FILE}"
 }
 
 # scrub_non_jit_credentials_on_failure is the EXIT-trap belt-and-braces for the
-# non-JIT config phase: if config.sh fails, it removes any credential-pattern
-# files so no failure path leaves credentials on the container's disk-backed
-# writable layer (ADR-002). It preserves the triggering exit code so a
-# failed config still exits non-zero for GARM.
+# non-JIT registration phase: if reading the token or running config.sh fails, it
+# removes any credential-pattern files and the registration token so no failure
+# path leaves credentials on the container's disk-backed writable layer
+# (ADR-002). It preserves the triggering exit code so a failed registration
+# still exits non-zero for GARM.
 #
 # This does NOT cover an unhandled TERM/INT/HUP: bash only runs the EXIT trap
 # on normal exit (including the `exit` builtin), never when the process is
@@ -454,12 +466,12 @@ scrub_non_jit_credentials_on_failure() {
     return 0
   fi
   scrub_non_jit_credentials
-  log "config.sh failed (exit ${code}); scrubbed credential-pattern files from the writable layer"
+  log "non-JIT registration failed (exit ${code}); scrubbed credential-pattern files and the registration token"
   return "${code}"
 }
 
 # scrub_non_jit_credentials_on_signal is the HUP/INT/TERM-trap handler for the
-# non-JIT config phase: it scrubs the same credential-pattern files as the
+# non-JIT registration phase: it scrubs the same credential-pattern files as the
 # EXIT trap above, then exits with the conventional 128+signum status
 # (143/130/129) so the container's exit code still reports "killed by
 # signal" to GARM/the container runtime. It clears every trap this phase set
@@ -470,26 +482,58 @@ scrub_non_jit_credentials_on_signal() {
   local signum="$1"
   trap - EXIT HUP INT TERM
   scrub_non_jit_credentials
-  log "received signal ${signum} during config.sh; scrubbed credential-pattern files from the writable layer"
+  log "received signal ${signum} during non-JIT registration; scrubbed credential-pattern files and the registration token"
   exit "$(( 128 + signum ))"
 }
 
 # install_non_jit_registration registers the runner with config.sh (as the
 # runner user via gosu by default, ADR-002), appending --disableupdate
-# unconditionally because the image is digest-managed (ADR-002). config.sh
-# writes .runner/.credentials/.credentials_rsaparams into the install dir
-# normally; ONLY after it SUCCEEDS are those files moved onto the tmpfs and
-# replaced with symlinks (move_non_jit_credentials_to_tmpfs), so steady-state
-# credentials are tmpfs-resident. The credentials are deliberately NOT
-# pre-linked before config.sh: the real runner's configure step reads
-# .credentials in its startup constructor and a dangling pre-created symlink
-# (its tmpfs target is not delivered in non-JIT mode) crashes it before
-# registration. The config phase is guarded by an EXIT trap plus HUP/INT/TERM
-# traps so no failure path — including an unhandled signal — leaves credentials
-# on the writable layer.
+# unconditionally because the image is digest-managed (ADR-002). It reads the
+# registration token and DELETES its tmpfs file before anything else runs, so
+# the token is not on disk while a job runs: jobs have passwordless sudo, and
+# the file would let one register further runners in the scope. The token then
+# lives only in a local, unexported shell variable and, while config.sh runs
+# (before any job starts), in config.sh's argument list. config.sh writes
+# .runner/.credentials/.credentials_rsaparams into the install dir normally;
+# ONLY after it SUCCEEDS are those files moved onto the tmpfs and replaced with
+# symlinks (move_non_jit_credentials_to_tmpfs), so steady-state credentials are
+# tmpfs-resident. The credentials are deliberately NOT pre-linked before
+# config.sh: the real runner's configure step reads .credentials in its startup
+# constructor and a dangling pre-created symlink (its tmpfs target is not
+# delivered in non-JIT mode) crashes it before registration. The whole phase,
+# including the token read, is guarded by an EXIT trap plus HUP/INT/TERM traps
+# so no failure path — including an unhandled signal — leaves credentials or the
+# token behind.
 install_non_jit_registration() {
+  # Declared apart from their assignments so a failing $(...) is handled
+  # explicitly below, instead of aborting under `set -e` without a message.
   local token url
-  token="$(cat "${CRED_DIR}/registration-token")"
+  local token_file="${CRED_DIR}/${REGISTRATION_TOKEN_FILE}"
+
+  # Scrub credential-pattern files and the registration token from the writable
+  # layer (and tmpfs) if anything below fails, or if the container receives
+  # HUP/INT/TERM (an unhandled signal would otherwise bypass the EXIT trap
+  # entirely — see scrub_non_jit_credentials_on_signal above), then clear every
+  # trap on success so the tmpfs-resident credentials are kept. Armed before the
+  # token is read so a failure or signal between the read and the removal still
+  # removes the token.
+  trap scrub_non_jit_credentials_on_failure EXIT
+  trap 'scrub_non_jit_credentials_on_signal 1' HUP
+  trap 'scrub_non_jit_credentials_on_signal 2' INT
+  trap 'scrub_non_jit_credentials_on_signal 15' TERM
+
+  # Read the token, then delete its file before the URL, the arguments or
+  # config.sh. Fails CLOSED: a missing, unreadable or empty token, or a file that
+  # cannot be removed, stops the runner here instead of leaving the token for jobs.
+  [[ -f "${token_file}" ]] \
+    || fail "registration token ${token_file} is missing"
+  token="$(cat "${token_file}")" \
+    || fail "could not read the registration token ${token_file}"
+  rm -f -- "${token_file}" \
+    || fail "could not remove the registration token ${token_file} after reading it"
+  [[ -n "${token}" ]] \
+    || fail "registration token ${token_file} was empty"
+
   url="$(build_non_jit_url)"
 
   local args=(
@@ -507,15 +551,6 @@ install_non_jit_registration() {
 
   own_runner_dir_as_runner
 
-  # Scrub credential-pattern files from the writable layer (and tmpfs) if
-  # config.sh fails, or if the container receives HUP/INT/TERM while it is
-  # running (an unhandled signal would otherwise bypass the EXIT trap
-  # entirely — see scrub_non_jit_credentials_on_signal above), then clear
-  # every trap on success so the tmpfs-resident credentials are kept.
-  trap scrub_non_jit_credentials_on_failure EXIT
-  trap 'scrub_non_jit_credentials_on_signal 1' HUP
-  trap 'scrub_non_jit_credentials_on_signal 2' INT
-  trap 'scrub_non_jit_credentials_on_signal 15' TERM
   log "registering runner via config.sh (non-JIT)"
   run_config_sh "${args[@]}"
   # config.sh SUCCEEDED (set -e would have exited into the EXIT-trap scrub

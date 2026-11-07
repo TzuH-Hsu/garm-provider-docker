@@ -403,6 +403,9 @@ readonly OS_TYPE=linux
 WATCH_INTERVAL_SECONDS="${WATCH_INTERVAL_SECONDS:-5}"
 WATCH_MAX_ITERATIONS="${WATCH_MAX_ITERATIONS:-120}"
 POST_JOB_WAIT_SECONDS="${POST_JOB_WAIT_SECONDS:-300}"
+# Step 4(c) waits this long for a non-JIT runner to finish registering before it
+# checks the tmpfs. Not configurable: a JIT runner never waits.
+readonly NON_JIT_REGISTRATION_WAIT_SECONDS=60
 
 ASSUME_YES=0
 VERIFY_FAILED=0
@@ -2666,23 +2669,43 @@ verify_no_credentials_in_inspect() {
   fi
 }
 
+# wait_for_non_jit_registration polls, for at most $2 seconds, until the non-JIT
+# runner "$1" has registered: config.sh has written its credentials and the
+# entrypoint has moved them onto the tmpfs, which is when /run/garm/runner appears.
+wait_for_non_jit_registration() {
+  local cid="$1" limit="$2" waited=0
+  while ! docker exec "${cid}" test -e /run/garm/runner 2>/dev/null; do
+    (( waited >= limit )) && return 1
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  return 0
+}
+
 verify_tmpfs_delivery() {
   local cid="$1"
   log "-- (c) tmpfs credential delivery (/run/garm) --"
-  log "  docker exec ${cid} ls -la /run/garm  (filenames/permissions only, never contents):"
-  docker exec "${cid}" ls -la /run/garm 2>&1 | sed 's/^/    /'
 
   local jit_enabled
   jit_enabled="$(printf '%s\n' "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cid}")" \
     | grep -m1 '^JIT_CONFIG_ENABLED=' | cut -d= -f2)"
 
-  local -a expected
-  if [[ "${jit_enabled}" == "true" ]]; then
-    expected=(runner credentials credentials_rsaparams .delivered)
-  else
-    expected=(registration-token .delivered)
-    log "  JIT_CONFIG_ENABLED=false: checking the non-JIT registration-token path instead"
+  # Without JIT the entrypoint registers the runner itself, so give it time to
+  # finish before looking: the credential files exist only after config.sh has
+  # succeeded.
+  if [[ "${jit_enabled}" != "true" ]]; then
+    log "  JIT_CONFIG_ENABLED=false: waiting up to ${NON_JIT_REGISTRATION_WAIT_SECONDS}s for the runner to register"
+    wait_for_non_jit_registration "${cid}" "${NON_JIT_REGISTRATION_WAIT_SECONDS}" || true
   fi
+
+  log "  docker exec ${cid} ls -la /run/garm  (filenames/permissions only, never contents):"
+  docker exec "${cid}" ls -la /run/garm 2>&1 | sed 's/^/    /'
+
+  # Both modes end with the same files on the tmpfs. Without JIT they are written
+  # by config.sh and moved there by the entrypoint rather than delivered up front,
+  # and the registration token the provider delivered is deleted by the
+  # entrypoint as soon as it has read it.
+  local -a expected=(runner credentials credentials_rsaparams .delivered)
 
   local f
   for f in "${expected[@]}"; do
@@ -2692,6 +2715,30 @@ verify_tmpfs_delivery() {
       bad "/run/garm/${f} MISSING"
     fi
   done
+
+  if [[ "${jit_enabled}" != "true" ]]; then
+    verify_registration_token_removed "${cid}"
+  fi
+}
+
+# verify_registration_token_removed fails when the non-JIT registration token is
+# still on the tmpfs of a runner that is up. Jobs run as a user that can read it
+# (and have passwordless sudo), and a registration token can register further
+# runners in the scope while it stays valid, so it must not outlive the
+# entrypoint's read. The check applies only once the runner has registered
+# (/run/garm/runner exists): before that the token is legitimately still there,
+# and the missing credential files above already report the stalled start.
+verify_registration_token_removed() {
+  local cid="$1"
+  if ! docker exec "${cid}" test -e /run/garm/runner 2>/dev/null; then
+    warn "the non-JIT runner has not registered, so the registration token check was skipped"
+    return 0
+  fi
+  if docker exec "${cid}" test -e /run/garm/registration-token; then
+    bad "/run/garm/registration-token still present on a running non-JIT runner: jobs on it could read the token and register further runners"
+  else
+    ok "/run/garm/registration-token absent (the entrypoint removed it after reading it)"
+  fi
 }
 
 verify_symlink_compat() {
