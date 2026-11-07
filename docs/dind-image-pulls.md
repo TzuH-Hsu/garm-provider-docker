@@ -72,7 +72,7 @@ needs no `insecure_registries` entry, because dockerd takes the scheme from the 
 `insecure_registries` key are in the [config reference](config-reference.md#registry-mirrors-for-the-sidecar).
 
 To check it, run `docker info` in a job and look for "Registry Mirrors", then read the mirror's access log (the
-real-job gate does both, see [`demo-m0.md`](demo-m0.md#registry-mirror-check-opt-in)).
+real-job gate does both, see [`live-gate.md`](live-gate.md#registry-mirror-check-opt-in)).
 
 **Do not combine these keys with a custom `dind_image` whose `daemon.json` also sets `registry-mirrors` or
 `insecure-registries`.** dockerd refuses to start when an option is set both as a flag and in the file, so

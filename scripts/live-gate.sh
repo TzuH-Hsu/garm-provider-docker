@@ -1,36 +1,33 @@
 #!/usr/bin/env bash
 #
-# scripts/demo-m0.sh - end-to-end real-job gate for garm-provider-docker.
+# scripts/live-gate.sh - end-to-end real-job gate for garm-provider-docker.
 #
 # Points the provider at a real GARM instance and a throwaway test
 # repository running a trivial echo workflow, and walks the full
 # lifecycle - CreateInstance -> JIT registration -> job runs ->
 # DeleteInstance -> runner confirmed gone from GitHub - while checking the
-# headline safety property (docs/plan.md §4: no host Docker socket, no
-# GARM credentials, no GitHub App key visible on the runner) and the two
-# ADR-002 verification items (exec-tar-into-tmpfs credential delivery,
-# actions/runner symlink-compat) along the way.
+# headline safety property (no host Docker socket, no GARM credentials, no
+# GitHub App key visible on the runner) and the two ADR-002 verification
+# items (exec-tar-into-tmpfs credential delivery, actions/runner
+# symlink-compat) along the way.
 #
-# This originated as the M0 go/no-go gate (docs/plan.md §3 M0: pool mode,
-# dind_mode=none, linux/amd64 only). M1-M4 have since shipped the full
-# per-job topology (job network, named workspace volume, DinD modes,
-# persistent caches, extra_specs, v0.1.1 self-description). v0.2.0 is the recorded
-# failing baseline against GARM v0.2.x; an end-to-end pass is claimed only for
+# v0.2.0 is the recorded failing baseline against GARM v0.2.x; an end-to-end
+# pass is claimed only for
 # a published release that passes this gate (v0.2.5 does, on the Ubuntu 26.04
 # runner image with both variants; v0.2.4 passed the revision before the
 # registry mirror check; v0.2.3 passed the revision before the
 # shared-network-namespace and published-port checks; v0.2.2 passed the
 # revision before --runner-image was added; v0.2.1 passed an earlier revision
 # but fails the IPv6 checks added for v0.2.2; for an unpublished release use
-# --from-source). The script keeps
-# dind_mode=none as its own default (the smallest, most portable slice -
-# DinD modes are a deliberate operator opt-in and out of scope for this
-# gate, see docs/demo-m0.md), but everything else it exercises is the
-# CURRENT provider, not the M0 slice.
+# --from-source). The script keeps dind_mode=none as its own default (the
+# smallest, most portable slice). DinD is a deliberate operator opt-in:
+# privileged-sidecar is the optional --dind variant, and sysbox-runc is not
+# covered (see docs/live-gate.md).
 #
-# See docs/demo-m0.md for the full runbook: prerequisites, what each check
-# proves, and a troubleshooting table. This script only prints instructions
-# and runs read-mostly checks; it never modifies GARM's own config or your
+# See docs/live-gate.md for the full runbook: prerequisites, what each check
+# proves, and a troubleshooting table, and docs/live-gate-runs.md for recorded
+# results. This script only prints instructions and runs read-mostly checks;
+# it never modifies GARM's own config or your
 # GitHub repository for you - those steps are always a manual, confirmed
 # action, by design.
 #
@@ -45,9 +42,9 @@
 #               operator installs, with digest-pin enforcement left ON
 #               (no allow_unpinned_runner_image).
 #   source     Builds the provider binary and the runner image from this
-#               checkout (the original M0-era behavior): a local `go
-#               build`, a local `docker build` of runner-images/noble (or
-#               runner-images/resolute with --runner-image resolute), and
+#               checkout: a local `go build`, a local `docker build` of
+#               runner-images/noble (or runner-images/resolute with
+#               --runner-image resolute), and
 #               allow_unpinned_runner_image=true (required for a mutable
 #               local tag). For development against uncommitted changes.
 #
@@ -64,8 +61,8 @@
 #               message queue for jobs, so NO inbound webhook is needed and
 #               the GARM host can sit behind a NAT. The workflow targets the
 #               scale set by NAME in `runs-on`. Provider JIT delivery is
-#               forced on for scale sets (docs/research.md §1.D).
-#   pool       Creates a webhook-driven pool (the original flow). Needs
+#               forced on for scale sets.
+#   pool       Creates a webhook-driven pool. Needs
 #               GitHub to be able to reach GARM's webhook endpoint.
 #
 # Two topology variants (see GATE_VARIANT below):
@@ -77,13 +74,13 @@
 #               privileged-sidecar runs a Privileged=true daemon on this
 #               host (ADR-001 "Residual risk") - use a disposable VM.
 #               With GATE_REGISTRY_MIRROR set (see below) it also checks the
-#               sidecar's registry mirror (opt-in; docs/demo-m0.md).
+#               sidecar's registry mirror (opt-in; docs/live-gate.md).
 #
 # Assumptions:
 #   - You are on a Linux Docker host (or macOS + Docker Desktop),
 #     linux/amd64 or linux/arm64.
 #   - A GARM server is ALREADY RUNNING and reachable, with garm-cli
-#     installed and authenticated against it (docs/demo-m0.md).
+#     installed and authenticated against it (docs/live-gate.md).
 #   - You have already registered a throwaway GitHub repository with GARM
 #     (`garm-cli repo add ...`) to point the demo pool at.
 #
@@ -93,7 +90,7 @@
 # argv or committed to an env var this script echoes.
 #
 # Usage:
-#   scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
+#   scripts/live-gate.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
 #                      [--runner-image noble|resolute] [COMMAND]
 #
 # COMMAND (default: all):
@@ -137,7 +134,7 @@
 #                   from v0.2.3 on).
 #   -h, --help      Show usage
 #
-# Environment variables (all optional unless noted - see docs/demo-m0.md):
+# Environment variables (all optional unless noted - see docs/live-gate.md):
 #   GARM_URL              Base URL of the running GARM server. Informational
 #                          only (Step 0 reachability probe); garm-cli itself
 #                          authenticates via its own stored profile.
@@ -171,7 +168,7 @@
 #                          the expected sha256 is remembered with the other
 #                          modes (the path is not). A result recorded from
 #                          such a run must name the commit the binary was
-#                          built from and its sha256 (docs/demo-m0.md).
+#                          built from and its sha256 (docs/live-gate.md).
 #   GARM_TARGET           "scaleset" (default) or "pool" - see above.
 #   GATE_VARIANT          "none" (default) or "dind" - see above.
 #   SCALESET_NAME         Scale set name (= the workflow's runs-on value).
@@ -244,7 +241,7 @@
 #                         interface_version printed in Step 1's [[provider]]
 #                          snippet: "v0.1.0" (default) or "v0.1.1". Keep
 #                          v0.1.0 on GARM <= v0.2.1 (see step_config and
-#                          docs/demo-m0.md); switch to v0.1.1 once a GARM
+#                          docs/live-gate.md); switch to v0.1.1 once a GARM
 #                          release includes cloudbase/garm#878.
 #   PROVIDER_BIN_DIR      Directory the provider binary is downloaded/built
 #                          into. Default: <repo>/bin
@@ -319,13 +316,13 @@ PROVIDER_BIN_DIR="${PROVIDER_BIN_DIR:-${REPO_ROOT}/bin}"
 PROVIDER_BIN="${PROVIDER_BIN_DIR}/garm-provider-docker"
 
 # Fixed (but overridable) default so re-running this script points GARM at
-# the same provider config path every time - see docs/demo-m0.md.
+# the same provider config path every time - see docs/live-gate.md.
 PROVIDER_CONFIG_DIR="${PROVIDER_CONFIG_DIR:-${TMPDIR:-/tmp}/garm-provider-docker-demo}"
 PROVIDER_CONFIG_FILE="${PROVIDER_CONFIG_DIR}/config.toml"
 
 # "source" mode only: a mutable local dev tag, which is why "source" mode
 # needs allow_unpinned_runner_image=true in the generated config (ADR-002/
-# ADR-005 F10; internal/config/config.go's validateDigestPinnedImage).
+# ADR-005; internal/config/config.go's validateDigestPinnedImage).
 # "release" mode never uses this - it pins runner_image by digest instead.
 # The runner image to gate: runner-images/<name> in "source" mode,
 # ghcr.io/tzuh-hsu/garm-runner-<name> in "release" mode. RUNNER_IMAGE_TAG's
@@ -365,7 +362,7 @@ readonly DIND_RUNNER_MEMORY=6GiB
 readonly DIND_DIND_MEMORY=4GiB
 readonly DIND_EXTRA_SPECS='{"flavor":"dind","dind_mode":"privileged-sidecar"}'
 
-# Registry mirror check (opt-in, dind variant only; docs/demo-m0.md "Registry
+# Registry mirror check (opt-in, dind variant only; docs/live-gate.md "Registry
 # mirror check"). GATE_REGISTRY_MIRROR is written to the generated config as
 # registry_mirrors (and GATE_INSECURE_REGISTRY, when set, as
 # insecure_registries); verify then checks the sidecar's dockerd flags, that
@@ -397,7 +394,7 @@ POOL_FLAVOR="${POOL_FLAVOR:-default}"
 # Fixed by design, not env-overridable: this gate only needs one runner to
 # ever exist at a time. OS_TYPE is fixed to linux - the only OS this
 # provider supports (internal/provider/create.go's validatePlatform). Both
-# linux/amd64 and linux/arm64 are supported as of M1; OS_ARCH below is
+# linux/amd64 and linux/arm64 are supported; OS_ARCH below is
 # auto-detected from the host (and must match it), not hardcoded to amd64.
 readonly MIN_IDLE_RUNNERS=0
 readonly MAX_RUNNERS=1
@@ -1255,7 +1252,7 @@ generate_provider_config() {
 
   if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
     cat > "${cfg_tmp}" <<EOF
-# Generated by scripts/demo-m0.sh (release mode, ${PROVIDER_VERSION}) -
+# Generated by scripts/live-gate.sh (release mode, ${PROVIDER_VERSION}) -
 ${binary_note}# gate config for garm-provider-docker. Every key besides runner_image
 # falls back to its documented default (docs/config-reference.md):
 # dind_mode = "none", docker_host = "unix:///var/run/docker.sock", and so
@@ -1268,11 +1265,11 @@ runner_image = "${runner_image}"
 EOF
   else
     cat > "${cfg_tmp}" <<EOF
-# Generated by scripts/demo-m0.sh (--from-source mode) - dev/CI gate
+# Generated by scripts/live-gate.sh (--from-source mode) - dev/CI gate
 # config ONLY, do not use in production.
 #
 # allow_unpinned_runner_image=true is a dev-only escape hatch
-# (internal/config/config.go; ADR-002/ADR-005 F10): it lets runner_image be
+# (internal/config/config.go; ADR-002/ADR-005): it lets runner_image be
 # a mutable local tag instead of a sha256-digest-pinned reference. Never set
 # this in a real deployment.
 docker_host = "unix:///var/run/docker.sock"
@@ -1387,7 +1384,7 @@ smoke_test_binary() {
 # usually cleared on reboot. The defaults are kept for backward
 # compatibility (they work when GARM runs as the same user, e.g. a
 # containerised dev GARM); set PROVIDER_BIN_DIR/PROVIDER_CONFIG_DIR to a
-# directory readable by GARM's service user otherwise (docs/demo-m0.md,
+# directory readable by GARM's service user otherwise (docs/live-gate.md,
 # Prerequisites).
 warn_if_unservice_readable_paths() {
   local var dir
@@ -1395,9 +1392,9 @@ warn_if_unservice_readable_paths() {
     dir="${!var}"
     case "${dir}" in
       /tmp|/tmp/*|/private/tmp|/private/tmp/*)
-        warn "${var} (${dir}) is under /tmp: it is usually cleared on reboot and may not be readable by GARM's service user. Use a directory readable by GARM's service user (see docs/demo-m0.md, Prerequisites)." ;;
+        warn "${var} (${dir}) is under /tmp: it is usually cleared on reboot and may not be readable by GARM's service user. Use a directory readable by GARM's service user (see docs/live-gate.md, Prerequisites)." ;;
       "${HOME}"|"${HOME}"/*)
-        warn "${var} (${dir}) is under \$HOME: GARM's service user typically cannot read a home directory, so GARM may fail to execute the provider or read its config. Use a directory readable by GARM's service user (see docs/demo-m0.md, Prerequisites)." ;;
+        warn "${var} (${dir}) is under \$HOME: GARM's service user typically cannot read a home directory, so GARM may fail to execute the provider or read its config. Use a directory readable by GARM's service user (see docs/live-gate.md, Prerequisites)." ;;
     esac
   done
 }
@@ -1680,7 +1677,7 @@ EOF
           docker rm -f gate-published
 EOF
     cat <<EOF
-      - name: hold the runner briefly for scripts/demo-m0.sh verify
+      - name: hold the runner briefly for scripts/live-gate.sh verify
         run: sleep ${hold_seconds}
   # A container job: the runner has the sidecar daemon bind /actions-runner/_work
   # as /__w and /actions-runner/externals as /__e into the job container, and the
@@ -1702,7 +1699,7 @@ EOF
 EOF
   else
     cat <<'EOF'
-          # Keep the job alive briefly so 'scripts/demo-m0.sh verify' has a
+          # Keep the job alive briefly so 'scripts/live-gate.sh verify' has a
           # window to inspect the live runner container before it exits -
           # this runner is single-job ephemeral by design (ADR-002).
           sleep 30
@@ -2114,10 +2111,10 @@ cache_disabled_in_config() {
 }
 
 # verify_topology checks the two OTHER per-allocation resources every
-# CreateInstance provisions alongside the runner container as of M1
-# (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's F4/
+# CreateInstance provisions alongside the runner container
+# (ADR-001/ADR-004): the per-job network (the claim marker; ADR-004's
 # nonce-scoped teardown all hinges on it existing and being labeled) and the
-# named, labeled workspace volume (replacing M0's anonymous one). Both are
+# named, labeled workspace volume. Both are
 # looked up by label rather than by name, since the workspace volume's name
 # embeds a create-nonce this script does not otherwise learn
 # (internal/spec/names.go's WorkspaceVolumeName).
@@ -2744,7 +2741,7 @@ step_verify() {
   if [[ "${VERIFY_FAILED}" -eq 0 ]]; then
     log "All checks PASSED for container ${cid}."
   else
-    log "One or more checks FAILED for container ${cid}. See docs/demo-m0.md's troubleshooting table."
+    log "One or more checks FAILED for container ${cid}. See docs/live-gate.md's troubleshooting table."
   fi
   return "${VERIFY_FAILED}"
 }
@@ -2909,7 +2906,7 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: scripts/demo-m0.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
+Usage: scripts/live-gate.sh [-y|--yes] [--from-source] [--version vX.Y.Z] [--pool] [--dind]
                           [--runner-image noble|resolute] [COMMAND]
 
 COMMAND (default: all):
@@ -2948,14 +2945,14 @@ published, digest-pinned runner image. Not allowed with --from-source.
 
 Optional registry mirror check (with --dind): set GATE_REGISTRY_MIRROR to a
 Docker Hub mirror origin (e.g. http://mirror.lan.example:5000); see the
-GATE_* variables in this script's header and docs/demo-m0.md. Unset, no
+GATE_* variables in this script's header and docs/live-gate.md. Unset, no
 mirror check runs.
 
 The modes chosen for preflight (or all) are remembered, so later single steps
 (pool, watch, verify, ...) use them without repeating the flags; an explicit
 flag that conflicts with the remembered mode is an error (re-run preflight).
 
-See docs/demo-m0.md for prerequisites, environment variables, what each
+See docs/live-gate.md for prerequisites, environment variables, what each
 check proves, and a troubleshooting table. No secret is ever read,
 generated, or printed by this script.
 EOF

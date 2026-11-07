@@ -91,6 +91,6 @@ pool ID GARM sends, so both forms work. Releases newer than 0.2.1 have not been 
 
 ## What has been verified
 
-The live gate ([`demo-m0.md`](demo-m0.md)) runs a real job through GARM v0.2.1 with scale-set dispatch and JIT, on
+The live gate ([`live-gate.md`](live-gate.md)) runs a real job through GARM v0.2.1 with scale-set dispatch and JIT, on
 a `linux/amd64` host, with `dind_mode = "none"` and `privileged-sidecar`. Pool (webhook) dispatch, the non-JIT
 path, `sysbox-runc` and `linux/arm64` hosts have not been verified end to end.
