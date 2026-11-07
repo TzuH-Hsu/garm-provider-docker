@@ -73,7 +73,7 @@ func TestResolveSelectsRunnerNotSidecar(t *testing.T) {
 		t.Fatalf("GetInstance(job-1) returned unexpected error: %v", err)
 	}
 	if inst.Status != params.InstanceRunning {
-		t.Errorf("[F6/N1] GetInstance resolved status=%q, want running — it selected the DinD sidecar, not the runner", inst.Status)
+		t.Errorf("GetInstance resolved status=%q, want running — it selected the DinD sidecar, not the runner", inst.Status)
 	}
 	if inst.ProviderID != "job-1" {
 		t.Errorf("ProviderID=%q, want the instance name job-1", inst.ProviderID)
@@ -87,7 +87,7 @@ func TestResolveSelectsRunnerNotSidecar(t *testing.T) {
 		t.Error("runner survived DeleteInstance")
 	}
 	if _, err := fake.ContainerInspect(context.Background(), sidecarID); err == nil {
-		t.Error("[F6] DinD sidecar leaked past DeleteInstance")
+		t.Error("DinD sidecar leaked past DeleteInstance")
 	}
 }
 
@@ -109,10 +109,10 @@ func TestResolveByInstanceNameCollidingWithAnotherRunnerID(t *testing.T) {
 		t.Fatalf("GetInstance(%q) returned unexpected error: %v", xID, err)
 	}
 	if inst.ProviderID != xID {
-		t.Errorf("[N2] GetInstance(%q) resolved ProviderID=%q, want %q (runner Y owns that instance-name)", xID, inst.ProviderID, xID)
+		t.Errorf("GetInstance(%q) resolved ProviderID=%q, want %q (runner Y owns that instance-name)", xID, inst.ProviderID, xID)
 	}
 	if inst.Status != params.InstanceRunning {
-		t.Errorf("[N2] resolved status=%q, want running — it mis-resolved to runner X via an id match", inst.Status)
+		t.Errorf("resolved status=%q, want running — it mis-resolved to runner X via an id match", inst.Status)
 	}
 
 	// Delete by the colliding id/name removes Y (the label owner); X survives.
@@ -120,10 +120,10 @@ func TestResolveByInstanceNameCollidingWithAnotherRunnerID(t *testing.T) {
 		t.Fatalf("DeleteInstance(%q) returned unexpected error: %v", xID, err)
 	}
 	if _, err := fake.ContainerInspect(context.Background(), yID); err == nil {
-		t.Error("[N2] runner Y (the instance-name owner) survived delete")
+		t.Error("runner Y (the instance-name owner) survived delete")
 	}
 	if _, err := fake.ContainerInspect(context.Background(), xID); err != nil {
-		t.Errorf("[N2] runner X (id-colliding, different instance) was wrongly deleted: %v", err)
+		t.Errorf("runner X (id-colliding, different instance) was wrongly deleted: %v", err)
 	}
 }
 
@@ -267,10 +267,10 @@ func TestResolveRejectsWrongRole(t *testing.T) {
 	// sidecar under this instance-name is part of an allocation whose runner is
 	// gone, and the privileged sidecar must never be left behind.
 	if err := p.DeleteInstance(context.Background(), "sidecar-1"); err != nil {
-		t.Errorf("DeleteInstance(sidecar-1) should reap the lingering managed sidecar (F6), got %v", err)
+		t.Errorf("DeleteInstance(sidecar-1) should reap the lingering managed sidecar, got %v", err)
 	}
 	if _, err := fake.ContainerInspect(context.Background(), resp.ID); err == nil {
-		t.Error("F6: DeleteInstance must reap the lingering privileged sidecar, but it survived")
+		t.Error("DeleteInstance must reap the lingering privileged sidecar, but it survived")
 	}
 }
 
@@ -318,7 +318,7 @@ func TestGetInstanceStatusMapping(t *testing.T) {
 			}
 			// provider_id is the stable instance NAME, not the container id.
 			if inst.ProviderID != "runner-x" || inst.Name != "runner-x" {
-				t.Errorf("ProviderID/Name = %q/%q, want runner-x/runner-x (F6)", inst.ProviderID, inst.Name)
+				t.Errorf("ProviderID/Name = %q/%q, want runner-x/runner-x", inst.ProviderID, inst.Name)
 			}
 			if inst.OSType != params.Linux || inst.OSArch != params.Amd64 {
 				t.Errorf("os fields = %q/%q, want linux/amd64", inst.OSType, inst.OSArch)

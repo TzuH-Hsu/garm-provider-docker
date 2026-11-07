@@ -22,7 +22,7 @@
         "required": ["dind_mode"]
       },
       "then": {
-        "description": "dind_mode=\"privileged-sidecar\" requires allowed_dind_modes to be present and to contain \"privileged-sidecar\" — mirroring the loader's fail-closed ceiling (allowed_dind_modes defaults to [\"none\"], the M4-W1 fail-closed amendment to ADR-001/ADR-005): a non-\"none\" dind_mode with an omitted, empty, or non-widened ceiling is REJECTED both here and by Config.EffectiveDindMode/validateDindMode at load/resolve time.",
+        "description": "dind_mode=\"privileged-sidecar\" requires allowed_dind_modes to be present and to contain \"privileged-sidecar\" — mirroring the loader's fail-closed ceiling (allowed_dind_modes defaults to [\"none\"], fail-closed per ADR-001 and ADR-005): a non-\"none\" dind_mode with an omitted, empty, or non-widened ceiling is REJECTED both here and by Config.EffectiveDindMode/validateDindMode at load/resolve time.",
         "required": ["allowed_dind_modes"],
         "properties": {
           "allowed_dind_modes": {
@@ -90,7 +90,7 @@
       "type": "array",
       "minItems": 1,
       "items": { "type": "string", "enum": ["none", "privileged-sidecar", "sysbox-runc"] },
-      "description": "Operator ceiling (ADR-001 F7): the set of modes any pool's extra_specs may ever select. Defaults to [\"none\"] — FAIL-CLOSED: DinD is unavailable until the operator widens this list explicitly, so a pool can never obtain a privileged sidecar by omission. dind_mode must be a member (of EVERY mode, including \"none\" — see the allOf conditionals below), so widening this list is also what makes a non-\"none\" dind_mode loadable. An empty array is rejected by minItems here: the loader never accepts an empty ceiling regardless of dind_mode (Config.validateDindMode/EffectiveDindMode both fail closed on an empty AllowedDindModes)."
+      "description": "Operator ceiling: the set of modes any pool's extra_specs may ever select. Defaults to [\"none\"] — FAIL-CLOSED: DinD is unavailable until the operator widens this list explicitly, so a pool can never obtain a privileged sidecar by omission. dind_mode must be a member (of EVERY mode, including \"none\" — see the allOf conditionals below), so widening this list is also what makes a non-\"none\" dind_mode loadable. An empty array is rejected by minItems here: the loader never accepts an empty ceiling regardless of dind_mode (Config.validateDindMode/EffectiveDindMode both fail closed on an empty AllowedDindModes)."
     },
     "dind_image": {
       "type": "string",
@@ -132,7 +132,7 @@
       "description": "Per-job bridge network behavior (ADR-001). Config-only, never an extra_specs channel.",
       "properties": {
         "enable_job_network": { "type": "boolean", "description": "Reserved; the isolated per-job network is always created. Defaults to true." },
-        "internal": { "type": "boolean", "description": "Docker's internal flag on each per-job network. Defaults to false (2026-07-21 owner ruling): the runner needs egress to reach GitHub and DinD needs it for registry pulls. Job-to-job isolation comes from each allocation's own separate network, not this flag." }
+        "internal": { "type": "boolean", "description": "Docker's internal flag on each per-job network. Defaults to false: the runner needs egress to reach GitHub and DinD needs it for registry pulls. Job-to-job isolation comes from each allocation's own separate network, not this flag." }
       }
     },
     "flavors": {
@@ -166,7 +166,7 @@
     "extra_specs": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Operator-owned controls over the GARM-admin extra_specs trust tier (ADR-005 H2). Governs what a pool's extra_specs may do beyond what the schema alone allows.",
+      "description": "Operator-owned controls over the GARM-admin extra_specs trust tier (ADR-005). Governs what a pool's extra_specs may do beyond what the schema alone allows.",
       "properties": {
         "allowed_env": {
           "type": "array",

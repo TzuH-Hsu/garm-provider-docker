@@ -179,13 +179,13 @@ func Parse(raw json.RawMessage) (ExtraSpecs, error) {
 		// The charset check comes first so a malformed key is rejected on its shape.
 		if !validEnvName(name) {
 			return ExtraSpecs{}, fmt.Errorf(
-				"extra_specs.extra_env key %q is not a valid environment variable name: names must match %s (no '=', whitespace, unicode, or leading digit) (H3)",
+				"extra_specs.extra_env key %q is not a valid environment variable name: names must match %s (no '=', whitespace, unicode, or leading digit)",
 				name, envNameRE.String())
 		}
 		// Reserved names are rejected even if the operator allowlists them.
 		if reservedEnvName(name) {
 			return ExtraSpecs{}, fmt.Errorf(
-				"extra_specs.extra_env may not set the hard-reserved variable %q: the provider hard-reserves %v and prefixes %v regardless of allowed_env (H2); provider-injected environment always wins",
+				"extra_specs.extra_env may not set the hard-reserved variable %q: the provider hard-reserves %v and prefixes %v regardless of allowed_env; provider-injected environment always wins",
 				name, reservedEnvExact, reservedEnvPrefixes)
 		}
 	}
@@ -259,7 +259,7 @@ func (s ExtraSpecs) Resolve(cfg config.Config) (Resolved, error) {
 		for _, name := range names {
 			if !cfg.ExtraSpecs.EnvAllowed(name) {
 				return Resolved{}, fmt.Errorf(
-					"extra_specs.extra_env key %q is not on the operator's allowlist ([extra_specs].allowed_env); extra env is fail-closed and rejected by default unless the operator opts the name in (H2)",
+					"extra_specs.extra_env key %q is not on the operator's allowlist ([extra_specs].allowed_env); extra env is fail-closed and rejected by default unless the operator opts the name in",
 					name)
 			}
 		}

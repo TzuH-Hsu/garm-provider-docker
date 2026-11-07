@@ -79,7 +79,7 @@ func TestCreateInstanceRejectsRunAsRootExtraEnv(t *testing.T) {
 
 	_, err := p.CreateInstance(context.Background(), b)
 	if err == nil {
-		t.Fatal("CreateInstance with RUN_AS_ROOT extra_env = nil error, want fail-closed reject (H2)")
+		t.Fatal("CreateInstance with RUN_AS_ROOT extra_env = nil error, want fail-closed reject")
 	}
 	if !strings.Contains(err.Error(), "RUN_AS_ROOT") {
 		t.Errorf("error %q should name the rejected hard-reserved variable", err.Error())
@@ -99,7 +99,7 @@ func TestCreateInstanceRejectsGarmTimeoutExtraEnv(t *testing.T) {
 
 	_, err := p.CreateInstance(context.Background(), b)
 	if err == nil {
-		t.Fatal("CreateInstance with GARM_CRED_WAIT_SECONDS extra_env = nil error, want fail-closed reject (H2)")
+		t.Fatal("CreateInstance with GARM_CRED_WAIT_SECONDS extra_env = nil error, want fail-closed reject")
 	}
 	assertNoResources(t, p, fake)
 }
@@ -115,7 +115,7 @@ func TestCreateInstanceRejectsNonAllowlistedEnvByDefault(t *testing.T) {
 
 	_, err := p.CreateInstance(context.Background(), b)
 	if err == nil {
-		t.Fatal("CreateInstance with a non-allowlisted extra_env = nil error, want fail-closed reject (H2)")
+		t.Fatal("CreateInstance with a non-allowlisted extra_env = nil error, want fail-closed reject")
 	}
 	assertNoResources(t, p, fake)
 }
@@ -131,7 +131,7 @@ func TestCreateInstanceRejectsEqualsInEnvKey(t *testing.T) {
 
 	_, err := p.CreateInstance(context.Background(), b)
 	if err == nil {
-		t.Fatal("CreateInstance with an '='-in-key extra_env = nil error, want charset reject (H3)")
+		t.Fatal("CreateInstance with an '='-in-key extra_env = nil error, want charset reject")
 	}
 	assertNoResources(t, p, fake)
 }

@@ -14,7 +14,7 @@
 //
 //   - Env unset: the gate is a no-op (cache disabled, no externals mount).
 //
-//     go test -tags dockerverify -v -run TestVerifyM2SeedGate ./internal/verify/
+//     go test -tags dockerverify -v -run TestVerifySeedGate ./internal/verify/
 //
 // It builds a small bash image, so it needs no GitHub access and no copy of the
 // full externals tree, and it touches no foreign resource.
@@ -60,7 +60,7 @@ func buildSeedGateImage(t *testing.T, root, tag string) {
 	}
 }
 
-func TestVerifyM2SeedGate(t *testing.T) {
+func TestVerifySeedGate(t *testing.T) {
 	root := repoRoot(t)
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])

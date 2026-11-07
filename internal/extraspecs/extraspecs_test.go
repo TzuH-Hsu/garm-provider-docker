@@ -115,7 +115,7 @@ func TestParseRejectsReservedEnvNames(t *testing.T) {
 			raw := json.RawMessage(`{"extra_env": {"` + name + `": "x"}}`)
 			_, err := Parse(raw)
 			if err == nil {
-				t.Fatalf("Parse extra_env %q = nil error, want reject (F8)", name)
+				t.Fatalf("Parse extra_env %q = nil error, want reject", name)
 			}
 			if !strings.Contains(err.Error(), name) {
 				t.Errorf("error %q should name the rejected variable %q", err.Error(), name)
@@ -378,7 +378,7 @@ func TestParseRejectsMalformedEnvNames(t *testing.T) {
 				t.Fatalf("marshal: %v", err)
 			}
 			if _, err := Parse(raw); err == nil {
-				t.Errorf("Parse extra_env key %q = nil error, want charset rejection (H3)", badKey)
+				t.Errorf("Parse extra_env key %q = nil error, want charset rejection", badKey)
 			}
 		})
 	}
@@ -393,7 +393,7 @@ func TestResolveRejectsNonAllowlistedEnvByDefault(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 	if _, err := specs.Resolve(cfg); err == nil {
-		t.Fatal("Resolve of a non-allowlisted extra_env by default = nil error, want fail-closed reject (H2)")
+		t.Fatal("Resolve of a non-allowlisted extra_env by default = nil error, want fail-closed reject")
 	}
 }
 
@@ -420,7 +420,7 @@ func TestParseRejectsHardReservedEvenIfAllowlisted(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			raw := json.RawMessage(`{"extra_env": {"` + name + `": "x"}}`)
 			if _, err := Parse(raw); err == nil {
-				t.Fatalf("Parse hard-reserved %q = nil error, want reject regardless of allowlist (H2)", name)
+				t.Fatalf("Parse hard-reserved %q = nil error, want reject regardless of allowlist", name)
 			}
 		})
 	}

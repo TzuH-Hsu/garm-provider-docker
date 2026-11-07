@@ -72,7 +72,7 @@ func TestExternalsROMount(t *testing.T) {
 	}
 	// The runner must NOT be able to write the shared externals.
 	if !m.ReadOnly {
-		t.Error("externals mount MUST be read-only (cross-repo RCE prevention, ADR-003 F4)")
+		t.Error("externals mount MUST be read-only (cross-repo RCE prevention, ADR-003)")
 	}
 }
 

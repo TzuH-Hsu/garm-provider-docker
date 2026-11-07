@@ -55,7 +55,7 @@ func evictByRepo(repoKeys ...string) func(map[string]string) (bool, string) {
 func failIfVolumeRemoved(t *testing.T, fake *docker.FakeClient) {
 	t.Helper()
 	fake.VolumeRemoveHook = func(name string) {
-		t.Errorf("VolumeRemove(%q) was called on the log-only eviction path — cache GC must be NON-DESTRUCTIVE (NEW-H1)", name)
+		t.Errorf("VolumeRemove(%q) was called on the log-only eviction path — cache GC must be NON-DESTRUCTIVE", name)
 	}
 }
 
@@ -229,9 +229,9 @@ func TestListDiagVolumes(t *testing.T) {
 
 // TestListUnprovableCacheCruft surfaces cache-name-prefixed volumes that lack our
 // cache=true label (unlabeled auto-created replacements / foreign squatters) for
-// operator-visibility logging, WITHOUT ever deleting them (ADR-003
-// never-delete-unprovable). A provably-ours cache and an unrelated foreign volume
-// are excluded.
+// operator-visibility logging, WITHOUT ever deleting them (ADR-003: a
+// volume that cannot be proved ours is never deleted). A provably-ours cache and
+// an unrelated foreign volume are excluded.
 func TestListUnprovableCacheCruft(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()

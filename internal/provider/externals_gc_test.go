@@ -142,7 +142,7 @@ func TestCreateInstanceExternalsSeededAndMountedReadOnly(t *testing.T) {
 		t.Errorf("externals mount source = %q, want %q", m.Name, ext[0])
 	}
 	if m.RW {
-		t.Error("externals mount is read-WRITE — it MUST be read-only (cross-repo RCE guard, F4)")
+		t.Error("externals mount is read-WRITE — it MUST be read-only (cross-repo RCE guard)")
 	}
 
 	// Diag volume mounted read-write and GARM_DIAG_DIR set for the entrypoint.
@@ -196,7 +196,7 @@ func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 
 	// The GC pass must never issue a cache-volume removal.
 	fake.VolumeRemoveHook = func(name string) {
-		t.Errorf("runCacheGC issued VolumeRemove(%q) — cache GC must be non-destructive (NEW-H1)", name)
+		t.Errorf("runCacheGC issued VolumeRemove(%q) — cache GC must be non-destructive", name)
 	}
 
 	// Directly seed two FULL-identity toolcache volumes for the same repo: a
@@ -213,7 +213,7 @@ func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 
 	// Both volumes SURVIVE — the log-only GC evicts nothing.
 	if !volPresent(t, fake, superseded) {
-		t.Error("GC removed the superseded-generation toolcache volume — cache GC must be log-only (NEW-H1)")
+		t.Error("GC removed the superseded-generation toolcache volume — cache GC must be log-only")
 	}
 	if !volPresent(t, fake, current) {
 		t.Error("GC removed the CURRENT-generation toolcache volume")

@@ -5,7 +5,7 @@
 // the permission gaps checked here. It needs a live daemon, image builds, and
 // outbound internet for the nested pulls. Run with:
 //
-//	go test -tags dockerverify -v -run TestVerifyM1NonRootDindAllocation ./internal/verify/
+//	go test -tags dockerverify -v -run TestVerifyNonRootDindAllocation ./internal/verify/
 //
 // The test drives the real provider binary through a full privileged-sidecar DinD
 // allocation and checks, with real command output run as the runner user:
@@ -107,7 +107,7 @@ func buildNonRootRunnerImage(t *testing.T, root, tag string) {
 		"set -euo pipefail\n" +
 		"# Source the REAL production entrypoint (main is guarded not to run when\n" +
 		"# sourced) and invoke the REAL ensure_docker_socket_group under its own\n" +
-		"# `set -euo pipefail`: this IS the F1 code path, verbatim.\n" +
+		"# `set -euo pipefail`: this IS the group-create code path, verbatim.\n" +
 		"# shellcheck source=/dev/null\n" +
 		"source /entrypoint.sh\n" +
 		"ensure_docker_socket_group\n" +
@@ -133,7 +133,7 @@ func execRunner(container string, args ...string) (string, error) {
 	return dockerTry(full...)
 }
 
-func TestVerifyM1NonRootDindAllocation(t *testing.T) {
+func TestVerifyNonRootDindAllocation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
@@ -155,9 +155,9 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	// added GID 2000, the test would pass without exercising that path. `getent group
 	// 2000` exits non-zero when the group is absent, which is the wanted state.
 	if out, err := dockerTry("run", "--rm", "--entrypoint", "getent", runnerTag, "group", spec.DindSocketGID); err == nil {
-		t.Fatalf("[N3] GID %s already exists in the freshly built image before the entrypoint runs (getent: %q); the F1 group-create path would be silently skipped", spec.DindSocketGID, strings.TrimSpace(out))
+		t.Fatalf("GID %s already exists in the freshly built image before the entrypoint runs (getent: %q); the group-create path would be silently skipped", spec.DindSocketGID, strings.TrimSpace(out))
 	}
-	t.Logf("[N3] GID %s absent in the freshly built image pre-entrypoint — the F1 group-create path stays load-bearing", spec.DindSocketGID)
+	t.Logf("GID %s absent in the freshly built image pre-entrypoint — the group-create path stays load-bearing", spec.DindSocketGID)
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
 	build := exec.Command("go", "build", "-o", bin, ".")
@@ -181,7 +181,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		`storage_driver = "overlay2"`,
 		`[resources]`,
 		`dind_memory = "2GiB"`,
-		// The cache is off: cache volumes survive DeleteInstance (TestVerifyM2W1CacheHit
+		// The cache is off: cache volumes survive DeleteInstance (TestVerifyCacheHit
 		// covers them) and would break the zero-managed-resources assertions after delete.
 		`[cache]`,
 		`enabled = false`,
@@ -215,7 +215,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	}
 	// provider_id is the stable instance name, not a container ID.
 	if created.ProviderID != nrInstance {
-		t.Errorf("[F6] provider_id=%q, want the instance name %q", created.ProviderID, nrInstance)
+		t.Errorf("provider_id=%q, want the instance name %q", created.ProviderID, nrInstance)
 	}
 	runnerName := spec.RunnerContainerName(nrInstance)
 	t.Logf("[create] provider_id=%s; runner container=%s; sidecar=%s", created.ProviderID, runnerName, nrDindName())
@@ -230,13 +230,13 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	// The runner carries the DinD socket GID as a supplementary group, and dockerd was
 	// started with the matching --group.
 	groupAdd := dockerOut(t, "inspect", runnerName, "-f", "{{json .HostConfig.GroupAdd}}")
-	t.Logf("[F1] runner HostConfig.GroupAdd=%s (want to include %s)", groupAdd, spec.DindSocketGID)
+	t.Logf("[group] runner HostConfig.GroupAdd=%s (want to include %s)", groupAdd, spec.DindSocketGID)
 	if !strings.Contains(groupAdd, spec.DindSocketGID) {
-		t.Errorf("[F1] runner GroupAdd=%s, want it to include the DinD socket GID %s", groupAdd, spec.DindSocketGID)
+		t.Errorf("[group] runner GroupAdd=%s, want it to include the DinD socket GID %s", groupAdd, spec.DindSocketGID)
 	}
 	dindCmd := dockerOut(t, "inspect", nrDindName(), "-f", "{{json .Config.Cmd}}")
 	if !strings.Contains(dindCmd, "--group="+spec.DindSocketGID) {
-		t.Errorf("[F1] dind cmd=%s, want --group=%s", dindCmd, spec.DindSocketGID)
+		t.Errorf("[group] dind cmd=%s, want --group=%s", dindCmd, spec.DindSocketGID)
 	}
 
 	if !waitForDindReady(t, nrDindName()) {
@@ -245,16 +245,16 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 
 	// As the non-root runner user: `docker info` and `docker run hello-world` work.
 	whoami, _ := execRunner(runnerName, "id")
-	t.Logf("[F1] runner-user identity: %s", strings.TrimSpace(whoami))
+	t.Logf("[group] runner-user identity: %s", strings.TrimSpace(whoami))
 	if info, err := execRunner(runnerName, "docker", "info", "--format", "{{.ServerVersion}}"); err != nil {
-		t.Errorf("[F1] `docker info` as the runner user FAILED (the permission gap): %v\n%s", err, info)
+		t.Errorf("[group] `docker info` as the runner user FAILED (the permission gap): %v\n%s", err, info)
 	} else {
-		t.Logf("[F1] `docker info` as the runner user OK; dind ServerVersion=%s", strings.TrimSpace(info))
+		t.Logf("[group] `docker info` as the runner user OK; dind ServerVersion=%s", strings.TrimSpace(info))
 	}
 	if hw, err := execRunner(runnerName, "docker", "run", "--rm", "hello-world"); err != nil {
-		t.Errorf("[F1] `docker run --rm hello-world` as the runner user FAILED: %v\n%s", err, hw)
+		t.Errorf("[group] `docker run --rm hello-world` as the runner user FAILED: %v\n%s", err, hw)
 	} else {
-		t.Logf("[F1] `docker run --rm hello-world` as the runner user OK: %s", firstLine(hw))
+		t.Logf("[group] `docker run --rm hello-world` as the runner user OK: %s", firstLine(hw))
 	}
 
 	// The workspace is shared with the daemon, both ways between the runner and a
@@ -262,31 +262,31 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	// Pre-pull busybox into the dind daemon so the nested `docker run` output is
 	// just the bind-mounted file content, not interleaved pull progress.
 	if out, err := execRunner(runnerName, "docker", "pull", "busybox"); err != nil {
-		t.Fatalf("[F2] pre-pull busybox into the dind daemon failed: %v\n%s", err, out)
+		t.Fatalf("[workspace] pre-pull busybox into the dind daemon failed: %v\n%s", err, out)
 	}
 	work := spec.RunnerWorkDir
-	if out, err := execRunner(runnerName, "sh", "-c", "echo runner-wrote-this > "+work+"/f2.txt"); err != nil {
-		t.Fatalf("[F2] runner could not write its workspace: %v\n%s", err, out)
+	if out, err := execRunner(runnerName, "sh", "-c", "echo runner-wrote-this > "+work+"/ws.txt"); err != nil {
+		t.Fatalf("[workspace] runner could not write its workspace: %v\n%s", err, out)
 	}
 	// A nested container bind-mounting the workspace path must see the runner's file.
-	seen, err := execRunner(runnerName, "docker", "run", "--rm", "-v", work+":/w", "busybox", "cat", "/w/f2.txt")
+	seen, err := execRunner(runnerName, "docker", "run", "--rm", "-v", work+":/w", "busybox", "cat", "/w/ws.txt")
 	if err != nil {
-		t.Errorf("[F2] nested container could not read the workspace bind: %v\n%s", err, seen)
+		t.Errorf("[workspace] nested container could not read the workspace bind: %v\n%s", err, seen)
 	} else if strings.TrimSpace(seen) != "runner-wrote-this" {
-		t.Errorf("[F2] nested container saw %q through the workspace bind, want %q — the daemon resolved an EMPTY path, not the runner's files", strings.TrimSpace(seen), "runner-wrote-this")
+		t.Errorf("[workspace] nested container saw %q through the workspace bind, want %q — the daemon resolved an EMPTY path, not the runner's files", strings.TrimSpace(seen), "runner-wrote-this")
 	} else {
-		t.Logf("[F2] nested container read the runner-written file through -v %s:/w", work)
+		t.Logf("[workspace] nested container read the runner-written file through -v %s:/w", work)
 	}
 	// And a write from the nested container is visible back in the runner workspace.
-	if out, err := execRunner(runnerName, "docker", "run", "--rm", "-v", work+":/w", "busybox", "sh", "-c", "echo nested-wrote-this > /w/f2b.txt"); err != nil {
-		t.Errorf("[F2] nested container could not write the workspace bind: %v\n%s", err, out)
+	if out, err := execRunner(runnerName, "docker", "run", "--rm", "-v", work+":/w", "busybox", "sh", "-c", "echo nested-wrote-this > /w/ws-nested.txt"); err != nil {
+		t.Errorf("[workspace] nested container could not write the workspace bind: %v\n%s", err, out)
 	}
-	if back, err := execRunner(runnerName, "cat", work+"/f2b.txt"); err != nil {
-		t.Errorf("[F2] runner could not read the nested-written file back: %v\n%s", err, back)
+	if back, err := execRunner(runnerName, "cat", work+"/ws-nested.txt"); err != nil {
+		t.Errorf("[workspace] runner could not read the nested-written file back: %v\n%s", err, back)
 	} else if strings.TrimSpace(back) != "nested-wrote-this" {
-		t.Errorf("[F2] runner read %q, want the nested container's write %q", strings.TrimSpace(back), "nested-wrote-this")
+		t.Errorf("[workspace] runner read %q, want the nested container's write %q", strings.TrimSpace(back), "nested-wrote-this")
 	} else {
-		t.Logf("[F2] runner read back the nested-container-written file — workspace is shared both ways")
+		t.Logf("[workspace] runner read back the nested-container-written file — workspace is shared both ways")
 	}
 
 	// The isolation properties still hold.
@@ -295,27 +295,27 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 		t.Errorf("could not start a nested container via the runner: %v\n%s", err, out)
 	}
 	if hostPS := dockerOut(t, "ps", "-a", "--format", "{{.Names}}"); strings.Contains(hostPS, nested) {
-		t.Errorf("[W3] ISOLATION BREACH: nested container %q is visible on the HOST daemon", nested)
+		t.Errorf("[isolation] ISOLATION BREACH: nested container %q is visible on the HOST daemon", nested)
 	} else {
-		t.Logf("[W3] nested workload invisible to the host daemon (isolated in the sidecar)")
+		t.Logf("[isolation] nested workload invisible to the host daemon (isolated in the sidecar)")
 	}
 	runnerMounts := dockerOut(t, "inspect", runnerName, "-f", "{{json .Mounts}}")
 	if strings.Contains(runnerMounts, "/var/run/docker.sock") {
-		t.Errorf("[W3] runner has a host docker.sock bind: %s", runnerMounts)
+		t.Errorf("[isolation] runner has a host docker.sock bind: %s", runnerMounts)
 	}
 	dindMounts := dockerOut(t, "inspect", nrDindName(), "-f", "{{json .Mounts}}")
 	if strings.Contains(dindMounts, "/var/run/docker.sock") {
-		t.Errorf("[W3] sidecar has a host docker.sock bind: %s", dindMounts)
+		t.Errorf("[isolation] sidecar has a host docker.sock bind: %s", dindMounts)
 	}
 	env := dockerOut(t, "inspect", runnerName, "-f", "{{range .Config.Env}}{{println .}}{{end}}")
 	if strings.Contains(env, instanceToken) || strings.Contains(env, srv.URL) {
-		t.Errorf("[W3] runner env leaks the instance token or metadata URL")
+		t.Errorf("[isolation] runner env leaks the instance token or metadata URL")
 	}
 	// Credentials are on the tmpfs, not the writable layer.
 	if _, err := execRunner(runnerName, "test", "-e", spec.CredentialDir+"/.delivered"); err != nil {
-		t.Errorf("[W3] credential delivery marker missing under %s", spec.CredentialDir)
+		t.Errorf("[isolation] credential delivery marker missing under %s", spec.CredentialDir)
 	}
-	t.Logf("[W3] no host socket on runner/sidecar; no token/metadata in env; creds present on the tmpfs")
+	t.Logf("[isolation] no host socket on runner/sidecar; no token/metadata in env; creds present on the tmpfs")
 
 	// Shared network namespace (ADR-001): as the non-root runner user, a port the
 	// inner daemon publishes is reachable on 127.0.0.1 and localhost. This is the
@@ -327,7 +327,7 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	// DeleteInstance removes everything; a repeat exits 30.
 	_, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", nrInstance, nil)
 	if delCode != 0 {
-		t.Errorf("[F4] DeleteInstance exit=%d, want 0", delCode)
+		t.Errorf("[delete] DeleteInstance exit=%d, want 0", delCode)
 	}
 	assertGone(t, "runner", "inspect", runnerName)
 	assertGone(t, "sidecar", "inspect", nrDindName())
@@ -336,14 +336,14 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	assertGone(t, "socket volume", "volume", "inspect", nrSocket)
 	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
-		t.Errorf("[F4] %d managed resources remain after delete, want 0", n)
+		t.Errorf("[delete] %d managed resources remain after delete, want 0", n)
 	} else {
-		t.Logf("[F4] DeleteInstance removed runner+sidecar+network+all volumes")
+		t.Logf("[delete] DeleteInstance removed runner+sidecar+network+all volumes")
 	}
 	if _, del2 := runProvider(t, bin, configFile, controllerID, "DeleteInstance", nrInstance, nil); del2 != 30 {
-		t.Errorf("[F4] repeat DeleteInstance exit=%d, want 30 (already gone)", del2)
+		t.Errorf("[delete] repeat DeleteInstance exit=%d, want 30 (already gone)", del2)
 	} else {
-		t.Logf("[F4] repeat DeleteInstance correctly returned exit 30")
+		t.Logf("[delete] repeat DeleteInstance correctly returned exit 30")
 	}
 
 	// Remove only the runner out of band. Deleting by provider_id must still remove
@@ -351,14 +351,14 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	b2 := nrBootstrap(srv.URL, caBundle)
 	stdout2, code2 := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b2)
 	if code2 != 0 {
-		t.Fatalf("[F6] re-create exit=%d, want 0; stdout=%s", code2, stdout2)
+		t.Fatalf("[recreate] re-create exit=%d, want 0; stdout=%s", code2, stdout2)
 	}
 	var created2 params.ProviderInstance
 	if err := json.Unmarshal([]byte(stdout2), &created2); err != nil {
-		t.Fatalf("[F6] parse re-create stdout: %v", err)
+		t.Fatalf("[recreate] parse re-create stdout: %v", err)
 	}
 	if !waitForDindReady(t, nrDindName()) {
-		t.Fatalf("[F6] dind daemon never became ready on re-create")
+		t.Fatalf("[recreate] dind daemon never became ready on re-create")
 	}
 	// The re-create is a new generation with a new nonce, so look up the differently
 	// named volumes by label before asserting they are removed.
@@ -368,15 +368,15 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	// Remove only the runner container out of band, leaving the privileged sidecar,
 	// network and volumes behind.
 	if out, err := dockerTry("rm", "-f", runnerName); err != nil {
-		t.Fatalf("[F6] out-of-band runner removal failed: %v\n%s", err, out)
+		t.Fatalf("[recreate] out-of-band runner removal failed: %v\n%s", err, out)
 	}
 	if _, err := dockerTry("inspect", nrDindName()); err != nil {
-		t.Fatalf("[F6] precondition: sidecar should still exist after removing only the runner: %v", err)
+		t.Fatalf("[recreate] precondition: sidecar should still exist after removing only the runner: %v", err)
 	}
 	// DeleteInstance by the ORIGINAL provider_id (the instance name).
 	_, delCode2 := runProvider(t, bin, configFile, controllerID, "DeleteInstance", created2.ProviderID, nil)
 	if delCode2 != 0 {
-		t.Errorf("[F6] DeleteInstance(provider_id=%q) after out-of-band runner removal exit=%d, want 0", created2.ProviderID, delCode2)
+		t.Errorf("[recreate] DeleteInstance(provider_id=%q) after out-of-band runner removal exit=%d, want 0", created2.ProviderID, delCode2)
 	}
 	assertGone(t, "leaked sidecar", "inspect", nrDindName())
 	assertGone(t, "network", "network", "inspect", nrNet())
@@ -384,9 +384,9 @@ func TestVerifyM1NonRootDindAllocation(t *testing.T) {
 	assertGone(t, "socket volume", "volume", "inspect", nrSocket2)
 	assertGone(t, "dind-state volume", "volume", "inspect", nrDindState2)
 	if n := controllerResourceCount(t, controllerID); n != 0 {
-		t.Errorf("[F6] %d managed resources leaked after delete-by-provider_id with the runner gone, want 0", n)
+		t.Errorf("[recreate] %d managed resources leaked after delete-by-provider_id with the runner gone, want 0", n)
 	} else {
-		t.Logf("[F6] delete-by-provider_id reaped the privileged sidecar + network + volumes even with the runner already gone — no leak")
+		t.Logf("[recreate] delete-by-provider_id reaped the privileged sidecar + network + volumes even with the runner already gone — no leak")
 	}
 }
 

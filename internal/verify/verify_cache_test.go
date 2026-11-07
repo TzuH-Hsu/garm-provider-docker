@@ -16,7 +16,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyM2W1CacheHit proves the ADR-003 persistent-cache contract on a real
+// TestVerifyCacheHit proves the ADR-003 persistent-cache contract on a real
 // daemon by running two allocations for the same repo_url. The toolcache and pnpm
 // store volumes are the same across both jobs (a file written to the toolcache in
 // job 1 is visible in job 2); they survive DeleteInstance; an org-scoped pool gets
@@ -28,8 +28,8 @@ import (
 // removal of this run's cache volumes by name, and a before/after volume snapshot
 // checks that no foreign volume was removed.
 //
-// Run with: go test -tags dockerverify -v -run TestVerifyM2W1CacheHit ./internal/verify/
-func TestVerifyM2W1CacheHit(t *testing.T) {
+// Run with: go test -tags dockerverify -v -run TestVerifyCacheHit ./internal/verify/
+func TestVerifyCacheHit(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 

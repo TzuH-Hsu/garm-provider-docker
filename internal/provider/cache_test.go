@@ -157,16 +157,16 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 		})
 	}
 
-	_, err := p.CreateInstance(context.Background(), cacheBootstrap("h3-job", cacheRepoURL, srv.URL))
+	_, err := p.CreateInstance(context.Background(), cacheBootstrap("cache-job", cacheRepoURL, srv.URL))
 	if err == nil {
 		t.Fatal("CreateInstance succeeded despite the externals cache being evicted and auto-recreated EMPTY during create; want a fail-closed allocation error")
 	}
-	t.Logf("[H3] CreateInstance failed closed as expected: %v", err)
+	t.Logf("CreateInstance failed closed as expected: %v", err)
 
 	// No runner left behind (rolled back) — it must never run against an empty
 	// externals tree.
-	if _, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("h3-job")); err == nil {
-		t.Error("[H3] the runner container was left present after a fail-closed create")
+	if _, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("cache-job")); err == nil {
+		t.Error("the runner container was left present after a fail-closed create")
 	}
 
 	// No LABELED externals cache remains (the original was evicted), but the
@@ -272,31 +272,31 @@ func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 	if err == nil {
 		t.Fatal("CreateInstance succeeded despite a transient inspect failure during cache revalidation; want a fail-closed allocation error")
 	}
-	t.Logf("[NEW-H1] CreateInstance failed closed as expected: %v", err)
+	t.Logf("CreateInstance failed closed as expected: %v", err)
 
 	// The warm toolcache cache volume MUST survive — a transient inspect error must
 	// never authorize deleting a valid cache.
 	tv, ok := volByName(t, fake, toolName)
 	if !ok {
-		t.Fatalf("[NEW-H1] the warm toolcache %q was DELETED by a transient revalidate inspect error — regression", toolName)
+		t.Fatalf("the warm toolcache %q was DELETED by a transient revalidate inspect error — regression", toolName)
 	}
 	if tv.Labels[spec.LabelCache] != "true" || tv.Labels[spec.LabelRepo] != repoKey {
-		t.Errorf("[NEW-H1] toolcache survived but lost its cache identity labels: %v", tv.Labels)
+		t.Errorf("toolcache survived but lost its cache identity labels: %v", tv.Labels)
 	}
 
 	// The other referenced caches (pnpm/diag/externals) — inspected successfully —
 	// must also survive; none is an orphan.
 	if _, ok := volByName(t, fake, spec.PnpmVolumeName(repoKey, testOSKey, "9")); !ok {
-		t.Error("[NEW-H1] pnpm store cache was deleted")
+		t.Error("pnpm store cache was deleted")
 	}
 	if _, ok := volByName(t, fake, spec.DiagVolumeName(repoKey)); !ok {
-		t.Error("[NEW-H1] diag cache was deleted")
+		t.Error("diag cache was deleted")
 	}
 
 	// The just-created runner must be rolled back — never started against an
 	// unverified cache tree.
 	if _, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName("newh1-job")); err == nil {
-		t.Error("[NEW-H1] the runner container was left present after a fail-closed create")
+		t.Error("the runner container was left present after a fail-closed create")
 	}
 }
 

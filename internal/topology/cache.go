@@ -59,7 +59,7 @@ func (m *Manager) EnsureCacheVolume(ctx context.Context, preferredName string, l
 			return CacheVolumeResult{Name: candidate, Hit: false}, nil
 		}
 		if attempt >= maxCacheReconcileAttempts {
-			return CacheVolumeResult{}, fmt.Errorf("cache slot %q and %d deterministic alternates are each occupied by a volume that is not our validated cache; refusing to delete any of them (ADR-003 never-delete-unprovable) and failing this allocation so GARM retries: %w", preferredName, attempt-1, verr)
+			return CacheVolumeResult{}, fmt.Errorf("cache slot %q and %d deterministic alternates are each occupied by a volume that is not our validated cache; refusing to delete any of them (ADR-003: a volume that cannot be proved ours is never deleted) and failing this allocation so GARM retries: %w", preferredName, attempt-1, verr)
 		}
 		// Leave the occupied slot untouched and route around it.
 		slog.WarnContext(ctx, "cache slot occupied by a volume that is not our validated cache; reconciling to an alternate name",
