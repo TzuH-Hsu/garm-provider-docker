@@ -21,22 +21,20 @@ func (f *FakeClient) SetStats(containerID, body string) {
 	}
 }
 
-// ContainerStatsOneShot models the one-shot stats endpoint: a missing
-// container is NotFound and a container that is not running is a Conflict,
-// like ExecOutput's daemon, since the real daemon has no cgroup to sample.
+// ContainerStatsOneShot returns the SetStats body for a running container. A missing
+// container is NotFound. A stopped one is a Conflict here, though the daemon answers 200
+// with an empty sample (name and ID, no blkio counters).
 //
-// A container that joined another's network namespace ("container:<ref>")
-// also models how the daemon adds network stats to the sample: it looks up
-// the namespace owner's sandbox, and the whole sample depends on that lookup.
-// With the owner removed the lookup is NotFound and the daemon answers with an
-// empty sample (name and ID, no blkio counters) although the container still
-// runs; with the owner stopped but not removed its sandbox ID is cleared and
-// the request fails.
+// For a container that joined another's network namespace ("container:<ref>") the
+// daemon looks up the owner's sandbox to add network stats, and the whole sample
+// depends on that lookup. With the owner removed, a current daemon returns an empty
+// sample (name and ID, no blkio counters) although the container runs, and a v28 daemon
+// fails the request; with the owner stopped but not removed its sandbox ID is cleared
+// and the request fails.
 func (f *FakeClient) ContainerStatsOneShot(ctx context.Context, containerID string) (container.StatsResponseReader, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Like the real client, a request on a context that is already done fails.
 	if err := ctx.Err(); err != nil {
 		return container.StatsResponseReader{}, err
 	}
@@ -65,9 +63,9 @@ func (f *FakeClient) ContainerStatsOneShot(ctx context.Context, containerID stri
 	}, nil
 }
 
-// ExecOutput models an output-capturing docker exec: it records the call and
-// reports ExecOutputText and ExecOutputExit, or what ExecOutputFunc returns
-// when it is set. Like the real daemon it requires a running container.
+// ExecOutput records the call and reports ExecOutputText and ExecOutputExit, or what
+// ExecOutputFunc returns when set. ExecOutputErr fails it. The container must be
+// running.
 func (f *FakeClient) ExecOutput(ctx context.Context, containerID string, cmd []string) (string, int, error) {
 	f.mu.Lock()
 	if f.ExecOutputErr != nil {

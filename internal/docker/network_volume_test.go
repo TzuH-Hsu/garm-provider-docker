@@ -71,11 +71,9 @@ func TestFakeClientNetworkCreateAndList(t *testing.T) {
 	}
 }
 
-// TestFakeClientNetworkCreateDuplicateNameConflict is the regression guard
-// for the fake matching the REAL daemon's network-create behavior (checked
-// live against Docker Engine 29.6.1/API 1.55 while building this interface,
-// see the doc comment on FakeClient.NetworkCreate): a second create reusing
-// an in-use name is rejected with a Conflict, unconditionally.
+// TestFakeClientNetworkCreateDuplicateNameConflict checks that a second network
+// create reusing an in-use name is rejected with a Conflict, as the real daemon
+// does (see FakeClient.NetworkCreate).
 func TestFakeClientNetworkCreateDuplicateNameConflict(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -128,9 +126,8 @@ func TestFakeClientNetworkRemove(t *testing.T) {
 		t.Fatalf("got %d networks after remove, want 0", len(out))
 	}
 
-	// Removing an already-gone network (by the ID from the first create) is
-	// tolerated by callers via errdefs.IsNotFound (ADR-004 idempotent
-	// teardown), so the fake must return that shape, not a generic error.
+	// Callers tolerate removing an already-gone network through
+	// errdefs.IsNotFound (ADR-004), so the fake must return that shape.
 	err = f.NetworkRemove(ctx, created.ID)
 	if err == nil {
 		t.Fatal("NetworkRemove of an already-removed network succeeded, want a NotFound error")
@@ -205,16 +202,10 @@ func TestFakeClientVolumeCreateAndList(t *testing.T) {
 	}
 }
 
-// TestFakeClientVolumeCreateNameCollisionIsIdempotent is the regression
-// guard for the fake matching the REAL daemon's volume-create behavior
-// (checked live against Docker Engine 29.6.1/API 1.55 while building this
-// interface, see the doc comment on FakeClient.VolumeCreate): UNLIKE
-// networks and containers, a second create reusing an in-use volume name is
-// NOT a conflict — it silently succeeds and returns the ORIGINAL volume,
-// discarding the second call's labels. Modeling this as a conflict (the
-// naive assumption, and what networks/containers actually do) would hide a
-// real divergence from daemon behavior, exactly the class of bug the M0
-// tmpfs-uid/gid lesson warns against.
+// TestFakeClientVolumeCreateNameCollisionIsIdempotent checks that, unlike networks
+// and containers, a second volume create reusing an in-use name is not a conflict:
+// it succeeds and returns the original volume, discarding the second call's
+// labels, as the real daemon does (see FakeClient.VolumeCreate).
 func TestFakeClientVolumeCreateNameCollisionIsIdempotent(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()

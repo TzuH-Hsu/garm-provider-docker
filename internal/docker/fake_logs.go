@@ -30,10 +30,9 @@ type fakeLogEntry struct {
 	line   string
 }
 
-// AppendLog records that containerID printed line (a trailing newline is
-// added, as the daemon stores one log message per line) on stream, and wakes
-// any ContainerLogs follower. It is how a test models the runner's own output,
-// e.g. the actions/runner "Listening for Jobs" line. Unknown IDs are ignored.
+// AppendLog records that containerID printed line (a trailing newline is added, as the
+// daemon stores one message per line) on stream, and wakes any ContainerLogs follower.
+// Unknown IDs are ignored.
 func (f *FakeClient) AppendLog(containerID string, stream LogStream, line string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -55,26 +54,20 @@ func (c *fakeContainer) wakeLogFollowers() {
 	c.logNotify = make(chan struct{})
 }
 
-// ContainerLogs models the daemon's GET /containers/{id}/logs as the moby SDK
-// surfaces it, matching what was observed against a real daemon for this
-// provider's runner container (Config.Tty=false):
+// ContainerLogs models GET /containers/{id}/logs for a container created without a
+// TTY, as observed on a real daemon:
 //
-//   - the body is stdcopy-multiplexed (an 8-byte header — stream byte, three
-//     zero bytes, big-endian uint32 length — then the payload), one frame per
-//     log line, so a caller MUST demultiplex with stdcopy.StdCopy; a TTY
-//     container's body is the raw bytes instead;
-//   - at least one of ShowStdout/ShowStderr is required, and only the selected
+//   - the body is stdcopy-multiplexed, one frame per log line, so a caller must
+//     demultiplex it with stdcopy.StdCopy; a TTY container's body is raw bytes;
+//   - at least one of ShowStdout and ShowStderr is required, and only the selected
 //     streams are returned;
-//   - Tail "N" starts the body at the last N lines recorded so far, counted
-//     across both streams before the stream selection, as the daemon counts
-//     them in its log file; "", "all" or anything that is not a non-negative
-//     integer means every line, as the daemon treats it;
-//   - without Follow the body ends (EOF) after the lines recorded so far;
-//   - with Follow it then stays open, streaming each new line, until the
-//     container is no longer running (EOF) or ctx is cancelled (the read
-//     fails with the context error, as the SDK's cancelled HTTP body does).
+//   - Tail "N" starts at the last N lines recorded, counted across both streams before
+//     stream selection; "", "all" or a non-integer means every line;
+//   - without Follow the body ends after the lines recorded so far; with Follow it
+//     stays open, streaming new lines, until the container is not running (EOF) or
+//     ctx is cancelled (the read fails with the context error).
 //
-// LogsErr, when set, is returned instead (an API-level failure).
+// LogsErr, when set, is returned instead.
 func (f *FakeClient) ContainerLogs(ctx context.Context, containerID string, options container.LogsOptions) (io.ReadCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -90,10 +83,8 @@ func (f *FakeClient) ContainerLogs(ctx context.Context, containerID string, opti
 		return nil, notFoundf("No such container: %s", containerID)
 	}
 	if c.logDriver == "none" {
-		// Observed on a real daemon (Docker Engine 29.8.2): GET
-		// /containers/{id}/logs answers HTTP 501 {"message":"configured
-		// logging driver does not support reading"}, which the SDK surfaces
-		// as an errdefs.NotImplemented error. No stream is returned.
+		// The daemon answers HTTP 501 "configured logging driver does not support reading",
+		// which the SDK surfaces as errdefs.NotImplemented.
 		return nil, errdefs.NotImplemented(errors.New("configured logging driver does not support reading"))
 	}
 	if c.logNotify == nil {

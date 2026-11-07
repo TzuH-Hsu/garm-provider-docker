@@ -10,11 +10,11 @@ import (
 	"time"
 )
 
-// pipeExecConn is a net.Pipe-backed execConn fake, so streamExec's
-// cancellation and leak-freedom behavior can be exercised without a Docker
-// daemon (NEW-3). Its output() read end blocks until the peer writes or the
-// connection is closed; Close() closes both ends, which is what a ctx-driven
-// force-close must do to unblock a StdCopy that is waiting on it.
+// pipeExecConn is a net.Pipe-backed execConn fake, so streamExec's cancellation and
+// leak-freedom behavior can be exercised without a Docker daemon. Its output()
+// read end blocks until the peer writes or the connection is closed; Close()
+// closes both ends, which is what a ctx-driven force-close must do to unblock a
+// StdCopy that is waiting on it.
 type pipeExecConn struct {
 	out     net.Conn // streamExec reads exec output from here
 	outPeer net.Conn // the write side; closing it yields EOF, closing out yields ErrClosedPipe

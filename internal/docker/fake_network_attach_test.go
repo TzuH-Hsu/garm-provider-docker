@@ -12,10 +12,10 @@ import (
 )
 
 // createAttachedRunner creates a running container attached to netName and
-// mounting volName at /actions-runner/_work, mirroring what the WP2 topology
-// layer builds. It first ensures the network and volume exist, since
-// ContainerStart now (F5) rejects a start whose attached network or required
-// named volume is missing. Returns the container ID.
+// mounting volName at /actions-runner/_work, as the topology layer builds it. It
+// first ensures the network and volume exist, since ContainerStart rejects a
+// start whose attached network or required named volume is missing. It returns the
+// container ID.
 func createAttachedRunner(t *testing.T, f *FakeClient, name, netName, volName string) string {
 	t.Helper()
 	// NetworkCreate 409s if the caller already created the network; tolerate it.
@@ -123,11 +123,9 @@ func TestFakeNetworkRemoveActiveEndpoints(t *testing.T) {
 	}
 }
 
-// TestFakeVolumeRemoveRejectsInUse is the F13(a) guard: the real daemon rejects
-// removing a volume still referenced by ANY container (running OR stopped),
-// even with force. The fake models that with a Conflict, so a teardown that
-// tried to remove a volume before its container fails in units too — and only
-// succeeds once the container is gone.
+// TestFakeVolumeRemoveRejectsInUse checks that, like the real daemon, removing a
+// volume still referenced by any container, running or stopped, fails with a
+// Conflict even with force, and succeeds once the container is gone.
 func TestFakeVolumeRemoveRejectsInUse(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -157,11 +155,10 @@ func TestFakeVolumeRemoveRejectsInUse(t *testing.T) {
 	}
 }
 
-// TestFakeContainerStartRejectsMissingNetwork is the F5 fake-fidelity guard:
-// ContainerStart fails when the attached user-defined network has been removed
-// out from under the container (e.g. by a concurrent sweep), matching the real
-// daemon — networks are NOT auto-created — so that class of bug can no longer
-// pass a unit test.
+// TestFakeContainerStartRejectsMissingNetwork checks that ContainerStart fails when
+// the attached user-defined network has been removed out from under the
+// container (for example by a concurrent sweep). Unlike volumes, the daemon does
+// not auto-create networks.
 func TestFakeContainerStartRejectsMissingNetwork(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -181,17 +178,12 @@ func TestFakeContainerStartRejectsMissingNetwork(t *testing.T) {
 	}
 }
 
-// TestFakeContainerCreateAutoCreatesMissingNamedVolume is the M2-W2 H3
-// fake-fidelity guard: referencing a NAMED volume that does not exist must make
-// ContainerCreate AUTO-CREATE it UNLABELED, matching the real daemon (verified on
-// Docker Engine 29.6.1: `docker create -v missing:/x …` materializes `missing`
-// with empty labels). This is the exact failure mode an operator-run manual
-// `docker volume prune` (or some other external actor) racing a create
-// triggers — never the provider's own GC, which is log-only and never removes a
-// cache volume itself (ADR-003's cache-GC-safety amendment) — the provider must
-// be able to detect the unlabeled replacement and fail closed, which it can
-// only test if the fake models the auto-create rather than pretending the
-// start fails.
+// TestFakeContainerCreateAutoCreatesMissingNamedVolume checks that referencing a
+// named volume that does not exist makes ContainerCreate create it unlabeled, as
+// `docker create -v missing:/x` does on the real daemon (checked on Docker Engine
+// 29.6.1). A volume removed by an outside actor between the provider's ensure and
+// the create comes back this way, and the provider can only detect the unlabeled
+// replacement if the fake models it (ADR-003).
 func TestFakeContainerCreateAutoCreatesMissingNamedVolume(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
@@ -214,7 +206,7 @@ func TestFakeContainerCreateAutoCreatesMissingNamedVolume(t *testing.T) {
 	if len(v.Labels) != 0 {
 		t.Errorf("auto-created volume must be UNLABELED (real Moby copies no labels), got %v", v.Labels)
 	}
-	// And with the volume now present, start succeeds (no spurious not-found).
+	// With the volume present, start succeeds.
 	if err := f.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		t.Errorf("ContainerStart after auto-create failed: %v", err)
 	}
