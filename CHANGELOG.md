@@ -10,6 +10,8 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-11-07
+
 ### Security
 
 - Release binaries and the provider image are now built with Go 1.27.3 instead
@@ -46,5 +48,6 @@ Earlier versions are described on the
   output was previously discarded.
 - A runner that never started no longer produces an exit report on delete.
 
-[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.8...v0.2.9
