@@ -163,9 +163,9 @@ a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Verification status
 
-The [live test](docs/live-gate.md) runs real GitHub jobs through a real GARM. I
-also run this provider for my own private repositories, on the first row's
-setup.
+The [live test](docs/live-gate.md) runs real GitHub jobs through a real GARM, and
+its results are in the [recorded runs](docs/live-gate-runs.md). I also run this
+provider for my own private repositories, on the first row's setup.
 
 | Setup | Status |
 |---|---|
