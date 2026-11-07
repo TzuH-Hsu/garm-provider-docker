@@ -297,8 +297,8 @@ func runCommand(t *testing.T, p *provider.Provider) (string, error) {
 
 // TestGarmV021ScaleSetLifecycleReplay drives one scale-set runner through
 // Create -> List -> Get -> Delete -> List using exactly what GARM v0.2.1 sends.
-// Before the fix, Create failed on the injected runner_install_template and
-// Delete/Get failed environment validation with "missing pool ID".
+// It covers the injected runner_install_template on Create and the empty pool ID
+// on Delete and Get.
 func TestGarmV021ScaleSetLifecycleReplay(t *testing.T) {
 	p, fake := newFakeProvider(t)
 	md := newMetadataServer(t)
