@@ -46,14 +46,14 @@ is specific to this provider and this demo.
 
 <!-- TOC -->
 - [Prerequisites](#prerequisites)
+- [Running the demo](#running-the-demo)
 - [Release mode vs. source mode](#release-mode-vs-source-mode)
 - [Scale set (default) vs. pool](#scale-set-default-vs-pool)
 - [The DinD variant](#the-dind-variant)
   - [Registry mirror check (opt-in)](#registry-mirror-check-opt-in)
 - [What this demo proves](#what-this-demo-proves)
-- [What this demo does not cover](#what-this-demo-does-not-cover)
-- [Running the demo](#running-the-demo)
 - [What each verification item proves](#what-each-verification-item-proves)
+- [What this demo does not cover](#what-this-demo-does-not-cover)
 - [Troubleshooting](#troubleshooting)
 - [Recording a result](#recording-a-result)
 - [Recorded runs](live-gate-runs.md)
@@ -140,277 +140,6 @@ is specific to this provider and this demo.
    export PROVIDER_BIN_DIR=/opt/garm-gate/bin PROVIDER_CONFIG_DIR=/opt/garm-gate/config
    export GARM_URL=http://127.0.0.1:<port>   # must match the API's bind address
    ```
-
-## Release mode vs. source mode
-
-`scripts/live-gate.sh` has two modes, selected by `--from-source` (or the
-`PROVIDER_SOURCE` env var), plus a variant of release mode for a locally
-built binary (see below):
-
-- **`release`** (default) — validates a **published release**, exactly as
-  an operator would install it:
-  1. Downloads the `garm-provider-docker_<version>_linux_<arch>` binary
-     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.5`)
-     for this host's architecture, plus that release's `SHA256SUMS`.
-  2. Verifies the downloaded binary against `SHA256SUMS` — **failing hard**
-     (not warning) on any mismatch or missing entry — before it is ever
-     executed.
-  3. Resolves `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s (or, with
-     `--runner-image resolute`, `garm-runner-resolute:<version>`'s) current
-     digest via `docker buildx imagetools inspect` (no pull required) and
-     writes the generated config's `runner_image` as
-     `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>` — **digest-pin
-     enforcement stays on**: `allow_unpinned_runner_image` is never set in
-     this mode, matching a real operator's config
-     (`examples/config.minimal.toml`).
-  4. Smoke-tests the binary (`GARM_COMMAND=GetVersion`) against the
-     generated config, so a bad download or a config the current loader
-     rejects fails here, immediately, with a clear message.
-- **`source`** (`--from-source`) — the original, M0-era local-dev flow:
-  builds the provider binary from this checkout (`go build`, version
-  stamped from `git describe`) and the runner image locally (`docker build
-  -f runner-images/noble/Dockerfile runner-images`, tagged
-  `garm-runner-noble:demo`), and sets
-  `allow_unpinned_runner_image = true` in the generated config (required —
-  a local mutable tag can never be digest-pinned). Use this when testing
-  uncommitted provider or runner-image changes.
-
-### Release mode with a locally built binary
-
-A pre-tag gate often needs the opposite split from `source`: a provider binary
-built from the commit under test, run against the **published** runner image,
-on a host where building images is not acceptable. Set both of these (they are
-only valid together, and not with `--from-source`):
-
-```sh
-export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker   # absolute path, executable
-export LOCAL_PROVIDER_SHA256=<64 lowercase hex characters>           # the sha256 you expect it to have
-scripts/live-gate.sh --version vX.Y.Z preflight
-```
-
-Everything stays release mode except where the binary comes from:
-
-- Preflight copies the file into its private staging directory and hashes the
-  **copy**. A mismatch with `LOCAL_PROVIDER_SHA256` is a hard failure: an
-  unverified binary is never staged or executed. Compute the expected value
-  where you built the binary (`sha256sum garm-provider-docker`) so that it
-  does not come from the file being checked.
-- No release asset or `SHA256SUMS` is downloaded, and the release does not
-  have to be published yet. `--version` (or `PROVIDER_VERSION`) only selects
-  the tag of `ghcr.io/tzuh-hsu/garm-runner-<name>` whose digest is resolved
-  and pinned, so that image must already be published. Digest-pin enforcement
-  stays ON: `allow_unpinned_runner_image` is never set.
-- The binary must be built for the host's OS and architecture (the smoke test
-  runs it once against the generated config). Because it is not a release
-  asset, the Linux-only restriction of release mode does not apply.
-- The script says so wherever it matters: a warning when the binary is staged,
-  a "LOCAL provider binary" line in the preflight summary, a comment in the
-  generated `config.toml`, and `, local binary` in the `description` of the
-  `[[provider]]` snippet. The expected sha256 is remembered in `gate-modes`
-  (the path is not); a later `preflight` without these variables goes back to
-  downloading the release.
-
-A result from this mode proves the **commit and binary you built**, not the
-published release asset; see [Recording a result](#recording-a-result).
-
-Either mode gates the Ubuntu 24.04 runner image by default. `--runner-image
-resolute` (or `RUNNER_IMAGE_NAME=resolute`) gates the Ubuntu 26.04 image
-instead: `runner-images/resolute` in source mode, `garm-runner-resolute` in
-release mode (published from v0.2.3 on). Like the other modes it is remembered
-by preflight for the later steps.
-
-Every combination ends with a generated demo provider `config.toml` (path printed
-by the script) and a verified, runnable provider binary; everything after
-Step 0 (registration, pool, workflow, verification) is identical regardless
-of mode.
-
-## Scale set (default) vs. pool
-
-| | Scale set (default) | Pool (`--pool` / `GARM_TARGET=pool`) |
-|---|---|---|
-| Job delivery | GARM long-polls GitHub's message queue | GitHub webhook → GARM |
-| Inbound connectivity needed | None (outbound HTTPS only) | GitHub must reach GARM's webhook URL |
-| Workflow `runs-on` | the scale set **name** (e.g. `garm-docker-gate-3fa9c1`) | the pool **tags** (e.g. `[docker, garm-demo]`) |
-| Create / list / runners / delete | `garm-cli scaleset add` / `list` / `runner list <id>` / `delete <id>` | `garm-cli pool add` / `list` / `runner list` / `delete <id>` |
-
-Use the default when GARM runs behind a NAT or VM switch (this gate's
-intended setup): a webhook-driven pool can never receive a job there. The
-script generates a unique scale set name (`garm-docker-gate-<6 hex>`),
-remembers it in the config directory so every step agrees, and prints the
-workflow with that exact `runs-on`. Scale set names and labels **cannot be
-changed after creation** (upstream `doc/scale-sets.md`); to change one,
-delete and re-create the scale set. Override with `SCALESET_NAME`.
-
-The `garm-cli scaleset add` flags the script prints were checked against
-upstream GARM v0.2.1 `cmd/garm-cli/cmd/scalesets.go` (`--repo`,
-`--provider-name`, `--name`, `--image`, `--flavor`, `--min-idle-runners`,
-`--max-runners`, `--os-arch`, `--os-type`, `--enabled`, `--extra-specs`;
-`--provider-name`, `--name`, `--image` and `--flavor` are required).
-Scale-set JIT delivery is forced on by GARM, and `GARM_POOL_EXTRASPECS` is
-empty for scale sets — this provider reads `extra_specs` from the stdin
-bootstrap payload, so it works unchanged (`docs/research.md` §1.D).
-
-## The DinD variant
-
-`--dind` (or `GATE_VARIANT=dind`) is an **optional** second variant; the
-default stays `dind_mode = "none"`. It generates, in addition to the
-default config:
-
-```toml
-allowed_dind_modes = ["none", "privileged-sidecar"]
-dind_image = "docker:dind@sha256:<digest resolved at preflight>"
-
-[flavors.dind]
-  runner_memory = "6GiB"
-  dind_memory = "4GiB"
-```
-
-and attaches `--extra-specs '{"flavor":"dind","dind_mode":"privileged-sidecar"}'`
-to the scale set (or pool). Preflight validates exactly that JSON against
-the generated config with the provider's own `ValidatePoolInfo` before
-anything touches Docker. The test workflow runs `docker run --rm
-hello-world` and a `docker build` of a trivial Dockerfile inside the job,
-which proves a non-root job can use the sidecar's daemon, and a step that
-writes a file into `$GITHUB_WORKSPACE` and reads it back through
-`docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt`
-(must print `ok`), which proves the sidecar daemon sees the runner's
-workspace (the sidecar mounts the same workspace volume at
-`/actions-runner/_work`). The same step then has a nested container write
-`gate-nested.txt` into the workspace and reads it back from the runner, which
-proves the sidecar's workspace mount is writable end to end. A last step
-starts a nested `busybox` httpd with an ephemeral published port (`-p 80`)
-and fetches it with `curl` at `127.0.0.1` and `localhost` (must print
-`published-ok`), which proves the sidecar shares the runner's network
-namespace (ADR-001, 2026-10-12 amendment), the way testcontainers and
-`docker compose` ports are used. The workflow also has a second job,
-`container-job`, which `needs` the first one (so the gate's single runner is
-free, and `verify` keeps its window on the first job). It runs in
-`container: debian:trixie-slim`, starts with `actions/checkout` and then reads
-the checked-out workflow file back with a `run:` step. This is the acceptance
-test for container jobs (ADR-001, 2026-10-29 amendment): the runner binds
-`/actions-runner/externals` into the job container as `/__e`, the sidecar's
-daemon resolves that source in its own filesystem, and `actions/checkout`, a
-JavaScript action, only starts if the sidecar holds the runner's externals. It
-needs the externals cache, which is on by default. Step 4 then also
-verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
-bind mounts on either container, `DOCKER_HOST`, labeled socket and
-`dind-state` volumes, the sidecar's mount set (socket, `dind-state`, workspace
-and, with the cache on, the runner's externals volume read-only), and the
-flavor's memory limits).
-
-**Caveat:** `privileged-sidecar` runs a `Privileged=true` daemon on the
-host; a malicious job could pivot to the host (ADR-001 "Residual risk").
-Use a disposable VM. The 6GiB + 4GiB flavor sizes are limits, not
-reservations, but size the VM accordingly.
-
-### Registry mirror check (opt-in)
-
-With `--dind`, setting `GATE_REGISTRY_MIRROR` adds a check of the sidecar's
-registry mirror (`registry_mirrors`, see [`dind-image-pulls.md`](dind-image-pulls.md)).
-Unset, which is the default, none of it runs and the gate is unchanged.
-
-```sh
-# The mirror is a Docker Hub pull-through cache your Docker host and the job
-# networks can reach (a distribution `registry` in proxy mode, per
-# dind-image-pulls.md). The log container is optional but recommended.
-# Use an address that is reachable from INSIDE the sidecar: the host's LAN IP
-# or a DNS name, never one in 172.17.0.0/16 (see the note below).
-export GATE_REGISTRY_MIRROR=http://mirror.lan.example:5000
-export GATE_MIRROR_LOG_CONTAINER=registry-mirror   # the mirror's container name on this host
-scripts/live-gate.sh --dind preflight
-# ... pool, then once the job is running and the runner is idle:
-scripts/live-gate.sh verify
-```
-
-What it changes and checks:
-
-- **Preflight** writes `registry_mirrors = ["<mirror>"]` into the generated
-  config (and `insecure_registries = ["<GATE_INSECURE_REGISTRY>"]` when that is
-  set), and refuses to continue if the provider build does not list
-  `registry_mirrors` in its config schema: a build without the key would load
-  the config, ignore the key, and run the sidecar with no mirror. A release that
-  predates the setting therefore fails here; use a release that includes it or
-  `--from-source`. The mirror and insecure registry are remembered with the
-  other modes (`gate-modes`), so later single steps need not repeat them.
-- **The workflow** gains a step, right after the first one, that fails the job
-  unless `docker info` in the job lists the mirror under Registry Mirrors
-  (dockerd prints it with a trailing `/`), and its final hold lasts 120 s
-  instead of 60 s to leave `verify` room for its extra pull.
-- **`verify`** adds, in the DinD part of check (b):
-  1. the sidecar's `dockerd` argv has `--registry-mirror=<mirror>`, and an
-     `--insecure-registry` flag only when `GATE_INSECURE_REGISTRY` is set. By
-     default the mirror is therefore exercised **without** an insecure entry,
-     which checks the claim that an `http://` mirror needs none (confirmed on
-     Engine 29.9.2). If that fails on your Engine, set
-     `GATE_INSECURE_REGISTRY` to the mirror's `host:port` and report it;
-  2. `docker info` through the runner's `DOCKER_HOST` (the sidecar's daemon)
-     lists the mirror, and the insecure registry when one is set;
-  3. a pull of `GATE_MIRROR_PULL_IMAGE` (default `nginx:alpine-slim`, a small
-     Docker Hub official image the sample workflow never pulls) succeeds and is
-     observed at the mirror. The image is removed first so the pull is real.
-     With `GATE_MIRROR_LOG_CONTAINER` set, the mirror's access log
-     (`docker logs --since <just before the pull>`) must show requests under
-     `/v2/library/<image>/`; this is the authoritative check, and its absence
-     fails the gate. Without it, the mirror's `/v2/_catalog` (read from inside
-     the runner, the same network path dockerd uses) must list the repository
-     after the pull. That needs a distribution-based mirror, and if the
-     repository was already cached it only proves the mirror holds it; `verify`
-     says so, and if the catalog cannot be read it asks for the log container
-     instead.
-
-Run `verify` while the job holds (the same window as the other `verify`
-checks). The mirror must be reachable from the job network; with
-`[network].internal = true` it cannot be (that network has no route out at
-all). The check pulls one small image through the mirror and
-does nothing else to it.
-
-**Choosing the mirror address.** The sidecar shares the runner container's
-network namespace, and its nested `dockerd` creates its own `docker0` bridge
-there with the default range `172.17.0.0/16`. A mirror written as
-`http://172.17.0.1:5000` (the usual address of the *host's* `docker0`) therefore
-resolves to the nested bridge inside the sidecar, the dial gets `connection
-refused`, and `dockerd` silently falls back to Docker Hub. Nothing fails: the
-pull still succeeds, just not through the mirror. Use an address that is
-reachable from inside the sidecar, such as the host's LAN IP or a DNS name, and
-keep it out of `172.17.0.0/16`. The `docker info` step still passes with a
-wrong address (it only lists the configured mirror), so the pull check is the
-one that catches it: with `GATE_MIRROR_LOG_CONTAINER` set, `verify` fails
-because the mirror's access log shows no request for the pulled image. If the
-check fails, confirm the pull succeeded anyway and look at the mirror's access
-log before suspecting the provider. Overriding the nested bridge range (for
-example `--bip` or `default-address-pools` through a custom `dind_image`) is
-outside this gate.
-
-## What this demo proves
-
-| # | Demo verification item | Maps to |
-|---|---|---|
-| (a) | The runner container, the per-job network, and the named workspace volume all carry the expected `garm.docker/*` ownership labels | `ADR-004`'s label schema (`ADR-001`'s per-job topology) |
-| (b) | `docker inspect` shows no `BEARER_TOKEN`/`METADATA_URL`/`CALLBACK_URL`-like env var, no bind mount (hence no host `docker.sock`) and no `Privileged` flag on the runner; in the `none` variant no DinD sidecar exists, in the `--dind` variant the `role=dind` sidecar has the expected labels, `Privileged=true`, no bind mounts, and the flavor's memory limits | `docs/plan.md` §4's headline acceptance criterion; `ADR-001` |
-| (c) | The credential files (plus the `.delivered` marker) actually land in `/run/garm` inside the running container | `ADR-002`'s **exec-tar-into-tmpfs** verification item — proves `docker exec`-streamed delivery works against a real Docker daemon, not just the fake client used in unit tests |
-| (d) | `/actions-runner/.runner` is a working symlink into `/run/garm`, and the runner process is actually running | `ADR-002`'s **actions/runner symlink-compat** verification item — proves the real `.NET` runner accepts a symlinked config file instead of falling back to a writable-layer copy |
-| (e) | After the job completes: the runner container (and DinD sidecar, socket and `dind-state` volumes in the `--dind` variant), its per-job network, and its named workspace volume are all gone; the runner is gone from GitHub; and no other `garm.docker/managed=true` resource is left over | `docs/plan.md` §4's "job end results in the runner being auto-removed... and the runner... [is] gone" criterion, for the variant that was run |
-
-## What this demo does not cover
-
-This gate runs with `dind_mode = "none"` by default — the smallest, most
-portable slice, needing no Sysbox or privileged-container support on the
-Docker host — and optionally with `privileged-sidecar` (`--dind`, above).
-It does **not** exercise:
-
-- `sysbox-runc` mode (needs Sysbox installed on the host), and
-  `privileged-sidecar` unless `--dind` is passed. DinD is a deliberate
-  operator opt-in (`allowed_dind_modes` defaults to `["none"]`,
-  fail-closed) with residual-risk tradeoffs documented in `ADR-001`, so the
-  default run does not enable it.
-- The persistent toolcache/pnpm/externals caches (`ADR-003`) beyond
-  confirming their volumes, if present, are correctly excluded from
-  teardown (Step 4(e)) — this gate does not run a second job to confirm a
-  cache is actually *reused* across jobs.
-- `extra_specs` beyond the single `--dind` payload above (the default run
-  carries none) — schema validation and the operator-ceiling/allowlist
-  behavior are covered by this repo's own unit and integration tests
-  (`internal/extraspecs`, `internal/verify`), not by this gate.
 
 ## Running the demo
 
@@ -670,12 +399,283 @@ from GARM's config. It also reminds you that persistent cache volumes are
 never touched by cleanup and shows the manual `docker volume prune` command
 to reclaim them.
 
+## Release mode vs. source mode
+
+`scripts/live-gate.sh` has two modes, selected by `--from-source` (or the
+`PROVIDER_SOURCE` env var), plus a variant of release mode for a locally
+built binary (see below):
+
+- **`release`** (default) — validates a **published release**, exactly as
+  an operator would install it:
+  1. Downloads the `garm-provider-docker_<version>_linux_<arch>` binary
+     asset from the GitHub Release (`PROVIDER_VERSION`, default `v0.2.5`)
+     for this host's architecture, plus that release's `SHA256SUMS`.
+  2. Verifies the downloaded binary against `SHA256SUMS` — **failing hard**
+     (not warning) on any mismatch or missing entry — before it is ever
+     executed.
+  3. Resolves `ghcr.io/tzuh-hsu/garm-runner-noble:<version>`'s (or, with
+     `--runner-image resolute`, `garm-runner-resolute:<version>`'s) current
+     digest via `docker buildx imagetools inspect` (no pull required) and
+     writes the generated config's `runner_image` as
+     `ghcr.io/tzuh-hsu/garm-runner-noble@sha256:<digest>` — **digest-pin
+     enforcement stays on**: `allow_unpinned_runner_image` is never set in
+     this mode, matching a real operator's config
+     (`examples/config.minimal.toml`).
+  4. Smoke-tests the binary (`GARM_COMMAND=GetVersion`) against the
+     generated config, so a bad download or a config the current loader
+     rejects fails here, immediately, with a clear message.
+- **`source`** (`--from-source`) — the original, M0-era local-dev flow:
+  builds the provider binary from this checkout (`go build`, version
+  stamped from `git describe`) and the runner image locally (`docker build
+  -f runner-images/noble/Dockerfile runner-images`, tagged
+  `garm-runner-noble:demo`), and sets
+  `allow_unpinned_runner_image = true` in the generated config (required —
+  a local mutable tag can never be digest-pinned). Use this when testing
+  uncommitted provider or runner-image changes.
+
+### Release mode with a locally built binary
+
+A pre-tag gate often needs the opposite split from `source`: a provider binary
+built from the commit under test, run against the **published** runner image,
+on a host where building images is not acceptable. Set both of these (they are
+only valid together, and not with `--from-source`):
+
+```sh
+export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker   # absolute path, executable
+export LOCAL_PROVIDER_SHA256=<64 lowercase hex characters>           # the sha256 you expect it to have
+scripts/live-gate.sh --version vX.Y.Z preflight
+```
+
+Everything stays release mode except where the binary comes from:
+
+- Preflight copies the file into its private staging directory and hashes the
+  **copy**. A mismatch with `LOCAL_PROVIDER_SHA256` is a hard failure: an
+  unverified binary is never staged or executed. Compute the expected value
+  where you built the binary (`sha256sum garm-provider-docker`) so that it
+  does not come from the file being checked.
+- No release asset or `SHA256SUMS` is downloaded, and the release does not
+  have to be published yet. `--version` (or `PROVIDER_VERSION`) only selects
+  the tag of `ghcr.io/tzuh-hsu/garm-runner-<name>` whose digest is resolved
+  and pinned, so that image must already be published. Digest-pin enforcement
+  stays ON: `allow_unpinned_runner_image` is never set.
+- The binary must be built for the host's OS and architecture (the smoke test
+  runs it once against the generated config). Because it is not a release
+  asset, the Linux-only restriction of release mode does not apply.
+- The script says so wherever it matters: a warning when the binary is staged,
+  a "LOCAL provider binary" line in the preflight summary, a comment in the
+  generated `config.toml`, and `, local binary` in the `description` of the
+  `[[provider]]` snippet. The expected sha256 is remembered in `gate-modes`
+  (the path is not); a later `preflight` without these variables goes back to
+  downloading the release.
+
+A result from this mode proves the **commit and binary you built**, not the
+published release asset; see [Recording a result](#recording-a-result).
+
+Either mode gates the Ubuntu 24.04 runner image by default. `--runner-image
+resolute` (or `RUNNER_IMAGE_NAME=resolute`) gates the Ubuntu 26.04 image
+instead: `runner-images/resolute` in source mode, `garm-runner-resolute` in
+release mode (published from v0.2.3 on). Like the other modes it is remembered
+by preflight for the later steps.
+
+Every combination ends with a generated demo provider `config.toml` (path printed
+by the script) and a verified, runnable provider binary; everything after
+Step 0 (registration, pool, workflow, verification) is identical regardless
+of mode.
+
+## Scale set (default) vs. pool
+
+| | Scale set (default) | Pool (`--pool` / `GARM_TARGET=pool`) |
+|---|---|---|
+| Job delivery | GARM long-polls GitHub's message queue | GitHub webhook → GARM |
+| Inbound connectivity needed | None (outbound HTTPS only) | GitHub must reach GARM's webhook URL |
+| Workflow `runs-on` | the scale set **name** (e.g. `garm-docker-gate-3fa9c1`) | the pool **tags** (e.g. `[docker, garm-demo]`) |
+| Create / list / runners / delete | `garm-cli scaleset add` / `list` / `runner list <id>` / `delete <id>` | `garm-cli pool add` / `list` / `runner list` / `delete <id>` |
+
+Use the default when GARM runs behind a NAT or VM switch (this gate's
+intended setup): a webhook-driven pool can never receive a job there. The
+script generates a unique scale set name (`garm-docker-gate-<6 hex>`),
+remembers it in the config directory so every step agrees, and prints the
+workflow with that exact `runs-on`. Scale set names and labels **cannot be
+changed after creation** (upstream `doc/scale-sets.md`); to change one,
+delete and re-create the scale set. Override with `SCALESET_NAME`.
+
+The `garm-cli scaleset add` flags the script prints were checked against
+upstream GARM v0.2.1 `cmd/garm-cli/cmd/scalesets.go` (`--repo`,
+`--provider-name`, `--name`, `--image`, `--flavor`, `--min-idle-runners`,
+`--max-runners`, `--os-arch`, `--os-type`, `--enabled`, `--extra-specs`;
+`--provider-name`, `--name`, `--image` and `--flavor` are required).
+Scale-set JIT delivery is forced on by GARM, and `GARM_POOL_EXTRASPECS` is
+empty for scale sets — this provider reads `extra_specs` from the stdin
+bootstrap payload, so it works unchanged (`docs/research.md` §1.D).
+
+## The DinD variant
+
+`--dind` (or `GATE_VARIANT=dind`) is an **optional** second variant; the
+default stays `dind_mode = "none"`. It generates, in addition to the
+default config:
+
+```toml
+allowed_dind_modes = ["none", "privileged-sidecar"]
+dind_image = "docker:dind@sha256:<digest resolved at preflight>"
+
+[flavors.dind]
+  runner_memory = "6GiB"
+  dind_memory = "4GiB"
+```
+
+and attaches `--extra-specs '{"flavor":"dind","dind_mode":"privileged-sidecar"}'`
+to the scale set (or pool). Preflight validates exactly that JSON against
+the generated config with the provider's own `ValidatePoolInfo` before
+anything touches Docker. The test workflow runs `docker run --rm
+hello-world` and a `docker build` of a trivial Dockerfile inside the job,
+which proves a non-root job can use the sidecar's daemon, and a step that
+writes a file into `$GITHUB_WORKSPACE` and reads it back through
+`docker run --rm -v "$GITHUB_WORKSPACE":/w alpine:3.20 cat /w/gate-shared.txt`
+(must print `ok`), which proves the sidecar daemon sees the runner's
+workspace (the sidecar mounts the same workspace volume at
+`/actions-runner/_work`). The same step then has a nested container write
+`gate-nested.txt` into the workspace and reads it back from the runner, which
+proves the sidecar's workspace mount is writable end to end. A last step
+starts a nested `busybox` httpd with an ephemeral published port (`-p 80`)
+and fetches it with `curl` at `127.0.0.1` and `localhost` (must print
+`published-ok`), which proves the sidecar shares the runner's network
+namespace (ADR-001, 2026-10-12 amendment), the way testcontainers and
+`docker compose` ports are used. The workflow also has a second job,
+`container-job`, which `needs` the first one (so the gate's single runner is
+free, and `verify` keeps its window on the first job). It runs in
+`container: debian:trixie-slim`, starts with `actions/checkout` and then reads
+the checked-out workflow file back with a `run:` step. This is the acceptance
+test for container jobs (ADR-001, 2026-10-29 amendment): the runner binds
+`/actions-runner/externals` into the job container as `/__e`, the sidecar's
+daemon resolves that source in its own filesystem, and `actions/checkout`, a
+JavaScript action, only starts if the sidecar holds the runner's externals. It
+needs the externals cache, which is on by default. Step 4 then also
+verifies the sidecar topology (`role=dind` labels, `Privileged=true`, no
+bind mounts on either container, `DOCKER_HOST`, labeled socket and
+`dind-state` volumes, the sidecar's mount set (socket, `dind-state`, workspace
+and, with the cache on, the runner's externals volume read-only), and the
+flavor's memory limits).
+
+**Caveat:** `privileged-sidecar` runs a `Privileged=true` daemon on the
+host; a malicious job could pivot to the host (ADR-001 "Residual risk").
+Use a disposable VM. The 6GiB + 4GiB flavor sizes are limits, not
+reservations, but size the VM accordingly.
+
+### Registry mirror check (opt-in)
+
+With `--dind`, setting `GATE_REGISTRY_MIRROR` adds a check of the sidecar's
+registry mirror (`registry_mirrors`, see [`dind-image-pulls.md`](dind-image-pulls.md)).
+Unset, which is the default, none of it runs and the gate is unchanged.
+
+```sh
+# The mirror is a Docker Hub pull-through cache your Docker host and the job
+# networks can reach (a distribution `registry` in proxy mode, per
+# dind-image-pulls.md). The log container is optional but recommended.
+# Use an address that is reachable from INSIDE the sidecar: the host's LAN IP
+# or a DNS name, never one in 172.17.0.0/16 (see the note below).
+export GATE_REGISTRY_MIRROR=http://mirror.lan.example:5000
+export GATE_MIRROR_LOG_CONTAINER=registry-mirror   # the mirror's container name on this host
+scripts/live-gate.sh --dind preflight
+# ... pool, then once the job is running and the runner is idle:
+scripts/live-gate.sh verify
+```
+
+What it changes and checks:
+
+- **Preflight** writes `registry_mirrors = ["<mirror>"]` into the generated
+  config (and `insecure_registries = ["<GATE_INSECURE_REGISTRY>"]` when that is
+  set), and refuses to continue if the provider build does not list
+  `registry_mirrors` in its config schema: a build without the key would load
+  the config, ignore the key, and run the sidecar with no mirror. A release that
+  predates the setting therefore fails here; use a release that includes it or
+  `--from-source`. The mirror and insecure registry are remembered with the
+  other modes (`gate-modes`), so later single steps need not repeat them.
+- **The workflow** gains a step, right after the first one, that fails the job
+  unless `docker info` in the job lists the mirror under Registry Mirrors
+  (dockerd prints it with a trailing `/`), and its final hold lasts 120 s
+  instead of 60 s to leave `verify` room for its extra pull.
+- **`verify`** adds, in the DinD part of check (b):
+  1. the sidecar's `dockerd` argv has `--registry-mirror=<mirror>`, and an
+     `--insecure-registry` flag only when `GATE_INSECURE_REGISTRY` is set. By
+     default the mirror is therefore exercised **without** an insecure entry,
+     which checks the claim that an `http://` mirror needs none (confirmed on
+     Engine 29.9.2). If that fails on your Engine, set
+     `GATE_INSECURE_REGISTRY` to the mirror's `host:port` and report it;
+  2. `docker info` through the runner's `DOCKER_HOST` (the sidecar's daemon)
+     lists the mirror, and the insecure registry when one is set;
+  3. a pull of `GATE_MIRROR_PULL_IMAGE` (default `nginx:alpine-slim`, a small
+     Docker Hub official image the sample workflow never pulls) succeeds and is
+     observed at the mirror. The image is removed first so the pull is real.
+     With `GATE_MIRROR_LOG_CONTAINER` set, the mirror's access log
+     (`docker logs --since <just before the pull>`) must show requests under
+     `/v2/library/<image>/`; this is the authoritative check, and its absence
+     fails the gate. Without it, the mirror's `/v2/_catalog` (read from inside
+     the runner, the same network path dockerd uses) must list the repository
+     after the pull. That needs a distribution-based mirror, and if the
+     repository was already cached it only proves the mirror holds it; `verify`
+     says so, and if the catalog cannot be read it asks for the log container
+     instead.
+
+Run `verify` while the job holds (the same window as the other `verify`
+checks). The mirror must be reachable from the job network; with
+`[network].internal = true` it cannot be (that network has no route out at
+all). The check pulls one small image through the mirror and
+does nothing else to it.
+
+**Choosing the mirror address.** The sidecar shares the runner container's
+network namespace, and its nested `dockerd` creates its own `docker0` bridge
+there with the default range `172.17.0.0/16`. A mirror written as
+`http://172.17.0.1:5000` (the usual address of the *host's* `docker0`) therefore
+resolves to the nested bridge inside the sidecar, the dial gets `connection
+refused`, and `dockerd` silently falls back to Docker Hub. Nothing fails: the
+pull still succeeds, just not through the mirror. Use an address that is
+reachable from inside the sidecar, such as the host's LAN IP or a DNS name, and
+keep it out of `172.17.0.0/16`. The `docker info` step still passes with a
+wrong address (it only lists the configured mirror), so the pull check is the
+one that catches it: with `GATE_MIRROR_LOG_CONTAINER` set, `verify` fails
+because the mirror's access log shows no request for the pulled image. If the
+check fails, confirm the pull succeeded anyway and look at the mirror's access
+log before suspecting the provider. Overriding the nested bridge range (for
+example `--bip` or `default-address-pools` through a custom `dind_image`) is
+outside this gate.
+
+## What this demo proves
+
+| # | Demo verification item | Maps to |
+|---|---|---|
+| (a) | The runner container, the per-job network, and the named workspace volume all carry the expected `garm.docker/*` ownership labels | `ADR-004`'s label schema (`ADR-001`'s per-job topology) |
+| (b) | `docker inspect` shows no `BEARER_TOKEN`/`METADATA_URL`/`CALLBACK_URL`-like env var, no bind mount (hence no host `docker.sock`) and no `Privileged` flag on the runner; in the `none` variant no DinD sidecar exists, in the `--dind` variant the `role=dind` sidecar has the expected labels, `Privileged=true`, no bind mounts, and the flavor's memory limits | `docs/plan.md` §4's headline acceptance criterion; `ADR-001` |
+| (c) | The credential files (plus the `.delivered` marker) actually land in `/run/garm` inside the running container | `ADR-002`'s **exec-tar-into-tmpfs** verification item — proves `docker exec`-streamed delivery works against a real Docker daemon, not just the fake client used in unit tests |
+| (d) | `/actions-runner/.runner` is a working symlink into `/run/garm`, and the runner process is actually running | `ADR-002`'s **actions/runner symlink-compat** verification item — proves the real `.NET` runner accepts a symlinked config file instead of falling back to a writable-layer copy |
+| (e) | After the job completes: the runner container (and DinD sidecar, socket and `dind-state` volumes in the `--dind` variant), its per-job network, and its named workspace volume are all gone; the runner is gone from GitHub; and no other `garm.docker/managed=true` resource is left over | `docs/plan.md` §4's "job end results in the runner being auto-removed... and the runner... [is] gone" criterion, for the variant that was run |
+
 ## What each verification item proves
 
 | Check | Mechanism | Why it can't be fully verified by unit tests alone |
 |---|---|---|
 | (c) exec-tar-into-tmpfs delivery | `docker exec <runner> test -e /run/garm/<file>` for each credential file plus `.delivered` | `internal/docker/fake.go`'s fake client cannot reproduce moby's real tmpfs/mount-namespace semantics that made the original `docker cp` design unbuildable (`ADR-002`'s amendment) — only a real daemon proves the `docker exec`-streamed tar actually lands in a real memory-backed tmpfs |
 | (d) actions/runner symlink-compat | `docker exec <runner> ls -la /actions-runner/.runner` shows `-> /run/garm/runner`, plus `docker top` shows the runner process running | Whether the real, unmodified `.NET` `actions/runner` binary accepts a symlinked `.runner`/`.credentials`/`.credentials_rsaparams` instead of requiring a real file is an external-binary behavior this repo's own tests cannot exercise (`ADR-002`'s open questions) |
+
+## What this demo does not cover
+
+This gate runs with `dind_mode = "none"` by default — the smallest, most
+portable slice, needing no Sysbox or privileged-container support on the
+Docker host — and optionally with `privileged-sidecar` (`--dind`, above).
+It does **not** exercise:
+
+- `sysbox-runc` mode (needs Sysbox installed on the host), and
+  `privileged-sidecar` unless `--dind` is passed. DinD is a deliberate
+  operator opt-in (`allowed_dind_modes` defaults to `["none"]`,
+  fail-closed) with residual-risk tradeoffs documented in `ADR-001`, so the
+  default run does not enable it.
+- The persistent toolcache/pnpm/externals caches (`ADR-003`) beyond
+  confirming their volumes, if present, are correctly excluded from
+  teardown (Step 4(e)) — this gate does not run a second job to confirm a
+  cache is actually *reused* across jobs.
+- `extra_specs` beyond the single `--dind` payload above (the default run
+  carries none) — schema validation and the operator-ceiling/allowlist
+  behavior are covered by this repo's own unit and integration tests
+  (`internal/extraspecs`, `internal/verify`), not by this gate.
 
 ## Troubleshooting
 
