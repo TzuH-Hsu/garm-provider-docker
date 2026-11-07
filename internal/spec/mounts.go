@@ -108,8 +108,8 @@ type RunnerContainerSpec struct {
 
 	// ToolcacheVolumeName/ToolcacheMountPath and PnpmVolumeName/PnpmMountPath are the
 	// repo-keyed caches, each mounted read-write only when both its name and path are set.
-	// They go into the runner only: setup actions and pnpm run there, so the sidecar has
-	// no bind source to resolve, and sharing them would widen their blast radius.
+	// They go into the runner only, since sharing them would widen their blast radius. A
+	// container job therefore gets no toolcache hits (ADR-001, Container jobs).
 	ToolcacheVolumeName string
 	ToolcacheMountPath  string
 	PnpmVolumeName      string

@@ -89,7 +89,7 @@ func (p *Provider) reportRunnerStatus(ctx context.Context, b params.BootstrapIns
 		req.LogLevel = logging.LevelFromEnv().String()
 	}
 	if err := p.spawnStatusWatcher(ctx, req); err != nil {
-		slog.WarnContext(ctx, "CreateInstance: could not start the runner status watcher; the runner stays installing (continuing)",
+		slog.WarnContext(ctx, "CreateInstance: could not start the runner status watcher; the runner stays pending (continuing)",
 			"instance", b.Name, "error", logging.Redact(err.Error(), b.InstanceToken))
 		return
 	}

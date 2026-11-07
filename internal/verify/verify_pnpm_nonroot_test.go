@@ -65,7 +65,7 @@ func buildPnpmWrapperImage(t *testing.T, root, tag string) {
 		"ENTRYPOINT [\"/test-entrypoint.sh\"]\n"
 	writeFile(t, filepath.Join(dir, "Dockerfile"), dockerfile)
 	if out, err := dockerTry("build", "--platform", "linux/amd64", "-t", tag, dir); err != nil {
-		t.Fatalf("build pnpm wrapper image: %v\n%s", out, err)
+		t.Fatalf("build pnpm wrapper image: %v\n%s", err, out)
 	}
 }
 
