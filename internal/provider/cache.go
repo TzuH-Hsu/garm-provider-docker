@@ -137,9 +137,9 @@ func (p *Provider) planCaches(ctx context.Context, bootstrap params.BootstrapIns
 
 	slog.InfoContext(ctx, "CreateInstance: repo-scoped caches resolved",
 		"instance", bootstrap.Name, "repo_key", repoKey, "os_key", osKey,
-		"toolcache_volume", toolName, "toolcache_hit", toolRes.Hit,
-		"pnpm_volume", pnpmName, "pnpm_hit", pnpmRes.Hit,
-		"diag_volume", diagName, "diag_hit", diagRes.Hit)
+		"toolcache_volume", toolRes.Name, "toolcache_hit", toolRes.Hit,
+		"pnpm_volume", pnpmRes.Name, "pnpm_hit", pnpmRes.Hit,
+		"diag_volume", diagRes.Name, "diag_hit", diagRes.Hit)
 	return plan, nil
 }
 

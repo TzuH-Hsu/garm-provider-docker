@@ -87,7 +87,8 @@ Volume names embed the attempt's nonce (`<instance>-<nonce>-workspace`, `-socket
 network keeps the stable name `<instance>-net`, since that is what makes the 409 work. Teardown finds volumes
 by label and removes each by the name it read, and a generation-unique name means a stale teardown can never
 name a newer generation's volume. A pre-flight check rejects an instance name long enough to push a volume
-name past Docker's 255-byte limit, before the first Docker call.
+name past 255 bytes, before the first Docker call. The daemon's name check has no length limit, but a local volume's
+name is a directory name, which Linux filesystems cap at 255 bytes.
 
 ### Teardown order
 

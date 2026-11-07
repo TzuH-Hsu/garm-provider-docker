@@ -598,7 +598,7 @@ func TestCreateInstanceAcceptsArm64(t *testing.T) {
 
 // TestCreateInstanceRejectsPathologicallyLongInstanceName exercises
 // spec.ValidateAllocationNames end to end: an instance name long enough that its
-// nonce-qualified volume names would exceed Docker's 255-byte limit must fail before
+// nonce-qualified volume names would exceed the 255-byte limit must fail before
 // the claim network or anything else is created, with a clear provider error and not an
 // opaque daemon rejection mid-allocation.
 func TestCreateInstanceRejectsPathologicallyLongInstanceName(t *testing.T) {

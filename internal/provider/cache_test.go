@@ -303,6 +303,31 @@ func TestRevalidateTransientInspectErrorDoesNotDeleteWarmCache(t *testing.T) {
 // TestCreateInstanceMountsRepoCaches: a repo-scoped pool gets the toolcache and
 // pnpm store volumes created, mounted at their configured paths, and the cache
 // env set. The cache volumes carry cache=true and NO instance-name.
+// TestCreateInstanceLogsReconciledCacheName pins that the resolved-caches line names
+// the volume the runner mounts, not the slot a foreign volume already holds.
+func TestCreateInstanceLogsReconciledCacheName(t *testing.T) {
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+	p, fake := newCacheProvider(t, false)
+	preferred := spec.ToolcacheVolumeName(spec.RepoKey(cacheRepoURL), testOSKey, "1")
+	if _, err := fake.VolumeCreate(context.Background(), volume.CreateOptions{Name: preferred}); err != nil {
+		t.Fatalf("seed foreign volume: %v", err)
+	}
+	logs := captureLogs(t)
+
+	if _, err := p.CreateInstance(context.Background(), cacheBootstrap("job-1", cacheRepoURL, srv.URL)); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	alternate := spec.AlternateCacheVolumeName(preferred, 1)
+	if m, ok := mountAt(inspectRunner(t, fake, "job-1"), "/opt/hostedtoolcache"); !ok || m.Name != alternate {
+		t.Fatalf("toolcache mount = %+v, want the alternate %q", m, alternate)
+	}
+	if want := "toolcache_volume=" + alternate; !strings.Contains(logs.String(), want) {
+		t.Errorf("resolved-caches line lacks %q, logs:\n%s", want, logs.String())
+	}
+}
+
 func TestCreateInstanceMountsRepoCaches(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()

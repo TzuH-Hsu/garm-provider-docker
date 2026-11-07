@@ -116,7 +116,7 @@ func TestVolumeNamesAreGenerationUnique(t *testing.T) {
 }
 
 // TestValidateDerivedName is the derived-name length/charset hardening guard:
-// a name at or under Docker's 255-byte resource-name limit and matching its
+// a name at or under the 255-byte limit and matching Docker's
 // [a-zA-Z0-9][a-zA-Z0-9_.-]* grammar is accepted; anything else is rejected
 // with a clear, specific error rather than being handed to the daemon to
 // reject opaquely.
@@ -133,8 +133,10 @@ func TestValidateDerivedName(t *testing.T) {
 	}{
 		{name: "normal name ok", kind: "workspace volume", value: "my-instance-0a1b2c3d-workspace", wantErr: false},
 		{name: "exactly at the 255-byte limit", kind: "workspace volume", value: longButValid, wantErr: false},
-		{name: "one byte over the limit", kind: "workspace volume", value: tooLong, wantErr: true, errSub: "exceeds Docker's 255-byte"},
+		{name: "one byte over the limit", kind: "workspace volume", value: tooLong, wantErr: true, errSub: "exceeds the 255-byte limit"},
 		{name: "empty name", kind: "job network", value: "", wantErr: true, errSub: "is empty"},
+		{name: "two characters ok", kind: "runner container", value: "ab", wantErr: false},
+		{name: "single character", kind: "runner container", value: "a", wantErr: true, errSub: "not a valid Docker resource name"},
 		{name: "invalid leading character", kind: "runner container", value: "-leading-dash", wantErr: true, errSub: "not a valid Docker resource name"},
 		{name: "invalid embedded character", kind: "runner container", value: "has/a/slash", wantErr: true, errSub: "not a valid Docker resource name"},
 	}
@@ -160,7 +162,7 @@ func TestValidateDerivedName(t *testing.T) {
 // a pathologically long one — long enough that the generation-nonce-
 // qualified volume names (~44 bytes of fixed overhead: a dash, the
 // 32-hex-char create-nonce, a dash, and the longest suffix "dind-state") push
-// past Docker's 255-byte resource-name limit — fails EARLY with a clear,
+// past the 255-byte limit — fails EARLY with a clear,
 // aggregated provider error rather than succeeding here and failing opaquely
 // at the daemon later, deep inside VolumeCreate.
 func TestValidateAllocationNamesPathologicallyLongInstanceName(t *testing.T) {
@@ -184,7 +186,7 @@ func TestValidateAllocationNamesPathologicallyLongInstanceName(t *testing.T) {
 		if !strings.Contains(err.Error(), "dind-state volume") {
 			t.Errorf("error = %q, want it to name the offending dind-state volume", err.Error())
 		}
-		if !strings.Contains(err.Error(), "exceeds Docker's 255-byte") {
+		if !strings.Contains(err.Error(), "exceeds the 255-byte limit") {
 			t.Errorf("error = %q, want a clear over-the-limit message", err.Error())
 		}
 	})

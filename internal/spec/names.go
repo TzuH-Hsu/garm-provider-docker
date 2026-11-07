@@ -47,12 +47,13 @@ func volumeName(instanceName, nonce, suffix string) string {
 	return RunnerContainerName(instanceName) + "-" + nonce + "-" + suffix
 }
 
-// dockerNameMaxLength is the longest resource name this provider hands to Docker.
+// dockerNameMaxLength is the longest name this provider derives. The daemon's name check
+// has no length limit, but a local volume's name is a directory name, which Linux filesystems cap
+// at 255 bytes.
 const dockerNameMaxLength = 255
 
-// dockerNamePattern is the character grammar the daemon enforces for container and
-// volume names. The daemon also requires a second character, which this does not check.
-var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+// dockerNamePattern is the grammar the daemon enforces for container and volume names.
+var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 
 // ValidateDerivedName returns an error unless name is non-empty, within
 // dockerNameMaxLength and matches dockerNamePattern. kind names the resource in the
@@ -63,7 +64,7 @@ func ValidateDerivedName(kind, name string) error {
 		return fmt.Errorf("derived %s name is empty", kind)
 	}
 	if len(name) > dockerNameMaxLength {
-		return fmt.Errorf("derived %s name %q is %d bytes, which exceeds Docker's %d-byte resource-name limit — the instance name is too long once this provider's generation-nonce/suffix are appended", kind, name, len(name), dockerNameMaxLength)
+		return fmt.Errorf("derived %s name %q is %d bytes, which exceeds the %d-byte limit on names this provider derives, set by the filesystem limit on a local volume's directory name — the instance name is too long once this provider's generation-nonce/suffix are appended", kind, name, len(name), dockerNameMaxLength)
 	}
 	if !dockerNamePattern.MatchString(name) {
 		return fmt.Errorf("derived %s name %q is not a valid Docker resource name (must match %s)", kind, name, dockerNamePattern.String())
