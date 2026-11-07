@@ -20,12 +20,9 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// exitReportTimeout bounds the Docker calls one exited-runner report makes:
-// the runner inspect (DeleteInstance's report only; the sweep already has one),
-// the DinD sidecar inspect and the runner's log read. The sweep runs inside
-// ListInstances and at the start of CreateInstance, and the other report inside
-// DeleteInstance, so a daemon that is slow to answer costs the report, not the
-// call it runs in.
+// exitReportTimeout bounds the Docker calls one exit report makes. The reports run
+// inside ListInstances, CreateInstance and DeleteInstance, so a slow daemon costs the
+// report and not the call.
 const exitReportTimeout = 2 * time.Second
 
 // exitLogTailLines is how many of the runner's last log lines the report asks
@@ -80,16 +77,12 @@ type runnerTail struct {
 	phase     string
 }
 
-// reportExitedRunner logs one line about a runner that exited on its own,
-// before the sweep tears its allocation down and the container, with its exit
-// state and logs, is gone: its exit code, State.FinishedAt, OOMKilled, the
-// exit details of the allocation's DinD sidecar if that has stopped too, the
-// phase it reached, and the last exitLogTailLines lines of its output, screened
-// by logging.SafeLogLines so no credential reaches the log.
-//
-// It is best-effort and log-only, bounded by exitReportTimeout: when the logs
-// cannot be read the line is logged at warn with the reason in place of the
-// tail, and nothing it does changes or fails the sweep.
+// reportExitedRunner logs one line about a runner that exited on its own, before the
+// sweep's teardown removes the container and with it the exit state and logs: its exit
+// details, its DinD sidecar's if that stopped too, the phase it reached, and its log
+// tail, screened so no credential reaches the log. When the logs cannot be read the
+// line is at warn with the reason in place of the tail. It is log-only and bounded by
+// exitReportTimeout.
 func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, containers []types.Container) {
 	ctx, cancel := context.WithTimeout(ctx, exitReportTimeout)
 	defer cancel()
@@ -102,33 +95,28 @@ func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, contai
 	slog.InfoContext(ctx, "orphan sweep: runner exited on its own", attrs...)
 }
 
-// reportStoppedRunners logs, for a DeleteInstance teardown, one line about each
-// runner in list that is not running and that scope lets the teardown remove,
-// since the removal takes its exit state and logs with it. GARM deletes an
-// instance as soon as its job's completed message arrives, well inside the
-// sweep's exited-runner grace, so a runner that crashed mid-job reaches this
-// path and never the sweep's line. The sweep's own teardown does not ask for
-// this report, having logged already; a runner in the "removing" state is
-// skipped because another removal has it, and a sweep or delete behind that
-// removal has logged already. A runner in the "created" state never started, so
-// it has no exit or logs to lose, and the sweep treats it as no runner too.
-//
-// A running runner, the ordinary scale-down, costs no Docker call, and neither
-// does a skipped one. Removal checks that fail are left to the removal loop to
-// report. exitReportTimeout bounds the whole report, the removal check's live
-// read included, however many stopped runners the allocation holds: it is the
-// delay this adds to DeleteInstance.
+// reportStoppedRunners logs, for a DeleteInstance teardown, one line about each stopped
+// runner in list that scope lets the teardown remove, since the removal takes its exit
+// state and logs with it. GARM deletes an instance as soon as its job's completed
+// message arrives, well inside the sweep's exited-runner grace, so a runner that
+// crashed mid-job reaches this path and never the sweep's line.
 func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Container, scope *teardownScope) {
 	if !scope.reportOnDelete {
 		return
 	}
+	// One budget for the whole report, the removal check's live read included: it is
+	// the delay this adds to DeleteInstance.
 	ctx, cancel := context.WithTimeout(ctx, exitReportTimeout)
 	defer cancel()
 
 	for _, c := range list {
+		// Running: an ordinary scale-down, and it costs no Docker call. Removing:
+		// another removal has it and has logged. Created: never started, so no exit or
+		// logs to lose.
 		if c.Labels[spec.LabelRole] != spec.RoleRunner || c.State == "running" || c.State == "removing" || c.State == "created" {
 			continue
 		}
+		// A failed removal check is left to the removal loop to report.
 		if ok, err := scope.mayRemove(ctx, c.Labels); err != nil || !ok {
 			continue
 		}
@@ -136,13 +124,9 @@ func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Contain
 	}
 }
 
-// reportStoppedRunner logs the delete line for the runner c, with the fields of
-// the sweep's line. The list summary has neither the exit details nor the TTY
-// flag the log read needs, so it inspects the runner first. The normal ephemeral
-// end, a completed job and a clean exit, logs at debug; anything else at warn.
-//
-// It is best-effort and log-only, and nothing it does changes or fails the
-// teardown.
+// reportStoppedRunner logs the delete line for the runner c. The list summary has
+// neither the exit details nor the TTY flag the log read needs, so it inspects first. A
+// completed job with a clean exit logs at debug, anything else at warn.
 func (m *Manager) reportStoppedRunner(ctx context.Context, c types.Container, list []types.Container) {
 	info, err := m.cli.ContainerInspect(ctx, c.ID)
 	if errdefs.IsNotFound(err) {
@@ -202,18 +186,9 @@ func (m *Manager) exitReportAttrs(ctx context.Context, r exitedRunner, container
 	return attrs, tail.phase, nil
 }
 
-// classifyRunnerPhase reads how far a runner got from its raw log tail. The
-// latest marker decides. With no marker the runner never listened, unless the
-// tail cannot show that: a full tail may have scrolled past the markers, and a
-// truncated one has lost its newest lines, either of which makes it unknown.
-//
-// The byte cap keeps the oldest lines of the tail, so on a truncated tail a
-// later marker may be gone: there only job_completed, the last marker a job can
-// print, stands, and an earlier one is unknown rather than a phase the runner
-// may have passed.
-//
-// It returns only one of the phase constants. It reads lines the screen would
-// withhold, so nothing of a line may leave it.
+// classifyRunnerPhase reads how far a runner got from its raw log tail: the latest
+// marker decides. It returns only a phase constant, since it reads lines the screen
+// would withhold and nothing of a line may leave it.
 func classifyRunnerPhase(rawLines []string, truncated bool) string {
 	for i := len(rawLines) - 1; i >= 0; i-- {
 		match := runnerProgressLine.FindStringSubmatch(rawLines[i])
@@ -223,6 +198,8 @@ func classifyRunnerPhase(rawLines []string, truncated bool) string {
 		switch {
 		case strings.HasPrefix(match[1], "Job "):
 			return phaseJobCompleted
+		// The byte cap keeps the oldest lines, so a later marker may be gone: only
+		// job_completed, the last marker a job can print, stands.
 		case truncated:
 			return phaseUnknown
 		case strings.HasPrefix(match[1], "Running job"):
@@ -231,6 +208,8 @@ func classifyRunnerPhase(rawLines []string, truncated bool) string {
 			return phaseListeningNoJob
 		}
 	}
+	// No marker: the runner never listened, unless a full tail scrolled past the
+	// markers or a truncated one lost them.
 	if truncated || len(rawLines) >= exitLogTailLines {
 		return phaseUnknown
 	}

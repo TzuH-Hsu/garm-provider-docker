@@ -50,7 +50,7 @@ func evictByRepo(repoKeys ...string) func(map[string]string) (bool, string) {
 }
 
 // failIfVolumeRemoved installs a hook that fails the test if ANY VolumeRemove is
-// issued — the load-bearing NEW-H1 assertion that the log-only eviction path never
+// issued — the load-bearing assertion that the log-only eviction path never
 // removes a cache volume.
 func failIfVolumeRemoved(t *testing.T, fake *docker.FakeClient) {
 	t.Helper()
@@ -202,7 +202,7 @@ func TestListDiagVolumes(t *testing.T) {
 	foreign := spec.CacheVolumeIdentity{ControllerID: "other", RepoKey: "repo-b", RepoURLDigest: spec.RepoURLDigest("https://github.com/x/repo-b")}
 	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-b"), foreign.DiagLabels(gcTime()))
 	// An INCOMPLETE diag volume (no repo-url-digest) for this controller — the
-	// strict enumeration gate (NEW-H2) must exclude it so the destructive prune
+	// strict enumeration gate must exclude it so the destructive prune
 	// never even enumerates it.
 	seedRawCacheVolume(t, fake, spec.DiagVolumeName("repo-incomplete"), map[string]string{
 		spec.LabelManaged:      "true",

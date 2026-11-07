@@ -36,7 +36,7 @@ func countExitLines(out string) int {
 	return strings.Count(out, exitLogMsg)
 }
 
-// TestSweepLogsExitedRunnerBeforeTeardown pins the acceptance line: a runner
+// TestSweepLogsExitedRunnerBeforeTeardown pins the line: a runner
 // that exited on its own and is then swept leaves exactly one line with its
 // instance, pool, exit code, FinishedAt, OOMKilled and the last 20 lines of its
 // output, and the allocation is still torn down.

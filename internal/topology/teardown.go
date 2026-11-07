@@ -15,9 +15,8 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// filtersForNonce selects this controller's managed resources tagged with one
-// CreateInstance attempt's create-nonce (ADR-004 claim-marker nonce), used to
-// clean up a resource an ambiguous create may have leaked.
+// filtersForNonce selects this controller's managed resources carrying one
+// create-nonce.
 func filtersForNonce(controllerID, nonce string) filters.Args {
 	return filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
@@ -26,94 +25,36 @@ func filtersForNonce(controllerID, nonce string) filters.Args {
 	)
 }
 
-// TeardownAllocation removes every managed, job-scoped resource for
-// instanceName in the ADR-004 (network-last) order — runner container, then
-// DinD sidecar (WP3), then job-scoped volumes (workspace, socket, dind-state),
-// then the job network (the claim marker) LAST — for THIS controller. It is
-// GENERATION-scoped (F4): at teardown start it reads the create-nonce the
-// instance's claim-marker network currently holds and removes ONLY resources
-// carrying that nonce, so a concurrent same-name CreateInstance that claims a
-// NEW generation mid-teardown (its resources carry a different nonce) is never
-// destroyed. It is fully idempotent: a NotFound at any step is tolerated. The
-// bool reports whether anything existed to remove, so DeleteInstance can return
-// exit 30 when the whole instance was already gone. Per-resource errors are
-// joined and returned, but the teardown continues past a failure so one stuck
-// resource does not strand the rest.
-//
-// The network is removed LAST (F4, ADR-004 amendment 2026-07-21): it is the
-// allocation's claim marker, so holding it until every volume is gone keeps a
-// concurrent same-name CreateInstance from claiming a new generation (its
-// CreateClaimNetwork 409s on the still-present network) and creating volumes
-// that this still-running teardown would then delete out from under it. The
-// nonce scoping is the second, independent guarantee on top of that ordering:
-// even in the fallback case where the claim network is already gone at teardown
-// start (nothing to key a generation to), removal is scoped so a generation
-// that claims the name mid-teardown is left untouched (see teardownScope).
-//
-// Cache and diagnostic volumes (ADR-003) are never touched: they carry no
-// instance-name label, so the instance-scoped filter structurally excludes
-// them, and spec.MatchesPredicate re-asserts the "NOT cache=true" conjunct
-// defense-in-depth.
+// TeardownAllocation removes instanceName's current generation for this controller:
+// runner, DinD sidecar, job-scoped volumes, then the job network last (ADR-004,
+// Teardown order). If a claim network exists, resources carrying another create-nonce
+// are left alone, so a same-name create that claims a new generation mid-teardown
+// survives. If none exists, everything under the name is a leftover to reap, except what
+// carries the nonce of a claim made since (ADR-004, Teardown scope). NotFound is tolerated at every step, and a failed removal does not
+// stop the rest: errors are joined. found reports whether anything existed to remove,
+// so DeleteInstance can return exit 30 when the instance is already gone. Cache and
+// diagnostic volumes are never matched.
 func (m *Manager) TeardownAllocation(ctx context.Context, instanceName string) (found bool, err error) {
 	return m.teardownGeneration(ctx, m.instanceScopedFilter(instanceName), false)
 }
 
-// TeardownAllocationReportingIO is TeardownAllocation that also logs, for a
-// DinD allocation, one line with the sidecar's cumulative block-device writes
-// and the images its daemon holds, taken just before the sidecar is stopped
-// (ADR-006 rollout step 0), and, for a runner that is not running, one line with
-// its exit details, the phase it reached and its screened log tail
-// (reportStoppedRunners, ADR-004 amendment 2026-11-04). DeleteInstance uses it;
-// the orphan sweep does not, since it runs inside other instances' creates and
-// must not slow them, and logs its own line about an exited runner. The reports
-// are best-effort and bounded by dindIOReportTimeout and exitReportTimeout: they
-// never change what is removed, and a failure in them is logged, not returned.
+// TeardownAllocationReportingIO is TeardownAllocation that first logs, before any
+// container stops, the exit details of a runner that is not running
+// (reportStoppedRunners) and each DinD sidecar's block-device writes and images
+// (ADR-006, phase 0). The reports are best-effort and time-bounded: they never change
+// what is removed, and their failures are logged, not returned. The orphan sweep does
+// not use it, since it runs inside other instances' creates and must not slow them, and
+// it logs its own line about an exited runner.
 func (m *Manager) TeardownAllocationReportingIO(ctx context.Context, instanceName string) (found bool, err error) {
 	return m.teardownGeneration(ctx, m.instanceScopedFilter(instanceName), true)
 }
 
-// TeardownAll removes EVERY managed, job-scoped resource for this controller —
-// runner containers, DinD sidecars (WP3), job-scoped volumes, and job networks —
-// in the ADR-004 (network-last) order (all containers first, then all volumes,
-// then all networks last, so no network is removed while it still has active
-// endpoints). It is the manual-rescue teardown behind RemoveAllInstances
-// (ADR-004): label-scoped to this controller, never a global wipe, and it
-// never touches cache or diagnostic volumes (they carry no instance-name, so
-// the predicate excludes them structurally). Best-effort: per-resource errors
-// are joined and the teardown continues.
-//
-// UNLIKE TeardownAllocation/the orphan sweep, TeardownAll is NOT
-// generation-nonce-scoped: it removes every resource matching the ownership
-// predicate at teardown start, regardless of which generation's create-nonce
-// it carries. This is deliberate (the rescue-path fix, post F4): a
-// generation-scoped rescue could leave an OLDER generation's residue behind
-// forever — e.g. a crashed generation A whose volume removal previously
-// failed, but whose claim network was already gone, coexisting with a live
-// generation B under a new nonce. Scoping removal to "whichever generation
-// each instance's claim network currently names" (as TeardownAllocation does)
-// makes a single rescue pass see and remove only generation B, silently
-// skipping A's leftover volume forever. RemoveAllInstances is a manual,
-// operator-invoked rescue whose whole point is "clean up everything this
-// controller owns" (ADR-004): it is safe to also remove a currently-live
-// generation's resources, and doing so is what actually reclaims A's
-// residue.
-//
-// This is now SAFE to do unconditionally because job-scoped volume names are
-// GENERATION-UNIQUE (F4, ADR-004 amendment 2026-07-21): each generation's
-// volume is discovered by its own managed+controller+instance-name label set
-// and removed by its own unique <instance>-<nonce>-<suffix> name, so a rescue
-// that enumerates and removes every managed volume for the controller can
-// never remove the WRONG generation's volume under another generation's
-// name — there is no shared name to collide on. The only nonce-STABLE
-// resource, the claim network, has no such collision risk here either: a
-// rescue pass legitimately reclaims whatever currently holds the name.
-//
-// The per-instance DeleteInstance/orphan-sweep paths (TeardownAllocation) are
-// UNCHANGED and remain generation-scoped (F4): those run automatically,
-// without an operator watching, so they must never delete a concurrent
-// peer's in-flight generation out from under it. TeardownAll's contract is
-// different by design — an operator invoking the manual rescue command
-// accepts that it removes everything, live or not.
+// TeardownAll removes every job-scoped resource this controller owns, in the same
+// order, for the RemoveAllInstances rescue. Unlike TeardownAllocation it is not scoped
+// to a generation, so it removes live allocations too: a scoped pass skips an older
+// generation's residue while a newer generation holds the claim network (ADR-004,
+// Teardown scope). Cache and diagnostic volumes
+// are never matched. Per-resource errors are joined and the teardown continues.
 func (m *Manager) TeardownAll(ctx context.Context) error {
 	f := spec.MatchPredicateFilters(m.controllerID)
 	scope := &teardownScope{m: m, mode: teardownModeAll}
@@ -121,28 +62,18 @@ func (m *Manager) TeardownAll(ctx context.Context) error {
 	return err
 }
 
-// Rollback is the creation-guard teardown (ADR-004): on any error during
-// CreateInstance after the claim marker exists, it removes only the resources
-// THIS attempt created — those carrying this attempt's create-nonce — in the
-// same container → volume → network order. Keying on the nonce means a
-// concurrent peer's resources (a different nonce) are never touched: the M0
-// NEW-2 property, now applied at claim-marker granularity across all resource
-// kinds.
+// Rollback is CreateInstance's creation guard (ADR-004): it removes only the resources
+// carrying this attempt's nonce, in the same order, so a concurrent peer's are never
+// touched.
 func (m *Manager) Rollback(ctx context.Context, instanceName, nonce string) error {
 	scope := &teardownScope{m: m, mode: teardownModeExact, exact: nonce}
 	_, err := m.runTeardown(ctx, m.instanceScopedNonceFilter(instanceName, nonce), scope)
 	return err
 }
 
-// teardownGeneration removes containers, then volumes, then the network(s)
-// matching f, in the ADR-004 (network-last) order, scoped to each instance's
-// generation nonce (F4). It reads the create-nonce each instance's claim-marker
-// network currently holds ONCE at the start (the authorized generation to
-// remove) and passes it to a teardownScope, so only that generation's resources
-// are removed and a generation that claims the name mid-teardown is protected.
-// It backs TeardownAllocation (DeleteInstance and the orphan sweep) only —
-// TeardownAll (the RemoveAllInstances rescue path) deliberately does NOT go
-// through this generation-scoped helper; see TeardownAll's doc for why.
+// teardownGeneration tears down what f matches, scoped to the generation each
+// instance's claim network holds now. That read happens once, before anything is
+// removed.
 func (m *Manager) teardownGeneration(ctx context.Context, f filters.Args, reportOnDelete bool) (bool, error) {
 	captured, err := m.claimNoncesByInstance(ctx, f)
 	if err != nil {
@@ -152,25 +83,16 @@ func (m *Manager) teardownGeneration(ctx context.Context, f filters.Args, report
 	return m.runTeardown(ctx, f, scope)
 }
 
-// runTeardown removes the containers, then volumes, then the network(s) matching
-// f, in that ADR-004 (network-last) order, gating every removal through scope.
-//
-// Ordering is load-bearing (F4): containers come first so the network has no
-// active endpoints when it is removed (the real daemon — and this repo's fake —
-// reject removing a network with attached containers) AND so a volume is never
-// removed while a container still references it (the real daemon rejects that
-// too); the network — the allocation's claim marker — is removed LAST so a
-// concurrent same-name create cannot claim a new generation and create volumes
-// mid-teardown (ADR-004 amendment 2026-07-21). The generation is re-validated
-// immediately before each destructive op via scope.mayRemove on the labels in
-// hand, so a resource whose ownership/generation changed since the enumerating
-// call is never removed.
+// runTeardown removes what f matches and scope allows, in the order ADR-004 requires
+// (Teardown order). scope re-checks the labels in hand before each removal.
 func (m *Manager) runTeardown(ctx context.Context, f filters.Args, scope *teardownScope) (bool, error) {
 	var (
 		found bool
 		errs  []error
 	)
 
+	// Containers first: the daemon rejects removing a network with active endpoints or
+	// a volume a container references.
 	cFound, cErr := m.removeContainers(ctx, f, scope)
 	found = found || cFound
 	if cErr != nil {
@@ -183,7 +105,8 @@ func (m *Manager) runTeardown(ctx context.Context, f filters.Args, scope *teardo
 		errs = append(errs, vErr)
 	}
 
-	// Network LAST (F4): the claim marker is held until every volume is gone.
+	// Network last: it is the claim marker, and while it exists a same-name create
+	// cannot claim a new generation and create volumes this teardown would delete.
 	nFound, nErr := m.removeNetworks(ctx, f, scope)
 	found = found || nFound
 	if nErr != nil {
@@ -193,17 +116,15 @@ func (m *Manager) runTeardown(ctx context.Context, f filters.Args, scope *teardo
 	return found, errors.Join(errs...)
 }
 
-// removeContainers stops then force-removes every managed container matching f,
-// runner before DinD sidecar (ADR-004 ordering). Force-remove reaps a
-// container's ANONYMOUS volumes; the named workspace/socket/dind-state volumes
-// survive and are removed by removeVolumes. NotFound is tolerated.
+// removeContainers stops then force-removes the containers f matches. Removal reaps a
+// container's anonymous volumes; named ones are left for removeVolumes.
 func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *teardownScope) (bool, error) {
 	list, err := m.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return false, fmt.Errorf("failed to list containers for teardown: %w", err)
 	}
 
-	// Runner before DinD (ADR-004): stop/remove order is runner, then sidecar.
+	// Runner before sidecar (ADR-004, Teardown order).
 	sort.SliceStable(list, func(i, j int) bool {
 		return roleRank(list[i].Labels) < roleRank(list[j].Labels)
 	})
@@ -212,8 +133,8 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 		found bool
 		errs  []error
 	)
-	// Log what a stopped runner left behind (exitreport.go) and every DinD
-	// sidecar's IO (dindio.go) before any container stops.
+	// These read exit state, logs and cgroup counters that stopping or removing takes
+	// away, so they run before any container stops.
 	m.reportStoppedRunners(ctx, list, scope)
 	m.newDindIOReporter(ctx, list, scope).reportAll(ctx, list, scope)
 	for _, c := range list {
@@ -226,8 +147,8 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 			continue
 		}
 		found = true
-		// Best-effort graceful stop first (ADR-004 ordering); the forced
-		// remove below reaps a still-running container regardless.
+		// Best-effort graceful stop; the forced remove reaps a still-running container
+		// regardless.
 		_ = m.cli.ContainerStop(ctx, c.ID, container.StopOptions{})
 		if err := m.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("failed to remove container %s: %w", c.ID, err))
@@ -236,12 +157,6 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 	return found, errors.Join(errs...)
 }
 
-// removeNetworks removes every managed job network matching f. It runs LAST
-// (F4, after removeContainers and removeVolumes): the network's endpoints are
-// already detached (the real daemon — and this repo's fake — reject removing a
-// network with active endpoints), and holding the claim-marker network until
-// the volumes are gone keeps a concurrent same-name create from claiming a new
-// generation mid-teardown (ADR-004 amendment). NotFound is tolerated.
 func (m *Manager) removeNetworks(ctx context.Context, f filters.Args, scope *teardownScope) (bool, error) {
 	list, err := m.cli.NetworkList(ctx, network.ListOptions{Filters: f})
 	if err != nil {
@@ -268,10 +183,6 @@ func (m *Manager) removeNetworks(ctx context.Context, f filters.Args, scope *tea
 	return found, errors.Join(errs...)
 }
 
-// removeVolumes removes every managed job-scoped volume matching f (workspace,
-// and WP3's socket/dind-state). force=true also removes a volume still
-// referenced by a stopped container — teardown removes containers first, so
-// this is defense-in-depth. NotFound is tolerated.
 func (m *Manager) removeVolumes(ctx context.Context, f filters.Args, scope *teardownScope) (bool, error) {
 	list, err := m.cli.VolumeList(ctx, volume.ListOptions{Filters: f})
 	if err != nil {
@@ -301,61 +212,42 @@ func (m *Manager) removeVolumes(ctx context.Context, f filters.Args, scope *tear
 	return found, errors.Join(errs...)
 }
 
-// teardownMode selects a teardownScope's nonce-gating policy.
+// teardownMode selects a teardownScope's nonce gating.
 type teardownMode int
 
 const (
-	// teardownModeExact removes only resources carrying an EXACT create-nonce —
-	// the creation-guard rollback path (THIS attempt's resources only).
+	// teardownModeExact removes only resources carrying one create-nonce (Rollback).
 	teardownModeExact teardownMode = iota
-	// teardownModeGeneration removes each instance's CURRENT generation only:
-	// the create-nonce its claim-marker network held at teardown start (F4).
-	// Used by TeardownAllocation (DeleteInstance/orphan sweep).
+	// teardownModeGeneration removes each instance's generation as of teardown start or,
+	// if it had no claim network then, its leftovers (TeardownAllocation).
 	teardownModeGeneration
-	// teardownModeAll removes every resource satisfying the ownership predicate
-	// regardless of its create-nonce — no generation gating at all. Used ONLY
-	// by TeardownAll (the RemoveAllInstances manual rescue path): see
-	// TeardownAll's doc for why dropping generation-scoping there is both safe
-	// (F4's generation-unique volume names) and necessary (an older, residual
-	// generation must not be left behind forever by a rescue that only ever
-	// sees each instance's CURRENT generation).
+	// teardownModeAll ignores the create-nonce (TeardownAll).
 	teardownModeAll
 )
 
-// teardownScope is the single gate every teardown removal passes through. It
-// re-asserts the full ADR-004 ownership predicate (managed + controller + has
-// instance-name + NOT cache=true) and layers the F4 generation-nonce guard on
-// top, so a resource that slipped through a coarse Docker-side filter is never
-// removed unless it genuinely belongs to this controller AND to the generation
-// this teardown is authorized to remove.
-//
-// The captured map is fixed ONCE at teardown start, so a generation that claims
-// an instance name AFTER the teardown began (a new claim network with a
-// different nonce) is never removed by this teardown of the prior generation.
+// teardownScope is the gate every teardown removal passes through. Checking the labels
+// in hand means a resource that slipped a coarse Docker filter, or whose generation
+// changed since the list, is not removed.
 type teardownScope struct {
 	m    *Manager
 	mode teardownMode
 
-	// exact is the required create-nonce in teardownModeExact (Rollback).
+	// exact is the required create-nonce in teardownModeExact.
 	exact string
 
-	// captured maps instance-name -> the create-nonce that instance's
-	// claim-marker network held at teardown START (teardownModeGeneration). A
-	// resource is removable only when its instance's captured nonce equals the
-	// resource's create-nonce.
+	// captured maps instance name to the create-nonce its claim network held at
+	// teardown start, in teardownModeGeneration. It is fixed then, so a later claim
+	// under a new nonce is never authorized for removal.
 	captured map[string]string
 
-	// reportOnDelete asks removeContainers to log a stopped runner's exit
-	// (exitreport.go) and each DinD sidecar's IO (dindio.go) before it stops any
-	// container. Set only by TeardownAllocationReportingIO.
+	// reportOnDelete asks removeContainers to log stopped runners' exits and DinD
+	// sidecars' IO first. Only TeardownAllocationReportingIO sets it.
 	reportOnDelete bool
 }
 
-// mayRemove reports whether a teardown may remove a resource with these labels,
-// applying the ADR-004 ownership predicate plus (in generation mode) the F4
-// generation-nonce guard. It takes ctx because the generation-mode fallback
-// re-reads the live claim nonce fresh, so the read that gates a removal is as
-// current as possible.
+// mayRemove reports whether a teardown may remove a resource with these labels: the
+// ADR-004 ownership predicate, then the mode's nonce check. Generation mode may read
+// the live claim nonce, which is where an error comes from.
 func (s *teardownScope) mayRemove(ctx context.Context, labels map[string]string) (bool, error) {
 	if !spec.MatchesPredicate(labels, s.m.controllerID) {
 		return false, nil
@@ -366,27 +258,20 @@ func (s *teardownScope) mayRemove(ctx context.Context, labels map[string]string)
 	case teardownModeExact:
 		return nonce == s.exact, nil
 	case teardownModeAll:
-		// The RESCUE path (TeardownAll): no generation gating at all — the
-		// ownership predicate above is the only gate. See TeardownAll's doc.
+		// The ownership predicate is the only gate.
 		return true, nil
 	}
 
 	// teardownModeGeneration.
 	inst := labels[spec.LabelInstanceName]
 	if gen, ok := s.captured[inst]; ok {
-		// A generation was claimed at teardown start: remove only its resources.
-		// This also removes the claim network itself (it carries gen), completing
-		// the teardown; a mid-teardown gen-B (different nonce) is left untouched.
+		// Remove only the captured generation, claim network included. A generation
+		// that claimed the name mid-teardown has another nonce.
 		return nonce == gen, nil
 	}
-	// Fallback: no claim network for this instance at start, so there is no live
-	// generation to key to and the resource is a leftover to reap — UNLESS a
-	// claim network has since appeared (a generation that claimed the name
-	// mid-teardown). Re-read the live claim nonce FRESH here, immediately before
-	// the removal decision (not once per phase), so a generation that claims the
-	// name between the phase's list and this decision is still protected: with
-	// its nonce matching the live claim marker, its resources are kept, so a late
-	// teardown can never delete a newer generation's resources.
+	// No claim network at start: no generation to key to, so this is a leftover to
+	// reap, unless a generation has since claimed the name. Read per decision, not per
+	// phase, so a claim made after this phase's list is still protected.
 	liveNonce, live, err := s.m.liveClaimNonce(ctx, inst)
 	if err != nil {
 		return false, err
@@ -397,12 +282,9 @@ func (s *teardownScope) mayRemove(ctx context.Context, labels map[string]string)
 	return true, nil
 }
 
-// claimNoncesByInstance maps each instance-name to the create-nonce its
-// claim-marker network currently holds, across the resources matching f. It is
-// the generation-nonce source captured at teardown start (F4) to fix the
-// authorized generation each instance's removal is scoped to. A network without
-// a create-nonce maps the instance to the empty string (still recorded, so the
-// fallback is not entered for it).
+// claimNoncesByInstance maps each instance name in f to the create-nonce its claim
+// network holds. A network without one maps to "", which still keeps the instance out
+// of mayRemove's fallback.
 func (m *Manager) claimNoncesByInstance(ctx context.Context, f filters.Args) (map[string]string, error) {
 	list, err := m.cli.NetworkList(ctx, network.ListOptions{Filters: f})
 	if err != nil {
@@ -423,12 +305,8 @@ func (m *Manager) claimNoncesByInstance(ctx context.Context, f filters.Args) (ma
 	return out, nil
 }
 
-// liveClaimNonce reads the create-nonce the claim-marker network for a SINGLE
-// instance currently holds, fresh. It is the generation-mode fallback's
-// protection source (mayRemove): a leftover whose instance has no claim network
-// at teardown start is reaped, but if a claim network has since reappeared its
-// nonce identifies a newer generation whose resources must be kept. The bool
-// reports whether a live claim network exists for the instance.
+// liveClaimNonce reads the create-nonce instanceName's claim network holds now. The
+// bool reports whether one exists.
 func (m *Manager) liveClaimNonce(ctx context.Context, instanceName string) (string, bool, error) {
 	f := m.instanceScopedFilter(instanceName)
 	f.Add("label", spec.LabelResource+"="+spec.ResourceJobNetwork)
@@ -444,8 +322,7 @@ func (m *Manager) liveClaimNonce(ctx context.Context, instanceName string) (stri
 	return "", false, nil
 }
 
-// roleRank orders containers for teardown: runner (0) before DinD sidecar (1)
-// before anything else (2), per ADR-004's "(1) runner, (2) DinD sidecar".
+// roleRank orders containers for teardown: runner, DinD sidecar, anything else.
 func roleRank(labels map[string]string) int {
 	switch labels[spec.LabelRole] {
 	case spec.RoleRunner:

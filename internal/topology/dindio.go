@@ -12,21 +12,14 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// dindIOReportTimeout bounds one sidecar's DinD IO report as a whole: the
-// sidecar inspect, the io.stat exec, the stats sample (only when io.stat is not
-// readable) and the image probe share it. The report is a measurement aid
-// (ADR-006 rollout step 0), so when a stalled disk makes the daemon slow it
-// gives up rather than hold up the teardown. Each report has its own budget,
-// counted from when it starts, so the runner lookup before it and an earlier
-// sidecar's report do not eat into it.
+// dindIOReportTimeout bounds one sidecar's IO report as a whole. The report is a
+// measurement aid (ADR-006, phase 0), so on a stalled disk it gives up rather than hold
+// up the teardown. Each report's budget counts from when it starts.
 const dindIOReportTimeout = 4 * time.Second
 
-// dindIOStepTimeout bounds each step that yields the written bytes, the
-// io.stat exec and the stats sample, within the report's budget. The written
-// bytes are taken first and on their own budget so a slow image probe, which
-// talks to the sidecar's daemon and can stall with the disk, can never cost
-// them, and the stats fallback never starts on a budget already spent. The
-// image probe gets whatever the report's budget has left.
+// dindIOStepTimeout bounds the io.stat exec and the stats sample each. The written
+// bytes come first on their own budget so a slow image probe, which talks to the
+// sidecar's daemon, cannot cost them.
 const dindIOStepTimeout = time.Second
 
 // dindIORepoTimeout bounds the lookup of the runner's repository, a single
@@ -70,9 +63,10 @@ func hasRole(list []types.Container, role string) bool {
 	return false
 }
 
-// runnerRepo reads the repository the allocation's runner registers against
-// from its environment, or "" if it cannot (the runner is gone, the inspect
-// fails, the pool is not repository scoped).
+// runnerRepo names the GitHub entity the allocation's runner registers against, from
+// its environment, or "" if it cannot: the runner is gone, the inspect fails, or the
+// runner uses JIT, where the provider sets none of RUNNER_ORG, RUNNER_REPO and
+// RUNNER_ENTERPRISE.
 func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container) string {
 	for _, c := range list {
 		if c.Labels[spec.LabelRole] != spec.RoleRunner {
@@ -89,13 +83,10 @@ func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container)
 	return ""
 }
 
-// reportAll logs the IO line for every DinD sidecar in list that scope lets
-// the teardown remove. It is a no-op on a nil reporter. removeContainers calls
-// it before it stops or removes any container of the allocation, not just
-// before the sidecar. The io.stat read does not depend on the runner, but the
-// stats fallback does when the sidecar shares the runner's network namespace
-// (see writtenAttrs), so the runner is left as it is until every report is
-// done. A removal check that fails is left to the removal loop to report.
+// reportAll logs the IO line for every DinD sidecar in list that scope lets the
+// teardown remove. It is a no-op on a nil reporter. It must run before any container
+// stops: the stats fallback depends on the runner when the sidecar shares its network
+// namespace. A failed removal check is left to the removal loop to report.
 func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, scope *teardownScope) {
 	if r == nil {
 		return
@@ -111,13 +102,9 @@ func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, 
 	}
 }
 
-// report logs the IO line for the DinD sidecar c. The written bytes are taken
-// first, from the sidecar's cgroup io.stat in a short exec of their own, or
-// from a stats sample when io.stat is not readable. Only then does a second
-// exec ask the sidecar's daemon what images it holds, with what is left of the
-// budget, so a stalled image probe costs only the image fields. Those are
-// logged whether or not the written bytes are known, so a WARN line still
-// records what the sidecar's daemon holds.
+// report logs the IO line for the DinD sidecar c. The image probe runs last, on what is
+// left of the budget, so a stalled probe costs only the image fields. Those are logged
+// even when the written bytes are unknown.
 func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
@@ -159,19 +146,13 @@ func (r *dindIOReporter) identity(ctx context.Context, c types.Container) ([]any
 	return attrs, nil
 }
 
-// writtenAttrs returns the log attributes for the bytes the sidecar wrote, and
-// whether they could be read at all.
-//
-// The primary source is the sidecar's cgroup io.stat. The stats endpoint cannot
-// serve a privileged sidecar at teardown: the sidecar joins the runner's
-// network namespace, the daemon adds network stats to a sample through that
-// namespace's owner, and an ephemeral runner has usually exited on its own
-// when its job ended, before the delete arrives. With the owner stopped the
-// stats request fails; with it removed the sample comes back without counters.
-// The stats sample stays the fallback for when io.stat is not readable (a
-// cgroup v1 host, a runtime that virtualises cgroupfs), where the sidecar
-// normally owns its network namespace.
+// writtenAttrs returns the log attributes for the bytes the sidecar wrote, and whether
+// they could be read.
 func (r *dindIOReporter) writtenAttrs(ctx context.Context, id string) ([]any, bool) {
+	// io.stat comes first because the stats endpoint cannot serve a privileged sidecar
+	// at teardown: the sidecar joins the runner's network namespace, the daemon adds
+	// network stats through that namespace's owner, and an ephemeral runner has usually
+	// exited before the delete arrives.
 	st, ioErr := r.readIOStat(ctx, id)
 	if ioErr == nil {
 		attrs := []any{"written_bytes", st.Written, "written_source", "io.stat"}
@@ -180,6 +161,8 @@ func (r *dindIOReporter) writtenAttrs(ctx context.Context, id string) ([]any, bo
 		}
 		return attrs, true
 	}
+	// The fallback for when io.stat is not readable (a cgroup v1 host, a runtime that
+	// virtualises cgroupfs), where the sidecar normally owns its network namespace.
 	written, statsErr := r.statsWrittenBytes(ctx, id)
 	if statsErr != nil {
 		return []any{"io_stat_error", ioErr.Error(), "stats_error", statsErr.Error()}, false

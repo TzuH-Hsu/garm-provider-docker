@@ -93,7 +93,7 @@ func seedRunnerFor(t *testing.T, fake *docker.FakeClient, controllerID, name str
 		t.Fatalf("seed ContainerCreate for %q returned unexpected error: %v", name, err)
 	}
 	fake.SetState(resp.ID, state, false)
-	// The exited-runner sweep grace (F8) is measured from State.FinishedAt, so a
+	// The exited-runner sweep grace is measured from State.FinishedAt, so a
 	// stopped seed runner models finishing when the allocation was created — old
 	// created-at ⇒ old FinishedAt ⇒ past grace, now ⇒ within grace.
 	if state == "exited" || state == "dead" {
@@ -118,9 +118,8 @@ func seedAllocationForController(t *testing.T, fake *docker.FakeClient, controll
 	seedRunnerFor(t, fake, controllerID, name, createdAt, nonce, runnerState)
 }
 
-// seedDindSidecarFor seeds a DinD sidecar container (role=dind) for name,
-// attached to the job network — used to exercise the runner-before-DinD
-// teardown ordering (ADR-004), even though WP2 itself never creates one.
+// seedDindSidecarFor seeds a DinD sidecar container (role=dind) for name, attached to
+// the job network, to exercise the runner-before-DinD teardown ordering (ADR-004).
 func seedDindSidecarFor(t *testing.T, fake *docker.FakeClient, controllerID, name string, createdAt time.Time, nonce string) string {
 	t.Helper()
 	id := spec.AllocationIdentity{ControllerID: controllerID, PoolID: "pool-1", InstanceName: name}
@@ -325,7 +324,7 @@ func TestCreateWorkspaceVolumeFresh(t *testing.T) {
 	if err := m.CreateWorkspaceVolume(context.Background(), identityFor("job-1"), "nonce-1"); err != nil {
 		t.Fatalf("CreateWorkspaceVolume returned unexpected error: %v", err)
 	}
-	// The volume name is generation-unique (F4): <instance>-<nonce>-workspace.
+	// The volume name is generation-unique: <instance>-<nonce>-workspace.
 	v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "nonce-1"))
 	if v.Labels[spec.LabelResource] != spec.ResourceWorkspace ||
 		v.Labels[spec.LabelInstanceName] != "job-1" ||
@@ -334,14 +333,11 @@ func TestCreateWorkspaceVolumeFresh(t *testing.T) {
 	}
 }
 
-// TestCreateWorkspaceVolumePriorGenerationNameDiffers is the F4 create-level
-// structural guard: a stale workspace volume left by a crashed PRIOR generation
-// of the same instance name carries that generation's nonce, so its name
-// (<instance>-<staleNonce>-workspace) DIFFERS from the fresh generation's name
-// (<instance>-<freshNonce>-workspace). The fresh create therefore never
-// idempotent-hits it and never reuses its content — the two volumes are
-// distinct by construction. (The stale one is reaped by the pre-create sweep /
-// teardown, not by create.)
+// TestCreateWorkspaceVolumePriorGenerationNameDiffers pins the structural guard: a
+// stale workspace volume left by a crashed prior generation of the same instance name
+// carries that generation's nonce, so its name differs from the fresh generation's. The
+// fresh create never idempotent-hits it and never reuses its content. The stale one is
+// reaped by the pre-create sweep or teardown, not by create.
 func TestCreateWorkspaceVolumePriorGenerationNameDiffers(t *testing.T) {
 	m, fake := newManager(t)
 	// A stale prior-generation workspace volume with residue, at ITS OWN
@@ -376,14 +372,12 @@ func TestCreateWorkspaceVolumePriorGenerationNameDiffers(t *testing.T) {
 }
 
 // TestCreateWorkspaceVolumeReplacesStaleContent exercises createFreshVolume's
-// ownership-validated replace path — now defense-in-depth behind the F4
-// generation-unique names. Since a fresh generation's name embeds its own
-// nonce, the ONLY way VolumeCreate can still idempotent-hit an existing volume
-// is at THIS generation's own name (e.g. a retried create step within one
-// attempt). We model that adversarial case: a volume already sitting at the
-// generation-unique name but carrying a DIFFERENT (stale) nonce label and
-// residue. createFreshVolume must detect the nonce mismatch, confirm the
-// ownership tuple, and replace it with a fresh, empty volume.
+// ownership-validated replace path. A fresh generation's name embeds its own nonce, so
+// VolumeCreate can only idempotent-hit a volume at this generation's own name (a
+// retried create step within one attempt, for example). This models that case: a volume
+// at the generation-unique name carrying a different nonce label and residue.
+// createFreshVolume must detect the mismatch, confirm the ownership tuple, and replace
+// it with a fresh, empty volume.
 func TestCreateWorkspaceVolumeReplacesStaleContent(t *testing.T) {
 	m, fake := newManager(t)
 	// A stale-labeled volume occupying THIS generation's own name (nonce
@@ -423,11 +417,10 @@ func TestCreateWorkspaceVolumeCreateErrorSurfaces(t *testing.T) {
 	}
 }
 
-// TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume is the F3 red-line
-// guard: a volume occupying the deterministic workspace name that does NOT
-// carry this controller's full ownership tuple (here, a completely foreign
-// volume) must NEVER be force-removed. The idempotent VolumeCreate returns it,
-// but createFreshVolume must fail closed rather than destroy someone else's
+// TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume pins that a volume occupying
+// the workspace name that does not carry this controller's full ownership tuple (here,
+// a completely foreign volume) is never force-removed. The idempotent VolumeCreate
+// returns it, but createFreshVolume must fail closed rather than destroy someone else's
 // data.
 func TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume(t *testing.T) {
 	m, fake := newManager(t)
@@ -453,7 +446,7 @@ func TestCreateWorkspaceVolumeRefusesToReplaceForeignVolume(t *testing.T) {
 	}
 }
 
-// TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume proves the F3
+// TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume proves the
 // ownership tuple is checked in FULL: a managed volume with the right resource
 // and instance-name but a DIFFERENT controller-id is not ours, so it must not
 // be replaced.
@@ -481,7 +474,7 @@ func TestCreateWorkspaceVolumeRefusesToReplaceOtherControllerVolume(t *testing.T
 	}
 }
 
-// --- CreateSocketVolume / CreateDindStateVolume (WP3 DinD) --------------------
+// --- CreateSocketVolume / CreateDindStateVolume (DinD) ------------------------
 
 func TestCreateSocketVolumeFresh(t *testing.T) {
 	m, fake := newManager(t)
@@ -550,7 +543,7 @@ func TestCreateDindStateVolumeCreateErrorSurfaces(t *testing.T) {
 	}
 }
 
-// TestTeardownAllocationRemovesFullDindTopology seeds every WP3 resource kind
+// TestTeardownAllocationRemovesFullDindTopology seeds every DinD resource kind
 // (runner + DinD sidecar + job network + workspace/socket/dind-state volumes)
 // and asserts teardown removes ALL of them in the ADR-004 order — both
 // containers before the network (the fake's active-endpoint check enforces
@@ -638,11 +631,9 @@ func TestTeardownAllocationLeavesForeignCacheAndOtherController(t *testing.T) {
 	findVolume(t, fake, "toolcache-generation-1") // must still exist
 }
 
-// TestTeardownRemovesNetworkLast is the F4 ordering guard: teardown removes all
-// containers first, then all volumes, then the job network (the claim marker)
-// LAST — so the network is held until every volume is gone and a concurrent
-// same-name create cannot claim a new generation mid-teardown (ADR-004
-// amendment 2026-07-21).
+// TestTeardownRemovesNetworkLast pins the order: all containers, then all volumes, then
+// the job network (the claim marker) last, so a concurrent same-name create cannot
+// claim a new generation mid-teardown (ADR-004, Teardown order).
 func TestTeardownRemovesNetworkLast(t *testing.T) {
 	m, fake := newManager(t)
 	now := time.Now()
@@ -676,28 +667,22 @@ func TestTeardownRemovesNetworkLast(t *testing.T) {
 			seenNetwork = true
 		}
 	}
-	// The network must be the very last removal (F4).
+	// The network must be the very last removal.
 	if n := len(fake.RemoveOrder); n == 0 || !strings.HasPrefix(fake.RemoveOrder[n-1], "network:") {
 		t.Errorf("last removal = %q, want the network last: order=%v", fake.RemoveOrder, fake.RemoveOrder)
 	}
 }
 
-// TestTeardownAllocationGenerationScopedProtectsConcurrentCreate reproduces the
-// F4 T1/T2/gen-B interleave: a teardown of generation A captures A's nonce, then
-// — in the window between that capture and its per-kind volume removal — a peer
-// teardown finishes removing A and a concurrent CreateInstance claims generation
-// B, creating B's fresh CLAIM NETWORK under the SAME stable name (the network is
-// the dedup primitive, so its name never changes) and B's workspace volume under
-// a generation-UNIQUE name embedding B's nonce. Before the fix, the still-running
-// teardown enumerated volumes purely by instance-name and deleted B's brand-new
-// volume. This test exercises the generation-nonce GATE (now defense-in-depth
-// behind the unique names) — it still protects the stable-named claim network,
-// and it also protects B's volume even though the VolumeListHook makes B's volume
-// appear in the teardown's own list snapshot.
+// TestTeardownAllocationGenerationScopedProtectsConcurrentCreate drives this
+// interleave: a teardown of generation A captures A's nonce, then, between that capture
+// and its volume removal, a peer teardown finishes removing A and a concurrent
+// CreateInstance claims generation B. B has a new claim network under the same stable
+// name and a workspace volume under a name embedding B's nonce. The test exercises the
+// generation-nonce gate, which protects the stable-named claim network and also B's
+// volume, since the hook makes B's volume appear in the teardown's own list.
 //
-// The interleave is driven deterministically via the fake's VolumeListHook,
-// which fires exactly when the teardown lists volumes for removal (T2's
-// per-kind volume list) — the precise instant the original bug struck.
+// The fake's VolumeListHook drives the interleave deterministically: it fires when the
+// teardown lists volumes for removal.
 func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T) {
 	m, fake := newManager(t)
 	now := time.Now()
@@ -710,7 +695,7 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 	fake.VolumeListHook = func() {
 		once.Do(func() {
 			ctx := context.Background()
-			// T1 finishes tearing down generation A (its runner is already gone —
+			// A peer teardown finishes removing generation A (its runner is already gone —
 			// removeContainers ran before this volume list — so its volume and
 			// claim network can be removed). Gen-A's volume name embeds gen-a.
 			if err := fake.VolumeRemove(ctx, spec.WorkspaceVolumeName("job-1", "gen-a"), true); err != nil {
@@ -762,7 +747,7 @@ func TestTeardownAllocationGenerationScopedProtectsConcurrentCreate(t *testing.T
 	}
 }
 
-// TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone is the F4
+// TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone is the
 // fallback guard: when the claim network is already GONE at teardown start
 // (nothing to key a generation to), removal falls back to instance-scoped — but
 // if a generation then claims the name mid-teardown (a live claim network with a
@@ -793,7 +778,7 @@ func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testin
 	}
 
 	// Generation B's volume and network survive: the fallback protected the nonce
-	// the live claim network holds (refreshLive re-read it before removing).
+	// the live claim network holds (mayRemove re-read it before removing).
 	if v := findVolume(t, fake, spec.WorkspaceVolumeName("job-1", "gen-b")); v.Labels[spec.LabelCreateNonce] != "gen-b" {
 		t.Errorf("[F4] surviving volume nonce = %q, want gen-b — the fallback deleted a newer generation's volume", v.Labels[spec.LabelCreateNonce])
 	}
@@ -802,21 +787,16 @@ func TestTeardownAllocationFallbackProtectsLiveGenerationWhenClaimGone(t *testin
 	}
 }
 
-// TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave is the
-// F4 STRUCTURAL guard the older VolumeListHook tests did not exercise (the
-// interleave codex flagged): generation B's volume appears AFTER the teardown's
-// volume-list snapshot but strictly BEFORE the teardown physically removes the
-// (generation A) volume it read from that snapshot. Because volume names are now
-// generation-UNIQUE (F4), B's volume has a DIFFERENT name than anything in the
-// teardown's snapshot, so the teardown — which removes only the exact names it
-// enumerated — can NEVER name-collide with B's fresh volume. This is the TOCTOU
-// removed by construction: the name protection here is independent of the
-// generation-nonce gate (B's volume is never even enumerated by this teardown,
-// so mayRemove is never consulted for it).
+// TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave pins the
+// structural guard on its own: generation B's volume appears after the teardown's
+// volume list but before the teardown removes the generation A volume it read from that
+// list. B's volume has a different name than anything in the list, and the teardown
+// removes only the exact names it listed, so it cannot name B's volume. This is
+// independent of the generation-nonce gate: B's volume is never listed by this
+// teardown, so mayRemove is never consulted for it.
 //
-// The boundary is driven deterministically by the fake's VolumeRemoveHook, which
-// fires immediately before each VolumeRemove — i.e. after the list snapshot,
-// exactly where the old name-based bug struck.
+// The fake's VolumeRemoveHook fires immediately before each VolumeRemove, after the
+// list.
 func TestTeardownGenerationUniqueVolumeNamesSurviveRemoveBoundaryInterleave(t *testing.T) {
 	m, fake := newManager(t)
 	now := time.Now()
@@ -881,7 +861,7 @@ func volumesSnapshot(t *testing.T, fake *docker.FakeClient) []*volume.Volume {
 	return out.Volumes
 }
 
-// TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined is the F7 guard: when the
+// TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined pins that when the
 // ambiguous-create cleanup (removing a leaked, nonce-tagged network) itself
 // fails, that failure is joined onto — not swallowed by — the returned error,
 // and the original create error is preserved for diagnostics.
@@ -908,7 +888,7 @@ func TestCreateClaimNetworkAmbiguousCleanupErrorIsJoined(t *testing.T) {
 
 func TestTeardownAllocationRemovesRunnerBeforeDind(t *testing.T) {
 	m, fake := newManager(t)
-	// A runner AND a DinD sidecar (WP3 shape) for the same instance, both
+	// A runner AND a DinD sidecar for the same instance, both
 	// attached to the job network. Teardown must remove both containers (runner
 	// first) before the network, or the fake's active-endpoint check trips.
 	seedAllocation(t, fake, "job-1", time.Now(), "n1", "running")
@@ -1001,21 +981,14 @@ func TestTeardownAllRemovesEveryControllerAllocationButNotCacheOrForeign(t *test
 	findVolume(t, fake, "toolcache-generation-1")
 }
 
-// TestTeardownAllRemovesOlderGenerationResidueAlongsideLiveGeneration is the
-// MEDIUM rescue-path fix: unlike TeardownAllocation/the orphan sweep,
-// TeardownAll (RemoveAllInstances) must NOT be generation-nonce-scoped, or an
-// older generation's residue — left behind by, e.g., a volume removal that
-// failed after its claim network had already been removed — is invisible to a
-// rescue pass that only ever sees "whichever generation currently holds the
-// claim network." This reproduces exactly that: generation A's workspace
-// volume survives with NO claim network at all (modeling that prior partial
-// failure directly), while generation B is a fully live allocation (network +
-// volume + running runner) under a DIFFERENT nonce. A single
-// RemoveAllInstances/TeardownAll pass must remove BOTH: A's residue (it still
-// satisfies the ADR-004 ownership predicate; scoping is now
-// generation-agnostic for this path) AND B's live allocation
-// (RemoveAllInstances's documented contract is "everything this controller
-// owns," ADR-004) — leaving zero managed resources for the controller.
+// TestTeardownAllRemovesOlderGenerationResidueAlongsideLiveGeneration pins why
+// TeardownAll is not generation-scoped, unlike TeardownAllocation and the sweep: an
+// older generation's residue, left by a volume removal that failed while its claim
+// network was removed, is invisible to a rescue that only sees whichever generation
+// holds the claim network. Generation A's workspace volume survives with no claim
+// network, while generation B is a fully live allocation under a different nonce. One
+// TeardownAll pass must remove both, leaving zero managed resources for the controller
+// (ADR-004, Teardown scope).
 func TestTeardownAllRemovesOlderGenerationResidueAlongsideLiveGeneration(t *testing.T) {
 	m, fake := newManager(t)
 	now := time.Now()
@@ -1146,7 +1119,7 @@ func TestSweepRemovesDanglingNetworkWithNoRunnerPastGrace(t *testing.T) {
 	}
 }
 
-// TestSweepUsesFinishedAtNotCreatedAtForExitedRunner is the F8 guard: the
+// TestSweepUsesFinishedAtNotCreatedAtForExitedRunner pins that the
 // exited-runner grace is measured from State.FinishedAt, NOT allocation
 // creation. A long-running job whose allocation was created long ago but which
 // only JUST exited must not be swept — it is inside the (short) exited grace
@@ -1169,7 +1142,7 @@ func TestSweepUsesFinishedAtNotCreatedAtForExitedRunner(t *testing.T) {
 	}
 }
 
-// TestSweepSkipsInFlightCreatePastExitedGraceButWithinInflightGrace is the F5
+// TestSweepSkipsInFlightCreatePastExitedGraceButWithinInflightGrace is the
 // guard: an allocation with NO runner yet (an in-flight create), older than the
 // short exited-runner grace (2m) but younger than the long in-flight-create
 // deadline (20m), must NOT be swept — a cold, emulated image pull plus

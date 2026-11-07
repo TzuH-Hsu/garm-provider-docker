@@ -15,23 +15,11 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// SweepOrphans opportunistically tears down abandoned allocations for this
-// controller (ADR-004): an exited (or missing) runner whose allocation is past
-// the grace window, or a claim-marker network / lingering volumes whose
-// instance name has no live runner past the grace window. It runs during
-// ListInstances — a call the provider is invoked for anyway — since there is no
-// background daemon.
-//
-// It never touches foreign or other-controller resources (every query is
-// label-scoped to this controller) and excludes any allocation younger than the
-// grace window — a peer's in-flight CreateInstance whose runner container does
-// not exist yet, or a just-finished job GARM may be about to delete itself.
-// Best-effort: a per-instance error is logged and the sweep continues.
-//
-// Before it tears down an allocation whose runner exited on its own, it logs
-// one line with the runner's exit details and screened log tail
-// (reportExitedRunner), since the teardown removes the only record of why the
-// runner exited.
+// SweepOrphans tears down this controller's abandoned allocations, as sweepInstance
+// decides them, logging an exited runner's exit details first (reportExitedRunner). It
+// runs at the start of CreateInstance and in ListInstances, since there is no
+// background process (ADR-004, Orphan sweep). Every query is label-scoped to this
+// controller. A per-instance error is logged and joined, and the sweep continues.
 func (m *Manager) SweepOrphans(ctx context.Context) error {
 	names, err := m.enumerateInstanceNames(ctx)
 	if err != nil {
@@ -52,14 +40,8 @@ func (m *Manager) SweepOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// SweepStale runs the orphan decision for a single instance name. As of F9 the
-// pre-create hook runs the host-wide SweepOrphans instead, but this targeted
-// variant is retained as a focused helper (and unit-tested boundary) for
-// clearing exactly one instance-name's stale leftovers — a crashed prior
-// allocation's stale workspace/socket/dind-state volume that the idempotent
-// VolumeCreate would otherwise silently reuse. It applies the same grace
-// windows as SweepOrphans, so a concurrent peer's fresh claim marker is never
-// swept.
+// SweepStale applies the orphan decision to one instance name, with the same grace
+// windows as SweepOrphans.
 func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 	swept, err := m.sweepInstance(ctx, instanceName)
 	if err != nil {
@@ -71,24 +53,13 @@ func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 	return nil
 }
 
-// sweepInstance applies the ADR-004 orphan decision to one instance name and,
-// if the allocation is abandoned, tears it down wholesale. It distinguishes the
-// two grace bases F5/F8 make explicit:
+// sweepInstance tears instanceName's allocation down if it is abandoned, and reports
+// whether anything was removed:
 //
-//   - a running runner container → active allocation, never swept (any age);
-//   - an EXITED (or dead) runner → a just-finished/failed job: age it from the
-//     runner's State.FinishedAt (F8) against the SHORT exitedGrace; past that,
-//     tear it down;
-//   - no runner container at all (or one still in the "created" state, never
-//     started) → an in-flight or never-completed create: age the allocation
-//     from its youngest resource's created-at label against the LONG
-//     inflightGrace (F5); only past that hard deadline — which exceeds every
-//     legitimate create phase, so a valid cold create is never swept — is it
-//     abandoned.
-//
-// The decision is deliberately conservative: an unparseable clock (no FinishedAt
-// on an exited runner, or no created-at when there is no runner) means "cannot
-// age" and the allocation is skipped rather than risk deleting something live.
+//   - a running runner is an active allocation, at any age;
+//   - a runner that exited is aged from State.FinishedAt against exitedGrace;
+//   - otherwise (no runner, one never started, or no readable FinishedAt) the allocation is
+//     aged from its youngest created-at against inflightGrace, and skipped if it has none.
 func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool, error) {
 	f := m.instanceScopedFilter(instanceName)
 
@@ -133,8 +104,7 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 			hasRunningRunner = true
 			continue
 		}
-		// An exited/dead runner: read its FinishedAt (F8) via inspect — the list
-		// summary does not carry it. Track the latest across any runners.
+		// The list summary has no FinishedAt. Track the latest across any runners.
 		if info, fa, ok := m.runnerFinishedAt(ctx, c.ID); ok {
 			if !hasExitedRunner || fa.After(exitedFinishedAt) {
 				exitedFinishedAt, hasExitedRunner = fa, true
@@ -159,36 +129,29 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	}
 
 	if hasExitedRunner {
-		// Exited-runner grace (F8): measured from FinishedAt, SHORT window.
 		if m.now().Sub(exitedFinishedAt) < m.exitedGrace {
-			return false, nil // just-finished — do not race GARM's own delete
+			return false, nil // just finished: do not race GARM's own delete
 		}
-		// The runner exited on its own and GARM has not deleted it: record why,
-		// while the container still holds its exit state and logs (exitreport.go).
+		// It exited on its own and GARM has not deleted it: record why while the
+		// container still holds its exit state and logs.
 		m.reportExitedRunner(ctx, latestExited, containers)
 		return m.TeardownAllocation(ctx, instanceName)
 	}
 
-	// No runner has run: an in-flight or never-completed create. Age from the
-	// youngest resource's created-at against the LONG in-flight-create grace
-	// (F5) — a valid cold create can exceed the short exited grace, so this
-	// deadline must be the one that exceeds every create phase.
+	// No runner with an exit time: an in-flight or never-completed create, whose
+	// deadline must exceed every create phase.
 	if !haveYoungest {
-		return false, nil // cannot age → conservatively skip
+		return false, nil // cannot age, so skip
 	}
 	if m.now().Sub(youngest) < m.inflightGrace {
-		return false, nil // too recent — a peer's still-in-progress create
+		return false, nil // too recent: a peer's still-in-progress create
 	}
 
 	return m.TeardownAllocation(ctx, instanceName)
 }
 
-// runnerFinishedAt inspects a runner container and returns the inspect and its
-// State.FinishedAt (F8), the moment the daemon recorded it exiting. The bool is
-// false when the container is gone (raced with a delete), the inspect fails, or
-// FinishedAt is absent/zero/unparseable — in which case the caller cannot age
-// the allocation on the exited-runner clock and falls back to the conservative
-// skip.
+// runnerFinishedAt returns a runner's inspect and State.FinishedAt. The bool is false
+// when the inspect fails or the time is absent, zero or unparseable.
 func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (types.ContainerJSON, time.Time, bool) {
 	inspected, err := m.cli.ContainerInspect(ctx, containerID)
 	if err != nil || inspected.State == nil {
@@ -205,10 +168,9 @@ func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (typ
 	return inspected, t, true
 }
 
-// enumerateInstanceNames returns the distinct instance names across this
-// controller's managed, job-scoped containers, networks, and volumes (the
-// ADR-004 predicate), so SweepOrphans can consider every allocation whether or
-// not its runner container still exists.
+// enumerateInstanceNames returns the distinct instance names across this controller's
+// job-scoped containers, networks and volumes, so an allocation is considered whether
+// or not its runner still exists.
 func (m *Manager) enumerateInstanceNames(ctx context.Context) (map[string]struct{}, error) {
 	f := spec.MatchPredicateFilters(m.controllerID)
 	names := map[string]struct{}{}
@@ -251,9 +213,8 @@ func (m *Manager) enumerateInstanceNames(ctx context.Context) (map[string]struct
 	return names, nil
 }
 
-// parseCreatedAt reads the garm.docker/created-at label (RFC3339, as
-// spec.AllocationIdentity's baseLabels writes it) into a time. The bool reports
-// whether the label was present and well-formed.
+// parseCreatedAt reads the created-at label. The bool reports whether it was present
+// and well-formed.
 func parseCreatedAt(labels map[string]string) (time.Time, bool) {
 	raw := labels[spec.LabelCreatedAt]
 	if raw == "" {
