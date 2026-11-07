@@ -15,32 +15,18 @@ type CredentialFile struct {
 	// RemoteName is the path segment after "credentials/" in the request
 	// GET {metadata-url}/credentials/{RemoteName}. Note: no leading dot.
 	RemoteName string
-	// LocalName is the filename the bytes are written to inside the
-	// runner's credential tmpfs (/run/garm). Note: no leading dot — these
-	// are bare transport filenames. The runner image entrypoint
-	// (runner-images/common/entrypoint.sh) polls the tmpfs for exactly
-	// these bare names and, once present, installs them into the runner
-	// install dir as .runner / .credentials / .credentials_rsaparams
-	// (ADR-002). The dotting happens at install time, not at delivery
-	// time.
+	// LocalName is the filename the bytes are written to inside the runner's
+	// credential tmpfs (/run/garm). It has no leading dot: the runner image
+	// entrypoint (runner-images/common/entrypoint.sh) polls for these bare
+	// names and installs them as .runner, .credentials and
+	// .credentials_rsaparams (ADR-002).
 	LocalName string
 }
 
-// JITCredentialFiles is the single authoritative mapping of the three JIT
-// credential files GARM's metadata service serves. Verified against GARM's
-// GetJITConfigFile handler (which returns entries by their JitConfiguration
-// map key) and the reference k8s provider's entrypoint, which fetches
-// exactly credentials/runner, credentials/credentials, and
-// credentials/credentials_rsaparams and writes them to .runner,
-// .credentials, and .credentials_rsaparams (research.md §1.C, §2.A). The
-// reference provider's entrypoint performs that dotting itself after
-// receiving the bare-named files; garm-provider-docker's own runner image
-// entrypoint does the same, so the tmpfs transport names here must stay
-// bare to match what it polls for.
-//
-// Keeping the remote→local mapping in exactly one place is deliberate: a
-// mismatch between the fetch path segment and the tmpfs filename would
-// silently break run.sh's direct (config.sh-less) boot.
+// JITCredentialFiles maps the three JIT credential files GARM's metadata service
+// serves, keyed in GARM's GetJITConfigFile handler by their JitConfiguration map
+// key, to their tmpfs names. The mapping lives only here because a mismatch would
+// silently break run.sh's direct boot, which does not run config.sh.
 var JITCredentialFiles = []CredentialFile{
 	{RemoteName: "runner", LocalName: "runner"},
 	{RemoteName: "credentials", LocalName: "credentials"},
@@ -55,7 +41,7 @@ var JITCredentialFiles = []CredentialFile{
 const RegistrationTokenFile = "registration-token"
 
 // registrationTokenPath is the metadata path for the classic, non-JIT
-// runner registration token (research.md §1.C metadata router).
+// runner registration token.
 const registrationTokenPath = "runner-registration-token"
 
 // CredentialFileContent is one fetched credential file: the on-disk name it
@@ -102,10 +88,9 @@ func (c *Client) FetchRegistrationToken(ctx context.Context) (CredentialFileCont
 // tmpfs). Entry names are the plain LocalName with no leading path, so
 // `tar -x` at the credential tmpfs lands each file directly in that directory.
 //
-// The archive is built entirely in memory — no host-side temp file is ever
-// created — which is the ADR-002 invariant that keeps credentials off host
-// disk. ModTime is fixed to the Unix epoch so the output is deterministic
-// (there is nothing time-sensitive about a credential file's mtime).
+// The archive is built entirely in memory, with no host-side temp file, which is
+// the ADR-002 invariant that keeps credentials off host disk. ModTime is fixed to
+// the Unix epoch so the output is deterministic.
 func TarArchive(files []CredentialFileContent) (*bytes.Buffer, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

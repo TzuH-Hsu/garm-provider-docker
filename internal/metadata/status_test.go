@@ -164,8 +164,8 @@ func TestNewStatusReporterCallbackURLValidation(t *testing.T) {
 	}
 }
 
-// TestPostStatusRefusesRedirects proves no redirect is followed — not even a
-// same-origin one — so the Bearer token is never re-sent and a POST is never
+// TestPostStatusRefusesRedirects proves no redirect is followed, not even a
+// same-origin one, so the Bearer token is never re-sent and a POST is never
 // silently rewritten into a GET.
 func TestPostStatusRefusesRedirects(t *testing.T) {
 	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {

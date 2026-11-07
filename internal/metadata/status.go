@@ -30,48 +30,31 @@ const statusPath = "/status"
 // 200; anything large is not something to buffer.
 const maxStatusResponseBytes = 64 << 10
 
-// statusUpdate is the JSON body GARM v0.2.1's InstanceStatusMessageHandler
-// decodes into params.InstanceUpdateMessage (params/requests.go):
-//
-//	Status  RunnerStatus `json:"status,omitempty"`
-//	Message string       `json:"message,omitempty"`
-//	AgentID *int64       `json:"agent_id,omitempty"`
-//
-// agent_id is deliberately NOT part of this type. GARM forwards a non-nil
-// agent_id into a non-forced UpdateInstance, whose validateAgentID rejects
-// any value that differs from the one already on the row ("agent ID
-// mismatch"); a scale-set runner's row already carries the agent ID GARM got
-// when it generated the JIT config, and the provider has no authoritative
-// source for it. Omitting the field leaves the row's agent ID untouched. That
-// is only correct when GARM already stored the agent ID, i.e. for JIT runners
-// (scale sets, and pools with JIT); the provider therefore reports status for
-// JIT runners only (internal/provider/status_report.go).
+// statusUpdate is the JSON body GARM v0.2.1's InstanceStatusMessageHandler decodes
+// into params.InstanceUpdateMessage (params/requests.go). agent_id is left out:
+// GARM rejects a value that differs from the one on the row, and the provider has
+// no authoritative source for it. Omitting it is only correct when GARM already
+// stored the agent ID, so status is reported for JIT runners only (ADR-002).
 type statusUpdate struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 }
 
 // StatusReporter posts runner status updates to one instance's GARM callback
-// endpoint, authenticated with that instance's Bearer token — the same call
-// GARM's own userdata templates make from inside a VM, made here by the
-// provider process so the runner container never sees the token. Construct it
-// with NewStatusReporter.
+// endpoint with that instance's Bearer token. GARM's userdata templates make the
+// same call from inside a VM; the provider makes it here so the runner container
+// never sees the token. Construct it with NewStatusReporter.
 type StatusReporter struct {
 	client    *Client
 	statusURL string
 }
 
 // NewStatusReporter builds a StatusReporter for callbackURL (BootstrapInstance's
-// callback-url). The URL gets the same transport-security validation as the
-// metadata-url (https, or plain http only to a loopback host; no userinfo) and
-// the same CA-bundle handling. Unlike the metadata client it follows NO
-// redirects at all: GARM's callback has no legitimate reason to redirect, and
-// a redirected POST is either silently rewritten into a GET (301/302/303) or
-// re-sent with the Bearer token to wherever the Location points (307/308).
-//
-// The "/status" suffix is appended unless the URL already ends in "/status"
-// (with or without a trailing slash), mirroring the normalization GARM's own
-// userdata templates apply to the same value.
+// callback-url), with the same URL validation and CA-bundle handling as the
+// metadata client. It follows no redirects: GARM's callback has no reason to
+// redirect, and a redirected POST either becomes a GET (301/302/303) or re-sends
+// the Bearer token to the Location (307/308). "/status" is appended unless the URL
+// already ends in it, as GARM's own userdata templates do.
 func NewStatusReporter(callbackURL, instanceToken string, caCertBundle []byte, opts ...Option) (*StatusReporter, error) {
 	c, err := newClient(callbackURLField, callbackURL, instanceToken, caCertBundle, opts...)
 	if err != nil {
