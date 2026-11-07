@@ -490,8 +490,8 @@ scrub_non_jit_credentials_on_signal() {
 # runner user via gosu by default, ADR-002), appending --disableupdate
 # unconditionally because the image is digest-managed (ADR-002). It reads the
 # registration token and DELETES its tmpfs file before anything else runs, so
-# the token is not on disk while a job runs: jobs have passwordless sudo, and
-# the file would let one register further runners in the scope. The token then
+# the file is gone before any job runs: jobs run as the file's owner, and the
+# token would let one register further runners in the scope. The token then
 # lives only in a local, unexported shell variable and, while config.sh runs
 # (before any job starts), in config.sh's argument list. config.sh writes
 # .runner/.credentials/.credentials_rsaparams into the install dir normally;
