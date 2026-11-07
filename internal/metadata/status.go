@@ -11,50 +11,40 @@ import (
 	"time"
 )
 
-// Runner statuses the provider reports through GARM's instance callback. The
-// strings are GARM's own params.RunnerStatus values (cloudbase/garm v0.2.1
-// params/params.go). Only the two a provider can truthfully assert from the
-// outside are exposed: "installing" once credentials are delivered, and
-// "idle" once the runner is listening for jobs.
+// The GARM params.RunnerStatus values a provider can assert from outside the runner:
+// installing once credentials are delivered, idle once it is listening for jobs.
 const (
 	RunnerStatusInstalling = "installing"
 	RunnerStatusIdle       = "idle"
 )
 
-// statusPath is the callback route GARM serves the status handler on
-// (apiserver/routers/routers.go: callbacks "/status" and "/status/").
+// statusPath is GARM's status callback route.
 const statusPath = "/status"
 
-// maxStatusResponseBytes caps how much of the callback response body is read
-// (and discarded) so the connection can be reused. GARM answers with an empty
-// 200; anything large is not something to buffer.
+// maxStatusResponseBytes caps how much of the response is drained so the connection
+// can be reused. GARM answers with an empty 200.
 const maxStatusResponseBytes = 64 << 10
 
-// statusUpdate is the JSON body GARM v0.2.1's InstanceStatusMessageHandler decodes
-// into params.InstanceUpdateMessage (params/requests.go). agent_id is left out:
-// GARM rejects a value that differs from the one on the row, and the provider has
-// no authoritative source for it. Omitting it is only correct when GARM already
-// stored the agent ID, so status is reported for JIT runners only (ADR-002).
+// statusUpdate is the JSON form of GARM's params.InstanceUpdateMessage. agent_id
+// is left out: GARM rejects a value that differs from the one on the row, and the
+// provider has no authoritative source for it. Omitting it is only correct when
+// GARM already stored the agent ID, so only JIT runners report status (ADR-002).
 type statusUpdate struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 }
 
-// StatusReporter posts runner status updates to one instance's GARM callback
-// endpoint with that instance's Bearer token. GARM's userdata templates make the
-// same call from inside a VM; the provider makes it here so the runner container
-// never sees the token. Construct it with NewStatusReporter.
+// StatusReporter posts runner status to one instance's GARM callback endpoint.
+// GARM's userdata templates make this call from inside a VM; the provider makes it
+// so the runner container never sees the token.
 type StatusReporter struct {
 	client    *Client
 	statusURL string
 }
 
-// NewStatusReporter builds a StatusReporter for callbackURL (BootstrapInstance's
-// callback-url), with the same URL validation and CA-bundle handling as the
-// metadata client. It follows no redirects: GARM's callback has no reason to
-// redirect, and a redirected POST either becomes a GET (301/302/303) or re-sends
-// the Bearer token to the Location (307/308). "/status" is appended unless the URL
-// already ends in it, as GARM's own userdata templates do.
+// NewStatusReporter returns a StatusReporter for callbackURL. It follows no
+// redirects: a redirected POST either becomes a GET or re-sends the token to the
+// Location.
 func NewStatusReporter(callbackURL, instanceToken string, caCertBundle []byte, opts ...Option) (*StatusReporter, error) {
 	c, err := newClient(callbackURLField, callbackURL, instanceToken, caCertBundle, opts...)
 	if err != nil {
@@ -64,14 +54,13 @@ func NewStatusReporter(callbackURL, instanceToken string, caCertBundle []byte, o
 	return &StatusReporter{client: c, statusURL: statusEndpoint(callbackURL)}, nil
 }
 
-// refuseRedirect is the StatusReporter redirect policy: never follow. Returning
-// http.ErrUseLastResponse hands the 3xx response itself back to the caller,
-// which PostStatus then reports as a refused redirect.
+// refuseRedirect hands the 3xx response back for doPost to report.
 func refuseRedirect(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-// statusEndpoint derives the status URL from GARM's callback URL.
+// statusEndpoint appends statusPath to callbackURL unless it already ends in it, as
+// GARM's userdata templates do.
 func statusEndpoint(callbackURL string) string {
 	base := strings.TrimRight(callbackURL, "/")
 	if strings.HasSuffix(base, statusPath) {
@@ -80,10 +69,8 @@ func statusEndpoint(callbackURL string) string {
 	return base + statusPath
 }
 
-// PostStatus reports status with a human-readable message. Transient failures
-// (transport errors, 5xx) are retried with the client's bounded retry policy;
-// any other non-2xx response is returned immediately. Every returned error has
-// the instance token scrubbed from it.
+// PostStatus reports status with a message, retrying transport errors and 5xx. Every
+// returned error has the instance token scrubbed from it.
 func (r *StatusReporter) PostStatus(ctx context.Context, status, message string) error {
 	body, err := json.Marshal(statusUpdate{Status: status, Message: message})
 	if err != nil {
@@ -112,8 +99,7 @@ func (r *StatusReporter) PostStatus(ctx context.Context, status, message string)
 	return c.redact(fmt.Errorf("reporting runner status %q: giving up after %d attempts: %w", status, c.maxRetries+1, lastErr))
 }
 
-// doPost performs one POST. The bool reports whether the failure is worth
-// retrying (transport error or 5xx).
+// doPost performs one POST. The bool reports whether the failure is worth retrying.
 func (r *StatusReporter) doPost(ctx context.Context, body []byte) (retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.statusURL, bytes.NewReader(body))
 	if err != nil {
