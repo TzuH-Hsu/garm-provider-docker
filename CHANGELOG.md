@@ -10,6 +10,21 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+### Security
+
+- Pools that set `disable_jit_config` no longer leave the registration token
+  on the runner. The provider delivers the token to `/run/garm/registration-token`
+  and the runner image's entrypoint read it, but nothing removed it, so it stayed
+  readable by job steps for the life of the runner. A registration token can
+  register new runners in the same repository, organization or enterprise
+  for as long as it is valid, which is one hour. The entrypoint now
+  deletes the file as soon as it has read it, before `config.sh` runs, and
+  stops the runner if it cannot. JIT pools and scale sets do not deliver the
+  file and were not affected. Use a runner image built from this change; runners
+  from earlier images keep the old behavior until they are replaced. During
+  registration, `config.sh` still receives the token on its command line, but
+  that runs before any job starts.
+
 ## [0.2.10] - 2026-11-07
 
 ### Security

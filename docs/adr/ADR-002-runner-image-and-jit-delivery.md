@@ -101,6 +101,19 @@ start-up and crashes (`FileNotFoundException`, exit 134), as observed on a live 
 credential files from the writable layer if `config.sh` fails. This path is implemented but has not been
 verified against a real GARM pool.
 
+The registration token is the one delivered file that must not stay on the tmpfs. The delivery exec runs as
+the runner user, so the file is readable by job steps, which also have passwordless sudo, and a registration
+token can register further runners in the same scope while it is valid. Unlike the JIT files it does not
+identify a single runner. The entrypoint therefore reads the token and deletes
+`/run/garm/registration-token` before it does anything else, so the file is gone before `config.sh` runs and
+long before any job starts. It fails closed: a missing, empty or unreadable token, or a file that cannot be
+removed, stops the runner. The failure and signal traps remove the file too, in case either arrives before the
+read. The token is held in an unexported shell variable and is passed to `config.sh` with `--token`, which
+puts it on that process's command line, visible to other processes in the container, but only while
+`config.sh` runs. No job runs yet at that point. `config.sh` can read the token from the environment
+instead, but that would not change who can see it before a job starts, so the command line is kept.
+`exec` replaces the entrypoint with the runner, so neither the variable nor the arguments survive into it.
+
 ### Status reporting
 
 GARM creates every runner as `pending`. On GARM v0.2.1 scale sets, the job-started handler moves a runner to
