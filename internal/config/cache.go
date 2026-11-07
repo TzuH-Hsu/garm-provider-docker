@@ -7,11 +7,7 @@ import (
 	"strings"
 )
 
-// Cache defaults (ADR-003/ADR-005). Enabled defaults to true, so an operator
-// who never touches [cache] still gets persistent repo-scoped caches; the
-// generation/pnpm-major salts and mount paths take the ADR-005 illustrative
-// values, and allow_org_shared stays off (org/enterprise pools get no persistent
-// cache without a deliberate opt-in).
+// Cache defaults. Caching is on out of the box; allow_org_shared stays off.
 const (
 	defaultCacheGeneration            = "1"
 	defaultCachePnpmMajor             = "9"
@@ -21,29 +17,14 @@ const (
 	defaultDiagnosticLogRetentionDays = 7
 )
 
-// cacheSegmentPattern is the grammar a generation/pnpm-major salt must match:
-// they are appended verbatim into a Docker volume name
-// (spec.ToolcacheVolumeName/PnpmVolumeName), so each must be a legal
-// Docker-resource-name fragment on its own.
+// cacheSegmentPattern limits generation and pnpm_major, which are embedded in
+// Docker volume names.
 var cacheSegmentPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// reservedMountPaths mirrors internal/spec's fixed in-runner mount targets that
-// a cache mount must never shadow: CredentialDir (/run/garm), DindSocketDir
-// (/run), the runner INSTALL dir (/actions-runner — H2: it transiently holds
-// .runner/.credentials* during a non-JIT registration and is the seed source for
-// externals, so a cache mounted onto it could persist credentials into a repo
-// cache), RunnerWorkDir (/actions-runner/_work), DindStateDir (/var/lib/docker),
-// and the fixed externals (RunnerExternalsDir) and diagnostic-logs (RunnerDiagDir)
-// mount targets. It is duplicated here rather than imported to keep package config
-// decoupled from package spec — the same layering choice spec/mounts.go documents
-// for its own dind-mode-string duplication. A configurable
-// toolcache_path/pnpm_store_path mounted at (or straddling) one of these would
-// break credential delivery, the DinD socket, the runner install dir, the
-// workspace, the daemon's data root, the read-only externals mount, or the
-// diag-logs volume. Every entry is already canonical (path.Clean is a no-op on
-// each); validateCacheMountPath canonicalizes the operator's input — and the
-// /var/run→/run symlink alias — before comparing, so a non-canonical spelling
-// cannot slip a mount onto any of these.
+// reservedMountPaths are the fixed in-runner mounts that a cache path must not
+// collide with. The runner install dir is on the list because it holds
+// registration credentials during a non-JIT setup. The list mirrors
+// internal/spec, which this package does not import. Every entry is canonical.
 var reservedMountPaths = []string{
 	"/run/garm",
 	"/run",
@@ -54,72 +35,38 @@ var reservedMountPaths = []string{
 	"/var/lib/docker",
 }
 
-// Cache is the [cache] table (ADR-003/ADR-005): the persistent repo-scoped
-// toolcache and pnpm-store caches, plus the shared externals cache, the per-repo
-// diagnostic-logs volume, and the opportunistic GC — all wired as of M2-W2.
-// stale_cache_eviction_days drives the GC's age-since-creation staleness
-// DETECTION — the GC only LOGS a stale/superseded cache volume for the
-// operator's own manual `docker volume prune`; it never deletes one itself
-// (ADR-003's cache-GC-safety amendment) — and diagnostic_log_retention_days the
-// provider-side diag prune (which does delete aged FILES inside the diag
-// volume, not the volume itself); both windows are range-validated here.
+// Cache is the [cache] table (ADR-003). The stale-cache GC only logs a stale
+// volume and never deletes one; the diagnostic-log prune deletes aged files
+// inside the diagnostics volume, not the volume.
 type Cache struct {
-	// Enabled toggles the whole persistent-cache feature. Default true. When
-	// false, CreateInstance provisions no cache volumes and sets no cache env
-	// (the M1 behavior).
+	// Enabled false provisions no cache volumes and sets no cache environment.
 	Enabled bool `toml:"enabled"`
 
-	// Generation is the toolcache generation salt (spec.ToolcacheVolumeName's
-	// <gen>): bumping it invalidates every repo's toolcache by moving to a
-	// fresh, empty volume name, without an explicit GC pass. Default "1". Must
-	// be a legal Docker-name fragment since it is embedded in the volume name.
+	// Generation and PnpmMajor are salts in the volume names: changing one starts
+	// a fresh, empty volume. Change PnpmMajor with pnpm's major version, because
+	// the store layout depends on it. Both must be legal Docker name fragments.
 	Generation string `toml:"generation"`
+	PnpmMajor  string `toml:"pnpm_major"`
 
-	// PnpmMajor is the pnpm store salt (spec.PnpmVolumeName's <pnpmMajor>):
-	// bump it on a pnpm major-version change, since the store's on-disk layout
-	// is tied to the pnpm major. Default "9". Same name-fragment constraint as
-	// Generation.
-	PnpmMajor string `toml:"pnpm_major"`
-
-	// ToolcachePath is where the toolcache volume mounts inside the runner and
-	// the value of RUNNER_TOOL_CACHE (research.md §3: the hosted-runner
-	// convention is /opt/hostedtoolcache). Absolute path. Default
-	// /opt/hostedtoolcache.
+	// ToolcachePath and PnpmStorePath are the absolute in-runner mount points.
+	// ToolcachePath is also the value of RUNNER_TOOL_CACHE; PnpmStorePath reaches
+	// pnpm through environment variables (ADR-003, "pnpm").
 	ToolcachePath string `toml:"toolcache_path"`
-
-	// PnpmStorePath is where the pnpm store volume mounts inside the runner and
-	// the value of npm_config_store_dir (pnpm <= 10) and pnpm_config_store_dir
-	// (pnpm >= 11), which pnpm honors as its store-dir.
-	// RESOLVED for M2 (ADR-003 open question): a named volume mounted at a fixed
-	// path plus npm_config_store_dir pointing pnpm at it — verified on Docker
-	// Engine 29.6.1 (`pnpm config get store-dir` and `pnpm store path` resolve
-	// to the volume, and package content is reused across containers sharing it,
-	// "downloaded 0"). Absolute path. Default /opt/pnpm-store.
 	PnpmStorePath string `toml:"pnpm_store_path"`
 
-	// AllowOrgShared is the org/enterprise opt-in (ADR-003). Default false: an
-	// org- or enterprise-scoped pool gets NO persistent cache, because repo_url
-	// is shared across every member repository and keying on it would silently
-	// pool them into one cross-repo cache. Setting this true opts into
-	// org/enterprise-keyed shared caches, explicitly treating the whole
-	// org/enterprise as ONE trust domain for cache purposes.
+	// AllowOrgShared gives organization and enterprise pools a persistent cache.
+	// Those pools share one repo_url across every member repository, so enabling
+	// this treats the whole organization as one trust domain.
 	AllowOrgShared bool `toml:"allow_org_shared"`
 
-	// StaleCacheEvictionDays and DiagnosticLogRetentionDays are ADR-003's GC/
-	// log-retention windows, consumed by M2-W2's opportunistic GC (age-since-
-	// creation staleness detection — log-only, never auto-deletes a cache
-	// volume; ADR-003's cache-GC-safety amendment) and provider-side diag prune
-	// (which does delete aged files) respectively. Both are
-	// range-validated (non-negative) so an operator's ADR-005-shaped config loads
-	// and a typo (a negative window) is caught rather than silently ignored.
-	// Defaults 30 / 7.
+	// Ages in days, both >= 0: when the GC logs a volume as stale, and when
+	// diagnostic files are deleted.
 	StaleCacheEvictionDays     int `toml:"stale_cache_eviction_days"`
 	DiagnosticLogRetentionDays int `toml:"diagnostic_log_retention_days"`
 }
 
-// defaultCache returns the [cache] defaults applied by Load before decoding the
-// TOML file, so an omitted key keeps its default while an explicitly-set key
-// (including enabled = false) overrides it.
+// defaultCache is applied before decoding, so an explicit key, including
+// enabled = false, overrides it.
 func defaultCache() Cache {
 	return Cache{
 		Enabled:                    true,
@@ -133,11 +80,8 @@ func defaultCache() Cache {
 	}
 }
 
-// validate checks the [cache] table. The retention windows are always
-// range-checked; the generation/pnpm-major salts and mount paths are enforced
-// only when the cache is Enabled (a disabled cache is inert, so its salts/paths
-// do not have to be well-formed — matching how a "none"-mode dind_image is only
-// required when a sidecar would actually be created).
+// validate always checks the retention windows. The salts and paths are checked
+// only when the cache is enabled, because a disabled cache never uses them.
 func (c Cache) validate() error {
 	if c.StaleCacheEvictionDays < 0 {
 		return fmt.Errorf("stale_cache_eviction_days must be >= 0, got %d", c.StaleCacheEvictionDays)
@@ -167,19 +111,10 @@ func (c Cache) validate() error {
 	return nil
 }
 
-// validateCacheMountPath requires an absolute, CANONICAL path that does not
-// collide (at, under, or over) with any reserved in-runner mount target.
-//
-// H2: raw-string validation was bypassable via canonical aliases — Docker mounts
-// at the path the kernel canonicalizes to, not the literal string, so
-// "/actions-runner/." , "/opt/../actions-runner", "//run//garm", or the
-// /var/run→/run symlink would let a cache land on the runner install dir, the
-// credential tmpfs, or the DinD socket while slipping past a raw-string ancestor
-// check. This closes it by: (1) rejecting any NON-canonical spelling
-// (path.Clean(raw) != raw catches dot-segments, repeated slashes, and trailing
-// slashes); (2) rejecting the filesystem root; (3) canonicalizing the /var/run
-// alias to /run BEFORE comparing; and (4) comparing CLEANED ancestor
-// relationships against the (canonical) reserved list.
+// validateCacheMountPath requires an absolute, canonical path that does not
+// collide with a reserved mount. Docker mounts at the path the kernel resolves,
+// so a spelling such as "/actions-runner/." would slip past a prefix check and
+// is rejected.
 func validateCacheMountPath(field, raw string) error {
 	if raw == "" {
 		return fmt.Errorf("%s is required when the cache is enabled", field)
@@ -194,11 +129,8 @@ func validateCacheMountPath(field, raw string) error {
 	if cleaned == "/" {
 		return fmt.Errorf("%s must not be the filesystem root", field)
 	}
-	// /var/run is a symlink to /run (verified on the runner base image:
-	// /var/run -> /run), so a cache configured at /var/run[/...] actually lands
-	// on /run[/...] — the DinD socket dir or the credential tmpfs (/run/garm).
-	// Canonicalize the alias before the ancestor check so it cannot smuggle a
-	// mount onto either.
+	// /var/run is a symlink to /run on the runner base image, so a path under it
+	// lands on the DinD socket dir or the credential tmpfs.
 	canon := canonicalizeVarRun(cleaned)
 	for _, r := range reservedMountPaths {
 		if pathIsAtOrUnder(canon, r) || pathIsAtOrUnder(r, canon) {
@@ -208,9 +140,7 @@ func validateCacheMountPath(field, raw string) error {
 	return nil
 }
 
-// canonicalizeVarRun rewrites the /var/run→/run symlink alias so a cache path
-// spelled under /var/run is checked against the reserved list as its real /run
-// target. It operates on an already-path.Clean'd absolute path.
+// canonicalizeVarRun rewrites a cleaned path under /var/run to its /run target.
 func canonicalizeVarRun(p string) string {
 	switch {
 	case p == "/var/run":
@@ -222,8 +152,7 @@ func canonicalizeVarRun(p string) string {
 	}
 }
 
-// pathIsAtOrUnder reports whether canonical path a IS b or is nested UNDER b
-// (b is an ancestor directory of a). Both must already be path.Clean'd.
+// pathIsAtOrUnder reports whether the cleaned path a is b or nested under it.
 func pathIsAtOrUnder(a, b string) bool {
 	return a == b || strings.HasPrefix(a, b+"/")
 }

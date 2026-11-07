@@ -1,12 +1,10 @@
-// Package config loads and validates this provider's TOML configuration
-// file (ADR-005).
+// Package config loads and validates the provider's TOML configuration file.
+// The keys are described in docs/config-reference.md.
 package config
 
 import (
-	// crypto/sha256 is imported for its side effect: it registers the sha256
-	// algorithm with opencontainers/go-digest, so digest-pinned image
-	// validation works even in a build (e.g. this package's isolated unit
-	// test binary) that would not otherwise link a sha256 implementation.
+	// Registers sha256 with go-digest, so digest validation also works in a
+	// binary that does not otherwise link it.
 	_ "crypto/sha256"
 	"fmt"
 
@@ -18,147 +16,62 @@ import (
 // defaultDockerHost is used when the config file omits docker_host.
 const defaultDockerHost = "unix:///var/run/docker.sock"
 
-// Config is this provider's TOML configuration schema (ADR-005). Unknown
-// TOML keys are tolerated rather than rejected — see Load — so a config
-// file may carry keys from a newer or older provider version without a
-// parse error.
-//
-// A published, go:embed'ed JSON Schema for this config is exposed for
-// self-documentation via JSONSchema() (schema.go / schema.json), returned by
-// the v0.1.1 GetConfigJSONSchema command (M3-W1). The loader still tolerates
-// unknown TOML keys and does not validate the file against that schema. The
-// extra_specs schema validation, the env-name charset, and the hard-reserved
-// set live in package internal/extraspecs (the extra_specs trust tier); the
-// operator-owned extra_env allowlist is the [extra_specs] table here (ExtraSpecs
-// below) — this struct is the operator-config tier.
+// Config is the operator tier of the provider's configuration (ADR-005). Load
+// ignores unknown TOML keys and does not validate against the published JSON
+// Schema (see JSONSchema).
 type Config struct {
-	// DockerHost is the address of the Docker daemon this provider talks
-	// to. Defaults to the local Unix socket when omitted or empty.
 	DockerHost string `toml:"docker_host"`
 
-	// RunnerImage is the image reference used for CreateInstance. It is
-	// required and has no default: image provenance must always be an
-	// explicit operator choice (ADR-002), never an implicit one. It must be
-	// pinned by a sha256 digest (name@sha256:<64-hex>) unless
-	// AllowUnpinnedRunnerImage is set. A pool may override this per-flavor
-	// (Flavors below) — that is the ONLY channel that varies the runner
-	// image; this field is the fallback when a flavor sets none.
+	// RunnerImage has no default: the operator must choose the image (ADR-002).
+	// A flavor's RunnerImage overrides it and is the only way a pool can vary
+	// the runner image.
 	RunnerImage string `toml:"runner_image"`
 
-	// AllowUnpinnedRunnerImage is a dev-only escape hatch. When false (the
-	// default) runner_image (and any flavor's own RunnerImage override)
-	// MUST be digest-pinned, so image provenance is reproducible and cannot
-	// drift under a mutable tag (ADR-002/ADR-005 F10). Set it true ONLY for
-	// local development against a tag; never in a real deployment.
+	// AllowUnpinnedRunnerImage is for development only. It relaxes the digest
+	// rule for RunnerImage and every flavor's RunnerImage.
 	AllowUnpinnedRunnerImage bool `toml:"allow_unpinned_runner_image"`
 
-	// DindMode selects this operator's default DinD sidecar strategy
-	// (ADR-001): "none" (default — no DinD sidecar is ever created; M0's
-	// only mode), "privileged-sidecar", or "sysbox-runc". A pool's
-	// extra_specs may request a narrower mode at CreateInstance time
-	// (WP2/WP3, ADR-005); this is the fallback used when it does not, and
-	// in every case the effective mode is bounded by AllowedDindModes.
+	// DindMode is the default for a pool that picks none. It must be in
+	// AllowedDindModes.
 	DindMode string `toml:"dind_mode"`
 
-	// AllowedDindModes is the operator ceiling on DindMode (ADR-001's F7,
-	// "the operator gets the final word"): the set of modes ANY pool's
-	// extra_specs may ever select on this host, regardless of what a pool
-	// or DindMode itself requests.
-	//
-	// Defaults to ["none"] — FAIL-CLOSED — when the config file omits this
-	// key (see defaultAllowedDindModes in dind.go for the full rationale):
-	// an operator must explicitly widen the ceiling before any DinD mode,
-	// privileged or otherwise, can be selected on this host. DindMode must
-	// always be a member of this list — see Validate — so widening the
-	// ceiling is also what makes a non-none dind_mode loadable at all.
+	// AllowedDindModes is the operator ceiling on every pool's mode. It defaults
+	// to ["none"] (see defaultAllowedDindModes).
 	AllowedDindModes []string `toml:"allowed_dind_modes"`
 
-	// DindImage is the DinD sidecar's image reference (ADR-001/ADR-002),
-	// e.g. "docker:dind@sha256:...". Required, and validated as
-	// digest-pinned exactly like RunnerImage, only when DindMode != "none";
-	// may be left empty when DindMode is "none" since no sidecar is ever
-	// created in that mode.
+	// DindImage is required when DindMode is not "none".
 	DindImage string `toml:"dind_image"`
 
-	// AllowUnpinnedDindImage is DindImage's own dev-only escape hatch. It
-	// is deliberately a SEPARATE flag from AllowUnpinnedRunnerImage rather
-	// than the two sharing one: an operator developing against an unpinned
-	// runner_image tag should not have to also relax pinning on the
-	// separately security-sensitive DinD sidecar image — privileged-sidecar
-	// is the default DinD MECHANISM once an operator opts into a DinD mode
-	// (ADR-001), but DinD itself defaults to "none" (no sidecar at all,
-	// above) — and vice versa. Two independent, narrowly-scoped escape
-	// hatches were judged cleaner than one shared flag whose blast radius
-	// covers both images — flagged in the WP1 report since ADR-005 left the
-	// naming/sharing choice open ("honor the existing
-	// allow_unpinned_runner_image flag naming").
+	// AllowUnpinnedDindImage is separate from AllowUnpinnedRunnerImage so that
+	// relaxing one image's pinning does not relax the other's.
 	AllowUnpinnedDindImage bool `toml:"allow_unpinned_dind_image"`
 
-	// StorageDriver is the explicit --storage-driver flag WP2/WP3's DinD
-	// sidecar entrypoint passes to dockerd (ADR-001): NAS host filesystems
-	// make storage-driver autodetection inside the sidecar unreliable, so
-	// this is always explicit, never autodetected. "overlay2" (the
-	// default) or "vfs" (the slower, more compatible fallback); any other
-	// value is rejected.
+	// StorageDriver is always passed to the sidecar's dockerd, never
+	// autodetected: autodetection is unreliable inside the sidecar on some host
+	// filesystems.
 	StorageDriver string `toml:"storage_driver"`
 
-	// RegistryMirrors are Docker Hub pull-through mirrors for the DinD
-	// sidecar's dockerd, emitted as one --registry-mirror=<url> flag each
-	// (issue #26). Each entry is a bare origin: an http or https URL with a
-	// host, an optional port and no path, query, fragment or userinfo. Empty
-	// (the default) adds no flag. dockerd consults mirrors only for Docker Hub
-	// and falls back to the upstream when a mirror is unreachable.
-	//
-	// Config-only and global: it is not a Flavor field and no extra_specs key
-	// carries it — a mirror is a property of this Docker host's network, not of
-	// a pool. Validated at load whatever dind_mode is. See registry.go.
-	RegistryMirrors []string `toml:"registry_mirrors"`
-
-	// InsecureRegistries are registries the sidecar's dockerd may reach over
-	// plain HTTP or with an untrusted certificate, emitted as one
-	// --insecure-registry=<entry> flag each. Each entry is host[:port] or a
-	// CIDR, never a URL. Empty (the default) adds no flag. Same trust tier and
-	// scope as RegistryMirrors.
+	// RegistryMirrors and InsecureRegistries configure the sidecar's dockerd
+	// (issue #26; see registry.go). They are config-only and global: a mirror
+	// belongs to the Docker host's network, not to a pool, so no extra_specs key
+	// or flavor field carries them.
+	RegistryMirrors    []string `toml:"registry_mirrors"`
 	InsecureRegistries []string `toml:"insecure_registries"`
 
-	// Resources is the [resources] table: runner_memory/dind_memory
-	// limits. No cpu or pids limits, by design (ADR-005).
 	Resources Resources `toml:"resources"`
+	Network   Network   `toml:"network"`
 
-	// Network is the [network] table: per-job network behavior (ADR-001).
-	Network Network `toml:"network"`
-
-	// Flavors is the [flavors.<name>] map: named, per-pool overrides for
-	// runner_memory/dind_memory/runner_image. A named flavor is the ONLY
-	// channel that varies the runner image per pool (ADR-002's owner
-	// ruling, restated in ADR-005) — no other field, in config or
-	// extra_specs, accepts a raw image reference.
+	// Flavors are named per-pool overrides, selected by extra_specs.flavor.
 	Flavors map[string]Flavor `toml:"flavors"`
 
-	// Cache is the [cache] table: ADR-003's persistent, repo-scoped toolcache
-	// and pnpm-store caches (M2-W1). Defaulted to enabled with the ADR-005
-	// values by Load; see cache.go.
-	Cache Cache `toml:"cache"`
-
-	// ExtraSpecs is the [extra_specs] table (ADR-005 H2): operator-owned
-	// controls over the GARM-admin extra_specs trust tier. Its allowed_env
-	// allowlist governs which environment-variable names a pool's
-	// extra_specs.extra_env may set — defaulting to EMPTY (fail-closed: no
-	// extra env passes unless the operator opts a name in). See extra_specs.go.
-	ExtraSpecs ExtraSpecsPolicy `toml:"extra_specs"`
-
-	// StatusReport is the [status_report] table: provider-side runner status
-	// reporting to GARM's instance callback, on by default. See
-	// status_report.go.
-	StatusReport StatusReport `toml:"status_report"`
-
-	// Logging is the [logging] table: an optional persistent log file next to
-	// stderr, unset by default. See logging.go.
-	Logging Logging `toml:"logging"`
+	Cache        Cache            `toml:"cache"`
+	ExtraSpecs   ExtraSpecsPolicy `toml:"extra_specs"`
+	StatusReport StatusReport     `toml:"status_report"`
+	Logging      Logging          `toml:"logging"`
 }
 
-// Load reads the TOML config file at path, applies defaults, and validates
-// the result. Unknown keys in the file are ignored rather than rejected.
+// Load reads the TOML config file at path, applies defaults and validates the
+// result.
 func Load(path string) (Config, error) {
 	cfg := Config{
 		DockerHost:       defaultDockerHost,
@@ -176,8 +89,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("failed to parse config file %q: %w", path, err)
 	}
 
-	// An explicit empty string in the file (docker_host = "") is treated
-	// the same as an omitted key, not as "no docker host".
+	// docker_host = "" means the same as an omitted key.
 	if cfg.DockerHost == "" {
 		cfg.DockerHost = defaultDockerHost
 	}
@@ -189,10 +101,7 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-// Validate checks every top-level invariant. Field-group-specific checks
-// (dind_mode/allowed_dind_modes/dind_image, storage_driver, [resources],
-// each flavor) are delegated to their own files (dind.go, resources.go,
-// flavor.go) to keep this file focused on orchestration.
+// Validate checks every invariant of c, including a Config built without Load.
 func (c Config) Validate() error {
 	if c.RunnerImage == "" {
 		return fmt.Errorf("runner_image is required")
@@ -231,12 +140,10 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// validateDigestPinnedImage requires ref (the field named fieldName, for
-// error messages) to be a canonical, digest-pinned image reference
-// (name@sha256:<64-hex>), so the exact image bytes are reproducible
-// (ADR-002/ADR-005 F10). A malformed reference is always rejected. A valid
-// tag-only reference is rejected unless allowUnpinned is set. Shared by
-// runner_image, dind_image, and each flavor's own runner_image override.
+// validateDigestPinnedImage requires ref, the value of fieldName, to be a
+// name@sha256:<64-hex> reference so the image bytes are reproducible. A
+// tag-only reference passes only when allowUnpinned is set; a malformed one
+// never does.
 func validateDigestPinnedImage(fieldName, ref string, allowUnpinned bool) error {
 	named, err := reference.ParseNormalizedNamed(ref)
 	if err != nil {

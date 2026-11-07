@@ -2,36 +2,24 @@ package config
 
 import "fmt"
 
-// Flavor is one named [flavors.<name>] entry (ADR-002/ADR-005): a pool
-// selects a flavor by name via extra_specs (WP2/WP3, M3's schema
-// validation), and each of its three fields, when set, overrides the
-// corresponding config-wide default for that pool. All three are optional;
-// an unset field falls through to the config-wide value — see
-// Config.EffectiveRunnerMemoryBytes, Config.EffectiveDindMemoryBytes
-// (resources.go), and Config.EffectiveRunnerImage below.
+// Flavor is a [flavors.<name>] entry. A pool selects it with extra_specs.flavor,
+// and each field that is set overrides the config-wide value for that pool.
 type Flavor struct {
-	// RunnerMemory overrides [resources].runner_memory for pools that
-	// select this flavor. Same human-readable byte-size shape.
+	// RunnerMemory overrides [resources].runner_memory.
 	RunnerMemory string `toml:"runner_memory"`
 
-	// DindMemory overrides [resources].dind_memory for pools that select
-	// this flavor.
+	// DindMemory overrides [resources].dind_memory.
 	DindMemory string `toml:"dind_memory"`
 
-	// RunnerImage overrides the top-level runner_image for pools that
-	// select this flavor. This is the ONLY way a pool can vary the runner
-	// image (ADR-002's owner ruling, restated in ADR-005) — no
-	// extra_specs field accepts a raw image reference.
+	// RunnerImage overrides the top-level runner_image. It is the only way a
+	// pool can vary the runner image: no extra_specs field takes an image
+	// reference (ADR-005).
 	RunnerImage string `toml:"runner_image"`
 }
 
-// validate checks a flavor's own fields: RunnerMemory/DindMemory (if set)
-// must be well-formed byte sizes, and RunnerImage (if set) must be
-// digest-pinned under the SAME allowUnpinnedRunnerImage escape hatch the
-// top-level runner_image uses — a flavor's image override is not a
-// separate trust tier from the top-level one, so it gets no escape hatch
-// of its own (unlike DindImage, which is a genuinely different image with
-// its own risk profile — see Config.AllowUnpinnedDindImage's doc comment).
+// validate checks the fields that are set. RunnerImage uses the top-level
+// allowUnpinnedRunnerImage flag, because it is the same trust tier as
+// runner_image; only dind_image has a flag of its own.
 func (f Flavor) validate(allowUnpinnedRunnerImage bool) error {
 	if f.RunnerMemory != "" {
 		if _, err := ParseByteSize(f.RunnerMemory); err != nil {
@@ -51,11 +39,8 @@ func (f Flavor) validate(allowUnpinnedRunnerImage bool) error {
 	return nil
 }
 
-// EffectiveRunnerImage returns the runner image a caller (WP2/WP3's
-// topology layer) should pull/run for flavorName: the flavor's own
-// runner_image when set, else this config's top-level runner_image. An
-// empty or unknown flavorName falls through to the top-level image, same
-// as EffectiveRunnerMemoryBytes/EffectiveDindMemoryBytes (resources.go).
+// EffectiveRunnerImage returns the flavor's runner_image, or the top-level
+// runner_image when flavorName is empty, unknown or sets none.
 func (c Config) EffectiveRunnerImage(flavorName string) string {
 	if fl, ok := c.Flavors[flavorName]; ok && fl.RunnerImage != "" {
 		return fl.RunnerImage
