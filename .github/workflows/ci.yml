@@ -7,6 +7,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a newly published Go or dependency advisory shows up without
+  # needing a pull request. Only the `govulncheck` job runs on this trigger.
+  schedule:
+    - cron: '23 5 * * 1'
   workflow_dispatch:
 
 # Cancel superseded runs on PRs only. On `main` every pushed commit should
@@ -22,6 +26,7 @@ permissions:
 jobs:
   build:
     name: build, vet, fmt, unit tests, shellcheck
+    if: github.event_name != 'schedule'
     # Not ubuntu-slim: the `-race` step is too CPU-bound for one vCPU.
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -30,12 +35,20 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # go.mod is the single source of truth for the Go version. setup-go
-      # parses it directly, so repo content never passes through a shell.
+      # parses it directly, so repo content never passes through a shell. It
+      # installs the `toolchain` line when there is one, else the `go` line.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+
+      # Fails if the Dockerfile's golang tag or the installed Go differs from
+      # go.mod's toolchain line. Also prints the version this job builds with.
+      - name: Check Go version matches go.mod and Dockerfile
+        run: |
+          go version
+          scripts/check-go-version.sh
 
       - name: go build ./...
         run: go build ./...
@@ -61,6 +74,32 @@ jobs:
 
       - name: shellcheck
         run: shellcheck runner-images/common/entrypoint.sh scripts/*.sh
+
+  # Not part of the required `build` check: a new advisory can turn this red
+  # on a pull request that did not cause it. Fails only on an advisory whose
+  # vulnerable symbol this module calls and that has a fixed version; see
+  # scripts/govulncheck.sh for the policy.
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check Go version matches go.mod and Dockerfile
+        run: |
+          go version
+          scripts/check-go-version.sh
+
+      - name: govulncheck (reachable, fixable advisories fail)
+        run: scripts/govulncheck.sh
 
   # Manual only, not part of the required gate: scenarios wait out real
   # timeouts (minutes), and it has not been validated on GitHub-hosted amd64.

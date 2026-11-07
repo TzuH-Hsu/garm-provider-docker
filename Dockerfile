@@ -16,7 +16,11 @@
 # Pin the builder stage to the host platform. Pure-Go cross-compilation needs
 # only GOOS/GOARCH, whereas running the Go toolchain under QEMU for the other
 # platform can crash (`go build` panics under emulation).
-FROM --platform=$BUILDPLATFORM golang:1.25.0@sha256:5502b0e56fca23feba76dbc5387ba59c593c02ccc2f0f7355871ea9a0852cebe AS builder
+#
+# The golang tag must equal the `toolchain` line in go.mod; CI checks it
+# (scripts/check-go-version.sh). Dependabot ignores this image, so bump both
+# by hand, and use the multi-arch index digest, not a per-platform one.
+FROM --platform=$BUILDPLATFORM golang:1.27.3@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e AS builder
 
 WORKDIR /src
 

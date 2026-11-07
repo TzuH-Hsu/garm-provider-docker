@@ -45,12 +45,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # go.mod is the single source of truth for the Go version.
+      # go.mod is the single source of truth for the Go version. setup-go
+      # installs its `toolchain` line when there is one, else the `go` line.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+
+      # Fails the release build if the installed Go is not the toolchain that
+      # go.mod names, so a binary is never built with a different Go silently.
+      - name: Check Go version matches go.mod and Dockerfile
+        run: |
+          go version
+          scripts/check-go-version.sh
 
       # A pushed tag is the version. Anything else, including a dispatch
       # aimed at a tag, gets a synthetic one. IS_RELEASE matches the publish

@@ -2,6 +2,12 @@ module github.com/TzuH-Hsu/garm-provider-docker
 
 go 1.25.0
 
+// The go line stays the language version this module is written for. The
+// toolchain line is the Go that builds and tests it, so release binaries carry
+// current standard library fixes. CI fails if the Dockerfile's golang tag
+// differs (scripts/check-go-version.sh); bump both together.
+toolchain go1.27.3
+
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/cloudbase/garm-provider-common v0.1.9

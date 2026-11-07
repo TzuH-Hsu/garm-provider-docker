@@ -10,6 +10,23 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+### Security
+
+- Release binaries and the provider image are now built with Go 1.27.3 instead
+  of Go 1.25.0, so they include the standard library security fixes released
+  since. `go.mod` keeps `go 1.25.0` as the language version and adds
+  `toolchain go1.27.3`. Before this, CI, the release workflow and the
+  Dockerfile all built with the language version, 1.25.0.
+- The remaining advisories in `github.com/docker/docker` v28.5.2 have no fixed
+  version on the module path this project uses, and are unchanged.
+
+### Added
+
+- CI runs `govulncheck` on pushes, pull requests and weekly. It fails only for
+  an advisory that is reachable from this code and has a fixed version.
+- CI fails when the Dockerfile's `golang` tag, the installed Go, and the
+  `toolchain` line in `go.mod` disagree.
+
 ## [0.2.9] - 2026-11-07
 
 ### Added
