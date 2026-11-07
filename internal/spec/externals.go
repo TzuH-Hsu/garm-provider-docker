@@ -8,89 +8,41 @@ import (
 	"github.com/docker/docker/api/types/strslice"
 )
 
-// This file holds ADR-003's externals-cache pure functions (M2-W2): the
-// image-digest-keyed externals volume name/labels, the READ-ONLY runner mount,
-// and the dedicated privileged seed step (ARC init-copy pattern, research.md
-// §3.D) that copies the runner image's own externals payload into the volume
-// exactly once, under a lock, before any runner ever mounts it. Like the rest of
-// package spec these are side-effect-free builders — no Docker calls, no
-// time.Now() — so they are cheap to table-test; the caller supplies the digest,
-// labels timestamp, and volume name.
-
-// RunnerExternalsDir is the runner image's own externals directory
-// (research.md §3.B: the myoung34/github-runner base installs the runner into
-// /actions-runner). It plays TWO roles: it is the SOURCE the seed step copies
-// FROM (the image ships its Node runtimes here), and it is the path the
-// externals volume is mounted READ-ONLY ONTO in the runner, so the runner reads
-// the shared, seeded Node runtimes instead of its own image-baked copy.
+// RunnerExternalsDir is the runner image's externals directory. The seed step copies
+// from it, and the externals volume is mounted read-only onto it in the runner.
 const RunnerExternalsDir = "/actions-runner/externals"
 
-// externalsSeededMarkerBasename is the atomic "seeding complete" sentinel's file
-// name (written LAST by the seed script, inside the externals volume). It is the
-// single source of truth for the marker's name, shared by the provider-side seed
-// (externalsSeededMarker, at the seed staging path) and the CONSUMER-side gate
-// (RunnerExternalsSeededMarkerPath, at the runner's read-only mount path). Keeping
-// one basename is what guarantees the runner waits for exactly the file the seeder
-// writes.
+// externalsSeededMarkerBasename is the marker's one name, so the runner waits for
+// exactly the file the seeder writes.
 const externalsSeededMarkerBasename = ".garm-seeded"
 
-// RunnerExternalsSeededMarkerPath is where the externals seed-completion marker
-// appears INSIDE THE RUNNER: the externals volume is mounted read-only at
-// RunnerExternalsDir, so the marker the seed script wrote at
-// <staging>/.garm-seeded surfaces here. The provider passes this path to the
-// runner entrypoint as RunnerExternalsSeededMarkerEnv so the entrypoint can BLOCK
-// until externals is fully seeded before launching the runner (ADR-003 W2
-// consumer-side seed gate, 2026-07-22) — the robust backstop that makes a
-// half-seeded start impossible AT THE POINT OF USE, regardless of provider-side
-// pin timing.
+// RunnerExternalsSeededMarkerPath is where the seed marker appears inside the runner.
+// The entrypoint blocks on it before launching the runner, which makes a half-seeded
+// start impossible whatever the provider's timing (ADR-003).
 const RunnerExternalsSeededMarkerPath = RunnerExternalsDir + "/" + externalsSeededMarkerBasename
 
-// RunnerExternalsSeededMarkerEnv carries RunnerExternalsSeededMarkerPath to the
-// runner-image entrypoint. The provider sets it ONLY when an externals cache is
-// actually mounted (cache enabled), so the entrypoint's seed-wait runs only when
-// externals seeding is expected; when unset the entrypoint skips the wait
-// entirely (a cache-disabled runner has no externals mount to wait on).
+// RunnerExternalsSeededMarkerEnv carries that path to the entrypoint. It is set only
+// when an externals volume is mounted; when unset, the entrypoint skips the wait.
 const RunnerExternalsSeededMarkerEnv = "GARM_EXTERNALS_SEEDED_MARKER"
 
-// externalsSeedStagingDir is where the externals volume is mounted READ-WRITE
-// inside the short-lived seed container. It is deliberately NOT
-// RunnerExternalsDir: mounting the volume over the image's own externals would
-// shadow the very SOURCE the seed copies from. The seed copies
-// RunnerExternalsDir/. -> externalsSeedStagingDir/ instead.
+// externalsSeedStagingDir is where the seed container mounts the volume read-write. It
+// cannot be RunnerExternalsDir: that would hide the image's externals, the copy's source.
 const externalsSeedStagingDir = "/garm-externals-seed"
 
-// externalsSeededMarker is the atomic "seeding complete" sentinel written LAST,
-// only after the full copy finishes (ADR-003 F15). A later job — or a
-// concurrent second seeder that lost the lock race — sees this file and skips
-// re-seeding, so it never mounts a half-copied externals tree. It lives inside
-// the volume (as a dotfile alongside the Node runtime dirs) so every container
-// sharing the volume sees the same marker.
+// externalsSeededMarker is written last, after the full copy. A later job, or a
+// seeder that lost the lock race, sees it and skips seeding.
 const externalsSeededMarker = externalsSeedStagingDir + "/" + externalsSeededMarkerBasename
 
-// externalsSeedLock is the flock lock file inside the volume. Two concurrent
-// first-jobs for the same image digest both open and flock it; because both
-// containers mount the SAME named volume, they lock the SAME underlying inode,
-// so exactly one seeder acquires it and copies while the other blocks, then
-// (finding the marker) no-ops. flock releases automatically when the holder's fd
-// closes on process exit, so a crashed seeder cannot deadlock the next one.
+// externalsSeedLock is the flock file inside the volume. Racing seeders mount the same
+// volume, so they lock the same inode. flock releases when the holder's fd closes, so
+// a crashed seeder cannot deadlock the next one.
 const externalsSeedLock = externalsSeedStagingDir + "/.garm-seed.lock"
 
-// externalsSeedScript is the seed container's shell program (ADR-003 F15,
-// ARC init-copy pattern). Under `sh -ec` it: takes an exclusive flock on the
-// in-volume lock file; if the atomic marker already exists, exits 0 (already
-// seeded — the common warm path and the lock-race loser); otherwise copies the
-// image's externals payload into the volume (when the image actually ships one),
-// fsyncs, and writes the marker LAST. `cp -a` preserves ownership/perms so the
-// runner (uid 1001) can execute the Node binaries through the read-only mount.
-// Any copy failure aborts non-zero (set -e), which fails the allocation rather
-// than mounting a partial tree.
-//
-// The copy is guarded by `[ -d <source> ]`: an image that ships no externals
-// (e.g. a minimal test/sleep image, or any non-actions-runner image) seeds the
-// volume EMPTY and still writes the marker, so the provider mounts a
-// consistent (if empty) read-only externals rather than failing the create —
-// such an image does not use externals anyway, and a real runner image always
-// has the source so the guard is a true no-op there.
+// externalsSeedScript takes the lock, exits if the marker exists, and otherwise copies
+// the image's externals and writes the marker last. `cp -a` preserves ownership so the
+// runner can execute the binaries through the read-only mount, and under `sh -e` a
+// failed copy fails the allocation rather than mounting a partial tree. An image with
+// no externals seeds an empty, marked volume rather than failing the create.
 const externalsSeedScript = `exec 9>"` + externalsSeedLock + `"
 flock 9
 if [ -e "` + externalsSeededMarker + `" ]; then
@@ -103,46 +55,28 @@ sync
 touch "` + externalsSeededMarker + `"
 `
 
-// externalsVolumeNamePrefix is the shared name prefix for externals volumes,
-// so an operator can spot them via `docker volume ls | grep`. The authoritative
-// selector is still the label set (cache=true + cache-kind=externals).
+// externalsVolumeNamePrefix is the name prefix of externals volumes.
 const externalsVolumeNamePrefix = cacheVolumeNamePrefix + string(CacheKindExternals) + "-"
 
-// ExternalsVolumeName builds the externals volume name (ADR-003):
-// garm-cache-externals-<imageDigest>. It is keyed on the runner IMAGE digest
-// ONLY — no repokey and no controller-id — so it is deliberately shared across
-// every repository AND every controller on the host: its contents are Node
-// runtimes tied to the runner image version, carrying no repository data, so
-// cross-repo/cross-controller sharing is safe (and the read-only mount, plus
-// privileged-only seeding, is what keeps it safe — see BuildExternalsSeedContainer
-// and ExternalsROMount). imageDigest must be a bare, Docker-name-safe token
-// (the caller passes the image ID's hex, digest colon stripped).
+// ExternalsVolumeName returns garm-cache-externals-<imageDigest>, with imageDigest a
+// bare Docker-name-safe token (the image ID's hex). It has no repokey or controller ID:
+// the contents are Node runtimes with no repository data, and sharing them is safe
+// because the mount is read-only and only the seed helper writes.
 func ExternalsVolumeName(imageDigest string) string {
 	return externalsVolumeNamePrefix + imageDigest
 }
 
-// ExternalsVolumeIdentity is the identity an externals volume's labels derive
-// from. Unlike CacheVolumeIdentity (controller + repokey), an externals volume
-// is scoped to a controller and an IMAGE DIGEST only — no repokey — because it
-// is shared across repositories. The controller-id is still recorded (so this
-// controller's opportunistic GC can find the externals volumes it created),
-// with the documented consequence that a controller-scoped GC will not reap an
-// externals volume first created (and thus labeled) by another controller — the
-// same cross-controller consequence the shared, controller-id-omitting NAME
-// already implies (ADR-003 amendment).
+// ExternalsVolumeIdentity is what an externals volume's labels derive from. ControllerID
+// records the creating controller, so each controller's GC reports only the externals
+// volumes it created, even though the volume name is shared.
 type ExternalsVolumeIdentity struct {
 	ControllerID string
 	ImageDigest  string
 }
 
-// ExternalsLabels returns the label set for an externals volume (ADR-003 W2):
-// the common cache markers (managed, controller-id, cache=true, a
-// CREATION-time last-used) plus cache-kind=externals and image-digest=<digest>.
-// It carries NO repo label (shared across repos) and — like every cache volume
-// — NO instance-name, so ADR-004's teardown/sweep predicate structurally
-// excludes it. lastUsed is supplied by the caller (never time.Now() here),
-// keeping this a pure builder; per local-volume label immutability it records the
-// creation instant and is not re-stamped on reuse (see cache.go / ADR-003).
+// ExternalsLabels returns an externals volume's labels. They have no repo label, since
+// the volume is shared, and no instance-name, so ADR-004's predicate excludes it.
+// lastUsed records creation and is not refreshed on reuse.
 func (e ExternalsVolumeIdentity) ExternalsLabels(lastUsed time.Time) map[string]string {
 	return map[string]string{
 		LabelManaged:      "true",
@@ -154,14 +88,10 @@ func (e ExternalsVolumeIdentity) ExternalsLabels(lastUsed time.Time) map[string]
 	}
 }
 
-// ExternalsROMount returns the externals volume mounted READ-ONLY into the
-// runner at RunnerExternalsDir (ADR-003 red-line F4). Read-only is the whole
-// point: because this volume is shared across every repository on the host, a
-// read-write mount would let any one job's untrusted `run:` steps overwrite a
-// shared Node binary (externals/<ver>/bin/node) that every OTHER repository's
-// runner then executes — a cross-repo remote-code-execution path. The runner
-// never writes it; only the privileged seed step (BuildExternalsSeedContainer)
-// ever populates it.
+// ExternalsROMount returns the externals volume mounted read-only at RunnerExternalsDir.
+// The volume is shared across repositories, so a writable mount would let one job's
+// `run:` steps overwrite a Node binary that every other repository's runner executes:
+// a cross-repository code execution path. Only the seed helper writes it.
 func ExternalsROMount(name string) mount.Mount {
 	return mount.Mount{
 		Type:     mount.TypeVolume,
@@ -171,45 +101,28 @@ func ExternalsROMount(name string) mount.Mount {
 	}
 }
 
-// ExternalsSeedContainerSpec bundles the inputs BuildExternalsSeedContainer
-// turns into the seed container's config. Image is the RUNNER image (its own
-// externals payload is the copy source); VolumeName is the externals volume;
-// Labels are the helper labels (role=cache-helper, no instance-name).
+// ExternalsSeedContainerSpec holds the inputs of BuildExternalsSeedContainer. Image is
+// the runner image, whose externals are the copy source. Labels are helper labels.
 type ExternalsSeedContainerSpec struct {
 	Image      string
 	VolumeName string
 	Labels     map[string]string
 }
 
-// BuildExternalsSeedContainer assembles the container.Config/HostConfig for the
-// short-lived externals SEED container (ADR-003 F15). It overrides the runner
-// image's entrypoint with the flock+copy+marker seed script
-// (externalsSeedScript) and mounts the externals volume READ-WRITE at the
-// staging dir — the ONE place this volume is ever written. The job's own
-// workflow code never runs in this container and never influences it: the
-// entrypoint is fully replaced and no job env is threaded in, so seeding stays
-// outside the untrusted execution boundary. It joins no network (the copy is
-// purely local) and drops the image CMD so only the seed script runs.
-//
-// Concurrency safety comes from the in-volume flock plus the atomic marker
-// written last: exactly one of N racing first-jobs copies; the rest block on the
-// lock and then no-op on the marker (externalsSeedScript). The provider runs
-// this container to completion BEFORE creating the runner, so the read-only
-// externals mount the runner gets is always a fully-seeded tree.
+// BuildExternalsSeedContainer returns the config of the container that seeds the
+// externals volume, the one place the volume is written. It replaces the image's
+// entrypoint and threads in no job environment, so workflow code cannot influence it.
+// Run it to completion before creating the runner (ADR-003, "Externals").
 func BuildExternalsSeedContainer(s ExternalsSeedContainerSpec) (*container.Config, *container.HostConfig) {
 	cfg := &container.Config{
 		Image:      s.Image,
 		Labels:     s.Labels,
 		Entrypoint: strslice.StrSlice{"/bin/sh", "-ec", externalsSeedScript},
-		// Drop the image CMD so nothing is appended as an argument to the seed
-		// script (the runner image's CMD is ["./run.sh"]).
+		// The image's CMD would otherwise be appended as arguments to the seed script.
 		Cmd: strslice.StrSlice{},
 	}
 	host := &container.HostConfig{
-		// No network (L9): the seed is a purely local `cp -a` under a flock and
-		// needs no egress, so the helper joins the "none" network rather than the
-		// default bridge — least privilege for a container that touches only the
-		// one mounted externals volume.
+		// The copy is local, so the helper gets no network.
 		NetworkMode: "none",
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeVolume,

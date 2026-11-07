@@ -8,40 +8,29 @@ import (
 	"strings"
 )
 
-// The two environment variables that point pnpm at its store. pnpm <= 10 reads
-// only the npm_config_ spelling and pnpm >= 11 reads only the pnpm_config_ one,
-// so the provider sets both. npm 11 prints a one-line "Unknown env config
-// store-dir" warning for the npm_config_ one on every npm/npx call; that is
-// cosmetic and unavoidable while pnpm 10 is supported (ADR-003, W2 amendment).
+// The variables that point pnpm at its store. pnpm <= 10 reads only the npm_config_
+// spelling and pnpm >= 11 only the pnpm_config_ one, so the provider sets both. npm 11
+// warns "Unknown env config store-dir" about the former; that is cosmetic (ADR-003).
 const (
 	PnpmStoreDirEnvNpm  = "npm_config_store_dir"
 	PnpmStoreDirEnvPnpm = "pnpm_config_store_dir"
 )
 
-// The environment variables that point pnpm at its metadata cache (packuments
-// and, on pnpm 11, the verified-lockfile record). Same split as the store dir:
-// pnpm <= 10 reads only npm_config_cache_dir, pnpm >= 11 only
-// pnpm_config_cache_dir, and either overrides XDG_CACHE_HOME. npm 11 prints an
-// "Unknown env config cache-dir" warning for the npm_config_ one, the same
-// cosmetic cost as store-dir (ADR-003, 2026-10-26 amendment).
+// The variables that point pnpm at its metadata cache, split the same way as the
+// store dir. Either overrides XDG_CACHE_HOME.
 const (
 	PnpmCacheDirEnvNpm  = "npm_config_cache_dir"
 	PnpmCacheDirEnvPnpm = "pnpm_config_cache_dir"
 )
 
-// PnpmMetadataCacheSubdir is the directory, directly under the pnpm store
-// mount, that holds pnpm's metadata cache. It is deliberately NOT the mount
-// root: `pnpm store prune` removes what it finds under cache-dir, and on pnpm 11
-// with cache-dir equal to the store root it deleted the whole store in a lab
-// run. In a sub-directory, prune can only drop the metadata, which is
-// re-fetched on demand. The runner user creates it on first use inside the
-// runner-owned store mount, so no extra ownership prep is needed.
+// PnpmMetadataCacheSubdir holds pnpm's metadata cache, directly under the store mount.
+// It must not be the mount root: `pnpm store prune` removes what it finds under
+// cache-dir, and on pnpm 11 that deleted a whole store (ADR-003). Here it can drop only
+// metadata, which is fetched again on demand.
 const PnpmMetadataCacheSubdir = "metadata-cache"
 
-// PnpmMetadataCacheDir returns the metadata cache directory for a pnpm store
-// mounted at storeDir, or "" when storeDir is empty (no persistent store, so
-// pnpm keeps its own default cache location). The result is always strictly
-// beneath storeDir, never storeDir itself.
+// PnpmMetadataCacheDir returns the metadata cache directory for a store mounted at
+// storeDir, or "" when storeDir is empty. It is never storeDir itself.
 func PnpmMetadataCacheDir(storeDir string) string {
 	if storeDir == "" {
 		return ""
@@ -49,8 +38,7 @@ func PnpmMetadataCacheDir(storeDir string) string {
 	return path.Join(storeDir, PnpmMetadataCacheSubdir)
 }
 
-// EntityScope identifies which GitHub entity level a bootstrap payload's
-// repo_url refers to.
+// EntityScope is the GitHub entity level a bootstrap payload's repo_url refers to.
 type EntityScope string
 
 const (
@@ -59,10 +47,8 @@ const (
 	EntityEnterprise EntityScope = "enterprise"
 )
 
-// Entity is the GitHub-only v1 (plan.md §6) result of parsing a
-// BootstrapInstance.RepoURL into the org/repo/enterprise scope the
-// myoung34/github-runner entrypoint's RUNNER_ORG/RUNNER_REPO/
-// RUNNER_ENTERPRISE variables expect (ADR-002; research.md §2.A).
+// Entity is a repo_url parsed into the scope the base image's RUNNER_ORG, RUNNER_REPO
+// and RUNNER_ENTERPRISE variables expect. GitHub only.
 type Entity struct {
 	Scope      EntityScope
 	Org        string // set for EntityRepo and EntityOrg
@@ -70,38 +56,22 @@ type Entity struct {
 	Enterprise string // set for EntityEnterprise only
 }
 
-// ParseEntity derives the GitHub entity scope from repo_url. The
-// detection heuristic is GitHub-only and based on URL path depth alone
-// (plan.md's open questions flag this same limitation for other forges):
+// ParseEntity derives the entity scope from repo_url's path depth, GitHub shapes only:
 //
 //	https://github.com/enterprises/<name>  -> enterprise
 //	https://github.com/<org>               -> org
 //	https://github.com/<org>/<repo>        -> repo
 //
-// A trailing "/" and/or ".git" suffix is tolerated. Case is preserved
-// exactly as given in repo_url: GitHub org/repo/enterprise names are
-// treated as opaque path segments here, never normalized, since GitHub's
-// API accepts whatever case the operator's URL used.
-//
-// It requires an ABSOLUTE http(s) URL with a non-empty host and REJECTS any
-// scheme-less, relative, or otherwise unparseable form. This is a fail-SAFE
-// boundary for the cache-eligibility decision (H1): url.Parse("github.com/acme")
-// yields a RELATIVE path ("github.com/acme") with an EMPTY host, which — split on
-// "/" — has two segments and would otherwise be misclassified as REPO scope, so
-// an org-scoped pool that happened to use a scheme-less repo_url would be handed
-// writable per-repo caches even with allow_org_shared=false (a cross-org leak).
-// Demanding a real scheme+host means such an input reaches DetectCacheEntityScope
-// as an error (→ CacheScopeUnknown → NO persistent cache), never a mis-scoped one.
+// A trailing "/" or ".git" is tolerated, and case is preserved. It returns an error
+// unless repo_url is an absolute http(s) URL with a host: url.Parse("github.com/acme")
+// yields a relative two-segment path, which would classify an org as a repo and hand
+// it writable per-repo caches.
 func ParseEntity(repoURL string) (Entity, error) {
 	u, err := url.Parse(strings.TrimSpace(repoURL))
 	if err != nil {
 		return Entity{}, fmt.Errorf("failed to parse repo_url %q: %w", repoURL, err)
 	}
 
-	// An absolute http(s) URL with a host is the ONLY shape that can be
-	// confidently classified; anything else (scheme-less "github.com/acme",
-	// bare "owner/repo", or a non-http scheme) is treated as unclassifiable so
-	// the cache decision fails safe rather than open.
 	switch scheme := strings.ToLower(u.Scheme); scheme {
 	case "http", "https":
 		// ok
@@ -136,89 +106,47 @@ func ParseEntity(repoURL string) (Entity, error) {
 	}
 }
 
-// RunnerEnvOptions holds everything BuildRunnerEnv needs to compute the
-// runner container's environment, per ADR-002's per-delivery-mode
-// contract.
+// RunnerEnvOptions holds the inputs of BuildRunnerEnv.
 type RunnerEnvOptions struct {
-	// JITConfigEnabled mirrors BootstrapInstance.JitConfigEnabled. It
-	// gates which of the fields below are emitted at all (ADR-002).
+	// JITConfigEnabled mirrors BootstrapInstance.JitConfigEnabled.
 	JITConfigEnabled bool
 
-	// GitHubURL is the base GitHub URL (e.g. "https://github.com"),
-	// always set for informational/connectivity-check use inside the
-	// entrypoint.
+	// GitHubURL is the base GitHub URL, always set.
 	GitHubURL string
 
-	// RunnerWorkDir is the runner's working directory inside the
-	// container, always set.
+	// RunnerWorkDir is the runner's working directory, always set.
 	RunnerWorkDir string
 
-	// DockerHost, when non-empty (DinD modes only, WP3), is emitted as
-	// DOCKER_HOST so the runner's docker CLI — and the entrypoint's
-	// `until docker info` readiness wait (ADR-002) — target the DinD
-	// sidecar's daemon over the shared socket volume (spec.DindDockerHost).
-	// Left empty ("none" mode), DOCKER_HOST is not set and the entrypoint
-	// skips the Docker readiness wait entirely (ADR-002's none-mode path).
+	// DockerHost is emitted as DOCKER_HOST in DinD modes. When empty, the entrypoint
+	// skips its Docker readiness wait.
 	DockerHost string
 
-	// ToolCacheDir, when non-empty, is emitted as RUNNER_TOOL_CACHE — the
-	// hosted-runner toolcache location the setup-* actions consult before
-	// downloading a tool (research.md §3; ADR-003). The provider sets it to the
-	// configured [cache].toolcache_path whenever the cache feature is enabled,
-	// even for a cache-INELIGIBLE allocation (giving the runner a consistent
-	// toolcache path — merely an ephemeral in-container one, since no persistent
-	// volume backs it there). Emitted in both JIT and non-JIT modes.
+	// ToolCacheDir is emitted as RUNNER_TOOL_CACHE. It is set whenever the cache
+	// feature is on, even without a persistent volume, so the path stays consistent.
 	ToolCacheDir string
 
-	// PnpmStoreDir, when non-empty, is emitted as BOTH npm_config_store_dir and
-	// pnpm_config_store_dir — the envs pnpm honors as its store-dir. pnpm <= 10
-	// reads only the npm_config_ spelling and pnpm >= 11 reads only the
-	// pnpm_config_ one (each ignores the other; verified against pnpm 10.16.1
-	// and 11.28.5), so both are set to keep the persistent store working across
-	// the pnpm major boundary. Package content is reused across containers
-	// sharing the volume. Set ONLY when a persistent pnpm store volume is
-	// actually mounted, so a cache-ineligible allocation leaves pnpm on its own
-	// default store. Emitted in both modes. The same condition also emits
-	// npm_config_cache_dir and pnpm_config_cache_dir, pointing at the
-	// PnpmMetadataCacheSubdir sub-directory of this path.
+	// PnpmStoreDir is emitted as both store-dir variables, with both cache-dir variables
+	// at its PnpmMetadataCacheSubdir. It is set only when a persistent store volume is
+	// mounted, so an ineligible allocation leaves pnpm on its defaults.
 	PnpmStoreDir string
 
-	// Entity is the parsed repo/org/enterprise scope (ParseEntity),
-	// consulted only in non-JIT mode.
+	// Entity is the parsed scope, used only without JIT.
 	Entity Entity
 
-	// RunnerName is the runner's name, consulted only in non-JIT mode.
+	// RunnerName is the runner's name, used only without JIT.
 	RunnerName string
 
-	// RunnerGroup mirrors BootstrapInstance.GitHubRunnerGroup, consulted
-	// only in non-JIT mode.
+	// RunnerGroup mirrors BootstrapInstance.GitHubRunnerGroup, used only without JIT.
 	RunnerGroup string
 
-	// Labels are the GARM-supplied runner labels
-	// (BootstrapInstance.Labels), which GARM itself only populates in
-	// non-JIT mode (research.md §1.B) — consulted only in non-JIT mode.
+	// Labels are GARM's runner labels, which it populates only without JIT.
 	Labels []string
 }
 
-// BuildRunnerEnv returns the runner container's environment variables,
-// per ADR-002's per-delivery-mode contract.
-//
-// It never sets the instance token / bearer token, the metadata URL, or
-// the callback URL under any circumstance — those three simply have no
-// field in RunnerEnvOptions and no code path here that could emit them.
-// This is what makes credential-invisibility (ADR-002's central design
-// goal, and the M0 go/no-go gate in plan.md) a property of this
-// function's structure rather than something that has to be reviewed for
-// each new field added to it.
-//
-// DOCKER_HOST is emitted only in DinD modes (opts.DockerHost non-empty, set
-// by WP3's CreateInstance to spec.DindDockerHost): it points the runner's
-// docker CLI at the sidecar's daemon over the shared socket volume, and the
-// entrypoint's `until docker info` wait blocks on that daemon's readiness
-// (ADR-001, ADR-002). In "none" mode opts.DockerHost is empty and DOCKER_HOST
-// is absent, so the entrypoint skips the Docker readiness wait — the M0
-// behavior. It applies in both JIT and non-JIT delivery modes, so it is
-// emitted before the JIT early return below.
+// BuildRunnerEnv returns the runner container's environment (ADR-002). It can never
+// emit the instance token, the metadata URL or the callback URL: RunnerEnvOptions has
+// no field for them, which makes credential invisibility a property of this function's
+// structure rather than something to review per field.
 func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 	env := []string{
 		"JIT_CONFIG_ENABLED=" + strconv.FormatBool(opts.JITConfigEnabled),
@@ -228,17 +156,10 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 	}
 	if opts.DockerHost != "" {
 		env = append(env, "DOCKER_HOST="+opts.DockerHost)
-		// F1: tell the entrypoint which supplementary GID to add the runner
-		// user to before dropping privileges, so a non-root `docker` call can
-		// reach the DinD socket (group-owned by this GID via dockerd --group).
-		// Emitted only in DinD modes (DockerHost set), alongside DOCKER_HOST.
 		env = append(env, DindSocketGIDEnv+"="+DindSocketGID)
 	}
-	// Persistent-cache env (ADR-003), emitted in BOTH JIT and non-JIT modes —
-	// like DOCKER_HOST, these apply regardless of credential-delivery mode, so
-	// they precede the JIT early return. RUNNER_TOOL_CACHE is a provider-injected
-	// name (the RUNNER_* reserved prefix, ADR-005): a pool's extra_specs can
-	// never override it once that path is wired.
+	// Like DOCKER_HOST, these apply in both delivery modes. extra_env cannot override
+	// RUNNER_TOOL_CACHE: the RUNNER_ prefix is reserved (ADR-005).
 	if opts.ToolCacheDir != "" {
 		env = append(env, "RUNNER_TOOL_CACHE="+opts.ToolCacheDir)
 	}
@@ -247,9 +168,7 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 			PnpmStoreDirEnvNpm+"="+opts.PnpmStoreDir,
 			PnpmStoreDirEnvPnpm+"="+opts.PnpmStoreDir,
 		)
-		// The metadata cache rides on the same volume, in a sub-directory (see
-		// PnpmMetadataCacheSubdir), so it exists under exactly the condition the
-		// store does and shares its repo scope and lifecycle.
+		// The metadata cache shares the store's volume, scope and lifecycle.
 		cacheDir := PnpmMetadataCacheDir(opts.PnpmStoreDir)
 		env = append(env,
 			PnpmCacheDirEnvNpm+"="+cacheDir,
@@ -258,14 +177,8 @@ func BuildRunnerEnv(opts RunnerEnvOptions) []string {
 	}
 
 	if opts.JITConfigEnabled {
-		// JIT mode: GARM bakes the runner's name, labels, group, and
-		// ephemeral flag into the .runner/.credentials files themselves
-		// at JIT-config-generation time (ADR-002; research.md §1.C).
-		// run.sh reads them from those files, not from the environment.
-		// Setting RUNNER_ORG/REPO/ENTERPRISE/GROUP/NAME/LABELS/
-		// NO_DEFAULT_LABELS/EPHEMERAL here would be inert at best,
-		// misleading at worst, so they are deliberately absent rather
-		// than set-and-ignored.
+		// GARM bakes the name, labels, group and ephemeral flag into the credential files
+		// and run.sh reads them there, so setting them here would only mislead (ADR-002).
 		return env
 	}
 

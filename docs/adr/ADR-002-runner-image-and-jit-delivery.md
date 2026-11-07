@@ -159,7 +159,8 @@ user-defined bridge network with Node 22 (`server.listen(port, 'localhost')`, th
 | 26.1.4, 29.9.0 | enabled | `ECONNREFUSED 127.0.0.1` (binds `::1`) | passes, no `::1` lines |
 
 Only the `all` key is set. It is the one the daemon consults when writing `/etc/hosts`, and it also covers
-`lo` and `eth0`. The sysctl is per namespace, needs no privilege and changes nothing on the host. There is
+`lo` and `eth0`, which already exist when it is applied, so `default` (new interfaces only) adds nothing. The
+sysctl is per namespace, needs no privilege and changes nothing on the host. There is
 no setting for it. A job that binds or dials `::1` explicitly will not work, and the runner could not use
 IPv6 beyond loopback anyway.
 

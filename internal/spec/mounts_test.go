@@ -39,16 +39,15 @@ func TestCredentialTmpfsMap(t *testing.T) {
 
 	// The tmpfs must be owned by the runner uid/gid so the unprivileged
 	// delivery exec can write into it and the runner can read it back
-	// (ADR-002 F2). Short-syntax uid/gid is exactly what the real daemon
-	// honors (and the long-syntax it rejects), so this is the load-bearing
-	// assertion for defect 1.
+	// (ADR-002). The daemon honors uid/gid in the short syntax and rejects them in the
+	// long syntax, so this is the load-bearing assertion.
 	if kv["uid"] != RunnerUID || kv["gid"] != RunnerGID {
 		t.Errorf("tmpfs uid/gid = uid=%q gid=%q, want uid=%s gid=%s", kv["uid"], kv["gid"], RunnerUID, RunnerGID)
 	}
 	if kv["mode"] != "0700" {
 		t.Errorf("tmpfs mode = %q, want 0700", kv["mode"])
 	}
-	// A size cap must be present (ADR-002 F2) and non-empty.
+	// A size cap must be present (ADR-002) and non-empty.
 	if kv["size"] == "" {
 		t.Errorf("tmpfs size cap missing in options %q", opts)
 	}
@@ -68,8 +67,8 @@ func TestWorkspaceMountIsAnonymousVolume(t *testing.T) {
 	if m.Target != RunnerWorkDir {
 		t.Errorf("Target = %q, want %q", m.Target, RunnerWorkDir)
 	}
-	// Empty Source == anonymous volume (M0). A named source here would
-	// mean a persistent/shared volume, which is an M1 concern.
+	// Empty Source means an anonymous volume. A named source here would mean a
+	// persistent or shared volume.
 	if m.Source != "" {
 		t.Errorf("workspace Source = %q, want empty (anonymous volume)", m.Source)
 	}
@@ -106,7 +105,7 @@ func TestBuildRunnerContainer(t *testing.T) {
 		t.Errorf("HostConfig.Tmpfs[%q] = %q, want runner uid/gid", CredentialDir, tmpfsOpts)
 	}
 
-	// Mounts holds ONLY the workspace volume now.
+	// Mounts holds ONLY the workspace volume.
 	if len(host.Mounts) != 1 {
 		t.Fatalf("Mounts = %d, want 1 (workspace only)", len(host.Mounts))
 	}
@@ -119,7 +118,7 @@ func TestBuildRunnerContainer(t *testing.T) {
 		}
 	}
 
-	// M0 default: no memory limit.
+	// Default: no memory limit.
 	if host.Resources.Memory != 0 {
 		t.Errorf("Memory = %d, want 0 (unlimited) by default", host.Resources.Memory)
 	}
@@ -161,7 +160,7 @@ func TestNamedWorkspaceMount(t *testing.T) {
 	if m.Source != "test-instance-01-workspace" {
 		t.Errorf("Source = %q, want the named workspace volume", m.Source)
 	}
-	// WP9-flagged JIT-workdir check: the workspace mount target MUST equal the
+	// The workspace mount target MUST equal the
 	// runner image's RUNNER_WORKDIR (/actions-runner/_work) so a job's _work
 	// lands on the dedicated volume, not the container rootfs (ADR-002).
 	if m.Target != RunnerWorkDir {
@@ -206,7 +205,7 @@ func TestBuildRunnerContainerNamedWorkspaceAndNetwork(t *testing.T) {
 }
 
 func TestBuildRunnerContainerDefaultsToAnonymousWorkspaceAndNoNetwork(t *testing.T) {
-	// No WorkspaceVolumeName / NetworkName: the M0 fallback shape.
+	// No WorkspaceVolumeName / NetworkName: the anonymous fallback shape.
 	_, host := BuildRunnerContainer(RunnerContainerSpec{Image: "x"})
 	if len(host.Mounts) != 1 || host.Mounts[0].Source != "" {
 		t.Errorf("Mounts = %+v, want a single anonymous (empty Source) workspace volume", host.Mounts)
@@ -238,7 +237,7 @@ func mountByTarget(mounts []mount.Mount, dest string) (mount.Mount, bool) {
 
 // TestBuildRunnerContainerExternalsAndDiagMounts: the externals volume is
 // mounted READ-ONLY at RunnerExternalsDir and the diag volume READ-WRITE at
-// RunnerDiagDir when their names are set (ADR-003 W2). The externals RO flag is
+// RunnerDiagDir when their names are set (ADR-003). The externals RO flag is
 // the load-bearing cross-repo-RCE guard.
 func TestBuildRunnerContainerExternalsAndDiagMounts(t *testing.T) {
 	_, host := BuildRunnerContainer(RunnerContainerSpec{

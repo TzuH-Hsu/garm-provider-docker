@@ -175,6 +175,9 @@ There is no daemon, so housekeeping runs on `CreateInstance` and `ListInstances`
 - Keying on `pool_id`: unstable for scale sets.
 - One global cache: breaks isolation.
 - Size-based eviction: per-volume size cannot be queried portably.
+- Recency from a sentinel file's mtime: on Docker Desktop the provider cannot stat a volume's filesystem from
+  outside the VM. Age is measured from creation instead, so even an active cache is eventually flagged, and if
+  an operator prunes it the next job re-creates it empty.
 - Organization-keyed caches by default: silently pools every member repository.
 - A writable externals volume: a cross-repository execution path.
 - Pruning diagnostic logs from the entrypoint: retention logic a job can reach is retention a job can disable.
