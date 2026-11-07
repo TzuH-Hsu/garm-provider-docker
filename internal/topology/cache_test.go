@@ -23,7 +23,7 @@ func cacheIdentity() spec.CacheVolumeIdentity {
 }
 
 // cacheVolumeByName returns a cache volume's labels and whether it is present,
-// discovered by the cache=true label filter (as W2's GC/purge will discover it).
+// discovered by the cache=true label filter.
 func cacheVolumeByName(t *testing.T, fake *docker.FakeClient, name string) (map[string]string, bool) {
 	t.Helper()
 	for _, v := range listCacheVolumes(t, fake) {
@@ -116,7 +116,7 @@ func rawVolumeLabels(t *testing.T, fake *docker.FakeClient, name string) (map[st
 	return v.Labels, true
 }
 
-// TestEnsureCacheVolumeReconcilesAroundForeignSquatter is the B2 structural guard:
+// TestEnsureCacheVolumeReconcilesAroundForeignSquatter pins that
 // a FOREIGN volume squatting the deterministic cache name is NEVER deleted (a
 // Moby auto-created unlabeled volume and a genuinely foreign one are
 // indistinguishable, so name-based deletion can never be foreign-safe) and NEVER
@@ -177,12 +177,11 @@ func TestEnsureCacheVolumeReconcilesAroundForeignSquatter(t *testing.T) {
 	}
 }
 
-// TestEnsureCacheVolumeReconcilesAroundRepokeyCollision is the L7-as-reconcile
-// case: a DIFFERENT repository whose cache collided on the truncated repokey (same
-// name and managed+cache markers, but a DIFFERENT full repo-url-digest) is NEVER
-// adopted (one repo must not mount another's cache) and NEVER deleted — the
-// provider reconciles around it to an alternate name, and the colliding cache is
-// preserved.
+// TestEnsureCacheVolumeReconcilesAroundRepokeyCollision: a DIFFERENT repository whose
+// cache collided on the truncated repokey (same name and managed+cache markers, but a
+// DIFFERENT full repo-url-digest) is NEVER adopted (one repo must not mount another's
+// cache) and NEVER deleted. The provider reconciles around it to an alternate name, and
+// the colliding cache is preserved.
 func TestEnsureCacheVolumeReconcilesAroundRepokeyCollision(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()
@@ -222,13 +221,10 @@ func TestEnsureCacheVolumeReconcilesAroundRepokeyCollision(t *testing.T) {
 	}
 }
 
-// TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge is the B3 no-wedge guard: an
-// UNLABELED volume holding the deterministic name (e.g. a Moby auto-created
-// replacement left behind by an evict/create race) must NOT permanently block
-// creation the way the old M6 adoption guard did (which rejected the name
-// forever). EnsureCacheVolume reconciles around it, so a subsequent create for the
-// same identity succeeds — no wedge — while the unlabeled volume is left as
-// (logged) cruft, never deleted.
+// TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge: an UNLABELED volume holding the
+// deterministic name (a daemon auto-created one, for example) must not permanently
+// block creation. EnsureCacheVolume reconciles around it, so a create for the same
+// identity succeeds, while the unlabeled volume is left as logged cruft, never deleted.
 func TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge(t *testing.T) {
 	m, fake := newManager(t)
 	ctx := context.Background()

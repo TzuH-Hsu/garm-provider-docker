@@ -253,11 +253,11 @@ func TestStatsFallbackSkippedWhenBudgetSpent(t *testing.T) {
 	}
 }
 
-// TestTeardownReportsDindIOAfterRunnerExited is the regression for the live
-// failure: the ephemeral runner exits on its own when its job ends, before
-// the delete arrives, so the stats request for the privileged sidecar (which
-// shares the runner's network namespace) fails with "id is empty". io.stat
-// does not depend on the runner, so the line still carries written_bytes.
+// TestTeardownReportsDindIOAfterRunnerExited pins a failure seen on a real daemon: the
+// ephemeral runner exits on its own when its job ends, before the delete arrives, so
+// the stats request for the privileged sidecar (which shares the runner's network
+// namespace) fails with "id is empty". io.stat does not depend on the runner, so the
+// line still carries written_bytes.
 func TestTeardownReportsDindIOAfterRunnerExited(t *testing.T) {
 	logs := captureLogs(t)
 	m, fake, sidecar := seedDindAllocation(t, "gha-1")

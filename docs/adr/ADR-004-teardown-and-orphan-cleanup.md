@@ -100,6 +100,21 @@ in hand, and the generation, which protects the stable-named network. Every step
 teardown is idempotent. `DeleteInstance` on an instance that is already gone returns 30, which GARM treats as
 success. The same order applies to `DeleteInstance`, the sweep, the creation guard and `RemoveAllInstances`.
 
+### Teardown scope
+
+`DeleteInstance` and the sweep run with no operator watching, so they must not delete a concurrent generation.
+At teardown start they read the nonce each instance's claim network holds and remove only resources carrying
+it, so a generation that claims the name mid-teardown is left alone. If no claim network exists at the start,
+there is no generation to key to and what remains is a leftover to reap. Even then, the live claim nonce is read
+again immediately before each removal, so a generation that claimed the name after the resource list was taken
+keeps its resources. The creation guard removes only its own attempt's nonce.
+
+`RemoveAllInstances` is not scoped to a generation. It removes everything that matches the predicate, live or
+not. A scoped rescue removes only the generation a claim network names, so while a newer generation holds the name,
+an older generation's residue, such as a volume whose removal failed while its network was removed, is skipped. Dropping
+the scope cannot remove the wrong volume, because each generation's volume is removed by its own unique name. The
+operator who runs the rescue accepts that it also removes live allocations.
+
 ### Orphan sweep
 
 There is no background process, so the sweep runs at the start of `CreateInstance` and in `ListInstances`. It

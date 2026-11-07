@@ -20,15 +20,9 @@ const maxStatsBytes = 1 << 20
 // controller, or the daemon omits blkio for this runtime.
 var errNoBlkioWrites = errors.New("stats sample has no blkio write counters")
 
-// parseBlkioWriteBytes reads one stats sample (the JSON body of the one-shot
-// stats endpoint) and returns the block-device bytes the container wrote over
-// its life: the sum of every "write" entry in blkio_stats.io_service_bytes_recursive
-// across devices.
-//
-// The entry shape differs by cgroup version. cgroup v1 reports Read, Write,
-// Sync, Async, Total (capitalised, and Total/Sync/Async overlap Read/Write);
-// cgroup v2 reports read and write (lower case) from io.stat. Only the write op
-// is summed, matched case-insensitively, so neither shape double counts.
+// parseBlkioWriteBytes reads one sample from the one-shot stats endpoint and returns
+// the block-device bytes the container wrote over its life, across devices. It returns
+// errNoBlkioWrites when the sample has no write counter.
 func parseBlkioWriteBytes(r io.Reader) (uint64, error) {
 	var sample struct {
 		BlkioStats container.BlkioStats `json:"blkio_stats"`
@@ -41,6 +35,9 @@ func parseBlkioWriteBytes(r io.Reader) (uint64, error) {
 		found bool
 	)
 	for _, e := range sample.BlkioStats.IoServiceBytesRecursive {
+		// cgroup v1 reports Read, Write, Sync, Async and Total, which overlap; v2
+		// reports read and write. Matching only the write op, in either case, double
+		// counts neither.
 		if strings.EqualFold(e.Op, "write") {
 			total += e.Value
 			found = true
@@ -60,13 +57,11 @@ func parseBlkioWriteBytes(r io.Reader) (uint64, error) {
 // daemon's docker/ subtree, so every container the job ran is counted.
 const ioStatPath = "/sys/fs/cgroup/io.stat"
 
-// ioStatScript prints the sidecar's cgroup io.stat for parseIOStat: an
-// "io_stat" marker, then each line of the file prefixed with "io ". A file
-// that is there but empty (no device saw IO yet) prints the marker alone; a
-// file that is missing or unreadable (a cgroup v1 host, no io controller on
-// the cgroup, a runtime that virtualises cgroupfs) prints "io_stat_missing".
-// It runs in an exec of its own, apart from the image probe, and only reads a
-// file, so it never waits on the sidecar's daemon.
+// ioStatScript prints the sidecar's cgroup io.stat for parseIOStat: an "io_stat"
+// marker, then each line prefixed with "io ". An empty file (no device saw IO yet)
+// prints the marker alone; a missing or unreadable one (a cgroup v1 host, no io
+// controller, a runtime that virtualises cgroupfs) prints "io_stat_missing". It only
+// reads a file, so it never waits on the sidecar's daemon.
 const ioStatScript = `if [ -e ` + ioStatPath + ` ] && io=$(sed 's/^/io /' ` + ioStatPath + ` 2>/dev/null); then
   echo io_stat
   [ -z "$io" ] || printf '%s\n' "$io"
@@ -105,10 +100,9 @@ func (s ioStat) byDevice() string {
 	return strings.Join(parts, ",")
 }
 
-// parseIOStat reads the io.stat records in the output of ioStatScript and
-// ignores every other line (stray stderr, for example). It returns errNoIOStat when the script found no
-// readable io.stat, and an error for a malformed line rather than a silently
-// wrong number.
+// parseIOStat reads the io.stat records in the output of ioStatScript and ignores every
+// other line. It returns errNoIOStat when the script found no readable io.stat, and an
+// error for a malformed line rather than a silently wrong number.
 func parseIOStat(out string) (ioStat, error) {
 	var (
 		st      ioStat
@@ -175,18 +169,15 @@ func isDecimal(s string) bool {
 	return true
 }
 
-// imageProbeScript runs inside the sidecar and prints one record per line,
-// parsed by parseImageProbe. It talks to the sidecar's own daemon over the
-// shared socket path and reads only metadata: image sizes come from `docker
-// image inspect`, never from walking the data root, which is slow on the
-// disks this feature is meant to measure. It exits non-zero when the daemon
-// does not answer or the image list or inspect fails: each step's status is
-// checked on its own, never through a pipeline, because a pipeline reports
-// only its last command's status and would turn a failed list into a
-// successful "no images" answer. The one deliberate exception is the content
-// size, which is optional and simply omitted when `du` fails. The content directory is only meaningful for the
-// containerd image store (a classic store also has a containerd directory,
-// but for runtime state only), so it is read only then.
+// imageProbeScript runs inside the sidecar and prints one record per line for
+// parseImageProbe. It reads only metadata from the sidecar's daemon: image sizes come
+// from `docker image inspect`, never from walking the data root, which is slow on the
+// disks this measures. It exits non-zero when the daemon does not answer or the image
+// list or inspect fails. Each step's status is checked on its own, because a pipeline
+// reports only its last command and would turn a failed list into a successful "no
+// images". The content size is optional, omitted when `du` fails, and read only for the
+// containerd image store: a classic store's containerd directory holds runtime state
+// only.
 const imageProbeScript = `export DOCKER_HOST=unix:///run/docker.sock
 info=$(docker info --format '{{.Driver}} {{.DriverStatus}}') || exit 3
 echo "driver ${info%% *}"

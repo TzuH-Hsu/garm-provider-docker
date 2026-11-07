@@ -88,7 +88,13 @@ never sees a half-seeded tree. The rules are therefore:
 - `EnsureCacheVolume` finds its cache **by label** (kind, repository or image digest, salt, OS key) and reuses
   it under whatever name it has. If none exists and the preferred name is free, it creates the volume there.
   If the preferred name is occupied by something that is not a validated cache of ours, it **routes around**
-  it to a deterministic alternate name (`<name>-x<8 hex>`) and never deletes it.
+  it to a deterministic alternate name (`<name>-x<8 hex>`) and never deletes it. After eight occupied slots it
+  fails the allocation, and GARM retries.
+- `VolumeCreate` is idempotent on a duplicate name: the daemon returns the existing volume with its original
+  labels and discards the new ones. Two controllers or concurrent first jobs that create one identity therefore
+  get one volume and both validate it, and only a real squatter triggers routing. If a race leaves two volumes
+  with one identity, the lexicographically smallest name wins. Both are valid caches, so the pick only has to
+  be stable.
 - After the runner is created and has pinned its volumes, the provider re-inspects each against the full
   expected identity. If one is not provably ours, the allocation fails closed, only this attempt's resources
   are rolled back, and the volume is **not** deleted. GARM retries, and the retry routes around the slot. The
