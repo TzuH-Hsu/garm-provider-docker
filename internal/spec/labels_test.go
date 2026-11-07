@@ -263,8 +263,7 @@ func TestResourceLabelBuilders(t *testing.T) {
 func TestNetworkLabelsIsTheClaimMarker(t *testing.T) {
 	// ADR-004: the job network doubles as the claim marker, so its labels
 	// must carry both instance-name and created-at — the two fields the
-	// concurrency-safe orphan sweep and duplicate-detection logic (WP2/WP3)
-	// key off.
+	// concurrency-safe orphan sweep and duplicate-detection logic key off.
 	id := AllocationIdentity{ControllerID: "c", PoolID: "p", InstanceName: "claim-me"}
 	labels := id.NetworkLabels(testCreatedAt)
 

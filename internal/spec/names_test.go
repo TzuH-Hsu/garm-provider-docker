@@ -47,7 +47,7 @@ func TestDerivedNames(t *testing.T) {
 		})
 	}
 
-	// Volume names are GENERATION-UNIQUE (F4): <instance>-<nonce>-<suffix>.
+	// Volume names are GENERATION-UNIQUE: <instance>-<nonce>-<suffix>.
 	const nonce = "0a1b2c3d"
 	volumeNames := []struct {
 		name string
@@ -89,7 +89,7 @@ func TestDerivedNamesAreDistinctFromEachOther(t *testing.T) {
 	}
 }
 
-// TestVolumeNamesAreGenerationUnique is the F4 name-uniqueness guard: two
+// TestVolumeNamesAreGenerationUnique is the name-uniqueness guard: two
 // generations of the SAME instance name produce DIFFERENT volume names (because
 // each embeds its own create-nonce), which is what makes a name-based teardown
 // generation-safe by construction — a stale teardown removing a volume by name
@@ -158,7 +158,7 @@ func TestValidateDerivedName(t *testing.T) {
 // derived-name-length-hardening guard for a full allocation attempt: a
 // normal instance name produces valid names for every derived resource, but
 // a pathologically long one — long enough that the generation-nonce-
-// qualified volume names (F4, ~44 bytes of fixed overhead: a dash, the
+// qualified volume names (~44 bytes of fixed overhead: a dash, the
 // 32-hex-char create-nonce, a dash, and the longest suffix "dind-state") push
 // past Docker's 255-byte resource-name limit — fails EARLY with a clear,
 // aggregated provider error rather than succeeding here and failing opaquely

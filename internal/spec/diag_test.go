@@ -72,9 +72,9 @@ func TestBuildDiagPruneContainer(t *testing.T) {
 	}
 	script := cfg.Entrypoint[2]
 
-	// A retention-scoped `find -delete`, NOT any unscoped destructive op. L8: the
-	// window is minute-precise (-mmin +<days*1440>), not -mtime (which rounds down
-	// to whole days and effectively widens 7d to 8d).
+	// A retention-scoped `find -delete`, not an unscoped operation. The window is
+	// minute-precise (-mmin +<days*1440>), because -mtime rounds down to whole days and
+	// widens 7d to 8d.
 	for _, want := range []string{"find " + diagPruneMountDir, "-type f", "-mmin +10080", "-delete"} {
 		if !strings.Contains(script, want) {
 			t.Errorf("prune script missing %q\nscript: %s", want, script)
@@ -94,14 +94,14 @@ func TestBuildDiagPruneContainer(t *testing.T) {
 	if host.Mounts[0].Source != "garm-cache-diag-logs-repo" || host.Mounts[0].Target != diagPruneMountDir {
 		t.Errorf("prune mount = %+v, want the diag volume at %q", host.Mounts[0], diagPruneMountDir)
 	}
-	// No network (L9): the prune joins the "none" network, not the default bridge.
+	// No network: the prune joins the "none" network, not the default bridge.
 	if !host.NetworkMode.IsNone() {
 		t.Errorf("prune NetworkMode = %q, want none", host.NetworkMode)
 	}
 }
 
 // TestDiagPruneRetentionInScript: the configured retention window appears in the
-// find -mmin predicate exactly, converted to minutes (L8).
+// find -mmin predicate exactly, converted to minutes.
 func TestDiagPruneRetentionInScript(t *testing.T) {
 	for _, days := range []int{1, 7, 30} {
 		cfg, _ := BuildDiagPruneContainer(DiagPruneContainerSpec{RetentionDays: days})

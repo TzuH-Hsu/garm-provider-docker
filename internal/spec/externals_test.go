@@ -70,7 +70,7 @@ func TestExternalsROMount(t *testing.T) {
 	if m.Target != RunnerExternalsDir {
 		t.Errorf("externals mount target = %q, want %q", m.Target, RunnerExternalsDir)
 	}
-	// RED-LINE F4: the runner must NOT be able to write the shared externals.
+	// The runner must NOT be able to write the shared externals.
 	if !m.ReadOnly {
 		t.Error("externals mount MUST be read-only (cross-repo RCE prevention, ADR-003 F4)")
 	}
@@ -92,8 +92,8 @@ func TestBuildExternalsSeedContainer(t *testing.T) {
 
 	// The lock + atomic-marker + copy-from-image mechanics must all be present.
 	for _, want := range []string{
-		"flock 9",                       // exactly-one-seeder lock (F15)
-		externalsSeededMarker,           // the .seeded sentinel
+		"flock 9",                       // exactly-one-seeder lock
+		externalsSeededMarker,           // the seeded marker
 		"cp -a \"" + RunnerExternalsDir, // copy FROM the image's own externals
 		externalsSeedStagingDir,         // copy INTO the staged volume mount
 	} {
@@ -102,7 +102,7 @@ func TestBuildExternalsSeedContainer(t *testing.T) {
 		}
 	}
 	// The marker is written LAST, AFTER the copy — otherwise a crash mid-copy
-	// would leave a "seeded" but partial tree (F15).
+	// would leave a "seeded" but partial tree.
 	if strings.Index(script, "cp -a") > strings.LastIndex(script, "touch \""+externalsSeededMarker) {
 		t.Error("seed script must write the .seeded marker AFTER the copy, not before")
 	}
@@ -132,7 +132,7 @@ func TestBuildExternalsSeedContainer(t *testing.T) {
 	if seedMount.Target == RunnerExternalsDir {
 		t.Error("seed must not mount the volume over the image's own externals (its copy source)")
 	}
-	// No network for the seed (L9): it joins the "none" network, not the default
+	// No network for the seed: it joins the "none" network, not the default
 	// bridge — least privilege for a purely-local copy.
 	if !host.NetworkMode.IsNone() {
 		t.Errorf("seed NetworkMode = %q, want none", host.NetworkMode)

@@ -4,94 +4,40 @@ import (
 	"time"
 )
 
-// This file holds ADR-003's opportunistic cache-GC staleness DECISION (M2-W2) as
-// a pure function over a cache volume's labels plus the current config snapshot
-// and the wall clock. Keeping the decision pure — no Docker calls, the caller
-// supplies `now` — makes every stale case (generation/pnpm-major/image-digest
-// supersession, age-since-creation, and the conservative keeps) cheap to
-// table-test; the topology layer does the label-scoped listing and
-// re-asserts these same labels are a cache volume before reporting it. The GC
-// is non-destructive (log-only, ADR-003 NEW-H1): a volume flagged stale here is
-// never auto-removed — it is surfaced to the operator, who reclaims disk with an
-// explicit `docker volume prune`.
-
-// CacheGCConfig is the current-config snapshot EvaluateCacheEviction compares a
-// cache volume against. The provider builds it from [cache] plus the resolved
-// runner-image digest.
+// CacheGCConfig is the current config EvaluateCacheEviction compares a volume with.
 type CacheGCConfig struct {
-	// Generation / PnpmMajor are the CURRENT toolcache generation and pnpm major
-	// salts ([cache].generation / pnpm_major). A cache volume whose own salt
-	// label differs is superseded.
+	// Generation and PnpmMajor are the current salts; another salt is superseded.
 	Generation string
 	PnpmMajor  string
 
-	// ImageDigest is the CURRENT runner image's digest (image ID hex). An
-	// externals volume whose image-digest label differs is superseded. It is
-	// EMPTY when the provider could not resolve the current digest this pass
-	// (e.g. the runner image is not present locally during a ListInstances GC),
-	// in which case externals supersession is skipped this pass (the volume is
-	// still subject to age-based flagging) and caught on a later pass — self-healing.
+	// ImageDigest is the current runner image's digest, and an externals volume with
+	// another is superseded. It is empty when the provider could not resolve it this
+	// pass, which skips that check until a later pass.
 	ImageDigest string
 
-	// StaleDays is [cache].stale_cache_eviction_days. A cache volume whose
-	// CREATION-time last-used label is older than this many days is flagged
-	// stale for operator pruning regardless of salt (the coarse, self-healing
-	// age backstop). Zero or negative disables age-based flagging entirely.
+	// StaleDays flags a volume older than this many days; <= 0 disables that.
 	StaleDays int
 
-	// Grace protects a very-recently-created SUPERSEDED volume from being
-	// flagged stale, so an in-flight older-generation/older-image job that just
-	// created its cache (but has not yet started the runner that would
-	// in-use-pin it) is not flagged out from under it. Measured from the
-	// volume's creation-time last-used label. Age-based flagging does not use
-	// the grace (an aged-out volume is old by definition).
+	// Grace keeps a superseded volume from being flagged until this old, so an in-flight
+	// older job that just created it is not flagged. Age-based flagging ignores it.
 	Grace time.Duration
 }
 
-// EvaluateCacheEviction decides whether the cache volume with these labels
-// should be FLAGGED STALE by the opportunistic GC (ADR-003 W2) for operator
-// visibility, given the current config snapshot and wall clock. It returns
-// (stale, reason); reason is a short human string for the operator-visibility
-// log and is "" when the volume is kept. Nothing is removed as a consequence of
-// this decision (ADR-003 NEW-H1, non-destructive/log-only GC): the caller logs
-// flagged volumes and names the exact `docker volume prune` an operator can run
-// to actually reclaim them.
-//
-// The staleness policy, given that the last-used label is IMMUTABLE and records
-// CREATION time (not reuse — W1's real-daemon finding: a local volume's labels
-// cannot be re-stamped), is:
-//
-//   - SUPERSESSION: a toolcache volume whose generation != the current
-//     generation, a pnpm volume whose pnpm-major != current, or an externals
-//     volume whose image-digest != the current runner image's digest — is
-//     flagged stale once it is older than Grace (so an in-flight older job is
-//     not flagged out from under itself). A toolcache or pnpm volume with no
-//     os-release label is superseded too: it predates OS-keyed cache names
-//     (ADR-003 2026-10-12 amendment), so no allocation mounts it any more.
-//     diag-logs volumes have no salt and are never superseded.
-//   - AGE: any cache volume whose creation-time last-used is older than
-//     StaleDays is flagged stale regardless of salt. This is the deliberately
-//     COARSE, self-healing backstop (ADR-003 amendment): because last-used
-//     cannot be re-stamped on a hit, even a still-warm cache is aged from its
-//     creation, so an active repo's cache is periodically flagged for the
-//     operator to prune; if the operator actually prunes it, it is simply
-//     re-created empty on the next job. Chosen over sentinel-mtime LRU for
-//     robustness on Docker Desktop, where the provider cannot stat a volume's
-//     filesystem from outside the VM (documented in ADR-003).
-//
-// A volume whose last-used is missing or unparseable cannot be aged, so it is
-// conservatively KEPT (never flag something we cannot place in time). A
-// non-cache label set (a caller mistake, since topology only lists cache
-// volumes) is also kept — defense-in-depth against ever flagging a job-scoped
-// or foreign resource here.
+// EvaluateCacheEviction reports whether the GC should flag this cache volume as stale,
+// and why. Nothing is removed: the caller logs flagged volumes for the operator to
+// prune (ADR-003, "Garbage collection"). Past cfg.Grace, a volume is flagged if its salt
+// is superseded, or if it is a toolcache or pnpm volume with no os-release label, which
+// no allocation mounts. Past cfg.StaleDays since creation, any volume is flagged; labels
+// cannot be re-stamped on a hit, so an active cache ages too. A label set whose
+// last-used is missing or malformed, or that is not a cache's, is kept.
 func EvaluateCacheEviction(labels map[string]string, cfg CacheGCConfig, now time.Time) (bool, string) {
 	if labels[LabelCache] != "true" {
-		return false, "" // not a cache volume — never touched here
+		return false, "" // not a cache volume
 	}
 
 	created, ok := parseLastUsed(labels)
 	if !ok {
-		return false, "" // cannot age → conservatively keep
+		return false, "" // cannot be aged, so keep it
 	}
 	age := now.Sub(created)
 
@@ -113,8 +59,6 @@ func EvaluateCacheEviction(labels map[string]string, cfg CacheGCConfig, now time
 				return true, preOSKeyReason
 			}
 		case CacheKindExternals:
-			// Skip when the current digest is unknown this pass (cfg.ImageDigest
-			// == ""): the volume is still subject to age eviction below.
 			if d := labels[LabelImageDigest]; cfg.ImageDigest != "" && d != "" && d != cfg.ImageDigest {
 				return true, "superseded externals image-digest " + shortDigest(d) + " (current " + shortDigest(cfg.ImageDigest) + ")"
 			}
@@ -131,14 +75,10 @@ func EvaluateCacheEviction(labels map[string]string, cfg CacheGCConfig, now time
 	return false, ""
 }
 
-// preOSKeyReason is the GC reason for a toolcache or pnpm volume created before
-// those volumes were keyed on the runner image's OS release: its name lacks the
-// OS key, so the provider never resolves to it again.
+// preOSKeyReason is for a toolcache or pnpm volume with no OS key in its name, which
+// the provider never resolves to.
 const preOSKeyReason = "superseded: created before toolcache/pnpm volumes were keyed on the OS release, no longer mounted"
 
-// parseLastUsed reads the garm.docker/last-used label (RFC3339, the creation
-// instant a cache volume's builder stamps) into a time. The bool reports whether
-// the label was present and well-formed.
 func parseLastUsed(labels map[string]string) (time.Time, bool) {
 	raw := labels[LabelLastUsed]
 	if raw == "" {
@@ -151,9 +91,7 @@ func parseLastUsed(labels map[string]string) (time.Time, bool) {
 	return t, true
 }
 
-// shortDigest trims a long image digest to its first 12 chars for a readable
-// eviction-log message. It never affects the eviction decision (that compares
-// full labels), only the human string.
+// shortDigest is for the log message only; the decision compares full labels.
 func shortDigest(d string) string {
 	if len(d) > 12 {
 		return d[:12]
@@ -161,8 +99,6 @@ func shortDigest(d string) string {
 	return d
 }
 
-// itoa is a tiny local int→string for the eviction reason, avoiding an fmt
-// import in this otherwise allocation-light pure file.
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

@@ -116,10 +116,10 @@ func TestDetectCacheEntityScope(t *testing.T) {
 		{name: "garbage is unknown", repoURL: "::::not a url", want: CacheScopeUnknown},
 		{name: "empty string is unknown", repoURL: "", want: CacheScopeUnknown},
 
-		// H1: a scheme-less or relative repo_url must FAIL SAFE to unknown (NO
-		// persistent cache), never be misclassified. url.Parse("github.com/acme")
-		// yields a relative two-segment path that would otherwise read as REPO
-		// scope, handing an org pool writable per-repo caches (a cross-org leak).
+		// A scheme-less or relative repo_url must fail safe to unknown (no persistent
+		// cache), never be misclassified. url.Parse("github.com/acme") yields a relative
+		// two-segment path that would otherwise read as repo scope, handing an org pool
+		// writable per-repo caches.
 		{name: "scheme-less org is unknown (was mis-read as repo)", repoURL: "github.com/acme", want: CacheScopeUnknown},
 		{name: "scheme-less repo is unknown", repoURL: "github.com/acme/repo", want: CacheScopeUnknown},
 		{name: "bare owner/repo is unknown", repoURL: "owner/repo", want: CacheScopeUnknown},
