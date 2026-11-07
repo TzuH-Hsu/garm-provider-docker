@@ -125,6 +125,10 @@ removes:
   racing GARM's own `DeleteInstance`;
 - an allocation with no live container whose marker is past the 20 minute deadline.
 
+A running, paused or restarting runner counts as live at any age, since a paused runner can still hold a job
+and neither clock describes it. If the sweep cannot inspect a runner that is not live, it logs the error and
+removes nothing, so a later sweep decides.
+
 Both windows exist so the sweep races neither GARM's own delete nor a peer create that has not yet reached the
 runner. The sweep before a create is not throttled, because a stale allocation of the instance being created
 must go before the create reuses its names. The sweep in `ListInstances` runs at most once per **3 minutes** per

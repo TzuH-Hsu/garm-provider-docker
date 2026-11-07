@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -56,10 +57,13 @@ func (m *Manager) SweepStale(ctx context.Context, instanceName string) error {
 // sweepInstance tears instanceName's allocation down if it is abandoned, and reports
 // whether anything was removed:
 //
-//   - a running runner is an active allocation, at any age;
+//   - a running, paused or restarting runner is an active allocation, at any age;
 //   - a runner that exited is aged from State.FinishedAt against exitedGrace;
 //   - otherwise (no runner, one never started, or no readable FinishedAt) the allocation is
 //     aged from its youngest created-at against inflightGrace, and skipped if it has none.
+//
+// A failed runner inspect returns the error and removes nothing, leaving the decision to
+// a later sweep.
 func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool, error) {
 	f := m.instanceScopedFilter(instanceName)
 
@@ -78,7 +82,7 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 
 	var (
 		hasResource      bool
-		hasRunningRunner bool
+		hasActiveRunner  bool
 		hasExitedRunner  bool
 		exitedFinishedAt time.Time
 		latestExited     exitedRunner
@@ -100,12 +104,16 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 		if !spec.MatchesPredicate(c.Labels, m.controllerID) || c.Labels[spec.LabelRole] != spec.RoleRunner {
 			continue
 		}
-		if c.State == "running" {
-			hasRunningRunner = true
+		if isActiveRunnerState(c.State) {
+			hasActiveRunner = true
 			continue
 		}
 		// The list summary has no FinishedAt. Track the latest across any runners.
-		if info, fa, ok := m.runnerFinishedAt(ctx, c.ID); ok {
+		info, fa, ok, err := m.runnerFinishedAt(ctx, c.ID)
+		if err != nil {
+			return false, fmt.Errorf("sweep: failed to inspect runner %s of %q: %w", c.ID, instanceName, err)
+		}
+		if ok {
 			if !hasExitedRunner || fa.After(exitedFinishedAt) {
 				exitedFinishedAt, hasExitedRunner = fa, true
 				latestExited = exitedRunner{summary: c, info: info}
@@ -124,7 +132,7 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	if !hasResource {
 		return false, nil // nothing for this instance name
 	}
-	if hasRunningRunner {
+	if hasActiveRunner {
 		return false, nil // active allocation, never sweep
 	}
 
@@ -150,22 +158,39 @@ func (m *Manager) sweepInstance(ctx context.Context, instanceName string) (bool,
 	return m.TeardownAllocation(ctx, instanceName)
 }
 
+// isActiveRunnerState reports whether the daemon still holds a runner in state as live.
+// Paused and restarting runners have no FinishedAt from this run, and can hold a job.
+func isActiveRunnerState(state string) bool {
+	switch state {
+	case container.StateRunning, container.StatePaused, container.StateRestarting:
+		return true
+	}
+	return false
+}
+
 // runnerFinishedAt returns a runner's inspect and State.FinishedAt. The bool is false
-// when the inspect fails or the time is absent, zero or unparseable.
-func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (types.ContainerJSON, time.Time, bool) {
+// when the runner is already gone or the time is absent, zero or unparseable. Any other
+// inspect failure is returned as an error.
+func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (types.ContainerJSON, time.Time, bool, error) {
 	inspected, err := m.cli.ContainerInspect(ctx, containerID)
-	if err != nil || inspected.State == nil {
-		return types.ContainerJSON{}, time.Time{}, false
+	if errdefs.IsNotFound(err) {
+		return types.ContainerJSON{}, time.Time{}, false, nil
+	}
+	if err != nil {
+		return types.ContainerJSON{}, time.Time{}, false, err
+	}
+	if inspected.State == nil {
+		return types.ContainerJSON{}, time.Time{}, false, nil
 	}
 	raw := inspected.State.FinishedAt
 	if raw == "" {
-		return types.ContainerJSON{}, time.Time{}, false
+		return types.ContainerJSON{}, time.Time{}, false, nil
 	}
 	t, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil || t.IsZero() || t.Year() <= 1 {
-		return types.ContainerJSON{}, time.Time{}, false
+		return types.ContainerJSON{}, time.Time{}, false, nil
 	}
-	return inspected, t, true
+	return inspected, t, true, nil
 }
 
 // enumerateInstanceNames returns the distinct instance names across this controller's
