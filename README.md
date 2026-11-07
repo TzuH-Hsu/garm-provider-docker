@@ -169,9 +169,9 @@ setup.
 
 | Setup | Status |
 |---|---|
-| GARM v0.2.1, scale sets, GitHub App, `interface_version` v0.1.0, amd64, Ubuntu 26.04 image, `none` and `privileged-sidecar` | Live-tested; last recorded release is v0.2.5 |
+| GARM v0.2.1, scale sets, GitHub App, `interface_version` v0.1.0, amd64, Ubuntu 26.04 image, `none` and `privileged-sidecar` | Live-tested on a local build of the v0.2.9 code; last recorded release asset is v0.2.5 |
 | Ubuntu 24.04 image | Last live-tested with v0.2.3 |
-| Container jobs in `privileged-sidecar` | Live-tested on a pre-release build |
+| Container jobs in `privileged-sidecar` | Live-tested on a local build of the v0.2.9 code |
 | `linux/arm64` | Published, not tested end to end |
 | `sysbox-runc` | Unit tests only |
 | Pools with webhooks, non-JIT runners, `interface_version` v0.1.1 with GARM | Not tested end to end |

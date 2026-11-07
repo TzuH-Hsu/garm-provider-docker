@@ -18,10 +18,11 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"). `main` at 1b9320c, which adds the
-container-job acceptance test, passes the current gate on the Ubuntu 26.04
-runner image, for `none` and `--dind` with a registry mirror (28 and 59 PASS);
-it is not a release yet. The `v0.2.5` release asset passed the revision before
+work against GARM v0.2.x (see "Results"). A local build of `main` at 0540477,
+the code for `v0.2.9`, passes the current gate on the Ubuntu 26.04 runner image,
+for `none` and `--dind` with a registry mirror (28 and 59 PASS); no release
+asset has been gated at this revision. `main` at 1b9320c added the container-job
+acceptance test and passed with the same counts. The `v0.2.5` release asset passed the revision before
 the container job (28 and 58 PASS, script at e4a37fd).
 `v0.2.4` passed the revision before the registry mirror check, on the same
 image (28 and 53 PASS, script at 0cf2a76). `v0.2.3` passed the revision
@@ -724,6 +725,52 @@ re-running it:
   image can all move independently between runs.
 
 ## Results
+
+The gate has been run end to end against a live GARM with a build of `main` at
+0540477, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
+`--dind` with a registry pull-through mirror), on 2026-11-07, using
+`scripts/demo-m0.sh` at the same commit. This is the code for `v0.2.9`. The
+Ubuntu 24.04 image was not part of this run; its last recorded gate is the
+`v0.2.3` one below.
+
+**Environment**
+
+- GARM v0.2.1 (scale-set dispatch, no webhook); provider `interface_version`
+  v0.1.0.
+- Docker Engine 29.9.3, amd64, Ubuntu 26.04 host, kernel 7.0.
+- Provider: a local build of `main` at 0540477 from a clean tree, whose
+  `GetVersion` reports `v0.2.8-19-g0540477`, sha256
+  `9cab1f6d72449198b8c0859a72742806fcc03bafa8786f31eb07451e15650ee1`, passed with
+  `LOCAL_PROVIDER_BIN` and `-y`. No published release asset was run, so this says
+  nothing about one until its `SHA256SUMS` entry matches or the release is gated.
+- Runner image, digest-pinned in the generated config (the `v0.2.5` digest),
+  with actions/runner 2.338.0:
+  - `ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:f9f20d3727653ff89afe75791a9bcfec965b11b13c0347f071ae2dcab802d2af`
+- DinD image `docker:dind@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121`,
+  daemon 29.9.3.
+- A Docker Hub pull-through mirror at a LAN address reachable from the sidecar.
+
+**Results**
+
+| Variant | `verify` | GitHub jobs | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `--dind` + registry mirror | 59 PASS, 0 FAIL | `demo` and `container-job` succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `none` | 28 PASS, 0 FAIL | succeeded | 2 PASS, 0 FAIL |
+
+- **Exit reports.** Killing an idle runner logged
+  `runner_phase=listening_no_job`, once from `DeleteInstance` and once from the
+  orphan sweep. Killing a runner during a job logged `runner_phase=job_started`
+  and exit code 137 from `DeleteInstance`; that phase was not observed on the
+  sweep line. A completed job logged `job_completed` at debug level only, and
+  scaling down a live idle runner logged no exit line.
+- **`DeleteInstance` time.** Scaling down a live idle runner took about 10.2 s
+  on this build and on `v0.2.8`, four cycles each, which is the container stop
+  grace period.
+- **Status watcher.** Its status lines reached the `[logging] file` log.
+- **Secrets.** A scan of the provider log for token, JIT and key material found
+  none.
+
+## Previous gate: `main` at 1b9320c
 
 The gate has been run end to end against a live GARM with a build of `main` at
 1b9320c, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
