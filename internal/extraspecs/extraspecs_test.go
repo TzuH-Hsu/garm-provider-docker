@@ -8,10 +8,9 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 )
 
-// testConfig is a hand-built config with a ceiling, a storage driver, memory
-// ceilings, and one named flavor that overrides both the runner image and the
-// runner-memory ceiling. Resolve does not require Validate(), so this is fine
-// as an in-test fixture.
+// testConfig is a hand-built config with an allowed_dind_modes ceiling, a storage
+// driver, memory ceilings, and one flavor that overrides the runner image and the
+// runner-memory ceiling. Resolve does not need Validate(), so it works as a fixture.
 func testConfig() config.Config {
 	return config.Config{
 		RunnerImage:      "ghcr.io/example/runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -98,7 +97,7 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
-// --- Parse: reserved-env denylist (F8) --------------------------------------
+// --- Parse: reserved-env denylist -------------------------------------------
 
 func TestParseRejectsReservedEnvNames(t *testing.T) {
 	reserved := []string{
@@ -303,8 +302,8 @@ func TestResolveStorageDriverOverrideAndDefault(t *testing.T) {
 
 func TestResolvePassesThroughLabelsAndEnv(t *testing.T) {
 	cfg := testConfig()
-	// H2: extra_env is fail-closed — FOO must be on the operator's allowlist to
-	// pass through. runner_labels carry no such gate.
+	// extra_env is fail-closed: FOO must be on the operator's allowlist to pass
+	// through. runner_labels carry no such gate.
 	cfg.ExtraSpecs = config.ExtraSpecsPolicy{AllowedEnv: []string{"FOO"}}
 	specs, _ := Parse(json.RawMessage(`{"runner_labels": ["gpu"], "extra_env": {"FOO": "bar"}}`))
 	res, err := specs.Resolve(cfg)
@@ -319,19 +318,19 @@ func TestResolvePassesThroughLabelsAndEnv(t *testing.T) {
 	}
 }
 
-// --- H1: memory overrides must be POSITIVE (0 in any representation rejected) --
+// --- Memory overrides must be positive (0 in any representation is rejected) --
 
 func TestResolveRejectsNonPositiveMemoryOverride(t *testing.T) {
-	// Every zero representation, and a negative, must be rejected for BOTH
-	// runner_memory and dind_memory — a pool must never be able to zero out (=
-	// unset = unlimited, on Docker) the operator's finite memory ceiling.
+	// Every zero representation, and a negative, must be rejected for both
+	// runner_memory and dind_memory: Docker treats a 0 limit as unset, so a pool
+	// could otherwise remove the operator's finite ceiling.
 	for _, bad := range []string{"0", "00", "0GiB", "0 B", "-1GiB"} {
 		t.Run("runner_memory="+bad, func(t *testing.T) {
 			cfg := testConfig() // runner ceiling 8GiB
 			specs, err := Parse(json.RawMessage(`{"runner_memory": "` + bad + `"}`))
 			if err != nil {
-				// The schema pattern already rejects these at Parse — that is a
-				// valid fail-closed outcome and is exactly what we want.
+				// The schema pattern already rejects these at Parse, which is also
+				// a valid fail-closed outcome.
 				return
 			}
 			if _, err := specs.Resolve(cfg); err == nil {
@@ -366,13 +365,12 @@ func TestResolveAcceptsPositiveMemoryWithinCeiling(t *testing.T) {
 	}
 }
 
-// --- H3: env-name charset (keys with '=', whitespace, unicode, leading digit) --
+// --- Env-name charset (keys with '=', whitespace, unicode, leading digit) ---
 
 func TestParseRejectsMalformedEnvNames(t *testing.T) {
-	// Each of these keys is invalid at the CHARSET level, so Parse rejects it
-	// BEFORE the reserved/allowlist checks — closing the bypass where a key like
-	// "JIT_CONFIG_ENABLED=false" would be emitted to Docker as
-	// "JIT_CONFIG_ENABLED=false=<value>" and flip the reserved variable.
+	// Each key fails the charset, so Parse rejects it before the reserved check.
+	// Otherwise "JIT_CONFIG_ENABLED=false" would reach Docker as
+	// "JIT_CONFIG_ENABLED=false=<value>" and set the reserved variable.
 	for _, badKey := range []string{"JIT_CONFIG_ENABLED=false", "A B", "1ABC", "clé", "DISABLE_RUNNER_UPDATE=false", "FOO=BAR"} {
 		t.Run(badKey, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{"extra_env": map[string]string{badKey: "x"}})
@@ -386,7 +384,7 @@ func TestParseRejectsMalformedEnvNames(t *testing.T) {
 	}
 }
 
-// --- H2: operator allowlist + hard-reserved set --------------------------------
+// --- Operator allowlist and hard-reserved set -------------------------------
 
 func TestResolveRejectsNonAllowlistedEnvByDefault(t *testing.T) {
 	cfg := testConfig() // no [extra_specs].allowed_env => empty => fail-closed
@@ -416,9 +414,8 @@ func TestResolveAcceptsAllowlistedEnv(t *testing.T) {
 }
 
 func TestParseRejectsHardReservedEvenIfAllowlisted(t *testing.T) {
-	// The hard-reserved check runs in Parse (config-independent), so an operator
-	// mistakenly allowlisting a reserved name can NEVER make it settable: Parse
-	// rejects it before Resolve's allowlist ever runs.
+	// Parse runs the reserved check without config, so allowlisting a reserved
+	// name cannot make it settable: Parse rejects it before Resolve runs.
 	for _, name := range []string{"RUN_AS_ROOT", "GARM_CRED_WAIT_SECONDS", "WAIT_FOR_DOCKER_SECONDS", "PATH", "LD_PRELOAD", "BASH_ENV", "IFS", "NODE_OPTIONS", "RUNNER_EPHEMERAL", "DOCKER_HOST"} {
 		t.Run(name, func(t *testing.T) {
 			raw := json.RawMessage(`{"extra_env": {"` + name + `": "x"}}`)
@@ -453,15 +450,15 @@ func TestSchemaJSONIsValidParseableSchema(t *testing.T) {
 	}
 }
 
-// --- GARM-reserved keys (ADR-005 amendment 2026-10-11) ----------------------
+// --- GARM-reserved keys (ADR-005) -------------------------------------------
 
 // garmWrapper is a base64 JSON string, the encoding GARM uses for the
 // []byte runner_install_template it injects.
 const garmWrapper = "IyEvYmluL2Jhc2gKZWNobyB3cmFwcGVyCg=="
 
 // TestParseAcceptsAndIgnoresGarmInjectedRunnerInstallTemplate: GARM v0.2.x
-// injects runner_install_template into every CreateInstance extra_specs
-// (util.MaybeAddWrapperToExtraSpecs). It is accepted and has no effect.
+// injects runner_install_template into every CreateInstance extra_specs. It is
+// accepted and has no effect.
 func TestParseAcceptsAndIgnoresGarmInjectedRunnerInstallTemplate(t *testing.T) {
 	cases := map[string]string{
 		"injected-only":       `{"runner_install_template":"` + garmWrapper + `"}`,
