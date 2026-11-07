@@ -271,7 +271,7 @@ Pauses for you to create it and confirm with `garm-cli scaleset list`
 ### Step 3 — trigger the workflow and watch
 
 Prints a sample workflow YAML to copy into
-`<your-test-repo>/.github/workflows/garm-m0-demo.yml` — `runs-on` set to
+`<your-test-repo>/.github/workflows/garm-live-gate.yml` — `runs-on` set to
 the scale set's name (or the pool's tags with `--pool`), and a job that does
 `echo hello && env | sort | head` (plus a short `sleep` so the ephemeral
 runner stays up long enough for Step 4's checks — this runner is
