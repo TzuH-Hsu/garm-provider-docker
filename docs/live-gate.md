@@ -1,6 +1,6 @@
 # End-to-end runbook: real GARM job
 
-This is the runbook for `scripts/demo-m0.sh`: point the built (or
+This is the runbook for `scripts/live-gate.sh`: point the built (or
 downloaded) provider at a real GARM instance and a throwaway test
 repository running a trivial echo workflow, and drive the full lifecycle —
 `CreateInstance` → JIT registration → job runs → `DeleteInstance` → runner
@@ -126,8 +126,8 @@ is specific to this provider and this demo.
      and builds the runner image locally
      (`docker build -f runner-images/noble/Dockerfile runner-images`, or
      `resolute` with `--runner-image resolute`).
-5. This repository checked out locally, with `scripts/demo-m0.sh`
-   executable (`chmod +x scripts/demo-m0.sh` if needed).
+5. This repository checked out locally, with `scripts/live-gate.sh`
+   executable (`chmod +x scripts/live-gate.sh` if needed).
 6. **Provider paths readable by GARM's service user.** GARM executes the
    provider binary and reads its config as its own service user, so both
    must live in a directory that user can read: not under a home
@@ -145,7 +145,7 @@ is specific to this provider and this demo.
 
 ## Release mode vs. source mode
 
-`scripts/demo-m0.sh` has two modes, selected by `--from-source` (or the
+`scripts/live-gate.sh` has two modes, selected by `--from-source` (or the
 `PROVIDER_SOURCE` env var), plus a variant of release mode for a locally
 built binary (see below):
 
@@ -187,7 +187,7 @@ only valid together, and not with `--from-source`):
 ```sh
 export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker   # absolute path, executable
 export LOCAL_PROVIDER_SHA256=<64 lowercase hex characters>           # the sha256 you expect it to have
-scripts/demo-m0.sh --version vX.Y.Z preflight
+scripts/live-gate.sh --version vX.Y.Z preflight
 ```
 
 Everything stays release mode except where the binary comes from:
@@ -319,9 +319,9 @@ Unset, which is the default, none of it runs and the gate is unchanged.
 # or a DNS name, never one in 172.17.0.0/16 (see the note below).
 export GATE_REGISTRY_MIRROR=http://mirror.lan.example:5000
 export GATE_MIRROR_LOG_CONTAINER=registry-mirror   # the mirror's container name on this host
-scripts/demo-m0.sh --dind preflight
+scripts/live-gate.sh --dind preflight
 # ... pool, then once the job is running and the runner is idle:
-scripts/demo-m0.sh verify
+scripts/live-gate.sh verify
 ```
 
 What it changes and checks:
@@ -418,9 +418,9 @@ It does **not** exercise:
 
 ```sh
 export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
-scripts/demo-m0.sh                         # scale set, dind_mode=none, v0.2.5 release
-scripts/demo-m0.sh --dind                  # same, plus the privileged-sidecar variant
-scripts/demo-m0.sh --pool                  # webhook-driven pool instead of a scale set
+scripts/live-gate.sh                         # scale set, dind_mode=none, v0.2.5 release
+scripts/live-gate.sh --dind                  # same, plus the privileged-sidecar variant
+scripts/live-gate.sh --pool                  # webhook-driven pool instead of a scale set
 ```
 
 Release mode first checks that the release is published (an HTTP HEAD
@@ -438,7 +438,7 @@ pool, confirming the GitHub UI). Pass `-y`/`--yes` to auto-confirm every
 pause, `--from-source` to build from this checkout instead, `--version
 vX.Y.Z` to validate a different release, `--pool` for a pool, `--dind` for
 the DinD variant, or run a single step directly
-(`scripts/demo-m0.sh verify`, etc.) — see `scripts/demo-m0.sh --help` for
+(`scripts/live-gate.sh verify`, etc.) — see `scripts/live-gate.sh --help` for
 the full command list and every environment variable it accepts.
 
 **Modes are remembered between steps.** `preflight` (and `all`) record the
@@ -449,7 +449,7 @@ set, `GATE_REGISTRY_MIRROR` / `GATE_INSECURE_REGISTRY` and the expected
 `$PROVIDER_CONFIG_DIR/gate-modes` (mode 0600, plain `KEY=value` lines that
 are parsed, never sourced). A later single step run without a flag for a
 mode uses the saved value and logs `using saved <mode>=<value>`, so
-`scripts/demo-m0.sh --dind preflight` followed by a plain `pool`, `watch`,
+`scripts/live-gate.sh --dind preflight` followed by a plain `pool`, `watch`,
 `verify` or `postjob` stays in the DinD variant. An explicit flag or
 environment value that conflicts with the saved one is an error rather than
 a silent switch: to change modes, re-run `preflight` with the new flags (it

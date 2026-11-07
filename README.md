@@ -163,7 +163,7 @@ a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Verification status
 
-The [live test](docs/demo-m0.md) runs real GitHub jobs through a real GARM. I
+The [live test](docs/live-gate.md) runs real GitHub jobs through a real GARM. I
 also run this provider for my own private repositories, on the first row's
 setup.
 

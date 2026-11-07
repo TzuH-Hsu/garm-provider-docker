@@ -44,7 +44,7 @@ production jobs:
 go test -tags dockerverify -v -timeout 25m ./internal/verify/...
 ```
 
-[`docs/demo-m0.md`](docs/demo-m0.md) describes the end-to-end run against a
+[`docs/live-gate.md`](docs/live-gate.md) describes the end-to-end run against a
 real GARM and GitHub. If your change affects the runner lifecycle, say whether
 you ran it.
 
