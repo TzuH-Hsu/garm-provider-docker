@@ -150,6 +150,11 @@ execute ([ADR-003](ADR-003-cache-keying-and-lifecycle.md)). With `[cache].enable
 externals volume, `/__e` stays empty, and JavaScript actions cannot run in a container job. Plain `run:`
 steps are unaffected.
 
+The runner also binds its tool cache directory as `/__t`. The toolcache volume stays out of the sidecar, so the
+daemon creates an empty directory for that source there. A container job starts with an empty tool cache, and
+what it installs goes away with the sidecar. This costs cache hits, not correctness, and it keeps a repository's
+toolcache out of the privileged sidecar.
+
 ### Job network
 
 Every allocation gets its own bridge network, drawn from the daemon's `default-address-pools`. The pool is

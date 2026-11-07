@@ -9,7 +9,7 @@
 //   - ID-or-name resolution: GARM_INSTANCE_ID is always the instance name, so every
 //     test here uses the name lookup. Collisions with ID-shaped names are unit-tested
 //     in internal/provider/lifecycle_test.go.
-//   - Exit codes 30 and 31: TestVerifyM1WP2Allocation (repeat delete, duplicate create).
+//   - Exit codes 30 and 31: TestVerifyAllocation (repeat delete, duplicate create).
 //   - Concurrent creation: unit tests in internal/topology. No failure mode was found
 //     that only a live daemon shows.
 package verify
@@ -33,7 +33,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-func buildM3ProviderBinary(t *testing.T) string {
+func buildProviderBinary(t *testing.T) string {
 	t.Helper()
 	root := repoRoot(t)
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
@@ -128,17 +128,17 @@ func runDeleteKillOnTeardownBarrier(t *testing.T, bin, configFile, controllerID,
 	return killErr == nil, sawBarrier
 }
 
-// TestVerifyM3ImagePullFailureLeavesNoOrphans proves a failed image pull leaves no
+// TestVerifyImagePullFailureLeavesNoOrphans proves a failed image pull leaves no
 // network or volume behind. The runner image is on a registry that refuses
 // connections, so the pull fails on the real daemon, not a stub. The pull comes
 // after the claim network and workspace volume exist and before credentials are
 // fetched, so this covers the guard's rollback on that path; (e) in
-// TestVerifyM1WP2Allocation covers the credential-fetch path. The unit-level
+// TestVerifyAllocation covers the credential-fetch path. The unit-level
 // counterpart is TestCreateInstancePullFailureLeavesNoLeftovers.
-func TestVerifyM3ImagePullFailureLeavesNoOrphans(t *testing.T) {
+func TestVerifyImagePullFailureLeavesNoOrphans(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
 	srv := newMetadataServer(t)
 	defer srv.Close()
@@ -156,7 +156,7 @@ func TestVerifyM3ImagePullFailureLeavesNoOrphans(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	b := bootstrapFor("m3-pullfail-01", srv.URL, caBundle)
+	b := bootstrapFor("pullfail-01", srv.URL, caBundle)
 	out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	if code == 0 {
 		t.Fatalf("CreateInstance with an unreachable registry unexpectedly succeeded: %s", out)
@@ -201,19 +201,19 @@ func newHangingCredentialsServer(t *testing.T) (*httptest.Server, func() bool) {
 	}
 }
 
-// TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete proves that a metadata
+// TestVerifyCredentialTimeoutThenSimulatedGARMDelete proves that a metadata
 // endpoint that never delivers the JIT config makes CreateInstance fail at the 60s
 // credential deadline with nothing left behind, and that the DeleteInstance GARM
 // then issues is a clean exit-30 no-op. It waits out the real deadline on a real
 // daemon, so it takes about a minute. It checks the cause is the credential
 // timeout: the server received a /credentials/ request, the create took about 60s,
 // and stderr names the credential fetch.
-func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
+func TestVerifyCredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-timeout-sleep:latest"
+	imageTag := "garm-timeout-sleep:latest"
 	buildSleepImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
@@ -227,7 +227,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	b := bootstrapFor("m3-timeout-01", srv.URL, caBundle)
+	b := bootstrapFor("timeout-01", srv.URL, caBundle)
 	start := time.Now()
 	out, stderr, code := runProviderIO(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	elapsed := time.Since(start)
@@ -269,7 +269,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	}
 
 	// The create rolled everything back, so GARM's delete must be a clean no-op: exit 30.
-	_, delCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-timeout-01", nil)
+	_, delCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "timeout-01", nil)
 	if delCode != 30 {
 		t.Errorf("simulated GARM delete after a timed-out create: exit=%d, want 30 (already gone, idempotent)", delCode)
 	} else {
@@ -277,7 +277,7 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 	}
 }
 
-// TestVerifyM3CancelDeleteInstanceIdempotent proves that a DeleteInstance killed
+// TestVerifyCancelDeleteInstanceIdempotent proves that a DeleteInstance killed
 // mid-teardown (GARM's exec timing out, or a provider crash) is recovered by
 // retrying it. Creation has a rollback guard and deletion has none, so retry
 // idempotency is the safety property. The runner image ignores SIGTERM, so
@@ -285,12 +285,12 @@ func TestVerifyM3CredentialTimeoutThenSimulatedGARMDelete(t *testing.T) {
 // about 10s, and the kill is timed to that marker. The test asserts the marker was
 // seen, the kill hit a running process, and the runner container still existed
 // afterwards, then that a fresh DeleteInstance converges to zero leftovers.
-func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
+func TestVerifyCancelDeleteInstanceIdempotent(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-cancel-trapterm:latest"
+	imageTag := "garm-cancel-trapterm:latest"
 	buildTrapTermImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
@@ -304,15 +304,15 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	b := bootstrapFor("m3-cancel-01", srv.URL, caBundle)
+	b := bootstrapFor("cancel-01", srv.URL, caBundle)
 	out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
 		t.Fatalf("CreateInstance exit=%d, want 0; stdout=%s", code, out)
 	}
-	runnerName := spec.RunnerContainerName("m3-cancel-01")
+	runnerName := spec.RunnerContainerName("cancel-01")
 
 	// Kill DeleteInstance mid-teardown, gated on the SIGTERM marker.
-	killedLive, sawBarrier := runDeleteKillOnTeardownBarrier(t, bin, cfg, controllerID, "m3-cancel-01", runnerName)
+	killedLive, sawBarrier := runDeleteKillOnTeardownBarrier(t, bin, cfg, controllerID, "cancel-01", runnerName)
 	if !sawBarrier {
 		t.Fatalf("never observed teardown enter its first destructive op (SIGTERM to the runner %q) before the kill — the barrier did not engage, so this run would prove nothing", runnerName)
 	}
@@ -328,13 +328,13 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 
 	// A fresh DeleteInstance must converge: exit 0 if resources remain, or 30 if the
 	// killed run had already finished. Any other code means the kill left a wedge.
-	_, retryCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-cancel-01", nil)
+	_, retryCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "cancel-01", nil)
 	if retryCode != 0 && retryCode != 30 {
 		t.Errorf("retry DeleteInstance after a mid-teardown kill: exit=%d, want 0 or 30 (idempotent convergence)", retryCode)
 	}
 
 	// A further delete must be a no-op, with zero resources left.
-	_, finalCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-cancel-01", nil)
+	_, finalCode := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "cancel-01", nil)
 	if finalCode != 30 {
 		t.Errorf("final DeleteInstance after retry: exit=%d, want 30 (fully converged)", finalCode)
 	}
@@ -345,7 +345,7 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 	}
 }
 
-// TestVerifyM3CrashOrphanSweptOnNextList proves that a runner that exited without
+// TestVerifyCrashOrphanSweptOnNextList proves that a runner that exited without
 // DeleteInstance ever being called is collected, with its volume and network, by
 // the opportunistic sweep on a later ListInstances. It stops the runner directly
 // through the Docker CLI, as when an ephemeral runner ends after its one job, waits
@@ -353,12 +353,12 @@ func TestVerifyM3CancelDeleteInstanceIdempotent(t *testing.T) {
 // clock, then runs a routine ListInstances. The window's boundaries are unit-tested
 // in internal/topology/topology_test.go; this checks the wiring against a real
 // daemon.
-func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
+func TestVerifyCrashOrphanSweptOnNextList(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-crash-sleep:latest"
+	imageTag := "garm-crash-sleep:latest"
 	buildSleepImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
@@ -372,7 +372,7 @@ func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	b := bootstrapFor("m3-crash-01", srv.URL, caBundle)
+	b := bootstrapFor("crash-01", srv.URL, caBundle)
 	out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
 		t.Fatalf("CreateInstance exit=%d, want 0; stdout=%s", code, out)
@@ -401,7 +401,7 @@ func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 	}
 
 	assertGone(t, "container", "inspect", runnerName)
-	assertGone(t, "network", "network", "inspect", spec.JobNetworkName("m3-crash-01"))
+	assertGone(t, "network", "network", "inspect", spec.JobNetworkName("crash-01"))
 	if n := controllerResourceCount(t, controllerID); n != 0 {
 		t.Errorf("after the sweep, %d resources remain for the crash-abandoned allocation, want 0", n)
 	} else {
@@ -409,19 +409,19 @@ func TestVerifyM3CrashOrphanSweptOnNextList(t *testing.T) {
 	}
 }
 
-// TestVerifyM3RestartNoDisruptionNoDoubleProvision proves a provider restart
+// TestVerifyRestartNoDisruptionNoDoubleProvision proves a provider restart
 // neither hides a running allocation nor allows a second one. Every command is a
 // fresh subprocess and the provider keeps no in-memory state (ADR-004), so a new
 // invocation is what a restarted provider looks like. The test creates an
 // allocation, checks that ListInstances and GetInstance from new subprocesses
 // report it running, then checks that a duplicate CreateInstance exits 31 and
 // leaves the original container's ID and running state unchanged.
-func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
+func TestVerifyRestartNoDisruptionNoDoubleProvision(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-restart-sleep:latest"
+	imageTag := "garm-restart-sleep:latest"
 	buildSleepImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
@@ -435,7 +435,7 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	b := bootstrapFor("m3-restart-01", srv.URL, caBundle)
+	b := bootstrapFor("restart-01", srv.URL, caBundle)
 	out, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
 		t.Fatalf("CreateInstance exit=%d, want 0; stdout=%s", code, out)
@@ -458,21 +458,21 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 	}
 	var found *params.ProviderInstance
 	for i := range list {
-		if list[i].Name == "m3-restart-01" {
+		if list[i].Name == "restart-01" {
 			found = &list[i]
 		}
 	}
 	if found == nil {
-		t.Fatalf("m3-restart-01 not visible in a fresh-process ListInstances after the (simulated) restart: %+v", list)
+		t.Fatalf("restart-01 not visible in a fresh-process ListInstances after the (simulated) restart: %+v", list)
 	}
 	if found.Status != params.InstanceRunning {
 		t.Errorf("post-restart ListInstances status=%q, want running", found.Status)
 	}
-	if found.ProviderID != "m3-restart-01" {
-		t.Errorf("post-restart ListInstances provider_id=%q, want the stable instance name (F6)", found.ProviderID)
+	if found.ProviderID != "restart-01" {
+		t.Errorf("post-restart ListInstances provider_id=%q, want the stable instance name", found.ProviderID)
 	}
 
-	getOut, getCode := runProvider(t, bin, cfg, controllerID, "GetInstance", "m3-restart-01", nil)
+	getOut, getCode := runProvider(t, bin, cfg, controllerID, "GetInstance", "restart-01", nil)
 	if getCode != 0 {
 		t.Fatalf("post-restart GetInstance exit=%d, want 0", getCode)
 	}
@@ -485,7 +485,7 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 	}
 
 	// A duplicate create from another fresh process must be rejected.
-	dupB := bootstrapFor("m3-restart-01", srv.URL, caBundle)
+	dupB := bootstrapFor("restart-01", srv.URL, caBundle)
 	dupOut, dupCode := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &dupB)
 	if dupCode != 31 {
 		t.Errorf("post-restart duplicate CreateInstance exit=%d, want 31; stdout=%s", dupCode, dupOut)
@@ -505,20 +505,20 @@ func TestVerifyM3RestartNoDisruptionNoDoubleProvision(t *testing.T) {
 	t.Logf("original allocation's container identity and running state are unchanged after simulated restart + duplicate-create attempt")
 }
 
-// TestVerifyM3ForeignResourceNonInterference proves that DeleteInstance, the
+// TestVerifyForeignResourceNonInterference proves that DeleteInstance, the
 // opportunistic sweep and RemoveAllInstances never touch a container, volume or
 // network that carries no garm.docker labels. It seeds randomly named foreign ones
-// (TestVerifyM2CacheSafety covers a foreign volume at a name the provider would
+// (TestVerifyCacheSafety covers a foreign volume at a name the provider would
 // claim), runs those operations next to real allocations, and checks the foreign
 // Docker IDs are unchanged after every step. It also reads internal/docker/client.go
 // to show that no Docker prune endpoint is reachable and that no production file
 // imports os/exec, so a prune cannot run at all, rather than merely not having run.
-func TestVerifyM3ForeignResourceNonInterference(t *testing.T) {
+func TestVerifyForeignResourceNonInterference(t *testing.T) {
 	controllerID := randControllerID(t)
 	canaries := ensureForeignCanaries(t)
-	bin := buildM3ProviderBinary(t)
+	bin := buildProviderBinary(t)
 
-	imageTag := "garm-m3-foreign-sleep:latest"
+	imageTag := "garm-foreign-sleep:latest"
 	buildSleepImage(t, imageTag)
 	cfg := noCacheConfig(t, imageTag)
 
@@ -528,9 +528,9 @@ func TestVerifyM3ForeignResourceNonInterference(t *testing.T) {
 
 	// Seed foreign, unmanaged resources.
 	foreignSuffix := randHex(t)
-	foreignContainer := "m3-foreign-container-" + foreignSuffix
-	foreignVolume := "m3-foreign-volume-" + foreignSuffix
-	foreignNetwork := "m3-foreign-network-" + foreignSuffix
+	foreignContainer := "foreign-container-" + foreignSuffix
+	foreignVolume := "foreign-volume-" + foreignSuffix
+	foreignNetwork := "foreign-network-" + foreignSuffix
 
 	if out, err := dockerTry("run", "-d", "--name", foreignContainer, "alpine:3.20", "sleep", "3600"); err != nil {
 		t.Fatalf("seed foreign container: %v\n%s", err, out)
@@ -568,19 +568,19 @@ func TestVerifyM3ForeignResourceNonInterference(t *testing.T) {
 	}
 
 	// Allocation A: create, then DeleteInstance.
-	bA := bootstrapFor("m3-foreign-a", srv.URL, caBundle)
+	bA := bootstrapFor("foreign-a", srv.URL, caBundle)
 	if _, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &bA); code != 0 {
 		t.Fatalf("CreateInstance A failed, exit=%d", code)
 	}
 	assertForeignUnchanged("after CreateInstance A")
 
-	if _, code := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "m3-foreign-a", nil); code != 0 {
+	if _, code := runProvider(t, bin, cfg, controllerID, "DeleteInstance", "foreign-a", nil); code != 0 {
 		t.Fatalf("DeleteInstance A failed, exit=%d", code)
 	}
 	assertForeignUnchanged("after DeleteInstance A")
 
 	// Allocation B: create, then RemoveAllInstances.
-	bB := bootstrapFor("m3-foreign-b", srv.URL, caBundle)
+	bB := bootstrapFor("foreign-b", srv.URL, caBundle)
 	if _, code := runProvider(t, bin, cfg, controllerID, "CreateInstance", "", &bB); code != 0 {
 		t.Fatalf("CreateInstance B failed, exit=%d", code)
 	}

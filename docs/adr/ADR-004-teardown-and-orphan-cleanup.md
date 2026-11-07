@@ -87,7 +87,8 @@ Volume names embed the attempt's nonce (`<instance>-<nonce>-workspace`, `-socket
 network keeps the stable name `<instance>-net`, since that is what makes the 409 work. Teardown finds volumes
 by label and removes each by the name it read, and a generation-unique name means a stale teardown can never
 name a newer generation's volume. A pre-flight check rejects an instance name long enough to push a volume
-name past Docker's 255-byte limit, before the first Docker call.
+name past 255 bytes, before the first Docker call. The daemon's name check has no length limit, but a local volume's
+name is a directory name, which Linux filesystems cap at 255 bytes.
 
 ### Teardown order
 
@@ -124,6 +125,10 @@ removes:
   `FinishedAt`. Runners are single-job, so an exited runner is a finished or failed job, and the grace avoids
   racing GARM's own `DeleteInstance`;
 - an allocation with no live container whose marker is past the 20 minute deadline.
+
+A running, paused or restarting runner counts as live at any age, since a paused runner can still hold a job
+and neither clock describes it. If the sweep cannot inspect a runner that is not live, it logs the error and
+removes nothing, so a later sweep decides.
 
 Both windows exist so the sweep races neither GARM's own delete nor a peer create that has not yet reached the
 runner. The sweep before a create is not throttled, because a stale allocation of the instance being created

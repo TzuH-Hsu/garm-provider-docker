@@ -41,9 +41,27 @@ func TestFakeContainerStatsOneShot(t *testing.T) {
 		t.Errorf("body = %q", body)
 	}
 
-	f.SetState(id, "exited", false)
-	if _, err := f.ContainerStatsOneShot(ctx, id); !errdefs.IsConflict(err) {
-		t.Fatalf("stopped container err = %v, want Conflict", err)
+	f.SetState(id, "paused", false)
+	paused, err := f.ContainerStatsOneShot(ctx, id)
+	if err != nil {
+		t.Fatalf("ContainerStatsOneShot of a paused container: %v", err)
+	}
+	defer paused.Body.Close()
+	if body, _ := io.ReadAll(paused.Body); string(body) != `{"blkio_stats":{}}` {
+		t.Errorf("paused body = %q, want the sample", body)
+	}
+
+	for _, state := range []string{"exited", "restarting"} {
+		f.SetState(id, state, false)
+		stopped, err := f.ContainerStatsOneShot(ctx, id)
+		if err != nil {
+			t.Fatalf("%s container err = %v, want an empty sample", state, err)
+		}
+		body, _ := io.ReadAll(stopped.Body)
+		stopped.Body.Close()
+		if strings.Contains(string(body), "blkio_stats") || !strings.Contains(string(body), id) {
+			t.Errorf("%s body = %q, want name and ID only", state, body)
+		}
 	}
 }
 

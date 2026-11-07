@@ -15,7 +15,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyOwnerRulingEgressAndIsolation proves that job networks default to
+// TestVerifyEgressAndIsolation proves that job networks default to
 // internal=false, so the runner keeps egress; that internal=true still blocks it;
 // and that job-to-job isolation comes from each allocation owning its own network,
 // not from the internal flag (ADR-001, Job network). It runs two allocations under
@@ -24,11 +24,11 @@ import (
 // Internal=true and be blocked. The test then checks that they sit on different
 // networks and that the default runner cannot reach the other runner by container
 // IP. Only a real daemon shows real routing and firewalling.
-func TestVerifyOwnerRulingEgressAndIsolation(t *testing.T) {
+func TestVerifyEgressAndIsolation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
-	imageTag := "garm-wp2-verify-sleep:latest"
+	imageTag := "garm-alloc-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
 
 	bin := filepath.Join(t.TempDir(), "garm-provider-docker")
@@ -81,7 +81,7 @@ internal = true
 	internalA := dockerOut(t, "network", "inspect", netA, "-f", "{{.Internal}}")
 	t.Logf("[default] network %s Internal=%s", netA, internalA)
 	if internalA != "false" {
-		t.Errorf("[default] job network Internal=%s, want false (2026-07-21 owner ruling default)", internalA)
+		t.Errorf("[default] job network Internal=%s, want false (default)", internalA)
 	}
 	egressOutA, egressErrA := dockerTry("exec", createdA.ProviderID, "sh", "-c", "wget -qO- -T 6 https://api.github.com/zen")
 	if egressErrA != nil {

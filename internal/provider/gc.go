@@ -126,7 +126,7 @@ func (p *Provider) logUnprovableCacheCruft(ctx context.Context) {
 	if len(shown) > cacheGCCruftLogMax {
 		shown = shown[:cacheGCCruftLogMax]
 	}
-	slog.InfoContext(ctx, "cache GC: cache-named volume(s) carry no managed cache labels (unlabeled auto-created replacements or foreign squatters); NOT deleting them (ADR-003 never-delete-unprovable) — an operator may reclaim disk manually if genuinely stale",
+	slog.InfoContext(ctx, "cache GC: cache-named volume(s) carry no managed cache labels (unlabeled auto-created replacements or foreign squatters); NOT deleting them (ADR-003: a volume that cannot be proved ours is never deleted) — an operator may reclaim disk manually if genuinely stale",
 		"resource", "cache-volume", "count", len(cruft), "cruft_volumes", strings.Join(shown, ", "))
 }
 

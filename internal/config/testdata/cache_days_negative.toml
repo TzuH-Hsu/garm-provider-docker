@@ -1,4 +1,4 @@
-# A negative retention window: rejected (typo guard, even though W2 consumes it).
+# A negative retention window: rejected (typo guard, even though the GC consumes it).
 runner_image = "ghcr.io/example/garm-runner-noble@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 [cache]

@@ -88,22 +88,22 @@ func TestParseEntity(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "scheme-less org URL is rejected (H1: was mis-read as a repo)",
+			name:    "scheme-less org URL is rejected (was mis-read as a repo)",
 			repoURL: "github.com/acme",
 			wantErr: true,
 		},
 		{
-			name:    "scheme-less repo URL is rejected (H1)",
+			name:    "scheme-less repo URL is rejected",
 			repoURL: "github.com/acme/repo",
 			wantErr: true,
 		},
 		{
-			name:    "bare owner/repo is rejected (H1)",
+			name:    "bare owner/repo is rejected",
 			repoURL: "owner/repo",
 			wantErr: true,
 		},
 		{
-			name:    "non-http scheme is rejected (H1)",
+			name:    "non-http scheme is rejected",
 			repoURL: "ssh://git@github.com/acme/repo",
 			wantErr: true,
 		},

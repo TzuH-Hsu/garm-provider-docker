@@ -1,2 +1,2 @@
-# A tag-only runner_image without the escape hatch: rejected (F10).
+# A tag-only runner_image without the escape hatch: rejected (ADR-005).
 runner_image = "ghcr.io/example/garm-runner-noble:dev"

@@ -100,7 +100,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, fmt.Errorf("failed to generate create nonce for %q: %w", instanceName, err)
 	}
 
-	// Reject a name whose derived volume names would pass Docker's 255-byte limit now,
+	// Reject a name whose derived volume names would pass the 255-byte limit now,
 	// not as an opaque daemon error after the claim network exists.
 	if err := spec.ValidateAllocationNames(instanceName, nonce); err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("instance name %q produces an invalid Docker resource name: %w", instanceName, err)

@@ -19,12 +19,12 @@
     "runner_memory": {
       "type": "string",
       "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
-      "description": "Runner container memory limit as a human byte size (e.g. \"4GiB\", \"512MiB\", \"2GB\"). Must be POSITIVE: a zero value in any representation (\"0\", \"0GiB\", \"0 B\") is rejected, because Docker treats a 0 memory limit as UNSET, which would silently remove the operator's ceiling (H1). Bounded by the effective configured runner_memory: a request exceeding the operator's ceiling is rejected (reject-not-clamp, owner ruling), not silently reduced."
+      "description": "Runner container memory limit as a human byte size (e.g. \"4GiB\", \"512MiB\", \"2GB\"). Must be POSITIVE: a zero value in any representation (\"0\", \"0GiB\", \"0 B\") is rejected, because Docker treats a 0 memory limit as UNSET, which would silently remove the operator's ceiling. Bounded by the effective configured runner_memory: a request exceeding the operator's ceiling is rejected, not silently reduced."
     },
     "dind_memory": {
       "type": "string",
       "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$",
-      "description": "DinD sidecar memory limit as a human byte size. Must be POSITIVE (a zero value is rejected, same as runner_memory — H1). Bounded by the effective configured dind_memory exactly like runner_memory; unused when the effective dind_mode is \"none\"."
+      "description": "DinD sidecar memory limit as a human byte size. Must be POSITIVE (a zero value is rejected, same as runner_memory). Bounded by the effective configured dind_memory exactly like runner_memory; unused when the effective dind_mode is \"none\"."
     },
     "storage_driver": {
       "type": "string",
@@ -40,7 +40,7 @@
       "type": "object",
       "additionalProperties": { "type": "string" },
       "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-      "description": "Extra environment variables for the runner container. Each NAME must match a strict env-name charset ^[A-Za-z_][A-Za-z0-9_]*$ (H3): a key containing '=', whitespace, unicode, or a leading digit is rejected, so a key like \"JIT_CONFIG_ENABLED=false\" can never smuggle a value past the exact-name reserved/allowlist checks and the provider-wins merge. Beyond the charset, extra_env is governed by an operator ALLOWLIST (config [extra_specs].allowed_env, default EMPTY): a name not on the allowlist is rejected at CreateInstance time (H2). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if allowlisted. A non-reserved allowlisted name that merely collides with a provider-injected variable is dropped in favor of the provider's value — provider-injected environment always wins the merge."
+      "description": "Extra environment variables for the runner container. Each NAME must match a strict env-name charset ^[A-Za-z_][A-Za-z0-9_]*$: a key containing '=', whitespace, unicode, or a leading digit is rejected, so a key like \"JIT_CONFIG_ENABLED=false\" can never smuggle a value past the exact-name reserved/allowlist checks and the provider-wins merge. Beyond the charset, extra_env is governed by an operator ALLOWLIST (config [extra_specs].allowed_env, default EMPTY): a name not on the allowlist is rejected at CreateInstance time. Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if allowlisted. A non-reserved allowlisted name that merely collides with a provider-injected variable is dropped in favor of the provider's value — provider-injected environment always wins the merge."
     }
   }
 }

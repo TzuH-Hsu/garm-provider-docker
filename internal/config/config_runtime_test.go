@@ -2,29 +2,29 @@ package config
 
 import "testing"
 
-// TestLoadM1 covers Load's validation of dind_mode, allowed_dind_modes,
+// TestLoadRuntime covers Load's validation of dind_mode, allowed_dind_modes,
 // dind_image, storage_driver, [resources] and [flavors.*] through testdata
 // fixtures.
-func TestLoadM1(t *testing.T) {
+func TestLoadRuntime(t *testing.T) {
 	tests := []struct {
 		name    string
 		path    string
 		wantErr bool
 	}{
-		{name: "full valid M1 config", path: "testdata/m1_valid.toml"},
-		{name: "unknown dind_mode is rejected", path: "testdata/m1_dind_mode_invalid.toml", wantErr: true},
-		{name: "dind_mode outside allowed_dind_modes is rejected", path: "testdata/m1_dind_mode_not_allowed.toml", wantErr: true},
-		{name: "unknown entry in allowed_dind_modes is rejected", path: "testdata/m1_allowed_dind_modes_invalid.toml", wantErr: true},
+		{name: "full valid config with every runtime field set", path: "testdata/full_non_default.toml"},
+		{name: "unknown dind_mode is rejected", path: "testdata/dind_mode_invalid.toml", wantErr: true},
+		{name: "dind_mode outside allowed_dind_modes is rejected", path: "testdata/dind_mode_not_allowed.toml", wantErr: true},
+		{name: "unknown entry in allowed_dind_modes is rejected", path: "testdata/allowed_dind_modes_invalid.toml", wantErr: true},
 		// A valid DinD config that never widens allowed_dind_modes is rejected at
 		// load, so the operator sees a startup error and not a failed create.
-		{name: "dind_mode is denied by the default ceiling when not widened", path: "testdata/m1_allowed_dind_modes_default_denies_dind.toml", wantErr: true},
-		{name: "dind_image required when dind_mode != none", path: "testdata/m1_dind_image_missing.toml", wantErr: true},
-		{name: "tag-only dind_image rejected by default", path: "testdata/m1_dind_image_unpinned.toml", wantErr: true},
-		{name: "tag-only dind_image accepted with its own escape hatch", path: "testdata/m1_dind_image_unpinned_allowed.toml"},
-		{name: "unsupported storage_driver is rejected", path: "testdata/m1_storage_driver_invalid.toml", wantErr: true},
-		{name: "malformed runner_memory is rejected", path: "testdata/m1_resources_invalid.toml", wantErr: true},
-		{name: "tag-only flavor runner_image is rejected", path: "testdata/m1_flavor_image_unpinned.toml", wantErr: true},
-		{name: "malformed flavor runner_memory is rejected", path: "testdata/m1_flavor_memory_invalid.toml", wantErr: true},
+		{name: "dind_mode is denied by the default ceiling when not widened", path: "testdata/allowed_dind_modes_default_denies_dind.toml", wantErr: true},
+		{name: "dind_image required when dind_mode != none", path: "testdata/dind_image_missing.toml", wantErr: true},
+		{name: "tag-only dind_image rejected by default", path: "testdata/dind_image_unpinned.toml", wantErr: true},
+		{name: "tag-only dind_image accepted with its own escape hatch", path: "testdata/dind_image_unpinned_allowed.toml"},
+		{name: "unsupported storage_driver is rejected", path: "testdata/storage_driver_invalid.toml", wantErr: true},
+		{name: "malformed runner_memory is rejected", path: "testdata/resources_invalid.toml", wantErr: true},
+		{name: "tag-only flavor runner_image is rejected", path: "testdata/flavor_image_unpinned.toml", wantErr: true},
+		{name: "malformed flavor runner_memory is rejected", path: "testdata/flavor_memory_invalid.toml", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -43,11 +43,11 @@ func TestLoadM1(t *testing.T) {
 	}
 }
 
-// TestLoadM1Defaults confirms a config with no DinD, storage or network keys
+// TestLoadRuntimeDefaults confirms a config with no DinD, storage or network keys
 // (testdata/valid.toml) loads with the documented defaults: dind_mode none, the
 // fail-closed ["none"] ceiling, overlay2, enable_job_network true and internal
 // false (ADR-001, "Job network").
-func TestLoadM1Defaults(t *testing.T) {
+func TestLoadRuntimeDefaults(t *testing.T) {
 	cfg, err := Load("testdata/valid.toml")
 	if err != nil {
 		t.Fatalf("Load returned unexpected error: %v", err)
@@ -71,7 +71,7 @@ func TestLoadM1Defaults(t *testing.T) {
 		t.Error("Network.EnableJobNetwork = false, want true (default)")
 	}
 	if cfg.Network.Internal {
-		t.Error("Network.Internal = true, want false (default, 2026-07-21 owner ruling)")
+		t.Error("Network.Internal = true, want false (default)")
 	}
 	if cfg.DindImage != "" {
 		t.Errorf("DindImage = %q, want empty (dind_mode=none, never set)", cfg.DindImage)

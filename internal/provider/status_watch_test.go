@@ -172,7 +172,7 @@ func TestCreateInstanceWatcherStartFailureDoesNotFailCreate(t *testing.T) {
 	if _, err := p.CreateInstance(context.Background(), statusBootstrap(meta.URL, cb.URL)); err != nil {
 		t.Fatalf("CreateInstance failed because the watcher could not start: %v", err)
 	}
-	if out := logs.String(); !strings.Contains(out, "could not start the runner status watcher") || strings.Contains(out, testInstanceToken) {
+	if out := logs.String(); !strings.Contains(out, "could not start the runner status watcher; the runner stays pending") || strings.Contains(out, testInstanceToken) {
 		t.Errorf("want a redacted watcher-start warning, logs:\n%s", out)
 	}
 }

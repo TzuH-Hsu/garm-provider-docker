@@ -146,7 +146,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	// Returned ProviderInstance. provider_id is the stable instance NAME,
 	// resolvable by label independently of the runner container.
 	if inst.ProviderID != "Test-Instance-01" {
-		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01 (F6)", inst.ProviderID)
+		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01", inst.ProviderID)
 	}
 	if inst.Name != "Test-Instance-01" {
 		t.Errorf("Name = %q, want Test-Instance-01", inst.Name)
@@ -598,7 +598,7 @@ func TestCreateInstanceAcceptsArm64(t *testing.T) {
 
 // TestCreateInstanceRejectsPathologicallyLongInstanceName exercises
 // spec.ValidateAllocationNames end to end: an instance name long enough that its
-// nonce-qualified volume names would exceed Docker's 255-byte limit must fail before
+// nonce-qualified volume names would exceed the 255-byte limit must fail before
 // the claim network or anything else is created, with a clear provider error and not an
 // opaque daemon rejection mid-allocation.
 func TestCreateInstanceRejectsPathologicallyLongInstanceName(t *testing.T) {
