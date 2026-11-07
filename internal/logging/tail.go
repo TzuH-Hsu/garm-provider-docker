@@ -12,12 +12,8 @@ import (
 // through, so a reader still sees that a line was there.
 const WithheldLine = "[line withheld: it may carry a credential]"
 
-// riskyWords are case-insensitive substrings that withhold a whole line. They
-// name the places a credential shows up in a runner's output: the JIT config
-// and the files it unpacks into (.runner, .credentials, .credentials_rsaparams
-// with its RSA modulus and exponent), registration and access tokens, HTTP
-// authorization headers, GARM's metadata and status-callback endpoints, and
-// key material.
+// riskyWords are case-insensitive substrings that withhold a line. "modulus" and
+// "exponent" cover the RSA parameters the runner unpacks from its JIT config.
 var riskyWords = []string{
 	"token",
 	"bearer",
@@ -44,11 +40,9 @@ var riskyWords = []string{
 	"cookie",
 }
 
-// riskyPatterns withhold a line that carries a credential-shaped value even
-// when no risky word is next to it.
+// riskyPatterns withhold a credential-shaped value that has no risky word nearby.
 var riskyPatterns = []*regexp.Regexp{
-	// GitHub tokens: classic PATs, OAuth, app installation, user-to-server and
-	// refresh tokens, and fine-grained PATs.
+	// GitHub tokens and fine-grained PATs.
 	regexp.MustCompile(`gh[opsur]_[A-Za-z0-9]{16,}`),
 	regexp.MustCompile(`github_pat_`),
 	// Base64 of a JSON object or a JWT header: the JIT config blob and GARM's
@@ -57,60 +51,33 @@ var riskyPatterns = []*regexp.Regexp{
 	// AWS access key IDs and Slack tokens, which a job's tooling may print.
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 	regexp.MustCompile(`xox[abposr]-`),
-	// A URL with userinfo, or with a query string, either of which can carry
-	// a credential.
+	// A URL with userinfo or a query string.
 	regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/@]+@`),
 	regexp.MustCompile(`(?i)https?://\S*\?\S*=`),
 }
 
-// credentialRunLen is the length at which an unbroken run of credential-alphabet
-// characters withholds its line, whatever its case or digit mix: any such run
-// could be a key, and its composition cannot prove it is not. Twenty is the
-// shortest common credential format this has to catch (an AWS access key ID;
-// a GitHub registration token is 29, a GitHub token 40, the JIT config far
-// longer), and it still lets through the runner's own status lines and
-// ordinary job names. Paths, digests and long identifiers are withheld.
+// credentialRunLen is the length at which a run of credential-alphabet characters
+// withholds its line, whatever its mix: composition cannot prove a run is not a
+// key. Twenty matches an AWS access key ID, the shortest common format, and still
+// passes the runner's status lines. Long paths and digests are withheld too.
 const credentialRunLen = 20
 
-// credentialRun matches credentialRunLen or more base64, base64url or hex
-// characters in a row. '.' is not in it, so a dotted name such as
-// Runner.Listener or a version number does not join two words into one run;
-// a JWT's segments are each long enough to match alone.
+// credentialRun leaves out '.' so a name like Runner.Listener does not join two
+// words into one run. A JWT's segments are each long enough to match alone.
 var credentialRun = regexp.MustCompile(`[A-Za-z0-9+/=_-]{` + strconv.Itoa(credentialRunLen) + `,}`)
 
 // bareBlob matches a line that is nothing but base64 characters, such as a
 // line of a PEM body whose BEGIN line has already scrolled out of the tail.
 var bareBlob = regexp.MustCompile(`^[A-Za-z0-9+/=_-]{8,}$`)
 
-// SafeLogLines returns the lines of a container's own output that may be
-// logged, in order, with every line that might carry a credential replaced by
-// WithheldLine, and how many lines it withheld.
+// SafeLogLines returns a container's output lines in order, with each line that
+// might carry a credential replaced by WithheldLine, and the number withheld.
+// Other lines are made printable and cut to maxLineBytes, so a line cannot forge
+// log structure or grow without bound.
 //
-// It exists for the one place this provider logs text it did not produce: the
-// tail of a runner container's output (topology's orphan sweep). The runner
-// never receives a credential in its environment or arguments (ADR-002), but
-// its output is the runner software's and the image's, not this provider's,
-// so it is screened rather than trusted. The screen is deliberately coarse: a
-// line is withheld whole rather than masked, and anything credential-shaped
-// counts, at the cost of withholding some harmless lines. A line is withheld
-// when it
-//
-//   - contains a risky word (token, bearer, authorization, jitconfig,
-//     credential, secret, password, metadata, callback, private key, ...);
-//   - matches a known token shape (ghp_/ghs_/gho_/ghu_/ghr_, github_pat_,
-//     base64 JSON or a JWT, AWS and Slack keys);
-//   - holds a URL with userinfo or a query string;
-//   - holds 20 or more base64, base64url or hex characters in a row, judged
-//     by length alone: a credential's alphabet can be any mix of case and
-//     digits, so no composition makes a long run safe;
-//   - is nothing but 8 or more base64 characters, at least one of them a
-//     digit or one of "+", "/" and "=";
-//   - lies between a PEM BEGIN line and its END line.
-//
-// Lines that pass are made printable (control characters become spaces,
-// invalid UTF-8 is replaced) and cut to maxLineBytes, so a line cannot forge
-// log structure or grow without bound. Screening runs on the whole line before
-// it is cut.
+// The container's output is not this provider's to trust. Screening is coarse and
+// covers the whole line before the cut, at the cost of withholding some harmless
+// lines.
 func SafeLogLines(lines []string, maxLineBytes int) (safe []string, withheld int) {
 	safe = make([]string, 0, len(lines))
 	inPEM := false
@@ -147,13 +114,13 @@ func lineIsRisky(line, lower string) bool {
 	if credentialRun.MatchString(line) {
 		return true
 	}
+	// A long word of letters, '_' or '-' is not a blob.
 	trimmed := strings.TrimSpace(line)
 	return bareBlob.MatchString(trimmed) && strings.ContainsAny(trimmed, "0123456789+/=")
 }
 
-// printable replaces control characters with spaces and invalid UTF-8 with
-// U+FFFD, and cuts s to at most maxBytes bytes on a rune boundary, marking a
-// cut with an ellipsis.
+// printable replaces control characters and invalid UTF-8, and cuts s to at most
+// maxBytes bytes on a rune boundary, marking a cut with an ellipsis.
 func printable(s string, maxBytes int) string {
 	s = strings.ToValidUTF8(s, "�")
 	s = strings.Map(func(r rune) rune {
