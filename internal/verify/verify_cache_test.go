@@ -16,48 +16,42 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyM2W1CacheHit is the M2-W1 real-daemon verification: it drives the
-// REAL provider binary through TWO allocations for the SAME repo_url and proves
-// the ADR-003 persistent-cache contract on a live daemon — the toolcache and
-// pnpm store volumes are the SAME volume across both jobs (a file written into
-// the toolcache in job 1 is visible in job 2), they are NOT torn down when each
-// allocation is deleted, an org-scoped pool gets no persistent cache by default,
-// and the pnpm store path the provider points pnpm at is honored end to end.
+// TestVerifyM2W1CacheHit proves the ADR-003 persistent-cache contract on a real
+// daemon by running two allocations for the same repo_url. The toolcache and pnpm
+// store volumes are the same across both jobs (a file written to the toolcache in
+// job 1 is visible in job 2); they survive DeleteInstance; an org-scoped pool gets
+// no persistent cache by default; and pnpm honors the store path the provider sets.
+// Only a real daemon shows volume reuse, mounts, and what survives a delete.
 //
-// Isolation: a UNIQUE controller-id AND a UNIQUE repo_url (random token) so the
-// cache repokey — and therefore the cache volume names — cannot collide with any
-// pre-existing volume. Cleanup is label-scoped to this controller-id (which the
-// cache volumes carry) plus an explicit removal of this run's cache volumes by
-// name; it NEVER touches foreign resources, and a before/after volume snapshot
-// asserts no foreign volume was removed.
+// The controller ID and repo_url are unique per run, so cache volume names cannot
+// collide with existing volumes. Cleanup is label-scoped to the controller ID plus
+// removal of this run's cache volumes by name, and a before/after volume snapshot
+// checks that no foreign volume was removed.
 //
 // Run with: go test -tags dockerverify -v -run TestVerifyM2W1CacheHit ./internal/verify/
 func TestVerifyM2W1CacheHit(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
-	// Unique repo (two path segments => repo-scoped) and a unique org (one
-	// segment => org-scoped), each with a random token so their repokeys are
-	// unique to this run.
+	// A unique repo (two path segments, so repo-scoped) and a unique org (one segment,
+	// so org-scoped), each with a random token.
 	token := randHex(t)
 	repoURL := "https://github.com/garm-cache-verify/repo-" + token
 	orgURL := "https://github.com/garm-cache-verify-org-" + token
 	repoKey := spec.RepoKey(repoURL)
 	orgKey := spec.RepoKey(orgURL)
 
-	// --- foreign snapshot: containers AND volumes must be untouched -----------
+	// Foreign snapshot: containers and volumes must be untouched.
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
-	// --- build sleep runner image + the REAL provider binary -----------------
 	imageTag := "garm-m2w1-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
 
-	// The toolcache and pnpm volumes are keyed on the runner image's OS key
-	// (ADR-003, 2026-10-12 amendment); the sleep image has no os-release label,
-	// so the key is derived from its content ID.
+	// The toolcache and pnpm volumes are keyed on the runner image's OS key (ADR-003).
+	// The sleep image has no os-release label, so the key comes from its content ID.
 	osKey := imageOSKey(t, imageTag)
 	toolVol := spec.ToolcacheVolumeName(repoKey, osKey, "1")
 	pnpmVol := spec.PnpmVolumeName(repoKey, osKey, "9")
@@ -70,7 +64,7 @@ func TestVerifyM2W1CacheHit(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// --- provider config with the persistent cache enabled -------------------
+	// Config with the persistent cache enabled.
 	configFile := filepath.Join(t.TempDir(), "config.toml")
 	writeFile(t, configFile, fmt.Sprintf(`docker_host = "unix:///var/run/docker.sock"
 runner_image = %q
@@ -89,11 +83,9 @@ allow_org_shared = false
 	defer srv.Close()
 	caBundle := caBundlePEM(t, srv)
 
-	// --- cleanup: label-scoped to THIS controller (cache volumes carry the
-	// controller-id label too) + explicit removal of this run's cache volumes by
-	// name, then assert no FOREIGN volume was removed and the foreign containers
-	// are intact. Caches are meant to persist across allocations, so the test
-	// itself is what removes them, at the very end.
+	// Remove this controller's resources by label, plus this run's cache volumes by
+	// name, since caches persist across allocations. Then check that no foreign volume
+	// was removed and the foreign containers are intact.
 	defer func() {
 		cleanupController(t, controllerID)
 		for _, v := range []string{toolVol, pnpmVol, orgToolVol} {
@@ -115,9 +107,8 @@ allow_org_shared = false
 		}
 	}()
 
-	// =========================================================================
-	// JOB A: create -> caches provisioned, mounted, env set; write a marker.
-	// =========================================================================
+	// Job A: create. The caches are provisioned and mounted, the env is set, and a
+	// marker is written.
 	bA := cacheBootstrapPayload("m2w1-job-a", repoURL, srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bA)
 	if code != 0 {
@@ -125,8 +116,8 @@ allow_org_shared = false
 	}
 	runnerA := "m2w1-job-a"
 
-	// (a) toolcache + pnpm volumes exist with the ADR-003 cache labels and NO
-	// instance-name (so they are excluded from teardown).
+	// (a) The toolcache and pnpm volumes exist with the ADR-003 cache labels and no
+	// instance-name label, which is what excludes them from teardown.
 	assertCacheVolumeLabels(t, toolVol, repoKey, string(spec.CacheKindToolcache))
 	assertCacheVolumeLabels(t, pnpmVol, repoKey, string(spec.CacheKindPnpm))
 
@@ -162,9 +153,7 @@ allow_org_shared = false
 	}
 	t.Logf("[d] wrote marker %q into the toolcache volume via job A's runner", marker)
 
-	// =========================================================================
-	// Delete job A: the allocation is torn down but the caches SURVIVE.
-	// =========================================================================
+	// Delete job A: the allocation is torn down but the caches survive.
 	if _, delCode := runProvider(t, bin, configFile, controllerID, "DeleteInstance", runnerA, nil); delCode != 0 {
 		t.Errorf("job A DeleteInstance exit=%d, want 0", delCode)
 	}
@@ -178,9 +167,7 @@ allow_org_shared = false
 	}
 	t.Logf("[delete] job A allocation torn down; both cache volumes survived")
 
-	// =========================================================================
-	// JOB B: same repo_url -> SAME cache volumes; marker from job A is visible.
-	// =========================================================================
+	// Job B: the same repo_url gets the same cache volumes, and job A's marker is visible.
 	bB := cacheBootstrapPayload("m2w1-job-b", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bB); code != 0 {
 		t.Fatalf("job B CreateInstance exit=%d, want 0", code)
@@ -194,8 +181,8 @@ allow_org_shared = false
 		t.Errorf("job B pnpm mount source = %q, want the SAME volume %q as job A", src, pnpmVol)
 	}
 
-	// THE cache-hit proof: the marker written in job A is present in job B,
-	// because both jobs mounted the SAME persistent toolcache volume.
+	// The cache hit: the marker written in job A is present in job B because both
+	// mounted the same persistent toolcache volume.
 	got, err := dockerTry("exec", runnerB, "cat", "/opt/hostedtoolcache/marker.txt")
 	if err != nil {
 		t.Fatalf("cache MISS: job A's toolcache marker is not readable in job B: %v\n%s", err, got)
@@ -213,12 +200,9 @@ allow_org_shared = false
 		t.Errorf("repo has %d repo-keyed cache volumes, want 3 (toolcache + pnpm + diag, reused across both jobs)", n)
 	}
 
-	// =========================================================================
-	// pnpm store path end-to-end: pnpm honors the provider's volume + env.
-	// (Runs pnpm against the PROVIDER-created pnpm volume; needs network for
-	// corepack, which this dockerverify suite already requires — best-effort so
-	// a transient corepack/network failure does not mask the provider result.)
-	// =========================================================================
+	// pnpm store path end to end: pnpm honors the provider's volume and env. It runs
+	// pnpm against the provider-created volume and needs network for corepack, so it is
+	// best-effort: a transient failure must not mask the provider result.
 	pnpmOut, pnpmErr := dockerTry("run", "--rm",
 		"-e", "npm_config_store_dir=/opt/pnpm-store",
 		"-e", "COREPACK_HOME=/tmp/corepack",
@@ -234,9 +218,7 @@ allow_org_shared = false
 		t.Logf("[pnpm-e2e] pnpm honors the provider's store: `pnpm config get store-dir` = /opt/pnpm-store on the provider-created volume %s", pnpmVol)
 	}
 
-	// =========================================================================
-	// ORG scope: a single-segment repo_url gets NO persistent cache by default.
-	// =========================================================================
+	// Org scope: a single-segment repo_url gets no persistent cache by default.
 	bOrg := cacheBootstrapPayload("m2w1-job-org", orgURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bOrg); code != 0 {
 		t.Fatalf("job org CreateInstance exit=%d, want 0", code)
@@ -268,8 +250,6 @@ allow_org_shared = false
 	}
 }
 
-// --- helpers -----------------------------------------------------------------
-
 func randHex(t *testing.T) string {
 	t.Helper()
 	var b [6]byte
@@ -293,8 +273,8 @@ func cacheBootstrapPayload(name, repoURL, metadataURL string, caBundle []byte) p
 	}
 }
 
-// volumeSet returns the set of all volume names on the host, for the
-// foreign-non-interference before/after snapshot.
+// volumeSet returns the names of all volumes on the host, for the before/after
+// snapshot of foreign resources.
 func volumeSet(t *testing.T) map[string]bool {
 	t.Helper()
 	set := map[string]bool{}
@@ -317,9 +297,9 @@ func assertCacheVolumeLabels(t *testing.T, name, repoKey, kind string) {
 		!strings.Contains(labels, "kind="+kind) {
 		t.Errorf("cache volume %q labels missing/incorrect: %s", name, labels)
 	}
-	// The cache volume must NOT carry an instance-name (the ADR-004 teardown
-	// exclusion). A label absent from the map renders empty via `index` for a
-	// map[string]string, so an empty value here proves the key is not set.
+	// The cache volume must not carry an instance-name label (the ADR-004 teardown
+	// exclusion). A missing label renders empty through `index`, so an empty value
+	// shows the key is unset.
 	inst := strings.TrimSpace(dockerOut(t, "volume", "inspect", name, "-f",
 		"{{index .Labels \"garm.docker/instance-name\"}}"))
 	if inst != "" && inst != "<no value>" {

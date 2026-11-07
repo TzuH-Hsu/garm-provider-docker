@@ -1,28 +1,28 @@
 //go:build dockerverify
 
-// This file adds the M3-W1 real-daemon verification harness for extra_specs and
-// the v0.1.1 self-description commands, gated behind the same `dockerverify`
-// build tag as the WP2/WP3 harnesses. Run it explicitly against a real daemon:
+// extra_specs and the v0.1.1 self-description commands against a real daemon. Run
+// with:
 //
 //	go test -tags dockerverify -v -run TestVerifyM3W1ExtraSpecs ./internal/verify/
 //
-// It drives the REAL provider binary and proves, on the live daemon:
+// The test drives the real provider binary and checks that:
 //
-//	(a) an extra_specs payload selecting a named flavor + a dind_mode within the
-//	    ceiling brings the runner up on that flavor's image with the selected
-//	    DinD mode (a privileged sidecar + DOCKER_HOST + socket mount that the
-//	    default none-mode config would NOT have produced);
-//	(b) an extra_specs dind_mode OUTSIDE allowed_dind_modes fails closed before
-//	    any Docker op (zero containers/networks/volumes);
+//	(a) an extra_specs payload selecting a named flavor and a dind_mode within the
+//	    ceiling brings the runner up on that flavor's image with the selected DinD
+//	    mode (a privileged sidecar, DOCKER_HOST and a socket mount that the default
+//	    none-mode config would not have produced);
+//	(b) an extra_specs dind_mode outside allowed_dind_modes fails closed before any
+//	    Docker operation, leaving zero containers, networks and volumes;
 //	(c) an extra_specs reserved override (extra_env RUNNER_EPHEMERAL, and a raw
-//	    image) is rejected before any Docker op;
-//	(d) GetExtraSpecsJSONSchema / GetConfigJSONSchema / GetSupportedInterfaceVersions
-//	    print valid output under GARM_INTERFACE_VERSION=v0.1.1, and ValidatePoolInfo
-//	    accepts a good extra_specs and rejects a ceiling-violating / reserved one.
+//	    image) is rejected before any Docker operation;
+//	(d) GetExtraSpecsJSONSchema, GetConfigJSONSchema and
+//	    GetSupportedInterfaceVersions print valid output under
+//	    GARM_INTERFACE_VERSION=v0.1.1, and ValidatePoolInfo accepts a good
+//	    extra_specs and rejects a ceiling-violating or reserved one.
 //
-// Everything is scoped to a unique controller-id and torn down at the end; the
-// host container/network/volume NAME sets are snapshotted before/after and
-// asserted identical, so no foreign resource is ever touched.
+// Everything is scoped to a unique controller ID and torn down at the end. The sets
+// of host container, network and volume names are snapshotted before and after and
+// required to match, so no foreign resource is touched.
 package verify
 
 import (
@@ -59,15 +59,13 @@ func m3Bootstrap(metadataURL string, caBundle []byte, extraSpecs string) params.
 	return b
 }
 
-// runProviderSelfDescribe execs the binary for a v0.1.1 self-description command
-// (no stdin, no instance id) with GARM_INTERFACE_VERSION=v0.1.1 and, when set,
-// GARM_POOL_EXTRASPECS. Returns STDOUT ONLY (not combined with stderr) and the
-// exit code: stdout is reserved for the command's JSON/text result (research.md
-// §1.E), while stderr now ALWAYS carries this provider's structured slog output
-// (M3-W2), including on a fully successful run — capturing them together would
-// interleave a log line into the middle of a JSON payload a caller then tries
-// to json.Unmarshal, corrupting the parse. Every other helper in this package
-// (runProviderIO) already keeps the two streams separate for the same reason.
+// runProviderSelfDescribe runs the binary for a v0.1.1 self-description command (no
+// stdin, no instance ID) with GARM_INTERFACE_VERSION=v0.1.1 and, when set,
+// GARM_POOL_EXTRASPECS. It returns stdout only, plus the exit code. Stdout is
+// reserved for the command's result, and stderr always carries the provider's
+// structured log output, even on success, so combining them would put a log line
+// inside a JSON payload and break json.Unmarshal. runProviderIO keeps the streams
+// separate for the same reason.
 func runProviderSelfDescribe(t *testing.T, bin, configFile, controllerID, command, extraSpecs string) (string, int) {
 	t.Helper()
 	env := append(os.Environ(),
@@ -104,7 +102,7 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
 
-	// --- foreign snapshot (identical after) ----------------------------------
+	// Foreign snapshot, compared after the run.
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
@@ -122,7 +120,7 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 		assertSnapshotIdentical(t, "volumes", beforeV, "volume", "ls", "--format", "{{.Name}}")
 	}()
 
-	// --- build two distinguishable cli-runner images + the provider binary ---
+	// Build two distinguishable cli-runner images and the provider binary.
 	baseTag := "garm-m3-verify-base:latest"
 	flavorTag := "garm-m3-verify-flavor:latest"
 	buildCliRunnerImage(t, baseTag)
@@ -135,9 +133,9 @@ func TestVerifyM3W1ExtraSpecs(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// Config: default dind_mode none, ceiling allows none + privileged-sidecar,
-	// a [flavors.big] that overrides the runner image. sysbox-runc is deliberately
-	// NOT in the ceiling (scenario b). Cache off (keeps the resource assertions clean).
+	// Config: default dind_mode none; the ceiling allows none and privileged-sidecar;
+	// [flavors.big] overrides the runner image. sysbox-runc is deliberately not in the
+	// ceiling, for (b). The cache is off, to keep the resource assertions clean.
 	configFile := filepath.Join(t.TempDir(), "config.toml")
 	writeFile(t, configFile, `docker_host = "unix:///var/run/docker.sock"
 runner_image = "`+baseTag+`"
@@ -161,9 +159,8 @@ runner_image = "`+flavorTag+`"
 	runnerName := spec.RunnerContainerName(m3Instance)
 	dindName := spec.DindContainerName(m3Instance)
 
-	// =========================================================================
-	// (a) flavor + dind_mode within the ceiling -> flavor image + privileged sidecar
-	// =========================================================================
+	// (a) A flavor and a dind_mode within the ceiling give the flavor image and a
+	// privileged sidecar.
 	b := m3Bootstrap(srv.URL, caBundle, `{"flavor": "big", "dind_mode": "privileged-sidecar"}`)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
@@ -226,9 +223,7 @@ runner_image = "`+flavorTag+`"
 		t.Errorf("(a) %d managed resources remain after delete, want 0", n)
 	}
 
-	// =========================================================================
-	// (b) dind_mode OUTSIDE the ceiling -> fail closed, zero resources
-	// =========================================================================
+	// (b) A dind_mode outside the ceiling fails closed with zero resources.
 	bad := m3Bootstrap(srv.URL, caBundle, `{"dind_mode": "sysbox-runc"}`) // not in allowed_dind_modes
 	out, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bad)
 	if code == 0 {
@@ -243,9 +238,7 @@ runner_image = "`+flavorTag+`"
 		t.Errorf("(b) a job network was created despite the ceiling violation")
 	}
 
-	// =========================================================================
-	// (c) reserved overrides -> rejected, zero resources
-	// =========================================================================
+	// (c) Reserved overrides are rejected with zero resources.
 	for _, es := range []string{
 		`{"extra_env": {"RUNNER_EPHEMERAL": "false"}}`,
 		`{"image": "attacker/evil:latest"}`,
@@ -262,9 +255,7 @@ runner_image = "`+flavorTag+`"
 		}
 	}
 
-	// =========================================================================
-	// (d) v0.1.1 self-description under GARM_INTERFACE_VERSION=v0.1.1
-	// =========================================================================
+	// (d) The v0.1.1 self-description commands, under GARM_INTERFACE_VERSION=v0.1.1.
 	schemaOut, schemaCode := runProviderSelfDescribe(t, bin, configFile, controllerID, "GetExtraSpecsJSONSchema", "")
 	if schemaCode != 0 {
 		t.Errorf("(d) GetExtraSpecsJSONSchema exit=%d, want 0: %s", schemaCode, schemaOut)

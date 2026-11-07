@@ -15,27 +15,15 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyOwnerRulingEgressAndIsolation is the live-daemon regression test
-// for the 2026-07-21 owner ruling (ADR-001's Amendment): job networks default
-// to internal=false so the runner/DinD retain egress, while per-allocation
-// network separation — not the internal flag — is what provides job-to-job
-// isolation. It drives the REAL provider binary through two allocations under
-// one controller-id:
-//
-//   - "owner-verify-default": [network] omitted, so config.Load's internal=
-//     false default applies. Asserts the job network reports Internal=false
-//     AND the runner can actually reach the public internet.
-//   - "owner-verify-internal-true": [network] internal=true, explicitly
-//     exercising the RESERVED advanced/opt-in path this field is kept for.
-//     Asserts the job network reports Internal=true AND the runner's
-//     outbound attempt is blocked — proving the flag still works exactly as
-//     documented for operators who choose the stricter, airgapped posture.
-//
-// It then asserts the two allocations sit on two DIFFERENT networks, and that
-// the default-config runner cannot reach the internal=true runner by
-// container IP: per-job isolation holds independently of either allocation's
-// own `internal` setting, because isolation comes from each allocation owning
-// its own separate network (ADR-001's Decision), not from this flag.
+// TestVerifyOwnerRulingEgressAndIsolation proves that job networks default to
+// internal=false, so the runner keeps egress; that internal=true still blocks it;
+// and that job-to-job isolation comes from each allocation owning its own network,
+// not from the internal flag (ADR-001, Job network). It runs two allocations under
+// one controller ID. One has no [network] block and must report Internal=false and
+// reach the public internet. The other sets [network] internal=true and must report
+// Internal=true and be blocked. The test then checks that they sit on different
+// networks and that the default runner cannot reach the other runner by container
+// IP. Only a real daemon shows real routing and firewalling.
 func TestVerifyOwnerRulingEgressAndIsolation(t *testing.T) {
 	root := repoRoot(t)
 	controllerID := randControllerID(t)
@@ -73,13 +61,11 @@ allow_unpinned_runner_image = true
 internal = true
 `, imageTag))
 
-	// Label-scoped teardown of everything for THIS controller-id, regardless
-	// of whether the explicit DeleteInstance calls below succeed.
+	// Remove everything for this controller ID, whether or not the DeleteInstance
+	// calls below succeed.
 	defer cleanupController(t, controllerID)
 
-	// =========================================================================
-	// Allocation A: default config -> internal=false, egress must work.
-	// =========================================================================
+	// Allocation A: the default config gives internal=false and working egress.
 	bDefault := bootstrapFor(nameDefault, srv.URL, caBundle)
 	stdoutA, codeA := runProvider(t, bin, defaultConfigFile, controllerID, "CreateInstance", "", &bDefault)
 	if codeA != 0 {
@@ -104,11 +90,8 @@ internal = true
 		t.Logf("[default] egress succeeded, api.github.com/zen replied: %q", strings.TrimSpace(egressOutA))
 	}
 
-	// =========================================================================
-	// Allocation B: internal=true config -> reserved advanced posture, egress
-	// must fail, proving the retained knob still works for operators who
-	// choose it.
-	// =========================================================================
+	// Allocation B: internal=true must block egress, so the opt-in still works for
+	// operators who want the stricter posture.
 	bInternal := bootstrapFor(nameInternal, srv.URL, caBundle)
 	stdoutB, codeB := runProvider(t, bin, internalConfigFile, controllerID, "CreateInstance", "", &bInternal)
 	if codeB != 0 {
@@ -133,10 +116,8 @@ internal = true
 		t.Logf("[internal=true] egress correctly blocked (wget failed as expected): %v", egressErrB)
 	}
 
-	// =========================================================================
-	// Isolation: two distinct networks; no cross-allocation reachability by
-	// IP, independent of either allocation's own `internal` setting.
-	// =========================================================================
+	// Isolation: two distinct networks, and no reachability by IP between the
+	// allocations, whatever either one's internal setting.
 	if netA == netB {
 		t.Fatalf("both allocations resolved to the same network name %q", netA)
 	}
@@ -159,8 +140,8 @@ internal = true
 	}
 }
 
-// bootstrapFor is bootstrap (verify_test.go), parameterized by instance name,
-// for tests that run more than one allocation under a single controller-id.
+// bootstrapFor is bootstrap with a caller-chosen instance name, for tests that run
+// several allocations under one controller ID.
 func bootstrapFor(name, metadataURL string, caBundle []byte) params.BootstrapInstance {
 	return params.BootstrapInstance{
 		Name:             name,

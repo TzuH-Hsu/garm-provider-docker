@@ -1,8 +1,7 @@
 //go:build dockerverify
 
-// This file verifies the REAL runner images (runner-images/noble and
-// runner-images/resolute: their real Dockerfiles and the shared real
-// entrypoint.sh) on a live daemon:
+// Verifies the real runner images (runner-images/noble and runner-images/resolute,
+// built from their real Dockerfiles and the shared entrypoint.sh) on a live daemon:
 //
 //   - the shared libraries a headless Chrome needs are installed, so a Chrome
 //     for Testing downloaded by a job (Puppeteer, Lighthouse CI) can start

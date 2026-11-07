@@ -1,22 +1,20 @@
 //go:build dockerverify
 
-// This file adds the M2 H4 real-daemon verification, run AS THE ACTUAL NON-ROOT
-// runner user (uid/gid 1001) doing a REAL `pnpm install` into the provider-created
-// pnpm store volume — the exact condition the earlier root-run / config-only
-// checks masked (the M1 F1/F2 root-masking lesson). It proves that a fresh,
-// root-owned cache volume is made writable by the unprivileged runner BEFORE the
-// gosu privilege drop, so `pnpm add` succeeds and populates the store rather than
-// failing EACCES.
+// Runs a real `pnpm install` as the non-root runner user (uid/gid 1001) into the
+// provider-created pnpm store volume. A root-run or config-only check would mask the
+// problem: a fresh, root-owned cache volume must be made writable by the
+// unprivileged runner before the gosu privilege drop, so `pnpm add` succeeds and
+// populates the store instead of failing with EACCES.
 //
 //	go test -tags dockerverify -v -run TestVerifyM2H4NonRootPnpmInstall ./internal/verify/
 //
-// It deliberately uses a CUSTOM [cache].pnpm_store_path that is NOT created in the
-// runner Dockerfile, so Moby's image-ownership copy cannot help and ONLY the
-// entrypoint's prepare_cache_dirs chown (the H4 fix, exercised VERBATIM by sourcing
-// the real entrypoint) can make the fresh volume writable — proving the fix handles
-// the operator-configurable store path, not just the baked-in default. Everything is
-// scoped to a unique controller-id and torn down by label; it snapshots host
-// containers/volumes before/after and never touches foreign resources.
+// It uses a custom [cache].pnpm_store_path that the runner Dockerfile does not
+// create, so Moby's image-ownership copy cannot help and only the entrypoint's
+// prepare_cache_dirs chown (run verbatim by sourcing the real entrypoint) can make
+// the fresh volume writable. That shows the fix handles the operator-configurable
+// store path, not just the baked-in default. Everything is scoped to a unique
+// controller ID and torn down by label, and a before/after snapshot of host
+// containers and volumes checks that no foreign resource was touched.
 package verify
 
 import (
@@ -33,13 +31,13 @@ const (
 	h4StorePath = "/opt/garm-pnpm-h4-custom" // deliberately NOT created in the Dockerfile
 )
 
-// buildPnpmWrapperImage layers a wrapper on the REAL production runner image
-// (runner-images/noble — its real Dockerfile + real entrypoint.sh) that SOURCES
-// the real /entrypoint.sh and invokes the REAL prepare_cache_dirs under that
-// file's own `set -euo pipefail`, then sleeps as PID 1 so the harness can
-// `docker exec -u runner` a real pnpm install. This is the H4 code path verbatim:
-// were the fix absent, the fresh root-owned store volume would stay root-owned and
-// the non-root `pnpm add` below would fail EACCES.
+// buildPnpmWrapperImage layers a wrapper on the production runner image
+// (runner-images/noble: its real Dockerfile and entrypoint.sh). The wrapper sources
+// the real /entrypoint.sh, calls the real prepare_cache_dirs under that file's own
+// `set -euo pipefail`, then sleeps as PID 1 so the test can `docker exec -u runner`
+// a real pnpm install. Without the chown in prepare_cache_dirs, the fresh root-owned
+// store volume would stay root-owned and the non-root `pnpm add` would fail with
+// EACCES.
 func buildPnpmWrapperImage(t *testing.T, root, tag string) {
 	t.Helper()
 
@@ -78,7 +76,7 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 	repoURL := "https://github.com/garm-h4-verify/repo-" + token
 	repoKey := spec.RepoKey(repoURL)
 
-	// --- foreign snapshot (must be identical after) --------------------------
+	// Foreign snapshot, compared after the run.
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
@@ -97,7 +95,7 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		t.Fatalf("go build provider: %v\n%s", err, out)
 	}
 
-	// CUSTOM pnpm_store_path — not created in the Dockerfile, so only the
+	// A custom pnpm_store_path that the Dockerfile does not create, so only the
 	// entrypoint chown can make the fresh, root-owned volume writable.
 	configFile := filepath.Join(t.TempDir(), "config.toml")
 	writeFile(t, configFile, strings.Join([]string{
@@ -136,10 +134,8 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		}
 	}()
 
-	// =========================================================================
-	// CreateInstance (repo-scoped, cache enabled) → provider creates + mounts the
-	// pnpm store volume at the custom path and sets npm_config_store_dir.
-	// =========================================================================
+	// CreateInstance (repo-scoped, cache enabled): the provider creates the pnpm store
+	// volume, mounts it at the custom path and sets npm_config_store_dir.
 	b := cacheBootstrapPayload(h4Instance, repoURL, srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &b)
 	if code != 0 {
@@ -173,18 +169,16 @@ func TestVerifyM2H4NonRootPnpmInstall(t *testing.T) {
 		t.Logf("[cache-dir] `pnpm config get cache-dir` = %s", got)
 	}
 
-	// The store dir must be owned by the runner user (the H4 entrypoint chown ran
-	// on the fresh, root-owned volume before privileges were dropped).
+	// The store dir must be owned by the runner user: the entrypoint chown ran on the
+	// fresh, root-owned volume before privileges were dropped.
 	owner := strings.TrimSpace(mustExecRunner(t, runner, "stat", "-c", "%U", h4StorePath))
 	if owner != "runner" {
 		t.Fatalf("[H4] pnpm store %s is owned by %q, want runner — the entrypoint chown did not run on the fresh root-owned volume", h4StorePath, owner)
 	}
 	t.Logf("[H4] pnpm store %s is runner-owned before the privilege drop", h4StorePath)
 
-	// =========================================================================
-	// THE PROOF: a REAL `pnpm add` AS THE NON-ROOT runner into the provider store.
-	// If the fresh volume were still root-owned this would fail EACCES.
-	// =========================================================================
+	// The proof: a real `pnpm add` as the non-root runner into the provider's store.
+	// If the fresh volume were still root-owned, this would fail with EACCES.
 	install := "set -e; d=$(mktemp -d); cd \"$d\"; " +
 		"printf '{\"name\":\"h4\",\"version\":\"1.0.0\"}' > package.json; " +
 		"pnpm add is-number@7.0.0; " +

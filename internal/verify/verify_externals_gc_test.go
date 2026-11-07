@@ -13,24 +13,29 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// TestVerifyM2W2ExternalsGCDiag is the M2-W2 real-daemon verification. It drives
-// the REAL provider binary and proves, on a live daemon, the ADR-003 W2 contract:
+// TestVerifyM2W2ExternalsGCDiag proves the ADR-003 externals, GC and diagnostics
+// contract on a real daemon, using the real provider binary:
 //
-//   - the externals volume is SEEDED ONCE (Node runtimes present) from the runner
-//     image's own externals, mounted READ-ONLY (a runner `touch` in it fails),
-//     and SHARED across two allocations for the same image digest;
-//   - a DIFFERENT runner-image digest gets a SEPARATE externals volume;
-//   - the opportunistic GC is NON-DESTRUCTIVE (NEW-H1): a superseded-generation
-//     cache is LOGGED for operator pruning but SURVIVES the GC pass;
-//   - the diagnostic-log prune helper deletes an aged file in a genuinely-ours
-//     (full-identity) diag volume and keeps a recent one, but does NOT prune a
-//     same-shaped diag volume of INCOMPLETE identity (NEW-H2 strict validation);
-//   - the built runner image has a working pnpm honoring the provider's store.
+//   - The externals volume is seeded once (Node runtimes present) from the runner
+//     image's own externals, mounted read-only (a `touch` in it fails), and shared
+//     across two allocations with the same image digest.
+//   - A different runner-image digest gets a separate externals volume.
+//   - The opportunistic GC is non-destructive: a superseded-generation cache is
+//     logged for operator pruning but survives the pass.
+//   - The diagnostic-log prune helper deletes an aged file in a diag volume with
+//     full identity labels and keeps a recent one, but does not prune a same-shaped
+//     diag volume with incomplete identity.
+//   - The prune is throttled: a pass inside the interval prunes nothing and leaves
+//     the stamp alone.
+//   - The built runner image has a working pnpm that honors the provider's store.
 //
-// Isolation: a unique controller-id + unique repo_url, so cache volume names
-// cannot collide with anything pre-existing. Cleanup is label-scoped to this
-// controller-id plus explicit removal of this run's cache volumes; it NEVER
-// touches foreign resources, asserted by a before/after volume snapshot.
+// Only a real daemon shows volume labels, read-only mounts, and what survives a GC
+// pass.
+//
+// The controller ID and repo_url are unique per run, so cache volume names cannot
+// collide with existing volumes. Cleanup is label-scoped to the controller ID plus
+// removal of this run's cache volumes, and a before/after volume snapshot checks
+// that no foreign volume was removed.
 //
 // Run with: go test -tags dockerverify -v -run TestVerifyM2W2ExternalsGCDiag ./internal/verify/
 func TestVerifyM2W2ExternalsGCDiag(t *testing.T) {
@@ -40,16 +45,16 @@ func TestVerifyM2W2ExternalsGCDiag(t *testing.T) {
 	repoURL := "https://github.com/garm-w2-verify/repo-" + token
 	repoKey := spec.RepoKey(repoURL)
 
-	// --- foreign snapshot ----------------------------------------------------
+	// Foreign snapshot.
 	canaries := ensureForeignCanaries(t)
 	assertForeignPresent(t, canaries[0])
 	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
-	// --- build the noble runner image (with externals + pnpm), then two
-	// sleep-entrypoint variants so the runner stays up for inspection while still
-	// carrying the real /actions-runner/externals payload. Variant B carries an
-	// extra label so its CONTENT digest differs from A → a distinct externals key.
+	// Build the noble runner image (with externals and pnpm), then two sleep-entrypoint
+	// variants, so the runner stays up for inspection while still carrying the real
+	// /actions-runner/externals payload. Variant B has an extra label, so its content
+	// digest differs from A's and it gets a distinct externals key.
 	nobleTag := "garm-w2-noble:" + token
 	buildNobleRunnerImage(t, root, nobleTag)
 	imageA := "garm-w2-runner-a:" + token
@@ -113,9 +118,8 @@ stale_cache_eviction_days = 30
 		}
 	}()
 
-	// =========================================================================
-	// (1) externals seeded once + RO + shared across two same-digest allocations
-	// =========================================================================
+	// (1) Externals are seeded once, read-only, and shared across two allocations with
+	// the same digest.
 	bA1 := cacheBootstrapPayload("w2-job-a1", repoURL, srv.URL, caBundle)
 	if out, code := runProvider(t, bin, configA, controllerID, "CreateInstance", "", &bA1); code != 0 {
 		t.Fatalf("job a1 CreateInstance exit=%d, want 0; stdout=%s", code, out)
@@ -140,8 +144,8 @@ stale_cache_eviction_days = 30
 		}
 	}
 
-	// Seeded ONCE: the volume holds the runner's Node runtimes plus the .seeded
-	// marker (copied from the image's own /actions-runner/externals).
+	// Seeded once: the volume holds the runner's Node runtimes and the .garm-seeded
+	// marker, copied from the image's own /actions-runner/externals.
 	seededLs := dockerOut(t, "run", "--rm", "-v", extVolA+":/x:ro", "alpine:3.20", "ls", "-A", "/x")
 	t.Logf("[1] externals volume contents: %s", strings.ReplaceAll(seededLs, "\n", " "))
 	if !strings.Contains(seededLs, "node20") || !strings.Contains(seededLs, ".garm-seeded") {
@@ -154,7 +158,7 @@ stale_cache_eviction_days = 30
 			t.Errorf("(1) %s externals mount = %q, want the shared %q", runner, src, extVolA)
 		}
 	}
-	// The runner CANNOT write the externals (red-line F4): a touch fails.
+	// The runner must not be able to write the externals: a touch fails.
 	if out, err := dockerTry("exec", "w2-job-a1", "sh", "-c", "touch "+spec.RunnerExternalsDir+"/evil 2>&1"); err == nil {
 		t.Errorf("(1) runner WROTE to the read-only externals mount — cross-repo RCE guard breached: %s", out)
 	} else {
@@ -166,9 +170,7 @@ stale_cache_eviction_days = 30
 		t.Errorf("(1) found %d externals volumes for digest A, want exactly 1 (seeded once, shared)", n)
 	}
 
-	// =========================================================================
-	// (2) a DIFFERENT image digest → a SEPARATE externals volume
-	// =========================================================================
+	// (2) A different image digest gets a separate externals volume.
 	bB1 := cacheBootstrapPayload("w2-job-b1", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configB, controllerID, "CreateInstance", "", &bB1); code != 0 {
 		t.Fatalf("job b1 CreateInstance exit=%d, want 0", code)
@@ -185,15 +187,12 @@ stale_cache_eviction_days = 30
 		t.Errorf("(2) job b1 externals mount = %q, want its own %q", src, extVolB)
 	}
 
-	// =========================================================================
-	// (3) log-only GC: a superseded-generation cache is LOGGED but SURVIVES
-	// =========================================================================
-	// NEW-H1: cache-volume GC is NON-DESTRUCTIVE (Docker has no atomic
-	// label-qualified volume delete, so an opportunistic by-name delete is
-	// inherently TOCTOU/foreign-unsafe). A superseded cache is surfaced in the
-	// operator log — with the exact `docker volume prune` purge command — but never
-	// auto-deleted. Pre-create a SUPERSEDED, FULL-IDENTITY toolcache (generation
-	// "old", created 2h ago, past the 30-min grace) for the same controller/repo.
+	// (3) Log-only GC: a superseded-generation cache is logged but survives. Cache GC
+	// is non-destructive because Docker has no atomic label-qualified volume delete, so
+	// an opportunistic by-name delete could hit a foreign volume. A superseded cache is
+	// logged for the operator, with the exact `docker volume prune` command, and never
+	// auto-deleted. Pre-create a superseded, full-identity toolcache (generation "old",
+	// created 2h ago, past the 30-minute grace) for the same controller and repo.
 	supersededVol := "garm-cache-toolcache-" + repoKey + "-old"
 	twoHoursAgo := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
 	if out, err := dockerTry("volume", "create",
@@ -237,9 +236,7 @@ stale_cache_eviction_days = 30
 		t.Logf("[3] the current-generation toolcache %s survived GC", currentVol)
 	}
 
-	// =========================================================================
-	// (4) the diag-prune helper deletes an aged file, keeps a recent one
-	// =========================================================================
+	// (4) The diag-prune helper deletes an aged file and keeps a recent one.
 	if _, err := dockerTry("volume", "inspect", diagVol); err != nil {
 		t.Fatalf("(4) no diag volume %q was created by the repo-scoped allocation: %v", diagVol, err)
 	}
@@ -252,9 +249,9 @@ stale_cache_eviction_days = 30
 		"touch -t "+oldStamp+" /logs/old.log && touch /logs/recent.log && ls -la /logs"); err != nil {
 		t.Fatalf("(4) seed diag files: %v\n%s", err, out)
 	}
-	// Trigger the GC/prune pass again. The step (3) pass already ran this
-	// interval's diag-prune round, so expire the stamp first (ADR-003 amendment
-	// 2026-10-26).
+	// Trigger the GC and prune pass again. The pass in step (3) already ran this
+	// interval's diag-prune round, so expire the stamp first (ADR-003, Garbage
+	// collection).
 	expireDiagPruneStamp(t, controllerID, "(4)")
 	if _, code := runProvider(t, bin, configA, controllerID, "ListInstances", "", nil); code != 0 {
 		t.Fatalf("(4) ListInstances exit=%d, want 0", code)
@@ -268,14 +265,12 @@ stale_cache_eviction_days = 30
 		t.Errorf("(4) the diag prune wrongly deleted the recent file recent.log: %s", diagLs)
 	}
 
-	// =========================================================================
-	// (4b) NEW-H2: an INCOMPLETE-identity same-shaped diag volume is NOT pruned
-	// =========================================================================
-	// A diag-NAMED volume for this controller missing a required identity key (no
-	// repo-url-digest) is NOT provably ours: the strict kind-aware enumeration
-	// excludes it, so the destructive find-delete never runs against it. Seed one
-	// with an aged file and confirm the file SURVIVES a GC pass. Cleaned up
-	// label-scoped by cleanupController (it carries this controller-id).
+	// (4b) A diag-named volume with incomplete identity is not pruned. A diag volume
+	// for this controller that lacks a required identity key (no repo-url-digest) is
+	// not provably ours: the strict kind-aware enumeration excludes it, so the
+	// destructive find-delete never runs against it. Seed one with an aged file and
+	// confirm the file survives a GC pass. cleanupController removes it by label,
+	// since it carries this controller ID.
 	incompleteDiagVol := spec.DiagVolumeName("incomplete-" + token)
 	if out, err := dockerTry("volume", "create",
 		"--label", "garm.docker/managed=true",
@@ -307,12 +302,10 @@ stale_cache_eviction_days = 30
 		t.Logf("[4b] the incomplete-identity diag volume's aged file SURVIVED — strict validation excluded it from the destructive prune")
 	}
 
-	// =========================================================================
-	// (4c) the diag prune is throttled: a pass inside the interval prunes nothing
-	// =========================================================================
-	// The (4b) pass claimed this interval's round. Another aged file written into
-	// the complete diag volume now SURVIVES a further GC pass, and the stamp is
-	// the same container (ADR-003 amendment 2026-10-26).
+	// (4c) The diag prune is throttled: a pass inside the interval prunes nothing. The
+	// (4b) pass claimed this interval's round, so an aged file written into the
+	// complete diag volume now survives a further GC pass, and the stamp container is
+	// unchanged (ADR-003, Garbage collection).
 	stampName := spec.DiagPruneStampName(controllerID)
 	stampBefore := strings.TrimSpace(dockerOut(t, "inspect", "-f", "{{.Id}}", stampName))
 	expireCacheGCStamp(controllerID) // let the GC pass run so only the diag-prune stamp throttles it
@@ -333,12 +326,10 @@ stale_cache_eviction_days = 30
 		t.Errorf("(4c) a throttled pass replaced the diag-prune stamp (%s -> %s)", stampBefore, stampAfter)
 	}
 
-	// =========================================================================
-	// (5) the built runner image has a working pnpm honoring the store env
-	// =========================================================================
-	// --platform is passed so the amd64-on-arm64 host does not emit a platform
-	// WARNING to stderr (which dockerOut merges into stdout); lastLine takes the
-	// command's real output line regardless of any residual daemon noise.
+	// (5) The built runner image has a working pnpm that honors the store env.
+	// --platform is passed so an amd64 image on an arm64 host does not print a platform
+	// warning to stderr, which dockerOut merges into stdout. lastLine takes the
+	// command's real output regardless of daemon noise.
 	pnpmVer := lastLine(dockerOut(t, "run", "--rm", "--platform", "linux/amd64", "--entrypoint", "pnpm", imageA, "--version"))
 	if pnpmVer == "" {
 		t.Error("(5) `pnpm --version` produced no output in the runner image")
@@ -438,10 +429,10 @@ func expireDiagPruneStamp(t *testing.T, controllerID, step string) {
 	}
 }
 
-// expireCacheGCStamp removes the controller's cache-GC stamp, standing in for
-// its throttle interval elapsing, so the next ListInstances or CreateInstance
-// runs a GC pass (ADR-004 amendment 2026-11-03). A missing stamp is fine: no
-// earlier pass may have claimed one.
+// expireCacheGCStamp removes the controller's cache-GC stamp, standing in for its
+// throttle interval elapsing, so the next ListInstances or CreateInstance runs a GC
+// pass (ADR-003, Garbage collection). A missing stamp is fine: no earlier pass may
+// have claimed one.
 func expireCacheGCStamp(controllerID string) {
 	_, _ = dockerTry("rm", "-f", spec.ThrottleStampName(controllerID, spec.StampCacheGC))
 }
