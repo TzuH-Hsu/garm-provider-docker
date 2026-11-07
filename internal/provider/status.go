@@ -2,18 +2,9 @@ package provider
 
 import "github.com/cloudbase/garm-provider-common/params"
 
-// mapContainerStatus maps a Docker container's state to GARM's
-// InstanceStatus wire vocabulary (research.md §1.E), per the WP8 table:
-//
-//	running           -> running
-//	exited            -> stopped
-//	created           -> pending_create
-//	dead / OOM-killed  -> error
-//	anything else      -> unknown
-//
-// OOMKilled and Dead are checked first: a container killed for OOM often
-// still reports its state string as "exited", but an OOM kill is an error,
-// not a clean stop, so it must not be reported as "stopped".
+// mapContainerStatus maps a Docker container state to GARM's InstanceStatus
+// (docs/garm-contract.md). OOMKilled and dead are checked first: an OOM-killed
+// container often still reports "exited", and that is an error, not a clean stop.
 func mapContainerStatus(state string, oomKilled, dead bool) params.InstanceStatus {
 	if oomKilled || dead {
 		return params.InstanceError

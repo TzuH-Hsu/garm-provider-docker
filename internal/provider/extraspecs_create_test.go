@@ -67,9 +67,9 @@ func TestCreateInstanceRejectsReservedExtraEnvBeforeAnyDockerOp(t *testing.T) {
 	assertNoResources(t, p, fake)
 }
 
-// TestCreateInstanceRejectsRunAsRootExtraEnv: RUN_AS_ROOT is hard-reserved (H2)
+// TestCreateInstanceRejectsRunAsRootExtraEnv: RUN_AS_ROOT is hard-reserved
 // — setting it via extra_env would run the runner AND its job as ROOT, defeating
-// the non-root isolation M1 established. It is rejected fail-closed before any
+// the non-root isolation. It is rejected fail-closed before any
 // Docker op, even though the operator set no allowlist (hard-reserved always wins).
 func TestCreateInstanceRejectsRunAsRootExtraEnv(t *testing.T) {
 	p, fake := newTestProvider(t)
@@ -88,7 +88,7 @@ func TestCreateInstanceRejectsRunAsRootExtraEnv(t *testing.T) {
 }
 
 // TestCreateInstanceRejectsGarmTimeoutExtraEnv: GARM_CRED_WAIT_SECONDS is
-// hard-reserved (GARM_* prefix, H2). The runner-image entrypoint reads it into
+// hard-reserved (GARM_* prefix). The runner-image entrypoint reads it into
 // Bash arithmetic, where a value like "a[$(cmd)]" is a command-substitution RCE
 // as root — so it must never be settable from a pool. Rejected before any Docker op.
 func TestCreateInstanceRejectsGarmTimeoutExtraEnv(t *testing.T) {
@@ -106,7 +106,7 @@ func TestCreateInstanceRejectsGarmTimeoutExtraEnv(t *testing.T) {
 
 // TestCreateInstanceRejectsNonAllowlistedEnvByDefault: with no operator
 // allowed_env (the default), a pool cannot inject ANY extra env — even a benign
-// name is rejected fail-closed before any Docker op (H2).
+// name is rejected fail-closed before any Docker op.
 func TestCreateInstanceRejectsNonAllowlistedEnvByDefault(t *testing.T) {
 	p, fake := newTestProvider(t) // no ExtraSpecs.AllowedEnv => empty => fail-closed
 
@@ -120,7 +120,7 @@ func TestCreateInstanceRejectsNonAllowlistedEnvByDefault(t *testing.T) {
 	assertNoResources(t, p, fake)
 }
 
-// TestCreateInstanceRejectsEqualsInEnvKey: an env key containing '=' (H3) is
+// TestCreateInstanceRejectsEqualsInEnvKey: an env key containing '=' is
 // rejected before any Docker op — it must not smuggle a reserved variable (e.g.
 // "JIT_CONFIG_ENABLED=false") past the exact-name reserved/allowlist checks.
 func TestCreateInstanceRejectsEqualsInEnvKey(t *testing.T) {
@@ -157,7 +157,7 @@ func TestCreateInstanceRejectsRawImageInExtraSpecs(t *testing.T) {
 // enforced on the pool's REQUESTED mode (threaded through EffectiveDindMode) —
 // a host whose allowed_dind_modes is ["none"] rejects a pool's
 // extra_specs.dind_mode=privileged-sidecar before any Docker op, no matter what
-// the admin set at the pool level (ADR-001 F7 / ADR-005).
+// the admin set at the pool level (ADR-001, ADR-005).
 func TestCreateInstanceRejectsDindModeOutsideCeilingViaExtraSpecs(t *testing.T) {
 	cfg := config.Config{
 		DockerHost:       "unix:///var/run/docker.sock",
@@ -226,9 +226,9 @@ func TestCreateInstanceFlavorSelectsImage(t *testing.T) {
 // TestCreateInstanceExtraEnvMergedProviderWins: an operator-ALLOWLISTED extra_env
 // value reaches the runner container; a non-reserved but provider-injected name
 // (DISABLE_RUNNER_UPDATE) that collides is DROPPED in favor of the provider's
-// value — provider-injected environment always wins the merge (ADR-005 H2).
+// value — provider-injected environment always wins the merge (ADR-005).
 func TestCreateInstanceExtraEnvMergedProviderWins(t *testing.T) {
-	// H2: both names must be on the operator's allowed_env allowlist to pass the
+	// Both names must be on the operator's allowed_env allowlist to pass the
 	// fail-closed extra_env gate; neither is hard-reserved.
 	cfg := config.Config{
 		DockerHost:       "unix:///var/run/docker.sock",

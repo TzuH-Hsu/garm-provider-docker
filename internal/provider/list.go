@@ -11,40 +11,18 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// ListInstances returns every managed RUNNER container scoped to this
-// controller, further scoped to poolID (GARM_POOL_ID) when it is non-empty
-// (ADR-004). The filter is label-only — the stateless, label-driven ownership
-// model means no local state store is consulted.
-//
-// It first runs the opportunistic orphan sweep (ADR-004): ListInstances is a
-// call the provider is invoked for anyway, so it is one of the two hooks (the
-// other being CreateInstance's pre-create sweep) where abandoned allocations
-// are collected without a background daemon. GARM calls ListInstances once per
-// pool or scale set on every consolidation pass, so the sweep runs at most once
-// per orphanSweepInterval per controller across provider processes
-// (sweepThrottled; ADR-004 amendment 2026-11-03). The sweep is best-effort — a
-// sweep failure must not fail the list GARM asked for.
+// ListInstances returns this controller's runner containers, scoped to poolID when it
+// is non-empty. There is no background daemon, so it also runs the throttled orphan
+// sweep and cache GC (ADR-004, Orphan sweep); neither can fail the list.
 func (p *Provider) ListInstances(ctx context.Context, poolID string) ([]params.ProviderInstance, error) {
 	p.sweepThrottled(ctx)
 
-	// Opportunistic, best-effort cache GC (ADR-003 W2): ListInstances is the
-	// second piggyback hook (the other being CreateInstance) where superseded/
-	// aged cache volumes are DETECTED and LOGGED for operator visibility (never
-	// auto-removed — ADR-003 NEW-H1: cache-volume GC is non-destructive/log-only,
-	// reclaimed only via an explicit operator `docker volume prune`), diag logs
-	// pruned, and leaked helpers reaped. Throttled to once per cacheGCInterval per
-	// controller, like the sweep. Best-effort — a GC failure must not fail the
-	// list GARM asked for.
 	p.runCacheGCThrottled(ctx)
 
 	f := filters.NewArgs(
 		filters.Arg("label", spec.LabelManaged+"=true"),
 		filters.Arg("label", spec.LabelControllerID+"="+p.controllerID),
-		// role=runner so a DinD sidecar (WP3) is never reported to GARM as an
-		// instance; a runner is the only container that represents a GARM
-		// instance. Its provider_id is the stable GARM instance NAME (F6,
-		// ADR-004 amendment 2026-07-21), resolved by the instance-name label —
-		// never the runner container's ID.
+		// Only a runner represents an instance to GARM, never a DinD sidecar.
 		filters.Arg("label", spec.LabelRole+"="+spec.RoleRunner),
 	)
 	if poolID != "" {

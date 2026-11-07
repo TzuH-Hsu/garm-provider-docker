@@ -12,7 +12,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 )
 
-// TestNewRejectsEmptyOrMalformedCeiling is the F10 construction guard: a
+// TestNewRejectsEmptyOrMalformedCeiling: a
 // hand-built or Load-bypassing Config whose allowed_dind_modes is empty or
 // malformed is rejected at provider construction, so it can never silently
 // permit every mode. A well-formed non-empty ceiling constructs fine, even
@@ -32,8 +32,7 @@ func TestNewRejectsEmptyOrMalformedCeiling(t *testing.T) {
 }
 
 // TestCreateInstanceFailsClosedWhenDindModeOutsideCeiling drives the ceiling
-// violation through the real CreateInstance path (not just resolveDindMode
-// in isolation): a constructed Config whose dind_mode falls outside its own
+// violation through the real CreateInstance path: a constructed Config whose dind_mode falls outside its own
 // allowed_dind_modes must be rejected before ANY Docker operation — the
 // same "before any Docker op" contract validatePlatform already gets
 // (TestCreateInstanceRejectsUnsupportedPlatform, create_test.go) — so a

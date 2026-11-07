@@ -13,20 +13,8 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/extraspecs"
 )
 
-// This file implements the four v0.1.1-only ExternalProvider methods (ADR-005):
-// GetSupportedInterfaceVersions, ValidatePoolInfo, GetConfigJSONSchema, and
-// GetExtraSpecsJSONSchema. Together with the eight v0.1.0 methods they make
-// *Provider satisfy executionv011.ExternalProvider (see provider.go's assertion),
-// so the same binary serves v0.1.1 when GARM_INTERFACE_VERSION=v0.1.1 and v0.1.0
-// by default — the top-level garm-provider-common execution package type-asserts
-// the provider against the versioned interface, and a provider that implements
-// v0.1.1 satisfies the v0.1.0 assertion too (v0.1.1 embeds the common interface).
-//
-// GARM's controller does not invoke these commands today (research.md §1.A), but
-// implementing them makes the provider self-documenting: a GARM admin's
-// `garm-cli pool update --extra-specs` can call ValidatePoolInfo to fail early,
-// and the two schema commands publish the config/extra_specs contracts, matching
-// the LXD provider's published-schema practice.
+// The v0.1.1-only ExternalProvider methods (ADR-005). GARM v0.2.1 does not call them
+// (docs/garm-contract.md), but they publish the config and extra_specs contracts.
 
 // GetSupportedInterfaceVersions reports the GARM external-provider interface
 // versions this binary implements: both v0.1.0 and v0.1.1.
@@ -39,28 +27,18 @@ func (p *Provider) GetConfigJSONSchema(_ context.Context) (string, error) {
 	return config.JSONSchema(), nil
 }
 
-// GetExtraSpecsJSONSchema returns the extra_specs published JSON Schema (the
-// go:embed'ed draft-07 schema CreateInstance validates every payload against).
+// GetExtraSpecsJSONSchema returns the draft-07 extra_specs schema CreateInstance
+// validates every payload against.
 func (p *Provider) GetExtraSpecsJSONSchema(_ context.Context) (string, error) {
 	return extraspecs.SchemaJSON(), nil
 }
 
-// ValidatePoolInfo validates a pool's extra_specs against the schema AND the
-// live config's ceiling/allowlist/flavor rules (the extra_env operator allowlist
-// and hard-reserved set included), returning nil on success and a descriptive
-// error otherwise — the same Parse+Resolve path CreateInstance runs,
-// so what this accepts is exactly what a create would accept (and what it
-// rejects, a create would reject before any Docker op).
-//
-// The image and flavor positional args are the pool's BootstrapInstance.Image /
-// .Flavor. image is deliberately ignored: image selection is named-flavor-only
-// (ADR-002), and the flavor a pool actually uses in this provider is
-// extra_specs.flavor, which Resolve validates. providerConfig is the config file
-// path GARM passes (the same GARM_PROVIDER_CONFIG_FILE already loaded into
-// p.cfg); it is reloaded when set so validation runs against exactly that file,
-// and its own load/validate errors surface here too. extraSpecsStr is the pool's
-// extra_specs as a string (raw JSON, or base64 JSON as GARM's controller path
-// encodes it — see decodePoolExtraSpecs).
+// ValidatePoolInfo runs a pool's extra_specs through the same Parse and Resolve path as
+// CreateInstance. A create can still reject what this accepts: a DinD mode with no
+// dind_image configured is checked only in CreateInstance. The image and flavor
+// arguments are ignored: an image is chosen by extra_specs.flavor, which Resolve
+// validates (ADR-002). A non-empty providerConfig is loaded and used instead of p.cfg.
+// extraSpecsStr is raw JSON or base64 JSON (decodePoolExtraSpecs).
 func (p *Provider) ValidatePoolInfo(_ context.Context, _ /*image*/, _ /*flavor*/, providerConfig, extraSpecsStr string) error {
 	cfg := p.cfg
 	if providerConfig != "" {
@@ -85,11 +63,9 @@ func (p *Provider) ValidatePoolInfo(_ context.Context, _ /*image*/, _ /*flavor*/
 	return nil
 }
 
-// decodePoolExtraSpecs normalizes the extra_specs string ValidatePoolInfo
-// receives into raw JSON. It accepts an empty string ({}), raw JSON directly
-// (what a direct caller and this repo's tests pass), and base64-encoded JSON as
-// a fallback (GARM_POOL_EXTRASPECS is base64 JSON per research.md §1.A). It fails
-// closed if the value is neither valid JSON nor valid base64-of-JSON.
+// decodePoolExtraSpecs normalizes an extra_specs string to raw JSON. Empty becomes {},
+// JSON is taken as is, and anything else must be base64 of JSON, the form of
+// GARM_POOL_EXTRASPECS.
 func decodePoolExtraSpecs(s string) (json.RawMessage, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

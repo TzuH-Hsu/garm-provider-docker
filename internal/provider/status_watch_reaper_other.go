@@ -2,7 +2,6 @@
 
 package provider
 
-// orphansAreReaped: outside Linux the provider is not expected to run in a
-// container as a child of a non-init PID 1 (launchd, for instance, reaps), so
-// orphans are assumed to be reaped.
+// orphansAreReaped assumes orphans are reaped: outside Linux the provider is not
+// expected to run in a container under a non-init PID 1.
 func orphansAreReaped() (bool, string) { return true, "" }

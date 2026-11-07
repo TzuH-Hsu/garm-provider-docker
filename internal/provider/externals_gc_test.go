@@ -31,7 +31,7 @@ func captureLog(t *testing.T) *bytes.Buffer {
 }
 
 // seedHelperContainer creates a cache-helper container with the given created-at
-// label and Docker state, returning its ID — so the H5 leaked-helper reaper can
+// label and Docker state, returning its ID — so the leaked-helper reaper can
 // be driven across the (state, age) matrix.
 func seedHelperContainer(t *testing.T, fake *docker.FakeClient, controllerID string, createdAt time.Time, state string) string {
 	t.Helper()
@@ -57,7 +57,7 @@ func helperContainerExists(t *testing.T, fake *docker.FakeClient, id string) boo
 	return err == nil
 }
 
-// TestReapLeakedHelpersRespectsStateAndAge is the H5 guard: the leaked-helper
+// TestReapLeakedHelpersRespectsStateAndAge: the leaked-helper
 // reaper never reaps a helper that could be a live peer's in-flight handoff
 // (a briefly `created` one, or a `running` seed/prune) yet DOES eventually reap a
 // wedged/crashed one so it cannot hold the externals seeding flock forever.
@@ -156,7 +156,7 @@ func TestCreateInstanceExternalsSeededAndMountedReadOnly(t *testing.T) {
 
 	// The consumer-side externals seed gate: because externals is mounted, the
 	// runner carries the marker env the entrypoint blocks on until seeding
-	// completes (ADR-003 W2 consumer-side gate).
+	// completes (ADR-003, Externals).
 	if !envHas(c, spec.RunnerExternalsSeededMarkerEnv+"="+spec.RunnerExternalsSeededMarkerPath) {
 		t.Errorf("%s env not set to %s (consumer-side externals seed gate)", spec.RunnerExternalsSeededMarkerEnv, spec.RunnerExternalsSeededMarkerPath)
 	}
@@ -187,14 +187,14 @@ func TestCreateInstanceSeedFailureFailsCreate(t *testing.T) {
 }
 
 // TestRunCacheGCLogsSupersededKeepsAll: the opportunistic GC is NON-DESTRUCTIVE
-// for cache volumes (NEW-H1). A superseded-generation toolcache volume (aged past
+// for cache volumes. A superseded-generation toolcache volume (aged past
 // the grace) is LOGGED for operator visibility but SURVIVES the GC pass — as does
 // the current-generation one — and no VolumeRemove is ever issued on the pass.
 func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 	p, fake := newCacheProvider(t, false) // current generation "1"
 	ctx := context.Background()
 
-	// The GC pass must never issue a cache-volume removal (NEW-H1).
+	// The GC pass must never issue a cache-volume removal.
 	fake.VolumeRemoveHook = func(name string) {
 		t.Errorf("runCacheGC issued VolumeRemove(%q) — cache GC must be non-destructive (NEW-H1)", name)
 	}
@@ -228,13 +228,13 @@ func TestRunCacheGCLogsSupersededKeepsAll(t *testing.T) {
 	}
 }
 
-// TestPruneDiagVolumeAbortsOnForeignIdentity is the NEW-H2 strict-identity gate at
+// TestPruneDiagVolumeAbortsOnForeignIdentity is the strict-identity gate at
 // the destructive boundary: a concurrent actor replaces the pinned diag volume, in
 // the ContainerCreate window, with a same-NAME diag volume of a DIFFERENT repo
 // identity (a repokey/name collision — same repo label, different repo-url-digest).
 // The pin-then-validate step re-inspects the pinned volume, detects the identity
 // mismatch against the enumeration snapshot, and ABORTS the prune WITHOUT the
-// destructive find-delete running and WITHOUT deleting the foreign volume (B2).
+// destructive find-delete running and WITHOUT deleting the foreign volume.
 func TestPruneDiagVolumeAbortsOnForeignIdentity(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 	ctx := context.Background()
@@ -278,7 +278,7 @@ func TestPruneDiagVolumeAbortsOnForeignIdentity(t *testing.T) {
 
 // TestRunCacheGCPrunesDiagVolume: after a repo-scoped create makes a diag
 // volume, an opportunistic GC pass runs a diag-prune helper against it — with the
-// retention-scoped `find -mmin -delete` (L8) and the diag volume mounted.
+// retention-scoped `find -mmin -delete` and the diag volume mounted.
 func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -317,7 +317,7 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	if !found {
 		t.Fatal("GC did not run a diag-prune helper")
 	}
-	// L9: the helper joins the "none" network, not the default bridge.
+	// The helper joins the "none" network, not the default bridge.
 	if !pruneNetIsNone {
 		t.Error("diag-prune helper NetworkMode is not none (L9)")
 	}
@@ -331,19 +331,13 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	}
 }
 
-// TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge is the
-// structural-redesign guard for the diag-prune path: an operator-run manual
-// `docker volume prune` (or some other external actor — never the provider's
-// own GC, which is log-only and never removes a cache volume itself) removes
-// the diag volume in the window between the prune helper's ContainerCreate pinning it
-// and the prune running. Real Moby then AUTO-CREATES an UNLABELED volume of the
-// same (deterministic) name. The pin-then-validate flow inspects the PINNED volume,
-// detects the unlabeled replacement (a FULL-identity check against the snapshot),
-// and ABORTS the prune WITHOUT deleting the unlabeled volume — never delete a
-// volume we cannot prove is ours (B2). The unlabeled volume is left in place as
-// cruft, and — because discovery is by label — a subsequent EnsureCacheVolume for
-// the same identity is NOT wedged: it reconciles around the squatted name to an
-// alternate.
+// TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge: an operator's
+// `docker volume prune` or another external actor removes the diag volume between the
+// prune helper's ContainerCreate pinning it and the prune running, and the daemon
+// recreates it empty and unlabelled. The provider inspects the pinned volume, detects
+// the replacement with a full-identity check against the listing, and aborts the prune
+// without deleting it. Discovery is by label, so a later EnsureCacheVolume for the same
+// identity routes around the name to an alternate.
 func TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge(t *testing.T) {
 	p, fake := newCacheProvider(t, false)
 	ctx := context.Background()

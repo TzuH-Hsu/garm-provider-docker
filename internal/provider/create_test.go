@@ -143,7 +143,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Fatalf("CreateInstance returned unexpected error: %v", err)
 	}
 
-	// Returned ProviderInstance. provider_id is the stable instance NAME (F6),
+	// Returned ProviderInstance. provider_id is the stable instance NAME,
 	// resolvable by label independently of the runner container.
 	if inst.ProviderID != "Test-Instance-01" {
 		t.Errorf("ProviderID = %q, want the instance name Test-Instance-01 (F6)", inst.ProviderID)
@@ -177,7 +177,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		t.Errorf("os labels = %q/%q", labels[spec.LabelOSType], labels[spec.LabelOSArch])
 	}
 
-	// Defect 1: the credential tmpfs must be requested via HostConfig.Tmpfs
+	// The credential tmpfs must be requested via HostConfig.Tmpfs
 	// (short syntax) at the credential dir, owned by the runner uid/gid and
 	// mode 0700 — the config the real daemon honors (the Mounts long-syntax
 	// uid/gid it rejects). This is the load-bearing assertion that CreateInstance
@@ -193,7 +193,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 		}
 	}
 
-	// Credential invisibility (ADR-002 / M0 gate): no env var may carry the
+	// Credential invisibility (ADR-002): no env var may carry the
 	// instance token or the metadata URL.
 	for _, e := range got.Config.Env {
 		if strings.Contains(e, testInstanceToken) {
@@ -217,7 +217,7 @@ func TestCreateInstanceHappyPathJIT(t *testing.T) {
 	}
 	ex := fake.Execs[0]
 	// The exec target is the runner container's actual ID (not its provider_id,
-	// which is the instance name as of F6).
+	// which is the instance name).
 	if wantID := runnerContainerID(t, fake, inst.Name); ex.ContainerID != wantID {
 		t.Errorf("exec target = %s, want the runner container ID %s", ex.ContainerID, wantID)
 	}
@@ -315,7 +315,7 @@ func TestCreateInstanceDuplicateReturnsExit31(t *testing.T) {
 	p, fake := newTestProvider(t)
 
 	// Seed an existing managed CLAIM-MARKER network for the same instance name
-	// (ADR-004): duplicate detection now keys off the network claim marker, not
+	// (ADR-004): duplicate detection keys off the network claim marker, not
 	// a runner container. A concurrent, still-in-flight CreateInstance that has
 	// not reached its container step yet is detected exactly this way.
 	seedClaimNetwork(t, fake, "Test-Instance-01", "peer-nonce")
@@ -555,16 +555,10 @@ func TestCreateInstanceRejectsUnsupportedPlatform(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceAcceptsArm64 is the multi-arch counterpart to the
-// rejection table above. linux/arm64 is a first-class supported platform as
-// of M4 — the release binaries, the provider image, and the runner image are
-// all built for both arches — so a full create must SUCCEED on an arm64
-// bootstrap, not merely pass the gate.
-//
-// Driving the whole allocation (not just validatePlatform) is the point: the
-// arch gate was the only thing that had ever stopped an arm64 payload, so
-// exercising every step behind it is what proves there was no second,
-// hidden amd64-only assumption further down the create path.
+// TestCreateInstanceAcceptsArm64 is the multi-arch counterpart to the rejection table
+// above: a full create must succeed on an arm64 bootstrap, not merely pass the gate.
+// Driving the whole allocation proves there is no hidden amd64-only assumption behind
+// the gate.
 func TestCreateInstanceAcceptsArm64(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -602,13 +596,11 @@ func TestCreateInstanceAcceptsArm64(t *testing.T) {
 	}
 }
 
-// TestCreateInstanceRejectsPathologicallyLongInstanceName is the
-// derived-name-length-hardening guard (internal/spec.ValidateAllocationNames)
-// exercised end to end: an instance name long enough that its
-// generation-nonce-qualified volume names (F4) would exceed Docker's
-// 255-byte resource-name limit must fail EARLY, before the claim network (or
-// anything else) is created — a clear provider error, not an opaque daemon
-// rejection surfacing mid-allocation.
+// TestCreateInstanceRejectsPathologicallyLongInstanceName exercises
+// spec.ValidateAllocationNames end to end: an instance name long enough that its
+// nonce-qualified volume names would exceed Docker's 255-byte limit must fail before
+// the claim network or anything else is created, with a clear provider error and not an
+// opaque daemon rejection mid-allocation.
 func TestCreateInstanceRejectsPathologicallyLongInstanceName(t *testing.T) {
 	p, fake := newTestProvider(t)
 	// Metadata URL is deliberately never contacted: the name-length check

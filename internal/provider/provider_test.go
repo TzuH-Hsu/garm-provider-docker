@@ -13,7 +13,7 @@ import (
 )
 
 // inspectRunner inspects the runner container CreateInstance built for
-// instanceName, resolved by its (lowercased) Docker name. As of F6 a created
+// instanceName, resolved by its (lowercased) Docker name. A created
 // instance's provider_id is the instance NAME, not the container ID, so tests
 // that want the actual runner container inspect it by its derived Docker name
 // rather than by provider_id.
@@ -28,7 +28,7 @@ func inspectRunner(t *testing.T, fake *docker.FakeClient, instanceName string) t
 
 // runnerContainerID returns the actual Docker container ID of the runner
 // CreateInstance built for instanceName (distinct from its provider_id, which
-// is the instance name as of F6).
+// is the instance name).
 func runnerContainerID(t *testing.T, fake *docker.FakeClient, instanceName string) string {
 	t.Helper()
 	return inspectRunner(t, fake, instanceName).ID
@@ -43,13 +43,13 @@ func newTestProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 		RunnerImage: "ghcr.io/example/runner@sha256:deadbeef",
 		// none mode (the default). DindMode is set explicitly because a
 		// hand-built Config does not go through config.Load's defaulting, and
-		// EffectiveDindMode now rejects an empty mode against the ceiling (F10).
+		// EffectiveDindMode rejects an empty mode against the ceiling.
 		DindMode: config.DindModeNone,
-		// A well-formed dind-mode ceiling is now required at provider
-		// construction (F10); hand-built test configs set it explicitly.
+		// A well-formed dind-mode ceiling is required at provider
+		// construction; hand-built test configs set it explicitly.
 		AllowedDindModes: []string{config.DindModeNone, config.DindModePrivilegedSidecar, config.DindModeSysboxRunc},
-		// Match config.Load's [network] defaults (ADR-001, amended
-		// 2026-07-21): job network on, internal off (egress allowed).
+		// Match config.Load's [network] defaults (ADR-001):
+		// job network on, internal off (egress allowed).
 		// Exercising the real defaults keeps the warning path
 		// (enable_job_network=false) out of the common test config.
 		Network: config.Network{EnableJobNetwork: true, Internal: false},

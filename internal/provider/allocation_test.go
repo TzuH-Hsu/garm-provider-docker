@@ -57,7 +57,7 @@ func seedAttachedRunner(t *testing.T, fake *docker.FakeClient, name string, crea
 		t.Fatalf("seed ContainerCreate returned unexpected error: %v", err)
 	}
 	fake.SetState(resp.ID, state, false)
-	// The exited-runner sweep grace (F8) is measured from State.FinishedAt, so a
+	// The exited-runner sweep grace is measured from State.FinishedAt, so a
 	// stopped seed runner models finishing when the allocation was created.
 	if state == "exited" || state == "dead" {
 		fake.SetFinishedAt(resp.ID, createdAt)
@@ -93,11 +93,9 @@ func volByName(t *testing.T, fake *docker.FakeClient, name string) (*volume.Volu
 	return nil, false
 }
 
-// volByResource finds a managed volume by its instance-name + resource labels,
-// for cases where the volume's generation-unique NAME embeds a create-nonce the
-// test does not know up front (F4): after CreateInstance generates a fresh
-// nonce, the workspace volume can only be located by label, not by a
-// reconstructed name.
+// volByResource finds a managed volume by its instance-name and resource labels. The
+// volume's name embeds a create-nonce the test does not know, so it can only be located
+// by label.
 func volByResource(t *testing.T, fake *docker.FakeClient, instanceName, resource string) (*volume.Volume, bool) {
 	t.Helper()
 	out, err := fake.VolumeList(context.Background(), volume.ListOptions{})
@@ -143,7 +141,7 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 	}
 
 	// (b) Workspace volume exists, labeled, sharing the attempt's nonce. Its
-	// name is generation-unique (F4): <instance>-<nonce>-workspace.
+	// name is generation-unique: <instance>-<nonce>-workspace.
 	v, ok := volByName(t, fake, spec.WorkspaceVolumeName(name, netNonce))
 	if !ok {
 		t.Fatalf("workspace volume %q was not created", spec.WorkspaceVolumeName(name, netNonce))
@@ -169,7 +167,7 @@ func TestCreateInstanceFullAllocationTopology(t *testing.T) {
 		t.Errorf("container nonce %q != network nonce %q (claim marker linkage broken)", got.Config.Labels[spec.LabelCreateNonce], netNonce)
 	}
 
-	// (d) WP9-flagged JIT-workdir check: the workspace volume is mounted at the
+	// (d) JIT workdir: the workspace volume is mounted at the
 	// runner image's RUNNER_WORKDIR (/actions-runner/_work).
 	if len(got.Mounts) != 1 {
 		t.Fatalf("runner mounts = %d, want 1 (workspace)", len(got.Mounts))
@@ -218,9 +216,8 @@ func TestCreateInstanceSweepsStaleAllocationBeforeReuse(t *testing.T) {
 
 	// A crashed prior allocation for the SAME instance name, past the grace
 	// window: a stale network, an exited runner, and a workspace volume carrying
-	// a residue marker. Without the pre-create sweep, the idempotent VolumeCreate
-	// would silently reuse the stale volume (cross-job residue), and the stale
-	// network would 409 the claim.
+	// a residue marker. Without the pre-create sweep, the stale network would 409 the
+	// claim and the stale volume would stay behind.
 	seedNet(t, fake, name, old, "stale-nonce")
 	seedAttachedRunner(t, fake, name, old, "stale-nonce", "exited")
 	seedWorkspaceVol(t, fake, name, old, "stale-nonce", map[string]string{"test.residue": "prior-job"})
@@ -231,7 +228,7 @@ func TestCreateInstanceSweepsStaleAllocationBeforeReuse(t *testing.T) {
 	}
 
 	// Exactly one of each resource, all fresh. The fresh volume's name embeds a
-	// new create-nonce the test does not know, so locate it by label (F4).
+	// new create-nonce the test does not know, so locate it by label.
 	v, ok := volByResource(t, fake, name, spec.ResourceWorkspace)
 	if !ok {
 		t.Fatal("workspace volume missing after create")
@@ -340,10 +337,9 @@ func TestDeleteInstanceReapsLingeringVolumeOnly(t *testing.T) {
 	assertNoLeftovers(t, fake)
 }
 
-// TestCreateInstanceJobNetworkDisabledStillIsolates confirms the WP2 decision
-// that enable_job_network=false is reserved and NOT honored: the isolated
-// per-job network is created anyway (it is both the isolation guarantee and the
-// ADR-004 claim marker).
+// TestCreateInstanceJobNetworkDisabledStillIsolates confirms that
+// enable_job_network=false is reserved and not honored: the per-job network is created
+// anyway, as it is both the isolation boundary and the ADR-004 claim marker.
 func TestCreateInstanceJobNetworkDisabledStillIsolates(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()

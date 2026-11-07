@@ -34,7 +34,7 @@ func newTwoOSCacheProvider(t *testing.T) (*Provider, *docker.FakeClient) {
 // TestCacheVolumesKeyedOnRunnerOSRelease: two pools of ONE repository, one on
 // the default (Ubuntu 24.04) image and one on a flavor's Ubuntu 26.04 image, get
 // separate toolcache and pnpm store volumes, each labelled with its OS release,
-// while the diag-logs volume stays shared (ADR-003, 2026-10-12 amendment).
+// while the diag-logs volume stays shared (ADR-003).
 func TestCacheVolumesKeyedOnRunnerOSRelease(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()

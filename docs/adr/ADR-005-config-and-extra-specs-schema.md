@@ -30,8 +30,8 @@ all of interface `v0.1.1`. One binary serves `v0.1.1` when `GARM_INTERFACE_VERSI
 otherwise. The two schemas are embedded next to the structs they describe (`internal/config/schema.json` and
 `internal/extraspecs/schema.json`) and returned by `GetConfigJSONSchema` and `GetExtraSpecsJSONSchema`. The
 config schema is documentation: the loader does not validate against it. `ValidatePoolInfo` runs the same
-parse-and-resolve path as `CreateInstance`, so `garm-cli pool update --extra-specs` can fail early on exactly
-what a create would reject. It ignores its positional `image` and `flavor` arguments, because the flavor a
+parse-and-resolve path as `CreateInstance`, so a bad pool definition can fail early. A create can still reject
+what it accepts: a DinD mode with no `dind_image` configured is checked only in `CreateInstance`. It ignores its positional `image` and `flavor` arguments, because the flavor a
 pool uses is `extra_specs.flavor`.
 
 ### What `extra_specs` may set

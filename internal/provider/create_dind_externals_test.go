@@ -12,8 +12,7 @@ import (
 )
 
 // TestCreateInstanceDinDExternalsMount covers the externals volume a container
-// job's /__e bind needs in the daemon's filesystem (ADR-001, 2026-10-29
-// amendment): with the externals cache enabled, a DinD sidecar mounts the same
+// job's /__e bind needs in the daemon's filesystem (ADR-001, Container jobs): with the externals cache enabled, a DinD sidecar mounts the same
 // digest-keyed volume the runner does, read-only, at RunnerExternalsDir — in
 // both DinD modes, since they share the sidecar spec. Without DinD there is no
 // sidecar, and with the cache disabled neither container has the volume.

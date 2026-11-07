@@ -25,7 +25,7 @@ import (
 const StatusWatcherArg = "__garm-provider-docker-status-watcher"
 
 // maxStatusWatchRequestBytes bounds the request read from stdin (the CA bundle
-// is the only variable-size field).
+// is the largest field).
 const maxStatusWatchRequestBytes = 1 << 20
 
 // statusWatchGrace is how far past the request deadline the watcher may run to
@@ -51,24 +51,17 @@ type statusWatchRequest struct {
 	CACertBundle  []byte    `json:"ca_cert_bundle,omitempty"`
 	Deadline      time.Time `json:"deadline"`
 
-	// ProxyEnv carries the provider process's proxy environment (the
-	// proxyEnvVars that are set). The watcher starts with an empty
-	// environment, but both its HTTP clients — the GARM callback and, for a
-	// tcp:// docker_host, the Docker API — resolve proxies from the
-	// environment exactly as the provider's do; without these the idle
-	// report could take a different network path than the installing one.
-	// Proxy URLs can embed credentials, so they travel here, not in the
-	// watcher's exec environment.
+	// ProxyEnv carries the set proxyEnvVars. The watcher's environment holds only
+	// watcherExecEnvVars, and without these the idle report could take a different
+	// network path than the installing one. Proxy URLs can embed credentials, so they travel
+	// here, not in its exec environment.
 	ProxyEnv map[string]string `json:"proxy_env,omitempty"`
 
-	// LogFile and LogLevel are the provider's [logging] file and resolved log
-	// level (a slog level name), both empty when no file is configured. The
-	// watcher's stdout and stderr are /dev/null and it starts with an empty
-	// environment, so without these its warnings would be lost. They are not
-	// secrets, and they select where and how much the watcher logs, never
-	// what: no log call in the watcher includes the token or the callback
-	// URL. An unusable file or an unknown level never rejects the request
-	// (see validate); the watcher falls back to discarding its logs.
+	// LogFile and LogLevel are the provider's [logging] file and resolved slog level,
+	// both empty when no file is configured. The watcher's stdout and stderr are
+	// /dev/null, so its warnings would otherwise be lost. Neither value rejects the
+	// request: an unusable file sends the logs to the discarded stderr, and an unknown
+	// level means info.
 	LogFile  string `json:"log_file,omitempty"`
 	LogLevel string `json:"log_level,omitempty"`
 }
@@ -92,11 +85,9 @@ func currentProxyEnv() map[string]string {
 	return env
 }
 
-// applyProxyEnv installs the carried proxy variables into this (watcher)
-// process before any HTTP client is used — net/http reads them once. It sets
-// only the known proxy variables. Setting them in-process does not change the
-// environment the kernel exposes for the process, which is the empty one it
-// was started with.
+// applyProxyEnv sets the carried proxy variables in this process before any HTTP client
+// is used, since net/http reads them once. The environment the kernel exposes for the
+// process stays the one it started with, which has no proxy variables.
 func applyProxyEnv(env map[string]string) error {
 	for _, k := range proxyEnvVars {
 		if v, ok := env[k]; ok {
@@ -148,10 +139,9 @@ type statusWatcherFunc func(ctx context.Context, req statusWatchRequest) error
 // Option customizes a Provider.
 type Option func(*Provider)
 
-// WithInProcessStatusWatcher runs idle detection inside CreateInstance itself,
-// synchronously, through the provider's own Docker client, instead of in a
-// detached process. It exists for tests and embedding, where re-executing the
-// binary is not possible; production uses startStatusWatcher.
+// WithInProcessStatusWatcher runs idle detection synchronously inside CreateInstance,
+// through the provider's own Docker client. It is for tests and embedding, where
+// re-executing the binary is not possible.
 func WithInProcessStatusWatcher() Option {
 	return func(p *Provider) { p.spawnStatusWatcher = p.runInProcessWatcher }
 }
@@ -172,16 +162,12 @@ var (
 	detachWatcher     = startDetachedWatcher
 )
 
-// startStatusWatcher is the production statusWatcherFunc. It detaches the
-// watcher when an orphaned process will be reaped, which is the normal case
-// (systemd, or a container started with an init such as docker run --init).
-// When the provider's PID namespace has a PID 1 that is not a known init —
-// typically GARM itself as PID 1 in a container started without --init —
-// a detached watcher would become a zombie once it exits, one per runner,
-// because nothing would wait for it. Then the watcher runs in-process
-// instead, inside CreateInstance and bounded by timeout_seconds; on GARM
-// versions that bound CreateInstance (exec_timeout_seconds) that wait counts
-// against the bound.
+// startStatusWatcher is the production statusWatcherFunc. It detaches the watcher when
+// an orphaned process will be reaped. When PID 1 of the provider's PID namespace is not
+// a known init, typically GARM in a container started without --init, a detached
+// watcher would stay a zombie once it exits, so the watcher runs inside CreateInstance
+// instead, bounded by timeout_seconds. On GARM versions that bound CreateInstance, that
+// wait counts against the bound.
 func (p *Provider) startStatusWatcher(ctx context.Context, req statusWatchRequest) error {
 	if reaped, pid1 := orphanReaperCheck(); !reaped {
 		slog.WarnContext(ctx, "CreateInstance: PID 1 in this PID namespace is not an init process that reaps orphans, so a detached status watcher would be left as a zombie; waiting for the runner inside CreateInstance instead. Run GARM's container with an init process (docker run --init, or init: true in Compose) to avoid this",
@@ -211,12 +197,11 @@ func reaperVerdict(comm string, err error) bool {
 	return knownReapers[strings.TrimSpace(comm)]
 }
 
-// RunStatusWatcher is the detached watcher's entry point (main.go dispatches
-// to it on StatusWatcherArg). It reads the request from in, waits for the
-// runner to come online within the request's deadline, reports the outcome to
-// GARM, and returns the process exit code. It cannot outlive the deadline by
-// more than statusWatchGrace: past that it exits regardless of what is still
-// in flight.
+// RunStatusWatcher is the detached watcher's entry point (main.go dispatches to it on
+// StatusWatcherArg). It reads the request from in, waits for the runner within the
+// request's deadline, reports the outcome to GARM, and returns the process exit code.
+// Its context ends statusWatchGrace past the deadline, and the process exits a second
+// later, whatever is still in flight.
 func RunStatusWatcher(in io.Reader) int {
 	raw, err := io.ReadAll(io.LimitReader(in, maxStatusWatchRequestBytes))
 	if err != nil {
@@ -247,14 +232,10 @@ func RunStatusWatcher(in io.Reader) int {
 	return 0
 }
 
-// installWatcherLogger makes the process-wide default logger append to the
-// provider's configured [logging] file at its level, so the watcher's warnings
-// survive its /dev/null stdout and stderr. It is the same logger normal
-// provider commands use (logging.NewWithFileAt), so the file is opened
-// O_APPEND and a line is one write(2): concurrent provider processes and
-// logrotate's copytruncate stay safe. With no file configured it changes
-// nothing. It never fails: an unusable path costs one warning on the discarded
-// stderr and the watcher carries on. The returned closer is never nil.
+// installWatcherLogger makes the default logger append to the provider's configured
+// [logging] file at its level, using the same logger as normal provider commands, so a
+// line is one O_APPEND write. With no file configured it changes nothing. An unusable
+// path costs one warning on the discarded stderr. The returned closer is never nil.
 func installWatcherLogger(req statusWatchRequest) io.Closer {
 	if req.LogFile == "" {
 		return io.NopCloser(nil)

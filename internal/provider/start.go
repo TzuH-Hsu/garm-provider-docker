@@ -7,9 +7,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 )
 
-// Start starts the runner container for instanceID (resolved by ID or name).
-// GARM does not currently invoke Start (research.md §1.G); it is kept thin to
-// satisfy the interface.
+// Start starts instanceID's runner container. GARM v0.2.1 does not call it.
 func (p *Provider) Start(ctx context.Context, instanceID string) error {
 	c, found, err := p.resolve(ctx, instanceID)
 	if err != nil {

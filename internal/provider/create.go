@@ -25,106 +25,39 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// credentialFetchDeadline is the aggregate bound on fetching all credential
-// files from the metadata service (ADR-002 F7). JIT config is valid ~60 min,
-// so this is comfortable headroom; the metadata client keeps its bounded
-// per-request retries within this deadline.
+// credentialFetchDeadline bounds fetching all credential files, the metadata client's
+// retries included. JIT configuration stays valid for about an hour.
 const credentialFetchDeadline = 60 * time.Second
 
-// cleanupTimeout bounds the creation guard's best-effort rollback. Rollback
-// runs under a context detached from the caller's (context.WithoutCancel), so
-// a caller cancellation cannot abort a partial-allocation cleanup; this
-// timeout keeps that detached cleanup from hanging (ADR-004).
+// cleanupTimeout bounds a rollback or removal that runs under a context detached from
+// the caller's, so a cancellation cannot abort it and it cannot hang.
 const cleanupTimeout = 30 * time.Second
 
-// credentialDeliverCmd is the command run inside the started container to
-// extract the streamed credential tar into the credential tmpfs. `-p`
-// preserves the archive's 0600 file modes; `-C` targets the tmpfs mount.
+// credentialDeliverCmd extracts the streamed credential tar into the credential tmpfs.
+// -p keeps the archive's 0600 file modes.
 var credentialDeliverCmd = []string{"tar", "-x", "-p", "-C", spec.CredentialDir}
 
-// CreateInstance provisions the full per-allocation topology for one runner —
-// in "none" mode or, when dind_mode is a DinD mode (privileged-sidecar, or
-// WP4's sysbox-runc — the two share this entire flow, differing only in the
-// sidecar's Privileged/Runtime pair, ADR-001), with an isolated DinD sidecar —
-// and delivers the runner's credentials without ever exposing them to the
-// container's environment or to host disk (ADR-002). Three checks run before
-// ANY Docker operation and fail closed on their own: platform support;
-// extra_specs schema-validation and resolution against this operator's config
-// (ADR-005), which is also where (WP4) dind_mode is resolved within the
-// operator's allowed_dind_modes ceiling (ADR-001 F7); and, when the resolved
-// dind_mode is non-"none", that a dind_image is actually configured — a
-// misconfiguration on any of the three is rejected before a network or volume
-// ever exists for the attempt. After those, the sequence is the ADR-001/
-// ADR-004 allocation flow:
+// CreateInstance provisions one runner's allocation (job network, volumes, caches,
+// runner and, in a DinD mode, a sidecar) and delivers its credentials into the running
+// container's tmpfs, so they never reach its environment or host disk (ADR-001,
+// ADR-002). It returns the instance name as provider_id.
 //
-//  1. run the host-wide, controller-scoped orphan sweep (F9): collect every
-//     abandoned allocation past its grace window (a crashed prior allocation of
-//     THIS instance-name included, so the idempotent VolumeCreate can never
-//     silently reuse a stale volume), while a peer's in-flight create is left
-//     untouched by F5's long in-flight-create deadline
-//  2. create the CLAIM-MARKER job network FIRST (ADR-004): a labeled bridge
-//     network stamped with instance-name, created-at, and this attempt's
-//     create-nonce. NetworkCreate's 409 is the atomic duplicate primitive —
-//     a same-instance managed collision returns exit 31 here
-//  3. create the named, labeled workspace volume — and, in DinD modes, the
-//     socket and dind-state volumes alongside it; pull the runner image if
-//     missing; then, when the cache feature is on, resolve the persistent
-//     caches, whose toolcache and pnpm volumes are keyed on the repository
-//     and the runner image's OS release (ADR-003)
-//  4. fetch the credentials provider-side, before the container exists, so a
-//     slow fetch can never outlive the entrypoint's credential wait
-//  5. seed the image-digest-keyed externals cache (cache feature only)
-//  6. in DinD modes, pull the dind image if missing, before the runner exists,
-//     so the pull never eats into the runner entrypoint's Docker readiness wait
-//  7. create the runner container on the job network, with the workspace volume
-//     at the runner workdir, a credential tmpfs, the configured memory limit,
-//     and — in DinD modes — DOCKER_HOST plus the shared socket volume mount
-//  8. start it (if the daemon cannot apply the runner's IPv6 sysctl,
-//     recreate and start it once without the sysctl, with a warning)
-//  9. in DinD modes, create and start the sidecar AFTER the runner: in
-//     privileged-sidecar mode it joins the runner's network namespace, which
-//     needs a running runner, so ports the inner daemon publishes are
-//     reachable on the runner's 127.0.0.1; in sysbox-runc mode it gets its own
-//     namespace on the job network (spec.DindSharesRunnerNetns). The runner's
-//     entrypoint waits for the daemon (`until docker info`) in parallel with
-//     the credential wait, so the sidecar starting a moment later is covered
-//  10. deliver the credentials by streaming an in-memory tar into a
-//     `docker exec`-run `tar -x` with an atomic .delivered marker, and verify
-//     BOTH the runner and (in DinD modes) the sidecar are running before
-//     reporting success
-//  11. report the runner "installing" to GARM's instance callback and, once the
-//     runner logs "Listening for Jobs" (bounded wait), "idle" — best-effort,
-//     never failing the create ([status_report], ADR-002 amendment)
-//
-// Any error after the claim marker exists triggers a nonce-keyed best-effort
-// rollback of THIS attempt's resources — network, all volumes, the runner AND
-// the DinD sidecar (ADR-004 creation guard) — so a failed create never leaves a
-// partial allocation behind and a concurrent peer's resources (a different
-// nonce) are never touched.
+// An instance name that is already claimed returns the duplicate error (exit 31). Any
+// later failure rolls back this attempt's resources, selected by its nonce, and leaves
+// cache volumes and a concurrent peer's resources alone (ADR-004).
 func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.BootstrapInstance) (params.ProviderInstance, error) {
 	instanceName := bootstrap.Name
 	if instanceName == "" {
 		return params.ProviderInstance{}, fmt.Errorf("bootstrap instance name is empty")
 	}
 
-	// Reject unsupported platforms before ANY Docker operation (ADR F8), so
-	// an out-of-scope OS/arch surfaces as a clean provider_fault rather than
-	// a partially-created allocation.
 	if err := validatePlatform(bootstrap); err != nil {
 		return params.ProviderInstance{}, err
 	}
 
-	// Parse, schema-validate, and resolve the pool's extra_specs (ADR-005) —
-	// the GARM-admin trust tier — against this operator's config BEFORE any
-	// Docker operation, so an over-broad, malformed, or escalating payload
-	// (a dind_mode outside allowed_dind_modes, a memory request over the
-	// ceiling, an unknown flavor, a reserved extra_env name) fails closed as a
-	// provider_fault before a network or volume ever exists for the attempt.
-	// extra_specs is read from the STDIN BootstrapInstance.extra_specs field,
-	// NOT GARM_POOL_EXTRASPECS, which GARM leaves empty ("null") for scale-set
-	// commands other than CreateInstance (research.md §1.D). Since GARM v0.2.0
-	// this payload also carries GARM's own runner_install_template, which
-	// Parse accepts and ignores (extraspecs.garmReservedKeys).
+	// extra_specs comes from stdin, never GARM_POOL_EXTRASPECS (docs/garm-contract.md).
+	// Resolving it first means a payload beyond the operator's limits fails before any
+	// Docker operation (ADR-005).
 	specs, err := extraspecs.Parse(bootstrap.ExtraSpecs)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("invalid extra_specs for %q: %w", instanceName, err)
@@ -133,62 +66,30 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("invalid extra_specs for %q: %w", instanceName, err)
 	}
-	// The effective DinD mode is resolved through config.EffectiveDindMode with
-	// the pool's requested mode threaded in as poolMode (ADR-005's single ceiling
-	// enforcement point, ADR-001 F7): allowed_dind_modes bounds it here, before
-	// any Docker op, without a second parallel check — so a misconfiguration that
-	// would escalate past the operator's ceiling never leaves a partial allocation.
 	dindMode := resolved.DindMode
 
-	// A DinD mode with no dind_image configured cannot possibly succeed, so
-	// reject it HERE — still before the first Docker call — rather than
-	// letting the create proceed to the sweep, the claim network, the
-	// volumes and the credential fetch only to fail at the sidecar pull.
-	//
-	// config.Load's validateDindMode already requires dind_image whenever the
-	// CONFIG's own dind_mode is non-none, but that check cannot see a pool's
-	// extra_specs: an operator whose config is dind_mode="none" (so no
-	// dind_image is required of them) but whose allowed_dind_modes has been
-	// widened can still receive a pool that selects privileged-sidecar. That
-	// combination passes the ceiling and only then discovers there is no
-	// image to run. This is the pre-Docker gate for exactly that case.
+	// config.Load requires dind_image only when the config's own dind_mode is a DinD
+	// mode. A config with dind_mode "none" and a wider allowed_dind_modes can still get
+	// a pool that selects one, so check before the first Docker call.
 	if dindMode != config.DindModeNone && p.cfg.DindImage == "" {
 		return params.ProviderInstance{}, fmt.Errorf(
 			"instance %q requests dind_mode %q but no dind_image is configured: set dind_image in the provider config, or narrow allowed_dind_modes so this pool cannot select a DinD mode",
 			instanceName, dindMode)
 	}
 
-	// Opportunistic pre-create orphan sweep (ADR-004, F9): CreateInstance is one
-	// of the two host-wide sweep hooks (the other being ListInstances), so it
-	// runs the FULL controller-scoped sweep — not just this instance-name — to
-	// collect abandoned allocations across the host. This is safe under F5's
-	// split grace: a peer's still-in-progress create (no runner yet, within the
-	// long in-flight-create deadline) is never swept, while a genuinely stale
-	// prior allocation of THIS instance-name is cleared so a stale workspace
-	// volume is removed rather than silently reused by the idempotent
-	// VolumeCreate. Best-effort: a sweep failure must not block a legitimate
-	// create.
+	// A stale allocation of this instance name must go first: its network would make
+	// this create a duplicate. A peer's create in progress is protected by the
+	// in-flight deadline (ADR-004, Orphan sweep).
 	if err := p.topo.SweepOrphans(ctx); err != nil {
 		slog.WarnContext(ctx, "CreateInstance: pre-create orphan sweep failed (continuing)",
 			"instance", instanceName, "error", err)
 	}
 
-	// Opportunistic, best-effort cache GC (ADR-003 W2): CreateInstance is one of
-	// the two piggyback hooks (the other being ListInstances) where superseded/
-	// aged cache volumes are DETECTED and LOGGED for operator visibility (never
-	// auto-removed — ADR-003 NEW-H1: cache-volume GC is non-destructive/log-only,
-	// reclaimed only via an explicit operator `docker volume prune`), diagnostic
-	// logs pruned to their retention window (the one remaining destructive cache
-	// action — it deletes FILES inside the diag volume, not the volume itself),
-	// and leaked helper containers reaped — there is no background daemon
-	// (ADR-004). It never hard-fails the create: every step logs and continues.
-	// Unlike the sweep above it is throttled (runCacheGCThrottled), sharing the
-	// once-per-cacheGCInterval round with ListInstances.
+	// Best-effort and, unlike the sweep above, throttled.
 	p.runCacheGCThrottled(ctx)
 
-	// enable_job_network=false is reserved and not yet honored (WP2): the job
-	// network is ALWAYS created, because it is the isolation guarantee AND
-	// ADR-004's claim marker. Warn rather than weaken isolation.
+	// enable_job_network=false is reserved and not honored: the network is both the
+	// isolation boundary and the claim marker, so it is always created.
 	if !p.cfg.Network.EnableJobNetwork {
 		slog.WarnContext(ctx, "CreateInstance: [network].enable_job_network=false is reserved and not yet honored; creating the isolated per-job network anyway",
 			"instance", instanceName)
@@ -199,14 +100,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, fmt.Errorf("failed to generate create nonce for %q: %w", instanceName, err)
 	}
 
-	// Fail EARLY — before this attempt's first Docker call — if instanceName
-	// is long enough (or charset-unsafe enough) that a derived name would be
-	// rejected by the daemon: the generation-nonce-qualified volume names
-	// (F4) add a fixed ~44 bytes on top of the instance name, so a
-	// pathologically long GARM instance name could otherwise push a volume
-	// name past Docker's 255-byte resource-name limit and surface as an
-	// opaque daemon rejection deep inside VolumeCreate, after the claim
-	// network (and possibly other resources) already exist.
+	// Reject a name whose derived volume names would pass Docker's 255-byte limit now,
+	// not as an opaque daemon error after the claim network exists.
 	if err := spec.ValidateAllocationNames(instanceName, nonce); err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("instance name %q produces an invalid Docker resource name: %w", instanceName, err)
 	}
@@ -217,28 +112,18 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		InstanceName: instanceName,
 	}
 
-	// The effective DinD mode (resolved and ceiling-checked above) decides
-	// whether this allocation gets the full isolated DinD topology (socket +
-	// dind-state volumes and a sidecar) or the none-mode flow. dindEnabled is
-	// an explicit positive test for the two DinD modes, so "none" — and any
-	// unset/empty mode from a hand-built config that skipped config.Load's
-	// defaulting — takes the none-mode path, byte-for-byte the M0/WP2 flow.
 	dindEnabled := dindMode == config.DindModePrivilegedSidecar || dindMode == config.DindModeSysboxRunc
 
-	// 1. CLAIM-MARKER NETWORK FIRST (ADR-004). A genuine same-instance
-	// duplicate returns exit 31; a foreign name collision is a hard error.
-	// Nothing of ours exists yet on any error/duplicate here.
+	// The claim network comes first (ADR-004). A failure here needs no rollback:
+	// CreateClaimNetwork removes a network it may have leaked, and reports if it could not.
 	if _, dupErr, err := p.topo.CreateClaimNetwork(ctx, identity, nonce, p.cfg.Network.Internal); dupErr != nil {
 		return params.ProviderInstance{}, dupErr
 	} else if err != nil {
 		return params.ProviderInstance{}, err
 	}
 
-	// From here the claim marker exists: any error rolls back THIS attempt's
-	// resources (network, volume, container) keyed on the nonce, under a
-	// context detached from the caller's with its own timeout, so a caller
-	// cancellation cannot abort it. A rollback failure is logged and joined
-	// onto the primary error rather than swallowed (ADR-004).
+	// From here any error rolls back this attempt's resources by nonce. A rollback
+	// failure is joined onto the primary error.
 	guarded := func(retErr error) (params.ProviderInstance, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
@@ -250,17 +135,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return params.ProviderInstance{}, retErr
 	}
 
-	// 2. Workspace volume (named, labeled, fresh — replaces any stale volume the
-	// idempotent VolumeCreate would otherwise return).
 	if err := p.topo.CreateWorkspaceVolume(ctx, identity, nonce); err != nil {
 		return guarded(err)
 	}
 
-	// 2b. DinD volumes (DinD modes only): the shared socket volume (dockerd's
-	// unix socket, shared with the runner) and the dind-state volume
-	// (/var/lib/docker, isolated per allocation), created alongside the
-	// workspace volume (ADR-001). Both carry this attempt's nonce, so the guard
-	// rolls them back on any later failure.
+	// The socket volume shares dockerd's socket with the runner; the dind-state volume
+	// holds /var/lib/docker, isolated per allocation.
 	if dindEnabled {
 		if err := p.topo.CreateSocketVolume(ctx, identity, nonce); err != nil {
 			return guarded(err)
@@ -270,31 +150,22 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		}
 	}
 
-	// 2c. Pull the runner image if missing (image comes from config/flavor;
-	// resolved.RunnerImage is EffectiveRunnerImage(extra_specs.flavor) — the
-	// named flavor is the ONLY image-varying channel, ADR-002). It comes before
-	// the caches because the toolcache and pnpm volumes are keyed on the
-	// image's OS release, read from the image itself (ADR-003, 2026-10-12
-	// amendment).
+	// Before the caches: the toolcache and pnpm volumes are keyed on the OS release
+	// read from the image itself (ADR-003).
 	runnerImage := resolved.RunnerImage
 	if err := p.ensureImage(ctx, runnerImage); err != nil {
 		return guarded(err)
 	}
 
-	// 2d. Persistent, repo-scoped caches (ADR-003): resolve entity scope and,
-	// when eligible, create-or-reuse the toolcache and pnpm store volumes for
-	// this repository and the runner image's OS release.
-	// Cache volumes carry no instance-name/create-nonce, so the creation-guard
-	// rollback never removes them — a create that fails after this point leaves
-	// the warm cache intact for the next job. An org/enterprise pool without
-	// allow_org_shared (or a disabled cache) gets no persistent cache volumes.
+	// Cache volumes carry no instance name or nonce, so a rollback leaves them warm for
+	// the next job.
 	plan, err := p.planCaches(ctx, bootstrap, runnerImage)
 	if err != nil {
 		return guarded(err)
 	}
 
-	// 3. Fetch credentials (ADR-002 F7): never enter the container env, built
-	// into an in-memory tar with the atomic ready marker as its last entry.
+	// Fetched before the runner exists, so a slow fetch cannot outlive the entrypoint's
+	// credential wait.
 	creds, err := p.fetchCredentials(ctx, bootstrap)
 	if err != nil {
 		return guarded(fmt.Errorf("failed to fetch credentials for %q: %w", instanceName, err))
@@ -304,14 +175,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("failed to build credential archive for %q: %w", instanceName, err))
 	}
 
-	// 4. Externals cache (ADR-003 W2): resolve the runner image's digest,
-	// create-or-reuse the shared externals volume keyed on it, and SEED it once
-	// (blocking) so the runner mounts a fully-populated, read-only externals
-	// tree. Gated only on the cache feature being enabled — externals apply to
-	// EVERY allocation regardless of entity scope, since they carry no repo data.
-	// It runs AFTER ensureImage so the image is present as both the digest source
-	// and the seed's copy source. A seed failure fails the allocation (guarded);
-	// the externals volume itself is never rolled back (it is a cache).
+	// Every entity scope gets externals: they carry no repository data. A failed seed
+	// fails the allocation, but the volume is a cache and is not rolled back.
 	if p.cfg.Cache.Enabled {
 		externalsVolume, externalsLabels, err := p.planExternals(ctx, runnerImage)
 		if err != nil {
@@ -321,14 +186,12 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		plan.addCacheRef(externalsVolume, externalsLabels)
 	}
 
-	// One timestamp for both containers' created-at labels this allocation.
+	// One timestamp for both containers' created-at labels.
 	createdAt := time.Now()
 
-	// 5. DinD modes: pull the dind image now, before the runner exists, so the
-	// pull never eats into the runner entrypoint's Docker readiness wait. The
-	// sidecar itself starts after the runner (step 6b). The runner gets
-	// DOCKER_HOST pointed at the shared socket and mounts the socket volume as
-	// its SOLE channel to the daemon — never a host docker.sock, never TCP.
+	// Pull before the runner exists, so the pull does not eat into the entrypoint's
+	// Docker readiness wait. The socket volume is the runner's only channel to the
+	// daemon: never a host docker.sock, never TCP.
 	dockerHost := ""
 	socketVolumeName := ""
 	if dindEnabled {
@@ -339,36 +202,22 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		socketVolumeName = spec.SocketVolumeName(instanceName, nonce)
 	}
 
-	// 6. Build the runner container: ownership labels (ADR-004) + informational
-	// os labels + this attempt's nonce, the per-mode env (ADR-002, plus
-	// DOCKER_HOST in DinD modes), the memory limit (config/flavor), the
-	// credential tmpfs, the NAMED workspace volume at the runner workdir,
-	// attachment to the job network as its sole network, and — in DinD modes —
-	// the shared socket volume mount.
 	labels := identity.ContainerLabels(spec.RoleRunner, createdAt)
 	labels[spec.LabelOSType] = string(bootstrap.OSType)
 	labels[spec.LabelOSArch] = string(bootstrap.OSArch)
 	labels[spec.LabelCreateNonce] = nonce
 
-	// Consumer-side externals seed gate (ADR-003 W2, 2026-07-22): when an
-	// externals cache is mounted, tell the runner entrypoint the in-mount marker
-	// path to BLOCK on until externals is fully seeded, so a half-seeded start is
-	// impossible at the point of use regardless of provider-side seed/pin timing.
+	// The entrypoint blocks on this marker, so a half-seeded start is impossible
+	// whatever the provider-side timing (ADR-003, Externals).
 	externalsSeededMarker := ""
 	if plan.externalsVolume != "" {
 		externalsSeededMarker = spec.RunnerExternalsSeededMarkerPath
 	}
-	// extra_specs.runner_labels are appended to the runner label set and
-	// extra_specs.extra_env is merged into the container env, both from the
-	// validated/resolved payload (reserved env names already rejected in
-	// extraspecs.Parse; provider-injected env wins any remaining collision).
 	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker, resolved.ExtraRunnerLabels, resolved.ExtraEnv)
 	if err != nil {
 		return guarded(err)
 	}
 
-	// resolved.RunnerMemoryBytes is the extra_specs override bounded by the
-	// configured/flavor ceiling (reject-not-clamp), already validated above.
 	memoryBytes := resolved.RunnerMemoryBytes
 
 	cfg, hostCfg := spec.BuildRunnerContainer(spec.RunnerContainerSpec{
@@ -379,42 +228,29 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		WorkspaceVolumeName: spec.WorkspaceVolumeName(instanceName, nonce),
 		NetworkName:         spec.JobNetworkName(instanceName),
 		SocketVolumeName:    socketVolumeName,
-		// Persistent, repo-scoped cache mounts (ADR-003). ToolcacheMountPath is
-		// set whenever the cache is enabled, but a mount is added only when the
-		// VOLUME name is also set (cache-eligible) — so a cache-ineligible
-		// allocation gets RUNNER_TOOL_CACHE (ephemeral) but no persistent mount.
+		// A cache-ineligible allocation has a path but no volume: RUNNER_TOOL_CACHE
+		// points inside the container and nothing persistent is mounted.
 		ToolcacheVolumeName: plan.toolcacheVolume,
 		ToolcacheMountPath:  plan.toolcachePath,
 		PnpmVolumeName:      plan.pnpmVolume,
 		PnpmMountPath:       plan.pnpmPath,
-		// Shared externals volume, mounted READ-ONLY (ADR-003 W2 red-line F4), and
-		// the per-repo diagnostic-logs volume, mounted read-write. Both are empty
-		// (unset) for a cache-disabled config; externals is set for any scope when
-		// the cache is enabled, diag only for a cache-eligible repo scope.
+		// Externals is mounted read-only. Both are empty with the cache disabled, and
+		// diag also for an ineligible scope.
 		ExternalsVolumeName: plan.externalsVolume,
 		DiagVolumeName:      plan.diagVolume,
 	})
 
-	// 5b/6. Create the runner, revalidate the cache volumes it references, and
-	// start it; the entrypoint then blocks waiting for the delivery marker. A
-	// host without IPv6 that rejects the runner's IPv6 sysctl gets one retry
-	// without it (createAndStartRunner). Any failure is rolled back by the
-	// nonce-keyed guard, which also removes a created-but-not-started runner.
+	// The entrypoint then blocks waiting for the delivery marker. The rollback also
+	// removes a runner that was created but not started.
 	runnerID, err := p.createAndStartRunner(ctx, cfg, hostCfg, instanceName, plan)
 	if err != nil {
 		return guarded(err)
 	}
 
-	// 6b. DinD sidecar (DinD modes only), started AFTER the runner (ADR-001,
-	// shared network namespace amendment). In privileged-sidecar mode it joins
-	// the runner's network namespace, so ports the inner daemon publishes
-	// (`docker run -p`, testcontainers, compose) are reachable on the runner's
-	// 127.0.0.1 as on a GitHub-hosted runner or in an ARC pod; the daemon
-	// refuses to join a namespace whose owner is not running, hence the order.
-	// Any IPv6 sysctl retry has already happened above, so the sidecar joins
-	// the runner that will actually serve the job, and the sysctl is applied
-	// once, by the namespace owner. The runner's entrypoint waits for the
-	// daemon in parallel with its credential wait.
+	// The sidecar starts after the runner: in privileged-sidecar mode it joins the
+	// runner's network namespace, and the daemon refuses to join one whose owner is not
+	// running. Any IPv6 sysctl retry has already happened, so it joins the runner that
+	// serves the job.
 	var dindID string
 	if dindEnabled {
 		id, derr := p.startDindSidecar(ctx, identity, nonce, dindMode, resolved.StorageDriver, resolved.DindMemoryBytes, createdAt, runnerID, plan.externalsVolume)
@@ -424,10 +260,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		dindID = id
 	}
 
-	// 7. Deliver the credentials into the running container's tmpfs by streaming
-	// the in-memory tar into a `docker exec`-run `tar -x` (memory → exec stdin →
-	// tmpfs, never host disk; docker cp cannot write a running container's user
-	// tmpfs — see docker.Client.ExecStream).
+	// docker cp cannot write to a running container's user tmpfs, so the tar goes
+	// through exec stdin and never touches host disk (ADR-002).
 	code, err := p.cli.ExecStream(ctx, runnerID, credentialDeliverCmd, archive)
 	if err != nil {
 		return guarded(fmt.Errorf("failed to deliver credentials to %q: %w", instanceName, err))
@@ -436,10 +270,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		return guarded(fmt.Errorf("credential delivery exec for %q exited with code %d", instanceName, code))
 	}
 
-	// 9. Verify BOTH containers are still running before reporting success
-	// (ADR-001 "verify BOTH containers running"; ADR-002 F7): a runner — or, in
-	// DinD modes, a sidecar — that exited during or right after delivery must
-	// not be reported to GARM as a healthy running instance.
+	// A container that exited during or right after delivery must not be reported
+	// running.
 	if err := p.verifyRunning(ctx, runnerID, "runner", instanceName); err != nil {
 		return guarded(err)
 	}
@@ -449,28 +281,13 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 		}
 	}
 
-	// 10. Report the runner's status to GARM's instance callback — installing
-	// now, idle once the runner logs that it is listening for jobs — bounded by
-	// [status_report].timeout_seconds (ADR-002 amendment). GARM v0.2.1 scale
-	// sets cannot move a runner to active from the pending status GARM creates
-	// it in, so without this a scale-set runner that takes a job wedges GARM's
-	// listener. Best-effort: it only logs, and it runs after every rollback
-	// point, so it can never fail or tear down this allocation.
+	// After every rollback point, so status reporting can never fail or tear down this
+	// allocation.
 	p.reportRunnerStatus(ctx, bootstrap, runnerID)
 
-	// CreateInstance reports running (research.md §2.A): the container is up and
-	// the runner registers once its entrypoint consumes the delivered
-	// credentials.
-	//
-	// The provider_id is the GARM INSTANCE NAME, not the runner container's ID
-	// (F6, ADR-004 amendment 2026-07-21). GARM passes provider_id back as
-	// GARM_INSTANCE_ID on DeleteInstance; keying it to the instance name — the
-	// label every allocation resource carries — means DeleteInstance can always
-	// resolve-and-teardown the whole allocation (dind sidecar, network, volumes)
-	// by that label, even when the runner container has already been removed out
-	// of band. Returning the runner container ID here instead would strand the
-	// privileged sidecar and volumes the moment the runner was gone, because
-	// those are labeled with the instance name, not the container id.
+	// provider_id is the instance name, not the container ID: every allocation resource
+	// carries that label, so DeleteInstance finds them all even when the runner is
+	// already gone (ADR-004, Identity).
 	return params.ProviderInstance{
 		ProviderID: instanceName,
 		Name:       instanceName,
@@ -480,42 +297,21 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	}, nil
 }
 
-// revalidateReferencedCaches confirms every persistent cache volume the runner
-// container now references is STILL the fully-identified cache the provider
-// ensured+seeded (ADR-003 W2 structural redesign, 2026-07-22). After
-// ContainerCreate pins the volumes, each is re-inspected and its LIVE labels
-// validated against the expected identity via spec.ValidateAdoptedCacheVolume —
-// the full cache-kind/repo/digest/salt tuple, NOT merely cache=true — so a
-// wrong-digest externals volume or a foreign same-name squatter is caught as well
-// as an UNLABELED auto-created replacement (an operator-run manual
-// `docker volume prune`, or some other external actor, removed the original in
-// the ensure→mount window and Moby recreated it empty — the provider's own GC
-// never removes a cache volume itself, only logs it as stale for the operator).
-//
-// It fails CLOSED — a non-nil error — whenever ANY referenced cache cannot be
-// confirmed (an identity mismatch OR an inspect failure: context cancellation, a
-// transient daemon error, NotFound), so the caller rolls back only THIS attempt's
-// own runner/allocation and never starts the runner against an unverified
-// (possibly empty) cache tree. It NEVER deletes the mismatched volume: a Moby
-// auto-created unlabeled volume and a genuinely foreign one are indistinguishable,
-// so name-based deletion can never be foreign-safe (B2). An unprovable volume is
-// left in place as disk cruft (logged once for operator visibility). On GARM's
-// retry, EnsureCacheVolume reconciles AROUND the unlabeled slot (label-as-identity),
-// so there is no permanent wedge and no foreign deletion.
+// revalidateReferencedCaches confirms that every cache volume the created runner pins
+// still has the identity it was ensured with. The daemon recreates a missing named
+// volume empty and unlabelled, so a volume removed since the ensure would otherwise
+// reach the runner. A mismatch or an inspect failure returns an error so the allocation
+// fails closed. The volume is never deleted, and GARM's retry routes around it
+// (ADR-003).
 func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePlan) error {
 	var bad []string
 	for _, ref := range plan.cacheRefs {
 		v, err := p.cli.VolumeInspect(ctx, ref.name)
 		if err != nil {
-			// inspect failed → don't know → don't delete, fail closed.
 			bad = append(bad, fmt.Sprintf("%s (inspect failed, not deleting: %v)", ref.name, err))
 			continue
 		}
 		if verr := spec.ValidateAdoptedCacheVolume(ref.name, v.Labels, ref.want); verr != nil {
-			// A SUCCESSFUL inspect PROVES this is not our seeded cache — an
-			// unlabeled auto-created replacement, or a foreign/wrong-digest volume.
-			// We do NOT delete it (never delete an unprovable volume — B2); it is
-			// left as cruft and logged, and GARM's retry reconciles around the slot.
 			slog.WarnContext(ctx, "CreateInstance: referenced cache volume is not our validated cache; leaving it in place as cruft and failing this allocation closed so GARM retries and reconciles around the slot",
 				"resource", "cache-volume", "volume", ref.name, "error", verr)
 			bad = append(bad, ref.name+" ("+verr.Error()+")")
@@ -528,9 +324,7 @@ func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePla
 }
 
 // bestEffortRemoveContainer force-removes a container under a detached context,
-// tolerating NotFound. Used to drop the just-created (not-yet-started) runner when
-// a referenced cache fails post-create revalidation, before the allocation is
-// rolled back — so the runner never starts against an unverified cache tree.
+// tolerating NotFound and only logging any other failure.
 func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
@@ -540,11 +334,8 @@ func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 	}
 }
 
-// withReadyMarker appends the atomic ready marker (spec.ReadyMarker) as the
-// LAST credential entry, so `tar -x` creates it only after every real
-// credential file is fully written. The entrypoint waits for exactly this
-// marker instead of polling the individual files, closing the window in
-// which it could observe a partial credential set (ADR-002 F1).
+// withReadyMarker appends spec.ReadyMarker as the last entry, so tar creates it only
+// after every credential file is written and the entrypoint never sees a partial set.
 func withReadyMarker(files []metadata.CredentialFileContent) []metadata.CredentialFileContent {
 	out := make([]metadata.CredentialFileContent, 0, len(files)+1)
 	out = append(out, files...)
@@ -552,10 +343,7 @@ func withReadyMarker(files []metadata.CredentialFileContent) []metadata.Credenti
 	return out
 }
 
-// ensureImage pulls imageRef if it is not already present locally (ADR-002:
-// image comes from provider config/flavor, pulled only when missing). The
-// bootstrap image field is informational and deliberately ignored — image
-// provenance stays an operator config choice.
+// ensureImage pulls imageRef if it is not present locally.
 func (p *Provider) ensureImage(ctx context.Context, imageRef string) error {
 	if _, _, err := p.cli.ImageInspectWithRaw(ctx, imageRef); err == nil {
 		return nil // already present
@@ -575,11 +363,8 @@ func (p *Provider) ensureImage(ctx context.Context, imageRef string) error {
 	return nil
 }
 
-// fetchCredentials fetches the runner's credentials from GARM's metadata
-// service (WP5): the three JIT files, or the non-JIT registration token. The
-// whole fetch is bounded by an aggregate deadline (ADR-002 F7) so a stalled
-// metadata service fails the create cleanly rather than delaying delivery
-// past the entrypoint's own credential wait.
+// fetchCredentials fetches the three JIT files, or the non-JIT registration token, from
+// GARM's metadata service within credentialFetchDeadline.
 func (p *Provider) fetchCredentials(ctx context.Context, b params.BootstrapInstance) ([]metadata.CredentialFileContent, error) {
 	mc, err := metadata.NewClient(b.MetadataURL, b.InstanceToken, b.CACertBundle)
 	if err != nil {
@@ -599,11 +384,8 @@ func (p *Provider) fetchCredentials(ctx context.Context, b params.BootstrapInsta
 	return []metadata.CredentialFileContent{tok}, nil
 }
 
-// newCreateNonce returns a random hex nonce for one CreateInstance attempt
-// (ADR-004 claim-marker nonce). crypto/rand makes collisions between two
-// concurrent attempts effectively impossible, which is what lets the nonce-keyed
-// rollback safely distinguish "the resources I created" from a concurrent
-// peer's.
+// newCreateNonce returns a random hex nonce for one CreateInstance attempt. Rollback
+// relies on it to tell this attempt's resources from a concurrent peer's.
 func newCreateNonce() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -612,23 +394,12 @@ func newCreateNonce() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// supportedOSArches is the set of architectures this provider accepts in a
-// bootstrap payload: the same two the release binaries, the provider image,
-// and the runner image are all built for (ADR-002's multi-arch release, and
-// the NAS-first linux/arm64 targets in the README — Raspberry Pi, arm64
-// Synology/generic Linux hosts).
-//
-// The provider itself has no architecture-specific logic: OSArch is carried
-// through to the informational garm.docker/os-arch label and echoed back on
-// the returned ProviderInstance, and image selection is by digest-pinned
-// reference whose multi-arch manifest the daemon resolves to the host's own
-// platform. This gate is therefore purely a statement of which platforms the
-// project ships and tests for, not a functional constraint.
+// supportedOSArches are the architectures the project ships binaries and images for.
+// The provider has no architecture-specific logic: OSArch only labels the container,
+// and the daemon resolves a multi-arch image to the host's platform.
 var supportedOSArches = []params.OSArch{params.Amd64, params.Arm64}
 
-// validatePlatform rejects bootstrap payloads outside the supported platform
-// set before any Docker operation, so an unsupported platform surfaces as a
-// provider_fault rather than a partially-created allocation (ADR F8).
+// validatePlatform rejects a bootstrap payload outside the supported platforms.
 func validatePlatform(b params.BootstrapInstance) error {
 	if b.OSType != params.Linux {
 		return fmt.Errorf("unsupported OS type %q for instance %q: only %q is supported", b.OSType, b.Name, params.Linux)
@@ -639,28 +410,11 @@ func validatePlatform(b params.BootstrapInstance) error {
 	return nil
 }
 
-// buildRunnerEnv computes the runner container's environment per ADR-002's
-// per-delivery-mode contract. The entity scope is only needed (and only
-// parsed) in non-JIT mode. dockerHost, when non-empty (DinD modes), is emitted
-// as DOCKER_HOST so the runner reaches the sidecar's daemon over the shared
-// socket volume; it is "" in none mode, leaving DOCKER_HOST unset (M0 behavior).
-//
-// toolCacheDir and pnpmStoreDir carry ADR-003's cache env: toolCacheDir becomes
-// RUNNER_TOOL_CACHE (set whenever the cache feature is enabled, from the
-// planCaches decision — possibly an ephemeral in-container path when the pool
-// is cache-ineligible), and pnpmStoreDir becomes npm_config_store_dir and
-// pnpm_config_store_dir (set only when a persistent pnpm store volume is
-// mounted). diagDir, when set (a
-// persistent diag volume is mounted), becomes GARM_DIAG_DIR so the entrypoint
-// can own the mounted _diag dir before dropping privileges. Any being "" omits
-// its env var.
-// extraRunnerLabels (extra_specs.runner_labels) are appended to the GARM-supplied
-// runner labels; like GARM's own Labels they only feed RUNNER_LABELS, which
-// spec.BuildRunnerEnv emits in NON-JIT mode only (in JIT mode GARM bakes the
-// label set into the runner config server-side), so they are inert in JIT mode
-// by construction — documented on the schema field. extraEnv (extra_specs.extra_env)
-// is merged AFTER the provider's own env with provider-injected values winning any
-// collision (mergeExtraEnv); reserved names were already rejected in extraspecs.Parse.
+// buildRunnerEnv computes the runner's environment (ADR-002, Environment). An empty
+// dockerHost, toolCacheDir, pnpmStoreDir, diagDir or externalsSeededMarker omits its
+// variable. extraRunnerLabels only feed RUNNER_LABELS, which is emitted without JIT:
+// with JIT, GARM bakes the labels into the runner configuration. extraEnv is merged
+// last, and provider-injected values win a collision.
 func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker string, extraRunnerLabels []string, extraEnv map[string]string) ([]string, error) {
 	labels := b.Labels
 	if len(extraRunnerLabels) > 0 {
@@ -685,34 +439,21 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 		opts.Entity = entity
 	}
 	env := spec.BuildRunnerEnv(opts)
-	// GARM_DIAG_DIR and GARM_EXTERNALS_SEEDED_MARKER are plain paths (never
-	// secrets), appended here rather than threaded through the
-	// credential-invisibility-audited spec.BuildRunnerEnv, so that function's
-	// structural "no secret can be emitted" property is untouched.
+	// Plain paths, never secrets. They stay out of spec.BuildRunnerEnv, which is
+	// structured so that no secret can be emitted.
 	if diagDir != "" {
 		env = append(env, spec.RunnerDiagDirEnv+"="+diagDir)
 	}
-	// The consumer-side externals seed gate: the entrypoint blocks on this marker
-	// until externals is fully seeded before launching the runner (ADR-003 W2).
-	// Set only when an externals cache is actually mounted, so the entrypoint's
-	// wait runs only when externals seeding is expected.
 	if externalsSeededMarker != "" {
 		env = append(env, spec.RunnerExternalsSeededMarkerEnv+"="+externalsSeededMarker)
 	}
-	// extra_specs.extra_env is merged LAST so provider-injected env always wins.
 	return mergeExtraEnv(env, extraEnv), nil
 }
 
-// mergeExtraEnv appends the pool's extra_specs.extra_env to env, but DROPS (and
-// logs) any key already set by a provider-injected variable — provider-injected
-// environment always wins the merge (ADR-005 H2). By the time env reaches here it
-// has already passed the full extra_specs gate: the charset check (H3), the
-// hard-reserved set (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) in
-// extraspecs.Parse, and the operator allowed_env allowlist in extraspecs.Resolve.
-// So a collision here is only a non-reserved, allowlisted name the provider ALSO
-// injects (e.g. npm_config_store_dir when a pnpm cache is mounted); GARM_* names
-// are hard-reserved and can never reach this point. Keys are applied in sorted
-// order for a deterministic, testable env.
+// mergeExtraEnv appends extra to env in sorted key order, dropping and logging any key
+// env already sets: provider-injected environment always wins. extraspecs has already
+// rejected reserved names and enforced allowed_env, so a collision is an allowlisted
+// name the provider also injects, such as npm_config_store_dir.
 func mergeExtraEnv(env []string, extra map[string]string) []string {
 	if len(extra) == 0 {
 		return env
@@ -739,10 +480,8 @@ func mergeExtraEnv(env []string, extra map[string]string) []string {
 	return env
 }
 
-// githubBaseURL derives the GitHub server base (scheme://host) from a
-// repo/org/enterprise URL, for the informational GITHUB_URL env var. It is
-// best-effort: a malformed repo_url yields an empty base rather than an
-// error, since GITHUB_URL is only a connectivity-check hint (ADR-002).
+// githubBaseURL returns the scheme and host of repoURL, or "" if it is malformed. It
+// feeds the informational GITHUB_URL variable, so a bad URL is not an error here.
 func githubBaseURL(repoURL string) string {
 	u, err := url.Parse(repoURL)
 	if err != nil || u.Host == "" {

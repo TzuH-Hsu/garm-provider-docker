@@ -15,27 +15,17 @@ import (
 // watcherHandoffTimeout bounds writing the request into the watcher's stdin.
 const watcherHandoffTimeout = 5 * time.Second
 
-// watcherArgv is the watcher's full command line: the provider binary and the
-// hidden StatusWatcherArg, nothing else — the request (instance token and
-// callback URL included) never appears in argv.
+// watcherArgv is the watcher's full command line. The request, with its token and
+// callback URL, never appears in argv.
 func watcherArgv(exe string) []string {
 	return []string{exe, StatusWatcherArg}
 }
 
-// watcherExecEnvVars are the only variables the watcher's exec environment
-// carries, and only when set in the provider. They hold no secret, and they
-// must be present when the process starts:
-//
-//   - SSL_CERT_FILE and SSL_CERT_DIR: Go's Unix (non-macOS) root-CA loader
-//     honours them, so a GARM callback trusted through them — rather than the
-//     bootstrap CA bundle — must stay trusted in the watcher. The roots are
-//     loaded once, on first use, so they are set before the process starts
-//     rather than later.
-//   - GODEBUG: runtime settings (x509 and TLS behaviour among them) that the
-//     runtime reads at start-up.
-//
-// Proxy variables are not here: proxy URLs can carry credentials, so they
-// travel in the stdin request (statusWatchRequest.ProxyEnv) instead.
+// watcherExecEnvVars are the only variables the watcher's exec environment carries,
+// when set. They hold no secret and must be present at start: Go loads root CAs from
+// SSL_CERT_FILE and SSL_CERT_DIR once, on first use, so a callback trusted through them
+// must stay trusted, and the runtime reads GODEBUG at start-up. Proxy variables can
+// carry credentials, so they travel in the stdin request instead.
 var watcherExecEnvVars = []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "GODEBUG"}
 
 // watcherExecEnv returns the watcher's environment: the set
@@ -51,28 +41,22 @@ func watcherExecEnv() []string {
 	return env
 }
 
-// watcherProcAttr is how the watcher is started:
-//
-//   - stdin is the read end of a private pipe the request is written into;
-//   - stdout and stderr are /dev/null. GARM reads the provider's stdout and
-//     stderr until EOF, so a watcher holding either pipe would keep GARM's
-//     CreateInstance call open until the watcher exits. No other descriptor
-//     is inherited (the runtime opens everything close-on-exec);
-//   - env: only watcherExecEnvVars (watcherExecEnv); nothing else from GARM's
-//     environment is passed on, and the request is not in it either;
-//   - Setsid: a new session and process group, so signals aimed at the
-//     provider process or its group do not reach the watcher, and the
-//     watcher has no controlling terminal;
-//   - working directory "/", so it pins no directory.
+// watcherProcAttr is how the watcher is started: stdin is the private request pipe, and
+// only watcherExecEnvVars reach its environment.
 func watcherProcAttr(stdin, devNull *os.File, env []string) *os.ProcAttr {
 	if env == nil {
 		env = []string{}
 	}
 	return &os.ProcAttr{
-		Dir:   "/",
-		Env:   env,
+		Dir: "/", // so it pins no directory
+		Env: env,
+		// GARM reads the provider's stdout and stderr until EOF, so a watcher holding either
+		// would keep CreateInstance open. Nothing else is inherited: the runtime opens
+		// every other descriptor close-on-exec.
 		Files: []*os.File{stdin, devNull, devNull},
-		Sys:   &syscall.SysProcAttr{Setsid: true},
+		// A new session: signals aimed at the provider's process group do not reach the
+		// watcher, and it has no controlling terminal.
+		Sys: &syscall.SysProcAttr{Setsid: true},
 	}
 }
 

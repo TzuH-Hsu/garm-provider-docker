@@ -168,13 +168,13 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 		t.Errorf("sidecar Privileged = %v, want true", dind.HostConfig)
 	}
 	// The RAW create request set no explicit runtime (privileged-sidecar uses
-	// the daemon default); inspect normalizes that to the daemon default (F13),
+	// the daemon default); inspect normalizes that to the daemon default,
 	// so the meaningful assertion is that no explicit sysbox runtime was set.
 	if raw := fake.RawRuntime(spec.DindContainerName(name)); raw != "" {
 		t.Errorf("sidecar raw Runtime create request = %q, want empty (default runtime)", raw)
 	}
 	// dockerd argv carries the explicit storage driver from config and the
-	// explicit socket --group (F1).
+	// explicit socket --group.
 	wantCmd := []string{"dockerd", "--host=unix:///run/docker.sock", "--storage-driver=overlay2", "--group=" + spec.DindSocketGID}
 	if !slices.Equal([]string(dind.Config.Cmd), wantCmd) {
 		t.Errorf("sidecar Cmd = %v, want %v", dind.Config.Cmd, wantCmd)
@@ -183,7 +183,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if !hasEnv(dind.Config.Env, "DOCKER_TLS_CERTDIR=") {
 		t.Errorf("sidecar env = %v, want DOCKER_TLS_CERTDIR= (TLS off)", dind.Config.Env)
 	}
-	// Joins the RUNNER's network namespace (shared netns amendment): no
+	// Joins the RUNNER's network namespace (ADR-001): no
 	// network attachment of its own, and no sysctl of its own.
 	runnerForNetns := inspectRunner(t, fake, name)
 	if dind.HostConfig.NetworkMode != spec.ContainerNetworkMode(runnerForNetns.ID) {
@@ -205,7 +205,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	// Socket at /run and dind-state at /var/lib/docker; no host docker.sock.
 	assertContainerMount(t, dind.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
 	assertContainerMount(t, dind.Mounts, spec.DindStateVolumeName(name, nonce), spec.DindStateDir)
-	// F2: the runner's workspace volume is ALSO mounted into the sidecar at the
+	// The runner's workspace volume is ALSO mounted into the sidecar at the
 	// runner workdir, so a nested `docker run -v "$PWD":/work` the job issues
 	// resolves its bind source (daemon-side) to the real checked-out files.
 	assertContainerMount(t, dind.Mounts, spec.WorkspaceVolumeName(name, nonce), spec.RunnerWorkDir)
@@ -220,7 +220,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	if !hasEnv(runner.Config.Env, "DOCKER_HOST=unix:///run/docker.sock") {
 		t.Errorf("runner env = %v, want DOCKER_HOST=unix:///run/docker.sock", runner.Config.Env)
 	}
-	// No credential leak (M0 invariant preserved in DinD mode).
+	// No credential leak.
 	for _, e := range runner.Config.Env {
 		if strings.Contains(e, testInstanceToken) || strings.Contains(e, srv.URL) {
 			t.Errorf("runner env leaks the token or metadata URL: %q", e)
@@ -230,7 +230,7 @@ func TestCreateInstanceDinDFullTopology(t *testing.T) {
 	assertContainerMount(t, runner.Mounts, spec.SocketVolumeName(name, nonce), spec.DindSocketDir)
 	assertContainerMount(t, runner.Mounts, spec.WorkspaceVolumeName(name, nonce), spec.RunnerWorkDir)
 	assertNoHostSocketMount(t, runner.Mounts)
-	// F1: the runner carries the DinD socket GID as a supplementary group so
+	// The runner carries the DinD socket GID as a supplementary group so
 	// its unprivileged user can reach the shared dockerd socket.
 	if !slices.Contains(runner.HostConfig.GroupAdd, spec.DindSocketGID) {
 		t.Errorf("runner GroupAdd = %v, want it to include the DinD socket GID %q", runner.HostConfig.GroupAdd, spec.DindSocketGID)
@@ -357,7 +357,7 @@ func TestCreateInstanceDinDImagePullFailureCleansUp(t *testing.T) {
 
 // TestCreateInstanceDinDSidecarCreateAmbiguousLeakCleansUp exercises the
 // ambiguous dind-create branch: ContainerCreate errors but the daemon still
-// recorded the sidecar (ADR-004 F6). Since the leaked sidecar carries this
+// recorded the sidecar. Since the leaked sidecar carries this
 // attempt's nonce, the nonce-keyed rollback must remove it along with the
 // already-running runner, the network and the volumes.
 func TestCreateInstanceDinDSidecarCreateAmbiguousLeakCleansUp(t *testing.T) {
@@ -545,14 +545,12 @@ func TestDeleteInstanceDinDTearsDownFullTopology(t *testing.T) {
 	}
 }
 
-// TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand is the F6 red-line
-// guard: after the runner container is removed out of band (a crash, or an
-// external `docker rm`), DeleteInstance by the ORIGINAL provider_id must still
-// reap the privileged DinD sidecar, the network, and every volume — not return
-// exit 30 and leak them. This is exactly the leak the old provider_id=container-id
-// scheme caused: the sidecar/network/volumes are labeled with the instance
-// NAME, so a stable name-keyed provider_id (F6) is what makes the label-scoped
-// teardown always resolvable, even with the runner gone.
+// TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand: after the runner container
+// is removed out of band (a crash, or an external `docker rm`), DeleteInstance by the
+// original provider_id must still reap the privileged DinD sidecar, the network and
+// every volume, not return exit 30 and leak them. They are labelled with the instance
+// name, so a name-keyed provider_id keeps the teardown resolvable with the runner gone
+// (ADR-004, Identity).
 func TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand(t *testing.T) {
 	srv := newJITMetadataServer(t)
 	defer srv.Close()
@@ -573,12 +571,12 @@ func TestDeleteInstanceReapsSidecarWhenRunnerRemovedOutOfBand(t *testing.T) {
 	if err := fake.ContainerRemove(context.Background(), runnerID, container.RemoveOptions{Force: true}); err != nil {
 		t.Fatalf("out-of-band runner removal returned unexpected error: %v", err)
 	}
-	// The sidecar is still present (this is the resource that used to leak).
+	// The sidecar is still present (the resource that would leak).
 	if _, err := fake.ContainerInspect(context.Background(), spec.DindContainerName(inst.Name)); err != nil {
 		t.Fatalf("precondition: DinD sidecar should still exist after removing only the runner: %v", err)
 	}
 
-	// DeleteInstance by the ORIGINAL provider_id (the instance name, F6).
+	// DeleteInstance by the ORIGINAL provider_id (the instance name).
 	if err := p.DeleteInstance(context.Background(), inst.ProviderID); err != nil {
 		t.Fatalf("DeleteInstance(%q) returned unexpected error: %v", inst.ProviderID, err)
 	}

@@ -16,7 +16,7 @@ import (
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
 
-// These tests cover the ListInstances throttle (ADR-004 amendment 2026-11-03):
+// These tests cover the ListInstances throttle (ADR-004, Orphan sweep):
 // the controller-wide orphan sweep and the cache GC run at most once per
 // interval per controller, across provider processes, each claimed through its
 // own never-started stamp container. CreateInstance's pre-create sweep is not

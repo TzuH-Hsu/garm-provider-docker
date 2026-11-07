@@ -40,10 +40,9 @@ GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=GetConfigJSONSchema \
   GARM_CONTROLLER_ID=x GARM_PROVIDER_CONFIG_FILE=/path/config.toml \
   ./garm-provider-docker
 
-# Validate a pool's extra_specs early (what `garm-cli pool update --extra-specs`
-# would call): exits non-zero with a descriptive error if it violates the schema,
-# the allowed_dind_modes ceiling, a memory ceiling, the extra_env allowlist, or a
-# hard-reserved env name.
+# Validate a pool's extra_specs early: exits non-zero with a descriptive error if it
+# violates the schema, the allowed_dind_modes ceiling, a memory ceiling, the extra_env
+# allowlist, or a hard-reserved env name.
 GARM_INTERFACE_VERSION=v0.1.1 GARM_COMMAND=ValidatePoolInfo \
   GARM_CONTROLLER_ID=x GARM_PROVIDER_CONFIG_FILE=/path/config.toml \
   GARM_POOL_EXTRASPECS='{"dind_mode":"privileged-sidecar"}' \
