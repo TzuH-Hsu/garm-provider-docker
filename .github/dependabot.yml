@@ -49,9 +49,13 @@ updates:
         # type and would escape the group. Grouping is per directory.
     ignore:
       # go.mod's `toolchain` line is the single source of truth for the Go
-      # version. The Dockerfile's `golang` tag is the one second copy, so bump
-      # it by hand together with go.mod; CI fails if they differ
-      # (scripts/check-go-version.sh).
+      # version, and the Dockerfile's `golang` tag is its one second copy.
+      # Renovate bumps both in one pull request (.github/renovate.json5), so
+      # Dependabot must not move the tag alone; CI fails if they differ
+      # (scripts/check-go-version.sh). A digest-only refresh of the pinned tag
+      # has no semver type, so it cannot be ignored here. It stays with
+      # Dependabot, and Renovate is set to skip it. To bump by hand when
+      # Renovate is unavailable, see CONTRIBUTING.md.
       - dependency-name: "golang"
         update-types:
           - "version-update:semver-major"
@@ -62,14 +66,32 @@ updates:
     # image per architecture. Dependabot preserves this; do not hand-replace
     # one with a platform-specific digest.
 
-  # Exists only so a gomod security PR has a config entry to be rebased or
-  # recreated from. `open-pull-requests-limit: 0` mutes version-update PRs;
-  # security PRs are not subject to that limit. Raise the limit if gomod
-  # version updates are ever wanted.
+  # Module requirements. This entry also gives gomod security PRs a config
+  # entry to be rebased or recreated from.
+  #   - Minor and patch bumps share one monthly PR. Majors get their own.
+  #   - `cooldown` delays version updates only; security PRs are not held back.
+  #   - `open-pull-requests-limit` caps version-update PRs only. Security PRs
+  #     have a separate fixed limit.
+  #   - github.com/docker/docker stays at v28.5.2+incompatible, the last
+  #     version on its module path (see go.mod), so no update is expected.
+  #   - A bump can raise go.mod's `go` line through `go get`, which changes
+  #     language and GODEBUG defaults. scripts/check-go-version.sh then fails
+  #     CI; do not accept that change without deciding to move the language
+  #     version. The `toolchain` line is Renovate's, not Dependabot's.
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
       interval: monthly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 3
     commit-message:
       prefix: "build(deps)"
+    groups:
+      go-modules:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

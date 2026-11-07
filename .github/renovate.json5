@@ -1,0 +1,110 @@
+// Mend Renovate (hosted GitHub App), scoped to the Go toolchain version only.
+// Everything else, including module requirements, GitHub Actions and the
+// other container images, stays with Dependabot (.github/dependabot.yml).
+//
+// Why this exists: the `toolchain` line in go.mod and the `golang` tag in the
+// root Dockerfile must name the same Go release, and CI fails when they
+// differ (scripts/check-go-version.sh). Dependabot cannot move the first and
+// is told to ignore the second, so Renovate bumps both in one pull request.
+//
+// This file is JSON5, not JSON, so each rule can carry its reason.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  // No `extends`. Presets such as config:recommended switch on the
+  // dependency dashboard, other managers and other rules, and would widen
+  // what Renovate may touch.
+  enabledManagers: ["gomod", "dockerfile"],
+
+  // `runner-images/*/Dockerfile` also matches the dockerfile manager.
+  includePaths: ["go.mod", "Dockerfile"],
+
+  dependencyDashboard: false,
+  automerge: false,
+
+  // Security alerts stay with Dependabot, which already owns them here.
+  vulnerabilityAlerts: { enabled: false },
+
+  // Same commit form as Dependabot's Docker and Go module updates.
+  semanticCommits: "enabled",
+  semanticCommitType: "build",
+  semanticCommitScope: "deps",
+
+  // No `minimumReleaseAge`. go.mod and the Dockerfile must change together,
+  // and an age check only works if both datasources report a release time.
+  // golang-version does. Docker Hub does only through its tags API, which can
+  // be unavailable, and then Renovate drops the Dockerfile half from the
+  // pull request and CI fails the version check. The golang image can also
+  // appear on Docker Hub after the Go release, so a pull request may fail the
+  // check until the Dockerfile change joins it.
+
+  prBodyNotes: [
+    "The `go` line in go.mod is held on purpose and must not change in this pull request. `toolchain` and the Dockerfile `golang` tag must stay in step.",
+  ],
+
+  packageRules: [
+    // Allowlist: switch every dependency off, then re-enable two below. This
+    // keeps `require` lines, the `go` directive (depType "golang") and the
+    // distroless final stage out of reach even if a manager is enabled later.
+    {
+      description: "Disable all updates by default",
+      matchManagers: ["gomod", "dockerfile"],
+      enabled: false,
+    },
+    {
+      description: "go.mod toolchain line",
+      matchManagers: ["gomod"],
+      matchDepNames: ["go"],
+      matchDepTypes: ["toolchain"],
+      enabled: true,
+    },
+    {
+      description: "golang builder image in the root Dockerfile",
+      matchManagers: ["dockerfile"],
+      matchDepNames: ["golang"],
+      enabled: true,
+    },
+    {
+      // A digest-only refresh keeps the same Go version, so it is a
+      // base-image refresh rather than a toolchain update. Dependabot's
+      // docker entry owns those. A tag bump still carries its new digest.
+      description: "Leave digest-only refreshes of golang to Dependabot",
+      matchManagers: ["dockerfile"],
+      matchDepNames: ["golang"],
+      matchUpdateTypes: ["digest"],
+      enabled: false,
+    },
+
+    // A new minor (1.27 to 1.28) is raised separately from patch releases of
+    // the current minor, so it can be reviewed on its own. Each group still
+    // spans go.mod and the Dockerfile.
+    {
+      // Without this, Renovate offers only the newest release, so an
+      // available 1.28.0 would hide a 1.27.x patch.
+      description: "Offer a patch and a minor at the same time",
+      matchDepNames: ["go", "golang"],
+      separateMinorPatch: true,
+    },
+    {
+      description: "Go patch releases in one pull request",
+      matchDepNames: ["go", "golang"],
+      matchUpdateTypes: ["patch"],
+      groupName: "Go patch releases",
+      groupSlug: "go-toolchain",
+    },
+    {
+      description: "A new Go minor in its own pull request",
+      matchDepNames: ["go", "golang"],
+      matchUpdateTypes: ["minor"],
+      groupName: "Go minor release",
+      groupSlug: "go-toolchain-minor",
+    },
+    {
+      description: "A new Go major in its own pull request",
+      matchDepNames: ["go", "golang"],
+      matchUpdateTypes: ["major"],
+      groupName: "Go major release",
+      groupSlug: "go-toolchain-major",
+    },
+  ],
+}
