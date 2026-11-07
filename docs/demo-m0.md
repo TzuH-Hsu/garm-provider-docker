@@ -18,10 +18,11 @@ GitHub App key, in either its environment or its mounts (`docs/plan.md`
 M1–M4 have since shipped the full per-job topology (job network, named
 workspace volume, DinD modes, persistent caches, `extra_specs`, v0.1.1
 self-description). `v0.2.0` is the recorded failing baseline: it does not
-work against GARM v0.2.x (see "Results"). A local build of `main` at 0540477,
-the code for `v0.2.9`, passes the current gate on the Ubuntu 26.04 runner image,
+work against GARM v0.2.x (see "Results"). A local build of `main` at 4146fa1,
+built with Go 1.27.3, passes the current gate on the Ubuntu 26.04 runner image,
 for `none` and `--dind` with a registry mirror (28 and 59 PASS); no release
-asset has been gated at this revision. `main` at 1b9320c added the container-job
+asset has been gated at this revision. `main` at 0540477, the code for `v0.2.9`,
+passed with the same counts on an earlier local build. `main` at 1b9320c added the container-job
 acceptance test and passed with the same counts. The `v0.2.5` release asset passed the revision before
 the container job (28 and 58 PASS, script at e4a37fd).
 `v0.2.4` passed the revision before the registry mirror check, on the same
@@ -727,6 +728,55 @@ re-running it:
   image can all move independently between runs.
 
 ## Results
+
+The gate has been run end to end against a live GARM with a build of `main` at
+4146fa1, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
+`--dind` with a registry pull-through mirror), on 2026-11-07, using
+`scripts/demo-m0.sh` at the same commit. This run covers the move of the release
+toolchain from Go 1.25.0 to Go 1.27.3. The Ubuntu 24.04 image was not part of
+this run; its last recorded gate is the `v0.2.3` one below.
+
+**Environment**
+
+- GARM v0.2.1 (scale-set dispatch, no webhook); provider `interface_version`
+  v0.1.0.
+- Docker Engine 29.9.3, amd64, Ubuntu 26.04 host, kernel 7.0.
+- Provider: a local build of `main` at 4146fa1 from a clean tree, using the flags
+  in `release.yml` and Go 1.27.3, with the version set to `v0.2.10` by hand to
+  match the tag build, sha256
+  `2097a279cd107c24d4e9b2b25dd3e22d6dcf557397d94602cc9b1a6709ebdba5`, passed with
+  `LOCAL_PROVIDER_BIN` and `-y`. No published release asset was run, and the
+  release build is not expected to match this binary byte for byte.
+- Runner image, digest-pinned in the generated config (the `v0.2.5` digest),
+  with actions/runner 2.338.0:
+  - `ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:f9f20d3727653ff89afe75791a9bcfec965b11b13c0347f071ae2dcab802d2af`
+- DinD image `docker:dind@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121`,
+  daemon 29.9.3.
+- A Docker Hub pull-through mirror at a LAN address reachable from the sidecar.
+
+**Results**
+
+| Variant | `verify` | GitHub jobs | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `--dind` + registry mirror | 59 PASS, 0 FAIL | `demo` and `container-job` succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `none` | 28 PASS, 0 FAIL | succeeded | 2 PASS, 0 FAIL |
+
+- **A failed first attempt.** The first `--dind` attempt stopped in preflight
+  with `failed to resolve a digest for docker:dind`, before any runner or job
+  existed. The script does not show the underlying error, so the cause is not
+  known. The same digest resolved by hand seconds later, and the retry is the
+  result above.
+- **Logs.** The provider log has no warnings or errors, and the same sequence of
+  lines as the `0540477` run.
+- **Not exercised.** The default Docker unix socket and GARM's HTTP callback URL
+  were used, so TLS was not exercised. The host sets no CPU quota, so the
+  runtime's cgroup-aware `GOMAXPROCS` had no limit to react to. The exit report
+  cases from the `0540477` run were not repeated. `go 1.25.0` stays in `go.mod`,
+  which keeps Go 1.25 `GODEBUG` defaults; the binary's build info records them.
+- **Secrets.** A scan of the provider log for token, JIT and key material found
+  none.
+
+## Previous gate: `main` at 0540477
 
 The gate has been run end to end against a live GARM with a build of `main` at
 0540477, in two variants on the Ubuntu 26.04 image (`dind_mode=none`, and
