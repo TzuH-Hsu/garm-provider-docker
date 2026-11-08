@@ -1609,7 +1609,7 @@ sample_workflow_yaml() {
     runs_on="$(tags_to_yaml_array "${POOL_TAGS}")" || exit 1
   fi
   cat <<EOF
-name: garm-m0-demo
+name: garm-live-gate
 on:
   workflow_dispatch: {}
 jobs:
@@ -1696,8 +1696,8 @@ EOF
       - uses: actions/checkout@v4
       - name: read a file checked out into the job container
         run: |
-          test -s .github/workflows/garm-m0-demo.yml
-          grep -Fx 'name: garm-m0-demo' .github/workflows/garm-m0-demo.yml
+          test -s .github/workflows/garm-live-gate.yml
+          grep -Fx 'name: garm-live-gate' .github/workflows/garm-live-gate.yml
           grep -q 'Debian' /etc/os-release
 EOF
   else
@@ -1737,9 +1737,9 @@ step_watch() {
   # remembered so a later `postjob` cannot silently check a previous run.
   forget_gate_instances
 
-  log "Copy the following into <your-test-repo>/.github/workflows/garm-m0-demo.yml,"
+  log "Copy the following into <your-test-repo>/.github/workflows/garm-live-gate.yml,"
   log "commit/push it, then trigger it (Actions tab > Run workflow, or"
-  log "'gh workflow run garm-m0-demo.yml' if you use the gh CLI):"
+  log "'gh workflow run garm-live-gate.yml' if you use the gh CLI):"
   echo
   sample_workflow_yaml
   echo
