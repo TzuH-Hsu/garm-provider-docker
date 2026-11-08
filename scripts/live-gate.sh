@@ -2082,12 +2082,22 @@ garm_runner_names() {
 resolve_runner_container() {
   RUNNER_CID=""
   RUNNER_INSTANCE=""
-  local names name id found_cid="" found_instance="" count=0 ids
+  local names name id found_cid="" found_instance="" count=0 ids recorded=""
   if [[ -n "${GATE_INSTANCE}" ]]; then
     names="$(printf '%s' "${GATE_INSTANCE}" | tr ', ' '\n')"
+  elif is_non_jit && recorded="$(load_gate_instances)" && [[ -n "${recorded}" ]]; then
+    # Non-JIT: the pool keeps one idle runner (min-idle-runners 1), so once the
+    # job's runner is gone GARM lists a replacement that never ran the workflow.
+    # The runner watch recorded for this run is the gate's runner; never swap in
+    # whatever the pool lists now.
+    names="${recorded}"
   else
+    recorded=""
     names="$(garm_runner_names)" \
       || { bad "could not read this gate's runner list from GARM, so the gate's own runner cannot be identified (set GATE_INSTANCE to the runner's instance name to bypass the lookup)"; return 1; }
+    if is_non_jit && [[ -n "${names}" ]]; then
+      warn "no gate runner instance was recorded for this run (watch records it as soon as it sees it), so verify takes the runner GARM lists now; if the workflow already finished it may be the replacement idle runner. Run 'watch' before triggering the job."
+    fi
   fi
   if [[ -z "${names}" ]]; then
     bad "GARM lists no runner for this gate's scale set/pool - has it created one yet? (Step 3)"
@@ -2104,6 +2114,10 @@ resolve_runner_container() {
       found_instance="${name}"
     done <<< "${ids}"
   done <<< "${names}"
+  if (( count == 0 )) && [[ -n "${recorded}" ]]; then
+    bad "verification window missed: the gate runner recorded for this run ($(printf '%s' "${names}" | tr '\n' ' ')) is already gone, and verify does not inspect its replacement idle runner. Trigger a fresh job: re-run 'watch' (it records the runner that will take the job), and run 'verify' while the job holds"
+    return 1
+  fi
   if (( count == 0 )); then
     bad "no runner container carries garm.docker/instance-name matching this gate's runner(s): $(printf '%s' "${names}" | tr '\n' ' ') (the container may not exist yet, or may already be gone)"
     return 1

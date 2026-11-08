@@ -733,9 +733,14 @@ What changes compared with the default gate:
   checked.
 - **`watch` and `postjob`** record only the first runner they see as the gate's
   runner, because of the replacement idle runner. The replacement is not part of
-  the checks. `watch` clears the recorded instances when it starts; if you run
-  `verify` without `watch`, remove `gate-instances` from the config directory
-  from an earlier run first, or give `GATE_INSTANCE`.
+  the checks. `watch` clears the recorded instances when it starts. `verify`
+  inspects the recorded runner (or `GATE_INSTANCE`) and never swaps in a
+  runner the pool lists now: if the recorded runner's container is already gone,
+  it FAILs with "verification window missed", and you re-run `watch` and
+  `verify` with a fresh job. Without a recorded runner, `verify` warns and takes
+  the one GARM lists, which after a finished job is the replacement idle runner,
+  so start `watch` before triggering the job and run `verify` while the job
+  holds.
 
 **Teardown.** Because GARM keeps replacing the idle runner, scale the pool down
 before deleting it. The Cleanup step prints:
