@@ -66,6 +66,20 @@ you ran it.
 | `runner-images/` | Runner images and their entrypoint |
 | `docs/adr/` | Design decisions and their reasoning |
 
+## Updating Go
+
+Renovate proposes Go toolchain updates, and Dependabot proposes module updates.
+The `go` line in `go.mod` is the language version and is held on purpose, so
+leave it alone; `scripts/check-go-version.sh` fails CI if it changes.
+
+If the bot is unavailable, bump by hand in one pull request:
+
+1. Set the `toolchain` line in `go.mod` to the new release.
+2. Set the `golang` tag and digest on the `FROM` line of the `Dockerfile` to the
+   same release. Get the multi-arch index digest with
+   `docker buildx imagetools inspect golang:<version> --format '{{.Manifest.Digest}}'`.
+3. Run `scripts/check-go-version.sh`.
+
 ## Branches and commits
 
 Name branches `<type>/<short-description>`, for example

@@ -5,7 +5,8 @@ go 1.25.0
 // The go line stays the language version this module is written for. The
 // toolchain line is the Go that builds and tests it, so release binaries carry
 // current standard library fixes. CI fails if the Dockerfile's golang tag
-// differs (scripts/check-go-version.sh); bump both together.
+// differs, or if the go line changes (scripts/check-go-version.sh). Renovate
+// bumps the toolchain line and the tag together; it never touches the go line.
 toolchain go1.27.3
 
 require (
@@ -30,9 +31,8 @@ require (
 	// holds pkg/stdcopy), and github.com/moby/moby/v2 (currently beta
 	// only). Tracked in issue #1.
 	//
-	// Dependabot gomod VERSION updates remain intentionally disabled
-	// for this reason (see .github/dependabot.yml), while gomod
-	// SECURITY updates remain active.
+	// Dependabot proposes no update for it, because none exists on this
+	// path (see .github/dependabot.yml).
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/moby/docker-image-spec v1.3.1
 	github.com/opencontainers/go-digest v1.0.0
