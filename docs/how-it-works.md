@@ -79,7 +79,9 @@ The instance token stays with the provider and never enters the container. The
 provider uses it to fetch `.runner`, `.credentials` and `.credentials_rsaparams`,
 which reach the runner only through a memory-backed `tmpfs` at `/run/garm`,
 streamed in with `docker exec` after the container is created. They are not in the
-environment, on host disk or in the container's writable layer. See
+environment, on host disk or in the container's writable layer. Without JIT the
+provider delivers a registration token the same way, and the entrypoint deletes
+it as soon as it has read it. See
 [ADR-002](adr/ADR-002-runner-image-and-jit-delivery.md).
 
 ## IPv4-only localhost

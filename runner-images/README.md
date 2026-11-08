@@ -53,7 +53,8 @@ sees a partial set. `docker cp` cannot be used, because Docker resolves its arch
 running container's user tmpfs mounts. The entrypoint symlinks the files from `/run/garm` into `/actions-runner`
 and never copies them to the writable layer. They exist only in container memory: not in the image, not in
 `docker inspect` output, not on host disk. The job's user can read them, since they are its own runner's
-credentials.
+credentials. The registration token that non-JIT pools receive is the exception: it is not scoped to one runner,
+so the entrypoint deletes it as soon as it has read it, before `config.sh` runs and before any job starts.
 
 ## Environment contract
 
@@ -100,11 +101,13 @@ Entrypoint tuning, not part of the provider's contract:
 3. **Install credentials.**
    - With JIT, link `/actions-runner/.runner`, `.credentials` and `.credentials_rsaparams` to the tmpfs files. Run
      no `config.sh`.
-   - Without JIT, run `./config.sh --unattended --ephemeral --disableupdate --url ... --token ... --name ...` as the
+   - Without JIT, first read `/run/garm/registration-token` and delete it, before any other step. The entrypoint
+     fails if the token is missing, empty or unreadable, or if the file cannot be removed. Then run
+     `./config.sh --unattended --ephemeral --disableupdate --url ... --token ... --name ...` as the
      runner user through `gosu`, and only after it succeeds move the generated files onto the tmpfs and replace them
      with symlinks. Linking before `config.sh` would leave dangling links, and the runner's `configure` step
-     crashes on one (`FileNotFoundException`, exit 134). A trap removes credential files from the writable layer if
-     `config.sh` fails. This path has not been verified against a real GARM pool.
+     crashes on one (`FileNotFoundException`, exit 134). A trap removes credential files and the registration
+     token if the read or `config.sh` fails. This path has not been verified against a real GARM pool.
 4. **Externals wait.** If `GARM_EXTERNALS_SEEDED_MARKER` is set, wait for it, so the runner never starts on a
    half-seeded externals tree.
 5. **Start.** Drop to the `runner` user with `gosu` and `exec ./run.sh` in the foreground, so it receives signals.
