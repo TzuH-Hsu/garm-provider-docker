@@ -8,7 +8,7 @@ on:
     branches: [main]
   pull_request:
   # Weekly, so a newly published Go or dependency advisory shows up without
-  # needing a pull request. Only the `govulncheck` job runs on this trigger.
+  # needing a pull request. Only the two govulncheck jobs run on this trigger.
   schedule:
     - cron: '23 5 * * 1'
   workflow_dispatch:
@@ -100,6 +100,48 @@ jobs:
 
       - name: govulncheck (reachable, fixable advisories fail)
         run: scripts/govulncheck.sh
+
+  # Keeps every advisory in the Security tab, including ones the gate above
+  # only reports as a notice or does not list. Separate from `govulncheck` so
+  # that check never depends on a token with write access, and so an upload
+  # problem cannot change its result. Not run for pull requests: forked pull
+  # requests cannot write security events, and per-PR alerts add noise.
+  # A scan that fails to run fails this job, since no upload step follows.
+  govulncheck-sarif:
+    name: govulncheck results in code scanning
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Replaces the workflow default, so `contents` is restated.
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No module cache: this job holds a token that can write security events.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check Go version matches go.mod and Dockerfile
+        run: |
+          go version
+          scripts/check-go-version.sh
+
+      # Same pinned govulncheck, built by the same toolchain, as the gate.
+      - name: govulncheck (SARIF)
+        run: scripts/govulncheck.sh --sarif > "${RUNNER_TEMP}/govulncheck.sarif"
+
+      # `category` keeps these results apart from CodeQL's default setup.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/govulncheck.sarif
+          category: govulncheck
 
   # Manual only, not part of the required gate: scenarios wait out real
   # timeouts (minutes), and it has not been validated on GitHub-hosted amd64.

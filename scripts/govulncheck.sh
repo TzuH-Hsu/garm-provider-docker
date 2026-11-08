@@ -22,34 +22,62 @@
 # built by the Go toolchain that go.mod selects. A govulncheck built by an
 # older Go cannot load packages from a newer standard library.
 #
+# Usage:
+#   govulncheck.sh [--sarif]
+#
+#   --sarif  Write the raw SARIF 2.1.0 report to stdout and apply no policy.
+#            CI uploads it to code scanning, so every advisory, called or not,
+#            stays visible there. It keeps the pinned version in one place.
+#
 # Environment:
 #   GOVULNCHECK_BIN  Path to a govulncheck binary to use instead of `go run`.
 #                    Meant for testing the policy under another GOTOOLCHAIN.
 #
 # Exit status: 0 policy satisfied, 1 policy violated, 2 the scan itself failed.
+# With --sarif the status is 0 whenever the scan ran, whatever it found.
 
 set -euo pipefail
 
 readonly GOVULNCHECK_VERSION="v1.9.0"
+
+sarif=false
+case "${1:-}" in
+  "") ;;
+  --sarif) sarif=true ;;
+  *)
+    echo "usage: govulncheck.sh [--sarif]" >&2
+    exit 2
+    ;;
+esac
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+if [ -n "${GOVULNCHECK_BIN:-}" ]; then
+  scan=("${GOVULNCHECK_BIN}")
+else
+  scan=(go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}")
+fi
+
+# Like -format json, -format sarif exits 0 even when it reports findings.
+if [ "${sarif}" = true ]; then
+  if ! "${scan[@]}" -format sarif ./...; then
+    echo "govulncheck.sh: govulncheck failed to scan the module" >&2
+    exit 2
+  fi
+  exit 0
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "govulncheck.sh: jq is required" >&2
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${repo_root}"
-
 report="$(mktemp)"
 trap 'rm -f "${report}"' EXIT
 
 # With -format json govulncheck exits 0 even when it reports findings, so a
 # non-zero status here means the scan did not run, not that it found something.
-if [ -n "${GOVULNCHECK_BIN:-}" ]; then
-  scan=("${GOVULNCHECK_BIN}")
-else
-  scan=(go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}")
-fi
 if ! "${scan[@]}" -format json ./... >"${report}"; then
   echo "govulncheck.sh: govulncheck failed to scan the module" >&2
   exit 2
