@@ -500,7 +500,11 @@ scripts/live-gate.sh --from-source preflight
   `[[provider]]` description names the build, never a release: `source
   <git describe of the checkout>` for a local `go build`, or `source, local
   binary sha256 <first 12 hex>, runner image from <git describe>` with a
-  pre-built binary.
+  pre-built binary. The `git describe` is the one preflight recorded as
+  `SOURCE_BUILD_ID` in `gate-modes` (published with the binary and config, so
+  a failed later preflight cannot change it); a `gate-modes` file from an older
+  version has none, and the description then says `build identity not
+  recorded`.
 - Without `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256`, source mode behaves
   exactly as before. Setting only one of the two is an error.
 
