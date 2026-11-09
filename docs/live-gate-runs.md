@@ -6,16 +6,17 @@ rewritten when the gate changes, so read it with the revision of the script it
 ran. The script was named `scripts/demo-m0.sh` at every commit recorded here, so
 use that path to read it, for example `git show 92d6c85:scripts/demo-m0.sh`.
 
-| Run | Date | Runner image | `verify`, `none` | `verify`, `--dind` | `postjob` | Script at |
-|---|---|---|---|---|---|---|
-| [`main` at 4146fa1](#main-at-4146fa1-2026-11-07), local build with Go 1.27.3 | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | all PASS | 4146fa1 |
-| [`main` at 0540477](#main-at-0540477-2026-11-07), local build, the code for `v0.2.9` | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | all PASS | 0540477 |
-| [`main` at 1b9320c](#main-at-1b9320c-2026-11-01), local build, first run with the container job | 2026-11-01 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | all PASS | 1b9320c |
-| [`v0.2.5`](#v025-2026-10-27) release asset | 2026-10-27 | Ubuntu 26.04 | 28 PASS | 58 PASS, with mirror | 1 PASS, 1 FAIL per run: a false positive in the script, not a leak | e4a37fd |
-| [`v0.2.4`](#v024-2026-10-12) release | 2026-10-12 | Ubuntu 26.04 | 28 PASS | 53 PASS | all PASS | 0cf2a76 |
-| [`v0.2.3`](#v023-2026-10-12) release | 2026-10-12 | Ubuntu 24.04 and 26.04 | 28 PASS on each | 50 PASS, 26.04 only | all PASS | 92d6c85 |
-| `v0.2.2` release (see [Earlier runs](#v023-2026-10-12)) | not recorded | not recorded | 28 PASS | 50 PASS | not recorded | efe5014 |
-| `v0.2.1` release (see [Earlier runs](#v023-2026-10-12)) | not recorded | not recorded | 26 PASS | 48 PASS | not recorded | fa4351c |
+| Run | Date | Runner image | `verify`, `none` | `verify`, `--dind` | `verify`, `--pool --non-jit` | `postjob` | Script at |
+|---|---|---|---|---|---|---|---|
+| [`main` at 950607f](#main-at-950607f-2026-11-09), local provider build with Go 1.27.3 and runner image built from the checkout | 2026-11-09 | Ubuntu 26.04, not digest-pinned | 28 PASS | 59 PASS, with mirror | 30 PASS | all PASS | 950607f |
+| [`main` at 4146fa1](#main-at-4146fa1-2026-11-07), local build with Go 1.27.3 | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | not run | all PASS | 4146fa1 |
+| [`main` at 0540477](#main-at-0540477-2026-11-07), local build, the code for `v0.2.9` | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | not run | all PASS | 0540477 |
+| [`main` at 1b9320c](#main-at-1b9320c-2026-11-01), local build, first run with the container job | 2026-11-01 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | not run | all PASS | 1b9320c |
+| [`v0.2.5`](#v025-2026-10-27) release asset | 2026-10-27 | Ubuntu 26.04 | 28 PASS | 58 PASS, with mirror | not run | 1 PASS, 1 FAIL per run: a false positive in the script, not a leak | e4a37fd |
+| [`v0.2.4`](#v024-2026-10-12) release | 2026-10-12 | Ubuntu 26.04 | 28 PASS | 53 PASS | not run | all PASS | 0cf2a76 |
+| [`v0.2.3`](#v023-2026-10-12) release | 2026-10-12 | Ubuntu 24.04 and 26.04 | 28 PASS on each | 50 PASS, 26.04 only | not run | all PASS | 92d6c85 |
+| `v0.2.2` release (see [Earlier runs](#v023-2026-10-12)) | not recorded | not recorded | 28 PASS | 50 PASS | not run | not recorded | efe5014 |
+| `v0.2.1` release (see [Earlier runs](#v023-2026-10-12)) | not recorded | not recorded | 26 PASS | 48 PASS | not run | not recorded | fa4351c |
 
 Every `verify` above had 0 FAIL. Counts grow as the gate gains checks, so they
 compare only between runs of the same revision:
@@ -27,12 +28,84 @@ compare only between runs of the same revision:
   before the shared network namespace and published-port checks, `v0.2.4` the
   one before the registry mirror check, and `v0.2.5` the one before the
   container job.
-- No published release asset was run at 4146fa1, 0540477 or 1b9320c, so those
-  three results do not cover one.
+- No published release asset was run at 950607f, 4146fa1, 0540477 or 1b9320c,
+  so those four results do not cover one.
+- 950607f is the first run that covers the non-JIT registration path, and the
+  first that dispatches through a pool. Older rows never ran
+  `--pool --non-jit`, because the gate had no such variant, so their cell in
+  that column reads "not run".
 - The Ubuntu 24.04 image has not been gated since `v0.2.3`.
 
 After the records come the [known upstream issue](#known-upstream-issue) they
 refer to and [what is still unverified](#still-unverified).
+
+## `main` at 950607f, 2026-11-09
+
+The gate has been run end to end against a live GARM with a build of `main` at
+950607f, in three variants on the Ubuntu 26.04 image (`dind_mode=none`, `--dind`
+with a registry pull-through mirror, and `--pool --non-jit`), on 2026-11-09,
+using the gate script at the same commit. This run covers the non-JIT
+registration path added in #87, and the runner image entrypoint change from #85.
+The Ubuntu 24.04 image was not part of this run; its last recorded gate is the
+`v0.2.3` one below.
+
+The gate ran in source mode (`--from-source`), because #85 changed the runner
+image entrypoint and no published image has it yet: the runner image was built
+locally from the checkout at 950607f.
+
+**Environment**
+
+- GARM v0.2.1; provider `interface_version` v0.1.0. The `none` and `--dind`
+  variants used a scale set (no webhook); the non-JIT variant used a pool.
+- Docker Engine 29.9.3, amd64, Ubuntu 26.04 host, kernel 7.0.
+- Provider: a local build of `main` at 950607f from a clean tree, using the flags
+  in `release.yml` and Go 1.27.3, whose `GetVersion` reports
+  `v0.2.10-21-g950607f`, sha256
+  `d80443fe6f8304017f5c81556bc71b0e6e255c93c24d3aa4588bee6894fdabb0`, passed with
+  `LOCAL_PROVIDER_BIN`, `LOCAL_PROVIDER_SHA256` and `-y`. No published release
+  asset was run, and the release build is not expected to match this binary byte
+  for byte.
+- Runner image: built locally from the checkout at 950607f (`--runner-image
+  resolute`, Ubuntu 26.04). It is not digest-pinned, because source mode sets
+  `allow_unpinned_runner_image=true`. No published image was run.
+- DinD image `docker:dind@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121`.
+- A Docker Hub pull-through mirror at a LAN address reachable from the sidecar.
+
+**Results**
+
+| Variant | `verify` | GitHub jobs | `postjob` |
+|---|---|---|---|
+| Ubuntu 26.04, `none`, scale set | 28 PASS, 0 FAIL, 0 WARN | succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `--dind` + registry mirror, scale set | 59 PASS, 0 FAIL, 0 WARN | `demo` and `container-job` succeeded | 2 PASS, 0 FAIL |
+| Ubuntu 26.04, `--pool --non-jit` | 30 PASS, 0 FAIL, 0 WARN | succeeded | 2 PASS, 0 FAIL |
+
+- **Non-JIT pool.** The pool sat on a separate `[[provider]]` entry with
+  `disable_jit_config = true`, with min-idle 1 and max 1. `verify` confirmed
+  `JIT_CONFIG_ENABLED=false`, so the non-JIT path was taken, and that
+  `/run/garm/registration-token` was absent. The job's own step
+  `test ! -e /run/garm/registration-token` succeeded. The runner unregistered
+  itself from GitHub after its job, as an ephemeral runner does.
+- **Pending status.** GARM listed the non-JIT runner as `pending` for its whole
+  life, idle, during the job and after it, because the provider's runner status
+  reporting is JIT-only. This is the known non-JIT limitation, not a failure.
+- **Slow deletion.** After the job, the exited runner container was removed about
+  2.5 minutes later by an orphan sweep (it removes exited managed containers on
+  the host), not by a `DeleteInstance`. GARM kept the stale instance until the
+  pool's runner bootstrap timeout (20 minutes), then called `DeleteInstance`,
+  which returned "instance already gone" (exit 30, logged at INFO), and then
+  created the replacement idle runner. With max-runners 1, no replacement could
+  start for those 17.5 minutes or so. This too is the known limitation.
+- **Cleanup.** Scaling the pool to zero and disabling it did not remove the idle
+  replacement runner. See "Teardown" under
+  [The non-JIT variant](live-gate.md#the-non-jit-variant) for what removes it,
+  and the runner it leaves behind on GitHub.
+- **Provider label.** In source mode the script's generated `[[provider]]`
+  description and remembered modes still mention the default release version
+  (`v0.2.5`), which means nothing in source mode. The binary is identified by
+  its sha256 above. A follow-up fixes the label.
+- **Logs.** The provider log has only INFO lines, no warnings or errors.
+- **Secrets.** A scan of the provider log for token, JIT and key material found
+  none.
 
 ## `main` at 4146fa1, 2026-11-07
 
@@ -486,7 +559,8 @@ race and the stall entirely once it is in a release.
   `v0.2.3`; both releases rebuilt it).
 - Published ports on the runner's `localhost` under `sysbox-runc`, whose
   sidecar keeps its own network namespace (ADR-001, 2026-10-12 amendment).
-- The non-JIT fallback path (`config.sh` writing credentials through the
-  pre-created symlinks onto the tmpfs, `ADR-002`).
+- A published runner image that has the #85 entrypoint change. The `950607f`
+  run used an image built locally from the checkout.
 - An arm64 host.
-- Pool and webhook dispatch mode (`--pool`).
+- Webhook-driven pool dispatch, and a pool on a JIT provider entry. The pool at
+  950607f was non-JIT, ran one idle runner and received no webhook.
