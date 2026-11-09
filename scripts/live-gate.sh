@@ -3145,19 +3145,24 @@ step_cleanup() {
   elif is_non_jit; then
     local pid="${POOL_ID:-<POOL_ID>}"
     target_cleanup="  # 1. Scale the non-JIT pool to zero and disable it FIRST. With min-idle-runners 1
-  #    GARM keeps replacing the idle runner, so deleting the pool outright (or just
-  #    disabling it) can leave a runner behind or race its replacement.
+  #    GARM keeps replacing the idle runner, so deleting the pool while it is
+  #    still enabled lets a replacement appear after you looked.
   garm-cli pool list --repo ${REPO:-<your-repo>}
   garm-cli pool update ${pid} --min-idle-runners 0 --enabled=false
+  #    Scaling down is not enough: GARM keeps the non-JIT runner pending and only
+  #    scales down idle runners, so it would stay until the bootstrap timeout.
+  #    Remove each runner listed for the pool explicitly.
+  garm-cli runner list ${pid}
+  garm-cli runner rm <RUNNER_NAME>            # once per runner listed above
   #    Wait until GARM lists no runners for the pool; then delete it (garm-cli
   #    requires it to be empty).
   garm-cli runner list ${pid}                 # repeat until no runners remain
   garm-cli pool delete ${pid}
-  #    Check the test repository's runner list on GitHub for leftovers (Settings >
-  #    Actions > Runners, or 'gh api repos/<owner>/<name>/actions/runners'). GARM's
-  #    status reporting is JIT-only, so a non-JIT runner can linger there; remove any
-  #    runner that is still listed from that page or with 'gh api -X DELETE
-  #    repos/<owner>/<name>/actions/runners/<runner-id>'."
+  #    A runner removed before it ran a job never unregistered itself and GARM has
+  #    no agent ID for it, so it stays on the test repository as an offline
+  #    registration. List the repository's runners and delete each leftover:
+  gh api repos/<owner>/<name>/actions/runners
+  gh api -X DELETE repos/<owner>/<name>/actions/runners/<runner-id>"
   else
     target_cleanup="  # 1. Disable and delete the demo pool (garm-cli requires it to be empty first)
   garm-cli pool list --repo ${REPO:-<your-repo>}

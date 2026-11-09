@@ -755,6 +755,22 @@ before deleting it. The Cleanup step prints:
 and tells you to keep the `docker_gate_nonjit` provider entry, together with the
 binary and config directory it points at.
 
+**Step 1 is not enough.** Setting min-idle to 0 and disabling the pool does not
+remove the idle replacement runner. GARM keeps it `pending` (see the limitation
+below) and only scales down idle runners, so the runner stays until the pool's
+runner bootstrap timeout (20 minutes by default). Remove it explicitly:
+
+1. `garm-cli runner rm <name>`, using the name from `garm-cli runner list
+   <POOL_ID>`
+2. wait until `garm-cli runner list <POOL_ID>` lists no runners
+3. `garm-cli pool delete <POOL_ID>`
+
+A non-JIT runner removed this way never ran a job, so it did not unregister
+itself, and GARM had no agent ID for it and did not remove it from GitHub. It
+stays on the repository as an offline runner. List the runners with
+`gh api repos/<owner>/<name>/actions/runners` and delete it with
+`gh api -X DELETE repos/<owner>/<name>/actions/runners/<runner-id>`.
+
 **Known limitation: pending status and slow deletion.** GARM's runner status
 reporting is JIT-only. For a non-JIT runner GARM can therefore keep reporting it
 as pending although its container has registered and is idle, it can take long
