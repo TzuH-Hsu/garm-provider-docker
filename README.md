@@ -169,12 +169,13 @@ provider for my own private repositories, on the first row's setup.
 
 | Setup | Status |
 |---|---|
-| GARM v0.2.1, scale sets, GitHub App, `interface_version` v0.1.0, amd64, Ubuntu 26.04 image, `none` and `privileged-sidecar` | Live-tested on a local build of the v0.2.10 code; last recorded release asset is v0.2.5 |
+| GARM v0.2.1, scale sets, GitHub App, `interface_version` v0.1.0, amd64, Ubuntu 26.04 image, `none` and `privileged-sidecar` | Live-tested on a local build of the v0.2.11 code; last recorded release asset is v0.2.5 |
 | Ubuntu 24.04 image | Last live-tested with v0.2.3 |
-| Container jobs in `privileged-sidecar` | Live-tested on a local build of the v0.2.10 code |
+| Container jobs in `privileged-sidecar` | Live-tested on a local build of the v0.2.11 code |
 | `linux/arm64` | Published, not tested end to end |
 | `sysbox-runc` | Unit tests only |
-| Pools with webhooks, non-JIT runners, `interface_version` v0.1.1 with GARM | Not tested end to end |
+| Pool with non-JIT runners (`disable_jit_config`), no webhook | Live-tested on a local build of the v0.2.11 code and a locally built runner image; GARM lists the runner as `pending` for its whole life |
+| Pools with webhooks, `interface_version` v0.1.1 with GARM | Not tested end to end |
 
 ## Compatibility
 
