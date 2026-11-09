@@ -10,6 +10,8 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-09
+
 ### Security
 
 - Pools that set `disable_jit_config` no longer leave the registration token
@@ -24,6 +26,39 @@ Earlier versions are described on the
   from earlier images keep the old behavior until they are replaced. During
   registration, `config.sh` still receives the token on its command line, but
   that runs before any job starts.
+
+### Added
+
+- Go updates are now proposed automatically. Renovate opens a pull request for
+  a new Go release that moves the `toolchain` line in `go.mod` and the
+  `golang` image in the Dockerfile together, and Dependabot opens a monthly
+  pull request for Go module updates. Nothing merges on its own.
+- CI fails when the `go` line in `go.mod` is not the expected language version
+  (`1.25.0`), so a module update cannot raise it unnoticed.
+- CI uploads the full `govulncheck` report to code scanning on pushes to
+  `main` and weekly, so each advisory appears as an alert in the Security tab.
+  The pass or fail rule of the `govulncheck` check is unchanged.
+
+### Fixed
+
+- The orphan sweep no longer removes a paused or restarting runner. It treated
+  only a `running` runner as live, so a paused runner was removed once its
+  allocation was 20 minutes old, and a runner that had run before and was
+  paused or restarting could be removed after 2 minutes. The provider never
+  pauses a runner or sets a restart policy, so this affected only runners that
+  an operator had paused with `docker pause` or given a restart policy with
+  `docker update`. If the sweep cannot inspect a runner that is not live, it
+  now logs the error and removes nothing, and a later sweep decides.
+- The `repo-scoped caches resolved` log line now names the cache volumes the
+  runner mounts. After the provider worked around a volume it does not own, the
+  line named the volume it had wanted instead.
+- The warning for a status watcher that could not start now says the runner
+  stays `pending`, which is what GARM shows. It said `installing`.
+- An instance name that would give a one-character container or volume name is
+  now rejected before anything is created. Docker requires at least two
+  characters. The error for a name over 255 bytes now says the limit comes from
+  the filesystem, since a local volume's name is a directory name, and not from
+  Docker.
 
 ## [0.2.10] - 2026-11-07
 
@@ -63,6 +98,7 @@ Earlier versions are described on the
   output was previously discarded.
 - A runner that never started no longer produces an exit report on delete.
 
-[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.11...HEAD
+[0.2.11]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.8...v0.2.9
