@@ -158,7 +158,8 @@ the DinD variant, or run a single step directly
 the full command list and every environment variable it accepts.
 
 **Modes are remembered between steps.** `preflight` (and `all`) record the
-effective `PROVIDER_SOURCE`, `PROVIDER_VERSION`, `GARM_TARGET`,
+effective `PROVIDER_SOURCE`, `PROVIDER_VERSION` (release mode only; source
+mode ignores it, so it is neither saved nor printed), `GARM_TARGET`,
 `GATE_VARIANT`, `GATE_NON_JIT`, `PROVIDER_INTERFACE_VERSION`,
 `RUNNER_IMAGE_NAME` and, when set, `GATE_REGISTRY_MIRROR` /
 `GATE_INSECURE_REGISTRY` and the expected `LOCAL_PROVIDER_SHA256` in
@@ -494,9 +495,12 @@ scripts/live-gate.sh --from-source preflight
   `allow_unpinned_runner_image = true`. The runner image therefore comes from the
   checkout the script runs in, so keep that checkout at the commit the binary was
   built from.
-- The warning, preflight summary line, `config.toml` comment, `, local binary`
-  in the `[[provider]]` description and the remembered `LOCAL_PROVIDER_SHA256` in
-  `gate-modes` work as in release mode.
+- The warning, preflight summary line, `config.toml` comment and the remembered
+  `LOCAL_PROVIDER_SHA256` in `gate-modes` work as in release mode. The
+  `[[provider]]` description names the build, never a release: `source
+  <git describe of the checkout>` for a local `go build`, or `source, local
+  binary sha256 <first 12 hex>, runner image from <git describe>` with a
+  pre-built binary.
 - Without `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256`, source mode behaves
   exactly as before. Setting only one of the two is an error.
 

@@ -751,6 +751,9 @@ explicit_mode_value() {
 stage_modes() {
   local key content=""
   for key in ${MODE_KEYS}; do
+    # PROVIDER_VERSION is ignored in source mode, so it is not remembered
+    # there (the default would read as the version that was gated).
+    [[ "${key}" == PROVIDER_VERSION && "${PROVIDER_SOURCE}" == "source" ]] && continue
     content+="${key}=${!key}"$'\n'
   done
   STAGE_MODES="${STAGE_CFG_DIR}/gate-modes"
@@ -790,6 +793,10 @@ load_saved_modes() {
 
   for key in ${MODE_KEYS}; do
     [[ " ${seen[*]-} " == *" ${key} "* ]] || continue
+    # An older gate-modes file may carry PROVIDER_VERSION from a source-mode
+    # run; it is ignored there, so neither load nor compare it (PROVIDER_SOURCE
+    # comes first in MODE_KEYS, so it is already effective here).
+    [[ "${key}" == PROVIDER_VERSION && "${PROVIDER_SOURCE}" == "source" ]] && continue
     v="SAVED_${key}"; v="${!v}"
     expl="$(explicit_mode_value "${key}")"
     cur="${!key}"
@@ -1151,10 +1158,30 @@ publish_staged_artifacts() {
 
 # --- Step 0: preflight -------------------------------------------------------
 
+# checkout_describe prints the build identity of this checkout: what a
+# source-mode binary is stamped with, and what labels a source-mode gate run.
+checkout_describe() {
+  git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev
+}
+
+# provider_label prints how generated output names the provider under test.
+# PROVIDER_VERSION only names a release, so source mode never prints it: it
+# labels the run by the checkout (built locally) or by the pre-built binary's
+# expected sha256 (plus the checkout the runner image is built from).
+provider_label() {
+  if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
+    printf 'release %s%s' "${PROVIDER_VERSION}" "${LOCAL_PROVIDER_SHA256:+, local binary}"
+  elif [[ -n "${LOCAL_PROVIDER_SHA256}" ]]; then
+    printf 'source, local binary sha256 %s, runner image from %s' "${LOCAL_PROVIDER_SHA256:0:12}" "$(checkout_describe)"
+  else
+    printf 'source %s' "$(checkout_describe)"
+  fi
+}
+
 build_provider_binary() {
   log "Building provider binary from source (go build -ldflags version stamp)..."
   local version
-  version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
+  version="$(checkout_describe)"
   local bin_tmp
   bin_tmp="$(mktemp "${STAGE_BIN_DIR}/build.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
   if ! ( cd "${REPO_ROOT}" && go build \
@@ -1612,7 +1639,7 @@ step_config() {
 [[provider]]
   name = "${PROVIDER_NAME}"
   provider_type = "external"
-  description = "garm-provider-docker ${gate_what} (${PROVIDER_SOURCE} ${PROVIDER_VERSION}${LOCAL_PROVIDER_SHA256:+, local binary})"
+  description = "garm-provider-docker ${gate_what} ($(provider_label))"
   disable_jit_config = ${disable_jit}
   [provider.external]
     provider_executable = "${PROVIDER_BIN}"
