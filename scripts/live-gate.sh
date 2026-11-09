@@ -339,6 +339,12 @@ EXPL_POOL_TAGS="${POOL_TAGS:-}"
 PROVIDER_SOURCE="${PROVIDER_SOURCE:-release}"
 PROVIDER_VERSION="${PROVIDER_VERSION:-v0.2.5}"
 
+# The checkout identity (git describe) that source-mode preflight built the
+# binary and/or runner image from. It is a recorded value, not a mode the
+# operator can choose: preflight stages it in gate-modes with the artifacts, and
+# later steps label the run from it. Deliberately not read from the environment.
+SOURCE_BUILD_ID=""
+
 # A pre-built local binary (see the header; release or source mode): the path is
 # used by preflight only; the expected sha256 is a remembered mode so later steps
 # can still tell that a local binary is installed.
@@ -704,7 +710,7 @@ validate_local_provider() {
 # variant and interface version. Format: KEY=value lines, parsed WITHOUT
 # sourcing or eval, keys and values strictly allowlisted.
 
-readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME GATE_REGISTRY_MIRROR GATE_INSECURE_REGISTRY LOCAL_PROVIDER_SHA256 GATE_NON_JIT"
+readonly MODE_KEYS="PROVIDER_SOURCE PROVIDER_VERSION GARM_TARGET GATE_VARIANT PROVIDER_INTERFACE_VERSION RUNNER_IMAGE_NAME GATE_REGISTRY_MIRROR GATE_INSECURE_REGISTRY LOCAL_PROVIDER_SHA256 GATE_NON_JIT SOURCE_BUILD_ID"
 
 modes_file() { printf '%s/gate-modes' "${PROVIDER_CONFIG_DIR}"; }
 
@@ -716,6 +722,7 @@ mode_value_valid() {
     GARM_TARGET)                [[ "$2" =~ ^(scaleset|pool)$ ]] ;;
     GATE_VARIANT)               [[ "$2" =~ ^(none|dind)$ ]] ;;
     GATE_NON_JIT)               [[ "$2" =~ ^[01]$ ]] ;;
+    SOURCE_BUILD_ID)            (( ${#2} <= MAX_NAME_LEN )) && [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ;;
     PROVIDER_INTERFACE_VERSION) [[ "$2" =~ ^v0\.1\.[01]$ ]] ;;
     RUNNER_IMAGE_NAME)          [[ "$2" =~ ^(noble|resolute)$ ]] ;;
     # These two may be empty (the mirror check is opt-in).
@@ -751,6 +758,12 @@ explicit_mode_value() {
 stage_modes() {
   local key content=""
   for key in ${MODE_KEYS}; do
+    # PROVIDER_VERSION is ignored in source mode, so it is not remembered
+    # there (the default would read as the version that was gated).
+    [[ "${key}" == PROVIDER_VERSION && "${PROVIDER_SOURCE}" == "source" ]] && continue
+    # SOURCE_BUILD_ID only exists for a source-mode preflight; release-mode
+    # files stay exactly as they were.
+    [[ "${key}" == SOURCE_BUILD_ID && ( "${PROVIDER_SOURCE}" != "source" || -z "${SOURCE_BUILD_ID}" ) ]] && continue
     content+="${key}=${!key}"$'\n'
   done
   STAGE_MODES="${STAGE_CFG_DIR}/gate-modes"
@@ -790,6 +803,19 @@ load_saved_modes() {
 
   for key in ${MODE_KEYS}; do
     [[ " ${seen[*]-} " == *" ${key} "* ]] || continue
+    # An older gate-modes file may carry PROVIDER_VERSION from a source-mode
+    # run; it is ignored there, so neither load nor compare it (PROVIDER_SOURCE
+    # comes first in MODE_KEYS, so it is already effective here).
+    [[ "${key}" == PROVIDER_VERSION && "${PROVIDER_SOURCE}" == "source" ]] && continue
+    # SOURCE_BUILD_ID is recorded by preflight, not chosen by the operator
+    # (explicit_mode_value has no entry for it, so it can never conflict). It
+    # only means something in source mode.
+    if [[ "${key}" == SOURCE_BUILD_ID ]]; then
+      if [[ "${PROVIDER_SOURCE}" == "source" ]]; then
+        v="SAVED_${key}"; SOURCE_BUILD_ID="${!v}"
+      fi
+      continue
+    fi
     v="SAVED_${key}"; v="${!v}"
     expl="$(explicit_mode_value "${key}")"
     cur="${!key}"
@@ -1151,10 +1177,45 @@ publish_staged_artifacts() {
 
 # --- Step 0: preflight -------------------------------------------------------
 
+# checkout_describe prints the build identity of this checkout: what a
+# source-mode binary is stamped with, and what labels a source-mode gate run.
+checkout_describe() {
+  git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev
+}
+
+# record_source_build_id sets SOURCE_BUILD_ID to this checkout's describe, in the
+# form gate-modes allows, for a source-mode preflight to stage with the
+# artifacts it builds from this checkout.
+record_source_build_id() {
+  local id
+  id="$(checkout_describe)"
+  id="${id//[^A-Za-z0-9._-]/_}"
+  id="${id#"${id%%[A-Za-z0-9]*}"}"
+  SOURCE_BUILD_ID="${id:0:${MAX_NAME_LEN}}"
+  [[ -n "${SOURCE_BUILD_ID}" ]] || SOURCE_BUILD_ID="dev"
+}
+
+# provider_label prints how generated output names the provider under test.
+# PROVIDER_VERSION only names a release, so source mode never prints it: it
+# labels the run by the build identity preflight recorded (SOURCE_BUILD_ID: the
+# checkout the binary and/or runner image were built from), not by the checkout
+# as it is now, which may have moved since. With a pre-built binary it adds the
+# binary's expected sha256. An older gate-modes file has no recorded identity.
+provider_label() {
+  local id="${SOURCE_BUILD_ID:-}"
+  if [[ "${PROVIDER_SOURCE}" == "release" ]]; then
+    printf 'release %s%s' "${PROVIDER_VERSION}" "${LOCAL_PROVIDER_SHA256:+, local binary}"
+  elif [[ -n "${LOCAL_PROVIDER_SHA256}" ]]; then
+    printf 'source, local binary sha256 %s, runner image %s' "${LOCAL_PROVIDER_SHA256:0:12}" "${id:+from }${id:-build identity not recorded}"
+  else
+    printf 'source %s' "${id:-build identity not recorded}"
+  fi
+}
+
 build_provider_binary() {
   log "Building provider binary from source (go build -ldflags version stamp)..."
   local version
-  version="$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo dev)"
+  version="$(checkout_describe)"
   local bin_tmp
   bin_tmp="$(mktemp "${STAGE_BIN_DIR}/build.XXXXXX")" || die "could not create a temporary file in ${STAGE_BIN_DIR}"
   if ! ( cd "${REPO_ROOT}" && go build \
@@ -1549,6 +1610,7 @@ step_preflight() {
       runner_image="$(resolve_runner_image_digest)" || exit 1
       ;;
     source)
+      record_source_build_id
       if [[ -n "${LOCAL_PROVIDER_BIN}" ]]; then
         stage_local_provider_binary
       else
@@ -1612,7 +1674,7 @@ step_config() {
 [[provider]]
   name = "${PROVIDER_NAME}"
   provider_type = "external"
-  description = "garm-provider-docker ${gate_what} (${PROVIDER_SOURCE} ${PROVIDER_VERSION}${LOCAL_PROVIDER_SHA256:+, local binary})"
+  description = "garm-provider-docker ${gate_what} ($(provider_label))"
   disable_jit_config = ${disable_jit}
   [provider.external]
     provider_executable = "${PROVIDER_BIN}"
