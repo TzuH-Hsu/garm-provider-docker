@@ -28,6 +28,7 @@ export REPO=<garm-repo-id-or-owner/name>   # from `garm-cli repo list`
 scripts/live-gate.sh                       # scale set, dind_mode=none, v0.2.5 release
 scripts/live-gate.sh --dind                # same, plus the privileged-sidecar variant
 scripts/live-gate.sh --pool                # webhook-driven pool instead of a scale set
+scripts/live-gate.sh --pool --non-jit      # non-JIT registration path (own provider entry, pool with one idle runner)
 ```
 
 Run one of these. It walks through every step and stops wherever you have to
@@ -41,6 +42,7 @@ act. On macOS, or to test uncommitted changes, add `--from-source`.
 - [Scale set (default) vs. pool](#scale-set-default-vs-pool)
 - [The DinD variant](#the-dind-variant)
   - [Registry mirror check (opt-in)](#registry-mirror-check-opt-in)
+- [The non-JIT variant](#the-non-jit-variant)
 - [What this gate proves](#what-this-gate-proves)
 - [What each verification item proves](#what-each-verification-item-proves)
 - [What this gate does not cover](#what-this-gate-does-not-cover)
@@ -113,7 +115,11 @@ act. On macOS, or to test uncommitted changes, add `--from-source`.
      toolchain on first use if yours is older) to build the provider binary,
      and builds the runner image locally
      (`docker build -f runner-images/noble/Dockerfile runner-images`, or
-     `resolute` with `--runner-image resolute`).
+     `resolute` with `--runner-image resolute`). On a host without Go, build
+     the binary elsewhere and hand it over with `LOCAL_PROVIDER_BIN` and
+     `LOCAL_PROVIDER_SHA256`; `--from-source` then skips `go build` and only
+     builds the runner image (see [Source mode with a pre-built
+     binary](#source-mode-with-a-pre-built-binary)).
 5. This repository checked out locally, with `scripts/live-gate.sh`
    executable (`chmod +x scripts/live-gate.sh` if needed).
 6. **Provider paths readable by GARM's service user.** GARM executes the
@@ -153,9 +159,9 @@ the full command list and every environment variable it accepts.
 
 **Modes are remembered between steps.** `preflight` (and `all`) record the
 effective `PROVIDER_SOURCE`, `PROVIDER_VERSION`, `GARM_TARGET`,
-`GATE_VARIANT`, `PROVIDER_INTERFACE_VERSION`, `RUNNER_IMAGE_NAME` and, when
-set, `GATE_REGISTRY_MIRROR` / `GATE_INSECURE_REGISTRY` and the expected
-`LOCAL_PROVIDER_SHA256` in
+`GATE_VARIANT`, `GATE_NON_JIT`, `PROVIDER_INTERFACE_VERSION`,
+`RUNNER_IMAGE_NAME` and, when set, `GATE_REGISTRY_MIRROR` /
+`GATE_INSECURE_REGISTRY` and the expected `LOCAL_PROVIDER_SHA256` in
 `$PROVIDER_CONFIG_DIR/gate-modes` (mode 0600, plain `KEY=value` lines that
 are parsed, never sourced). A later single step run without a flag for a
 mode uses the saved value and logs `using saved <mode>=<value>`, so
@@ -199,7 +205,11 @@ then, depending on mode:
   -f runner-images/<name>/Dockerfile runner-images`), and generates a
   `config.toml` with
   `allow_unpinned_runner_image = true` (required for the mutable local
-  tag).
+  tag). With `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256` set, the `go
+  build` is replaced by staging that pre-built binary after its sha256
+  matches (see [Source mode with a pre-built
+  binary](#source-mode-with-a-pre-built-binary)); the runner image is still
+  built locally.
 
 Either way, Step 0 finishes by running the obtained binary once
 (`GARM_COMMAND=GetVersion`) against the generated config, so a bad
@@ -227,7 +237,9 @@ Prints the exact `[[provider]]` section to add to GARM's own `config.toml`
 the provider executable's absolute path, the generated config file's
 absolute path, and `interface_version = "v0.1.0"` by default
 (`PROVIDER_INTERFACE_VERSION=v0.1.1` overrides it). Pauses for you to add it
-and restart/reload GARM, then confirm with `garm-cli provider list`.
+and restart/reload GARM, then confirm with `garm-cli provider list`. With
+`--non-jit` it prints a separate entry with `disable_jit_config = true`
+instead; see [The non-JIT variant](#the-non-jit-variant).
 
 **Why v0.1.0.** On GARM v0.2.1 and earlier, GARM's own v0.1.1
 `ListInstances` wrapper inverts its error check (`if err == nil` in
@@ -259,7 +271,7 @@ Prints the exact `garm-cli scaleset add` command (`garm-cli pool add` with
 `--pool`) against your `REPO`, with the generated scale set `--name` (the
 workflow's `runs-on`), `--enabled`, `--min-idle-runners 0 --max-runners 1`
 (fixed by design — this gate only ever needs one runner to exist at a
-time), `--extra-specs` in the `--dind` variant, `--os-arch` set to this host's
+time; `--min-idle-runners 1` with `--non-jit`), `--extra-specs` in the `--dind` variant, `--os-arch` set to this host's
 auto-detected architecture (`amd64` or `arm64`; `OS_ARCH` may only restate it),
 and placeholder `--image`/`--flavor` values (required by `garm-cli`, but
 informational only for this provider: `CreateInstance` always uses the
@@ -384,8 +396,8 @@ to reclaim them.
 ## Release mode vs. source mode
 
 `scripts/live-gate.sh` has two modes, selected by `--from-source` (or the
-`PROVIDER_SOURCE` env var), plus a variant of release mode for a locally
-built binary (see below):
+`PROVIDER_SOURCE` env var). Both can take a pre-built provider binary instead
+of obtaining one themselves (see below):
 
 - **`release`** (default) — validates a **published release**, exactly as
   an operator would install it:
@@ -420,7 +432,8 @@ built binary (see below):
 A pre-tag gate often needs the opposite split from `source`: a provider binary
 built from the commit under test, run against the **published** runner image,
 on a host where building images is not acceptable. Set both of these (they are
-only valid together, and not with `--from-source`):
+only valid together; with `--from-source` they do something different, see
+the next section):
 
 ```sh
 export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker   # absolute path, executable
@@ -452,6 +465,43 @@ Everything stays release mode except where the binary comes from:
 
 A result from this mode proves the **commit and binary you built**, not the
 published release asset; see [Recording a result](#recording-a-result).
+
+### Source mode with a pre-built binary
+
+`--from-source` normally runs `go build`, so the gate host needs a Go
+toolchain. When it has none and installing one is not wanted, cross-compile the
+binary elsewhere (for the host's OS and architecture, from the commit under
+test) and give the gate the file and its sha256, the same pair as above:
+
+```sh
+# on the build machine
+GOOS=linux GOARCH=amd64 go build -o garm-provider-docker .
+sha256sum garm-provider-docker
+
+# on the gate host (no Go needed)
+export LOCAL_PROVIDER_BIN=/opt/garm-gate/build/garm-provider-docker
+export LOCAL_PROVIDER_SHA256=<the sha256 printed on the build machine>
+scripts/live-gate.sh --from-source preflight
+```
+
+- The binary goes through the same verification as in release mode: preflight
+  copies it into its private staging directory, hashes the **copy**, and dies on
+  a mismatch, so an unverified binary is never staged or run. Compute the
+  expected value where you built the binary, not from the file being checked.
+- `go build` is skipped and `go` is not required. Nothing else changes in
+  source mode: the runner image is still built locally from
+  `runner-images/<name>` (`docker build`), and the generated config still sets
+  `allow_unpinned_runner_image = true`. The runner image therefore comes from the
+  checkout the script runs in, so keep that checkout at the commit the binary was
+  built from.
+- The warning, preflight summary line, `config.toml` comment, `, local binary`
+  in the `[[provider]]` description and the remembered `LOCAL_PROVIDER_SHA256` in
+  `gate-modes` work as in release mode.
+- Without `LOCAL_PROVIDER_BIN` and `LOCAL_PROVIDER_SHA256`, source mode behaves
+  exactly as before. Setting only one of the two is an error.
+
+As in release mode, a result from this run proves the commit and binary you
+built; record both (see [Recording a result](#recording-a-result)).
 
 Either mode gates the Ubuntu 24.04 runner image by default. `--runner-image
 resolute` (or `RUNNER_IMAGE_NAME=resolute`) gates the Ubuntu 26.04 image
@@ -621,6 +671,101 @@ log before suspecting the provider. Overriding the nested bridge range (for
 example `--bip` or `default-address-pools` through a custom `dind_image`) is
 outside this gate.
 
+## The non-JIT variant
+
+`--non-jit` (or `GATE_NON_JIT=1`) is an **optional** variant that gates the
+non-JIT registration path. It needs `--pool` and cannot be combined with
+`--dind`.
+
+```sh
+export REPO=<garm-repo-id-or-owner/name>
+scripts/live-gate.sh --pool --non-jit
+```
+
+**Why a pool.** Without JIT the provider delivers a registration token to
+`/run/garm/registration-token`; the runner image's entrypoint reads it, deletes
+the file at once, and only then runs `config.sh`, so a job step never sees the
+token (a registration token can register further runners in the same scope while
+it is valid). Scale sets never reach this path: GARM forces JIT for them whatever
+`disable_jit_config` says. Only a pool on a provider entry with
+`disable_jit_config = true` takes it, so the default scale-set gate leaves the
+token deletion untested.
+
+**Why `--min-idle-runners 1`.** The gate host is meant to sit behind a NAT and
+receives no GitHub webhooks, so a pool never creates a runner on demand. GARM's
+own loop (`ensureMinIdleRunners`) does not need a webhook: with
+`--min-idle-runners 1` it creates one idle runner as soon as the pool is
+enabled, and that runner pulls the queued job from GitHub itself. The pool is
+still capped at `--max-runners 1`, and carries the dedicated tag
+`garm-gate-nonjit` (override with `POOL_TAGS`) so no other job lands on it.
+
+**Why a separate provider entry.** `disable_jit_config` belongs to GARM's
+`[[provider]]` entry, not to the pool. Step 1 therefore prints a **second** entry,
+`docker_gate_nonjit` by default (override with `PROVIDER_NAME`), with
+`disable_jit_config = true`. It points at the same provider executable and config
+file as the normal gate entry, which stays as it is and keeps serving scale sets.
+GARM reads its `[[provider]]` sections at startup, so adding the entry **requires
+a GARM restart**. The entry is kept after the run; the next non-JIT run reuses it.
+Make sure the pool uses this entry (Step 2 prints `--provider-name` for it): on
+the normal entry the runner would take the JIT path and `verify` would fail.
+
+What changes compared with the default gate:
+
+- **Step 1** prints the `docker_gate_nonjit` block described above, with the note
+  that it is an additional entry and needs a restart.
+- **Step 2** prints `garm-cli pool add ... --min-idle-runners 1 --max-runners 1
+  --tags garm-gate-nonjit` against the non-JIT provider entry. The runner appears
+  shortly after the pool is enabled and waits for the job. It is ephemeral, so
+  after the job GARM creates a replacement idle runner until the pool is scaled to
+  zero (see below). Note the pool ID: `verify`, `watch` and the teardown need it
+  (`POOL_ID`).
+- **Step 3** prints the sample workflow as `garm-live-gate-nonjit.yml`, with
+  `runs-on: ["garm-gate-nonjit"]` and an extra step that fails if the token is
+  visible to the job (`test ! -e /run/garm/registration-token`).
+- **Step 4** expects JIT to be disabled: the runner's `JIT_CONFIG_ENABLED` must be
+  `false`, otherwise the pool is not on the non-JIT entry and the run FAILs. The
+  token check of check (c) is mandatory here: after the registration wait
+  (up to 60 seconds), `/run/garm/registration-token` still being present is a
+  FAIL, whether or not the runner managed to register (in the default gate the
+  check is skipped for a runner that has not registered). The other checks are
+  the same as for JIT runners: the entrypoint moves the credentials onto the
+  tmpfs after `config.sh` has succeeded, so the same files and symlinks are
+  checked.
+- **`watch` and `postjob`** record only the first runner they see as the gate's
+  runner, because of the replacement idle runner. The replacement is not part of
+  the checks. `watch` clears the recorded instances when it starts. `verify`
+  inspects the recorded runner (or `GATE_INSTANCE`) and never swaps in a
+  runner the pool lists now: if the recorded runner's container is already gone,
+  it FAILs with "verification window missed", and you re-run `watch` and
+  `verify` with a fresh job. Without a recorded runner, `verify` warns and takes
+  the one GARM lists, which after a finished job is the replacement idle runner,
+  so start `watch` before triggering the job and run `verify` while the job
+  holds.
+
+**Teardown.** Because GARM keeps replacing the idle runner, scale the pool down
+before deleting it. The Cleanup step prints:
+
+1. `garm-cli pool update <POOL_ID> --min-idle-runners 0 --enabled=false`
+2. wait until `garm-cli runner list <POOL_ID>` lists no runners
+3. `garm-cli pool delete <POOL_ID>`
+4. check the test repository's runner list on GitHub (Settings > Actions >
+   Runners, or `gh api repos/<owner>/<name>/actions/runners`) for leftovers and
+   remove any that remain
+
+and tells you to keep the `docker_gate_nonjit` provider entry, together with the
+binary and config directory it points at.
+
+**Known limitation: pending status and slow deletion.** GARM's runner status
+reporting is JIT-only. For a non-JIT runner GARM can therefore keep reporting it
+as pending although its container has registered and is idle, it can take long
+to notice that the ephemeral runner finished and delete it, and a runner can
+linger in GitHub's list. The gate treats this as a known limitation, not a
+failure: `verify` inspects the container rather than GARM's status, and `postjob`
+logs, instead of failing, that GARM has not deleted the runner container within
+`POST_JOB_WAIT_SECONDS` (and skips the leftover-resource check for that run;
+re-run `postjob` after GARM has deleted it or after the pool teardown). The
+teardown above removes what is left.
+
 ## What this gate proves
 
 | # | Verification item | Maps to |
@@ -668,6 +813,10 @@ It does **not** exercise:
 | Step 0 fails to resolve the runner image digest | `docker buildx` missing, or this host cannot reach `ghcr.io` | Confirm `docker buildx version` works; check outbound network/proxy/firewall rules for `ghcr.io`. |
 | No job is ever picked up in scale-set mode | The workflow's `runs-on` does not exactly match the scale set name, the scale set is disabled, or GARM cannot reach GitHub (outbound HTTPS) | `garm-cli scaleset show <id>` (enabled? name?); compare `runs-on` with the name in the script's output; check GARM's logs for message-queue errors. |
 | No job is ever picked up in pool mode (`--pool`) | GitHub cannot deliver webhooks to GARM (e.g. GARM behind a NAT) | Use the default scale-set mode, or expose the webhook endpoint. |
+| `--non-jit` Step 4(c) reports `JIT_CONFIG_ENABLED is 'true'` | The pool was created on the normal provider entry, or `docker_gate_nonjit` was added without `disable_jit_config = true` | `garm-cli pool show <POOL_ID>` must name the provider printed in Step 1; confirm the entry in GARM's `config.toml` and that GARM was restarted after adding it. |
+| `--non-jit` Step 4(c) reports `/run/garm/registration-token still present` | The runner image predates the entrypoint change that deletes the token after reading it, or the entrypoint stopped before reading it | Use a runner image built from the current checkout (`--from-source`) or a release that includes the change; read `docker logs <runner>`. |
+| `--non-jit` Step 2: no runner ever appears | The pool is disabled, the `min-idle-runners 1` setting was not applied, or GARM was not restarted after adding the provider entry | `garm-cli pool show <POOL_ID>` (enabled? min idle?), `garm-cli provider list`, and GARM's log for provider errors. |
+| `--non-jit` runner stays pending in GARM, or `postjob` logs the "known non-JIT limitation" line | GARM's status reporting is JIT-only | Not a failure. Run the teardown from Cleanup and check GitHub's runner list for leftovers. |
 | `--dind` Step 4(b) reports the sidecar missing or the runner cannot reach its daemon | `allowed_dind_modes`/`extra_specs` not applied, the sidecar failed to start, or `docker:dind` could not be pulled | `docker ps -a --filter label=garm.docker/role=dind`; `docker logs <sidecar>`; confirm the scale set was created with the printed `--extra-specs`. |
 | `--dind` Step 4(b) reports the sidecar not in the runner's network namespace, or a published port not reachable at `127.0.0.1` | A provider older than the 2026-10-12 shared network namespace change (ADR-001), or a runner image without `curl` | Check the provider version; `docker inspect -f '{{.HostConfig.NetworkMode}}' <sidecar>` must print `container:<runner id>`. |
 | Runner container never appears after `garm-cli scaleset add` / `pool add` | The provider failed silently from GARM's point of view, or the pool/provider isn't wired up correctly | Check GARM's own log output (`docker logs garm` if run via Docker, `journalctl -u garm` if run via systemd) for lines mentioning this provider's executable or name — GARM logs a provider subprocess's stderr on failure. Confirm `garm-cli provider list` shows the provider and `garm-cli pool show <POOL_ID>` shows it `enabled`. This provider logs structured key=value lines (`internal/logging`); look for `level=ERROR` entries. |
@@ -692,7 +841,7 @@ table, so the result can be cited later without re-running it. Record:
   printed.
 - **Host**: OS and architecture (`uname -sm`) and `docker version`'s
   `Server.Version`.
-- **The provider binary, when `LOCAL_PROVIDER_BIN` was used**: the git
+- **The provider binary, when `LOCAL_PROVIDER_BIN` was used** (in either mode): the git
   commit it was built from (and whether the tree was clean) and its sha256,
   as given in `LOCAL_PROVIDER_SHA256` and echoed by the preflight summary. A
   result from a local binary says nothing about the published release asset
@@ -700,8 +849,9 @@ table, so the result can be cited later without re-running it. Record:
   (or the release is gated again in plain release mode), so state which it is.
 - **Per-item PASS/FAIL**: the (a)–(e) results from Step 4's output (paste
   the script's own PASS/FAIL lines rather than summarizing from memory).
-- **Mode**: `release`, `release` with a local binary, or `--from-source`;
-  dispatch target (scale set or `--pool`); variant (`none` or `--dind`); and
-  whether `-y`/`--yes` was used.
+- **Mode**: `release`, `release` with a local binary, `--from-source`, or
+  `--from-source` with a pre-built binary; dispatch target (scale set or
+  `--pool`); variant (`none`, `--dind` or `--non-jit`); and whether
+  `-y`/`--yes` was used.
 - **Date** the run happened, since GARM, this provider, and the runner
   image can all move independently between runs.
