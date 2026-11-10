@@ -120,6 +120,18 @@ RUN chown runner:runner /usr/local/bin /usr/local/lib
 # modes) before execing the runner.
 COPY --chmod=0755 common/entrypoint.sh /entrypoint.sh
 
+# Job-started hook (ADR-002): the runner runs ACTIONS_RUNNER_HOOK_JOB_STARTED
+# before the first step of every job. The dispatcher runs each check in
+# job-started.d, and the shipped check fails a job whose pnpm store holds a
+# 0-byte pnpm binary instead of letting it pass green without running
+# anything. Root-owned and not writable by the runner user, so a job cannot
+# replace a hook. The path must end in .sh. A value set in the container's
+# environment replaces this one; GARM_JOB_HOOKS=fail|warn|off tunes it
+# (runner-images/README.md).
+COPY --chmod=0755 common/hooks/job-started.sh /opt/garm/hooks/job-started.sh
+COPY --chmod=0755 common/hooks/job-started.d/ /opt/garm/hooks/job-started.d/
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh
+
 ENTRYPOINT ["/entrypoint.sh"]
 # CMD is documentation only: the entrypoint always execs ./run.sh.
 CMD ["./run.sh"]

@@ -57,6 +57,53 @@ func TestVerifyRunnerImageContents(t *testing.T) {
 	}
 }
 
+// verifyJobStartedHooks checks the job-started hook the image ships: the
+// dispatcher and its drop-ins are root-owned and mode 0755, the runner is told
+// to run the dispatcher, and the dispatcher, run the way the runner runs a hook
+// (bash --noprofile --norc -e -o pipefail, as the runner user), fails on a
+// store holding a 0-byte pnpm binary and passes on a healthy one.
+func verifyJobStartedHooks(t *testing.T, tag string) {
+	t.Helper()
+	const hook = "/opt/garm/hooks/job-started.sh"
+
+	env := dockerOut(t, "image", "inspect", tag, "-f", "{{range .Config.Env}}{{println .}}{{end}}")
+	if !strings.Contains(env, "ACTIONS_RUNNER_HOOK_JOB_STARTED="+hook+"\n") {
+		t.Errorf("image env lacks ACTIONS_RUNNER_HOOK_JOB_STARTED=%s:\n%s", hook, env)
+	}
+
+	for _, path := range []string{
+		"/opt/garm", "/opt/garm/hooks", "/opt/garm/hooks/job-started.d",
+		hook, "/opt/garm/hooks/job-started.d/10-pnpm-store.sh",
+	} {
+		out := dockerOut(t, "run", "--rm", "--entrypoint", "stat", tag, "-c", "%U:%G %a", path)
+		if out != "root:root 755" {
+			t.Errorf("%s is %q, want root:root 755 (a job must not be able to replace a hook)", path, out)
+		}
+	}
+
+	// A planted store, as the runner user, through the real dispatcher.
+	const plant = "set -e; s=$(mktemp -d); " +
+		"d=$s/v11/links/@pnpm/exe/11.7.0/aaaa/node_modules/@pnpm/exe; mkdir -p \"$d\"; " +
+		"printf x > \"$d/pnpm\"; " +
+		"export pnpm_config_store_dir=$s; run() { bash --noprofile --norc -e -o pipefail " + hook + "; }; "
+	runner := func(script string) (string, error) {
+		return dockerTry("run", "--rm", "--user", "runner", "--entrypoint", "bash", tag, "-c", plant+script)
+	}
+	if out, err := runner("run"); err != nil {
+		t.Errorf("hook failed on a healthy store: %v\n%s", err, out)
+	}
+	out, err := runner(": > \"$d/pnpm\"; run")
+	if err == nil {
+		t.Errorf("hook passed on a store with a 0-byte pnpm binary:\n%s", out)
+	}
+	if !strings.Contains(out, "::error title=Damaged pnpm store::") {
+		t.Errorf("hook did not print the pnpm annotation:\n%s", out)
+	}
+	if out, err := runner(": > \"$d/pnpm\"; GARM_JOB_HOOKS=warn run"); err != nil {
+		t.Errorf("hook failed in warn mode: %v\n%s", err, out)
+	}
+}
+
 func verifyRunnerImageContents(t *testing.T, root, name string) {
 	want, ok := imageExpectations[name]
 	if !ok {
@@ -100,6 +147,8 @@ func verifyRunnerImageContents(t *testing.T, root, name string) {
 	if out, err := dockerTry("run", "--rm", "--user", "runner", "--entrypoint", "bash", tag, "-c", probe); err != nil {
 		t.Errorf("runner user cannot install into /usr/local/bin and /usr/local/lib as intended: %v\n%s", err, out)
 	}
+
+	verifyJobStartedHooks(t, tag)
 
 	// Open-file soft limit, against the REAL raise_nofile_soft_limit (entrypoint
 	// sourced, main not run). The entrypoint's own effect is asserted exactly
