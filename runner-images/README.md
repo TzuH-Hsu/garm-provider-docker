@@ -185,8 +185,8 @@ The shipped check is `10-pnpm-store.sh`. It reads the store from `pnpm_config_st
 
 | Value | Effect |
 |---|---|
-| `fail` (default; also unset or empty) | After all checks have run, the hook exits 1. "Set up runner" fails, no step runs, and the job is red. |
-| `warn` | The annotations are printed and the job runs. |
+| `fail` (default; also unset or empty) | Each finding is printed as an error annotation. After all checks have run, the hook exits 1. "Set up runner" fails, no step runs, and the job is red. |
+| `warn` | Each finding is printed as a warning annotation, and the job runs. |
 | `off` | No check runs. |
 
 An unknown value acts as `fail` and prints a warning that names the value, so a typo cannot switch the checks off quietly. An image built on these, or a runner started without the provider, can set `GARM_JOB_HOOKS` itself (for example with an `ENV` line) and gets the same behaviour. `extra_env` cannot set it, because the `GARM_` prefix is reserved.
@@ -196,9 +196,11 @@ An unknown value acts as `fail` and prints a warning that names the value, so a 
 
 | Exit status | Meaning |
 |---|---|
-| `0` | Nothing wrong, or nothing to check. |
-| `10` | Damage detected. The check has already printed an annotation, for example `::error title=...::<what is wrong, why it matters, how to fix it>`, on one line. |
-| anything else, or a timeout | The check itself malfunctioned. The dispatcher prints a `::warning::` that names the check, ignores the result and continues, so a buggy check cannot fail every job. |
+| `0` | Nothing wrong, or nothing to check. Anything the check printed is discarded. |
+| `10` | Damage detected. The check prints a plain message on stdout: what is wrong, why it matters and how to fix it. |
+| anything else, or a timeout (30 s) | The check itself malfunctioned. The dispatcher prints a `::warning::` that names the check, ignores the result and continues, so a buggy check cannot fail every job. |
+
+**A check prints a plain message, never a workflow command.** The dispatcher owns the annotation level. It reads what the check printed (stdout and stderr, at most 4 KiB, longer output is cut and marked), and for exit status `10` it prints one annotation named after the file (`10-pnpm-store.sh` becomes the title "Job-started check failed: pnpm-store"). The annotation is an error in `fail` mode and a warning in `warn` mode, so a job that carries on never shows a failure-level annotation. The message is escaped (`%`, carriage return and line feed, and `:` and `,` in the title) and only ever printed inside that annotation, so a check cannot start a workflow command of its own (`::set-env`, `::add-mask`, ...), even by accident. Write the message as one short paragraph.
 
 The runner executes the dispatcher as `bash --noprofile --norc -e -o pipefail <file>` and ignores its shebang. The
 dispatcher guards its own commands for that. A check should stay read-only, cheap and silent when nothing is

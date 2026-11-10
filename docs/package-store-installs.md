@@ -127,13 +127,13 @@ bootstraps 11.19.0 and v6.1.0 bootstraps 11.25.0. Each switch also leaves a dang
 **The runner image now checks for it.** A damaged store used to turn every job green without running anything.
 The runner images ([`runner-images/README.md`](../runner-images/README.md#job-started-hook)) run a check before
 the first step of every job. If the store has a 0-byte `pnpm` binary, the job fails at "Set up runner", no step
-runs, and the run shows an error annotation titled "Damaged pnpm store" that names the cause and the fix. The
+runs, and the run shows an error annotation titled "Job-started check failed: pnpm-store" that names the cause and the fix. The
 first job that starts on a damaged store is the one that fails, and so does every later job until the store is
 replaced. The check reads the store from `pnpm_config_store_dir` (or `npm_config_store_dir`), which the provider
 sets only while the persistent store is mounted, and it costs a few milliseconds. It looks for exactly the entry
 that the manual check below does.
 
-To keep jobs running while you fix a store, the operator can set `job_hooks = "warn"` (print the annotation and run the job) or `job_hooks = "off"` (do not check) at the top level of the provider config, or for one pool with `{"job_hooks": "warn"}` in its `extra_specs`. The default is `"fail"`. Change it back once the store is replaced ([config reference](config-reference.md#job-hooks-job_hooks)). A custom runner image has the check only if it is built from these images or copies the hook.
+To keep jobs running while you fix a store, the operator can set `job_hooks = "warn"` (print a warning annotation and run the job) or `job_hooks = "off"` (do not check) at the top level of the provider config, or for one pool with `{"job_hooks": "warn"}` in its `extra_specs`. The default is `"fail"`. Change it back once the store is replaced ([config reference](config-reference.md#job-hooks-job_hooks)). A custom runner image has the check only if it is built from these images or copies the hook.
 
 **What to do.**
 

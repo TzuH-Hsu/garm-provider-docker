@@ -7,9 +7,11 @@
 # 0, so install, lint, test and build steps all pass without running anything.
 #
 # Exit 0: nothing wrong, or no pnpm store to look at. Exit 10: damage found,
-# after printing an ::error:: annotation. The dispatcher (job-started.sh) runs
-# this as `bash <file>`; it is read-only and stays cheap (a stat and a find
-# over a handful of directories).
+# after printing a plain message. The dispatcher (job-started.sh) runs this as
+# `bash <file>` and turns the message into an error or warning annotation
+# according to GARM_JOB_HOOKS, so this script prints no workflow commands. It
+# is read-only and stays cheap (a stat and a find over a handful of
+# directories).
 #
 # The predicate is the one the manual operator check in the docs uses:
 #   find <store>/v11/links/@pnpm -path '*/node_modules/@pnpm/*/pnpm' -type f -size 0
@@ -34,5 +36,5 @@ hit=$(find "$links" -path '*/node_modules/@pnpm/*/pnpm' -type f -size 0 -print -
 # from a store a job could write to).
 entry=$(printf '%s' "${hit#"$store"/}" | tr -c '[:print:]' '?')
 
-echo "::error title=Damaged pnpm store::The repository's persistent pnpm store holds a 0-byte pnpm binary ($entry). Every pnpm command in this job would print nothing and exit 0, so install, lint, test and build steps would pass without running. Use pnpm/action-setup v6.1.0 or newer (it bootstraps pnpm 11.22.0 or newer). The runner operator must also remove this repository's pnpm cache volume, because newer pnpm versions do not repair the emptied file. Details: $DOCS_URL"
+echo "The repository's persistent pnpm store holds a 0-byte pnpm binary ($entry). Every pnpm command in this job would print nothing and exit 0, so install, lint, test and build steps would pass without running. Use pnpm/action-setup v6.1.0 or newer (it bootstraps pnpm 11.22.0 or newer). The runner operator must also remove this repository's pnpm cache volume, because newer pnpm versions do not repair the emptied file. Details: $DOCS_URL"
 exit 10

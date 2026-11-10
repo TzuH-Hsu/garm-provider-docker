@@ -222,8 +222,11 @@ then pass without doing its work. The case seen is a 0-byte `pnpm` binary in the
 The images therefore set `ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh`. The runner runs that
 script before the first step of every job, as the `runner` user after the privilege drop, and shows its output
 in the job log. It is a dispatcher that runs each `/opt/garm/hooks/job-started.d/*.sh` in name order with a
-per-check timeout. A check exits 0 for fine, 10 for damage it has already printed an `::error::` annotation for,
-and anything else for "the check itself broke", which only warns. `GARM_JOB_HOOKS` decides what damage does:
+per-check timeout. A check exits 0 for fine, 10 for damage with a plain message on stdout, and
+anything else for "the check itself broke", which only warns. The dispatcher, not the check, owns the
+annotation: it captures the message (capped, escaped, never echoed raw) and emits one `::error::` in `fail` mode
+or one `::warning::` in `warn` mode, so a job that goes on never carries a failure-level annotation and a check
+cannot inject a workflow command. `GARM_JOB_HOOKS` decides what damage does:
 `fail` (the default) exits 1, which fails "Set up runner" and skips every step; `warn` continues; `off` skips the
 checks. The hook files are root-owned `0755`, so a job cannot replace them. An operator-set
 `ACTIONS_RUNNER_HOOK_JOB_STARTED` in the container environment replaces ours, and a derived image adds checks by

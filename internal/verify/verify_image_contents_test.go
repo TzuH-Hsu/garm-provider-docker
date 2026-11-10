@@ -96,11 +96,15 @@ func verifyJobStartedHooks(t *testing.T, tag string) {
 	if err == nil {
 		t.Errorf("hook passed on a store with a 0-byte pnpm binary:\n%s", out)
 	}
-	if !strings.Contains(out, "::error title=Damaged pnpm store::") {
-		t.Errorf("hook did not print the pnpm annotation:\n%s", out)
+	if !strings.Contains(out, "::error title=Job-started check failed%3A pnpm-store::") {
+		t.Errorf("hook did not print the pnpm error annotation:\n%s", out)
 	}
-	if out, err := runner(": > \"$d/pnpm\"; GARM_JOB_HOOKS=warn run"); err != nil {
+	out, err = runner(": > \"$d/pnpm\"; GARM_JOB_HOOKS=warn run")
+	if err != nil {
 		t.Errorf("hook failed in warn mode: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "::warning title=Job-started check found damage%3A pnpm-store::") || strings.Contains(out, "::error") {
+		t.Errorf("warn mode must annotate with a warning only:\n%s", out)
 	}
 }
 

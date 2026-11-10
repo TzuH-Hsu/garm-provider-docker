@@ -102,8 +102,8 @@ A job can leave a persistent cache, such as the pnpm store, in a state that make
 
 | Value | Effect |
 |---|---|
-| `fail` (default) | The job fails before its first step, with an annotation that names the cause and the fix. |
-| `warn` | The annotation is printed and the job runs. |
+| `fail` (default) | The job fails before its first step, with an error annotation that names the cause and the fix. |
+| `warn` | The finding is printed as a warning annotation (never an error) and the job runs. |
 | `off` | The checks do not run. |
 
 Set the default for every pool with the top-level key `job_hooks` in the provider config, and override it for one pool with `{"job_hooks": "warn"}` in its `extra_specs`. The pool's value wins, then the config's, then `fail`. An unknown value is a config error at load and an `extra_specs` rejection. There is no `allowed_*` ceiling, because a pool that turns a check off gains no privilege and only loses a safety net. The provider always sets the resolved value in the runner container as `GARM_JOB_HOOKS`. Runner images that do not carry the hook ignore it, and a custom image that sets `GARM_JOB_HOOKS` itself gets the same behaviour ([`runner-images/README.md`](../runner-images/README.md#job-started-hook)).

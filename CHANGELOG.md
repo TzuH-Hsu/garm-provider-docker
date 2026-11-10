@@ -18,7 +18,8 @@ Earlier versions are described on the
   behind (`pnpm/action-setup` before v6.1.0). Before, every `pnpm` command in
   such a job printed nothing and exited 0, so install, lint, test and build
   steps passed without running. Now the job fails at "Set up runner" with an
-  annotation that names the cause and the fix. The operator still has to remove
+  error annotation that names the cause and the fix (a warning annotation when
+  `job_hooks` is `warn`). The operator still has to remove
   the repository's pnpm cache volume; see `docs/package-store-installs.md`.
   Other checks can be added as files in `/opt/garm/hooks/job-started.d/` of a
   derived image. The hook needs a runner image built from this change.
