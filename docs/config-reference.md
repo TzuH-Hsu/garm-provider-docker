@@ -89,10 +89,25 @@ they are rejected rather than silently ignored.
 - **`extra_env` is fail-closed through an operator allowlist.** The operator lists the variable names a pool may set in `[extra_specs].allowed_env`, which is **empty** by default. A name not on the list is **rejected**, so by default a pool can inject no extra environment at all.
 - **`extra_env` names must match `^[A-Za-z_][A-Za-z0-9_]*$`.** A key containing `=`, whitespace, non-ASCII characters or a leading digit is rejected. Otherwise the key `JIT_CONFIG_ENABLED=false` would reach Docker as `JIT_CONFIG_ENABLED=false=<value>` and set a reserved variable.
 - **Hard-reserved `extra_env` names are always rejected, even if allowlisted (case-insensitive):**
-  - prefixes `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*`, `GARM_*`, `LD_*`
+  - prefixes `RUNNER_*`, `DOCKER_*`, `ACTIONS_RUNNER_INPUT_*`, `GARM_*` (except `GARM_JOB_HOOKS`, below), `LD_*`
   - exact `JIT_CONFIG_ENABLED`, `GITHUB_URL`, `RUN_AS_ROOT`, `WAIT_FOR_DOCKER_SECONDS`, `BASH_ENV`, `ENV`, `IFS`, `PATH`, `NODE_OPTIONS`
 
   The provider, the runner-image entrypoint or the interpreter relies on these names. `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=...` would break the single-job teardown model or the DinD socket guarantees. `RUN_AS_ROOT=true` would run the runner and its job as **root**. The entrypoint reads `GARM_CRED_WAIT_SECONDS` and `WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic, where a crafted value is command substitution as root. `BASH_ENV`, `LD_*` and `PATH` are shell and loader hijack vectors. A non-reserved, allowlisted name that collides with another provider-injected variable is dropped in favour of the provider's value: **provider-injected environment always wins**.
+- **`GARM_JOB_HOOKS` is the one `GARM_` name a pool can set, and only if you allowlist it.** It sets what the
+  runner image's job-started hook does when a check finds damage (today: a 0-byte `pnpm` binary in a repository's
+  persistent pnpm store, see [`package-store-installs.md`](package-store-installs.md#pnpm-switching-its-own-version-pnpm-11-before-1122)):
+
+  | Value | Effect |
+  |---|---|
+  | `fail` (default, also when unset or empty) | The job fails before its first step, with an annotation that names the cause and the fix. |
+  | `warn` | The annotation is printed and the job runs. |
+  | `off` | The checks do not run. |
+
+  An unknown value acts as `fail` and prints a warning that names it. The name is matched exactly (not
+  case-insensitively like the other reserved names), because the hook reads that exact name. Unlike
+  `GARM_CRED_WAIT_SECONDS`, the hook runs as the unprivileged `runner` user and compares the value with fixed words
+  only, which is why this one name is safe to open. Add it to `[extra_specs].allowed_env`, then give a pool
+  `{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`. Runner images that do not carry the hook ignore it.
 
 ### Never settable from `extra_specs` (structurally)
 
@@ -291,9 +306,9 @@ set no extra env at all); add the names you trust a pool admin to set:
 ```toml
 [extra_specs]
 # Environment-variable NAMES a pool's extra_specs.extra_env may set. Default empty.
-# Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) are
-# rejected even if listed here.
-allowed_env = ["MY_CI_FLAG", "TZ"]
+# Hard-reserved names (RUNNER_*, DOCKER_*, GARM_* except GARM_JOB_HOOKS, RUN_AS_ROOT,
+# PATH, LD_*, ...) are rejected even if listed here.
+allowed_env = ["MY_CI_FLAG", "TZ"]   # add "GARM_JOB_HOOKS" to let a pool choose fail, warn or off
 ```
 
 ### `[status_report]` (runner status reported to GARM)

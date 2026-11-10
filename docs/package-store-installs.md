@@ -124,6 +124,21 @@ In two consecutive jobs on one fresh store, bootstraps 11.5.0, 11.15.0, 11.19.0,
 bootstraps 11.19.0 and v6.1.0 bootstraps 11.25.0. Each switch also leaves a dangling symlink in
 `<store>/v11/projects`, which does not affect installs.
 
+**The runner image now checks for it.** A damaged store used to turn every job green without running anything.
+The runner images ([`runner-images/README.md`](../runner-images/README.md#job-started-hook)) run a check before
+the first step of every job. If the store has a 0-byte `pnpm` binary, the job fails at "Set up runner", no step
+runs, and the run shows an error annotation titled "Damaged pnpm store" that names the cause and the fix. The
+first job that starts on a damaged store is the one that fails, and so does every later job until the store is
+replaced. The check reads the store from `pnpm_config_store_dir` (or `npm_config_store_dir`), which the provider
+sets only while the persistent store is mounted, and it costs a few milliseconds. It looks for exactly the entry
+that the manual check below does.
+
+To keep jobs running while you fix a store, the operator can set `GARM_JOB_HOOKS` to `warn` (print the annotation
+and run the job) or `off` (do not check) for a pool. The name goes on `[extra_specs].allowed_env`, and the pool's
+`extra_specs` carries `{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`
+([config reference](config-reference.md#ceilings-the-extra_env-allowlist-and-the-hard-reserved-set)). A custom
+runner image has the check only if it is built from these images or copies the hook.
+
 **What to do.**
 
 - **Repositories:** use `pnpm/action-setup` v6.1.0 or newer, or any setup whose bootstrap pnpm is 11.22.0 or

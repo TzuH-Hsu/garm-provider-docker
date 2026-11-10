@@ -165,6 +165,60 @@ image's own Node through a small `/usr/local/bin/pnpm` wrapper. The pnpm **major
 provider's `[cache].pnpm_major` (default `9`), because the store layout is tied to it. When you change one,
 change the other.
 
+## Job-started hook
+
+A job can leave a directory that the provider persists (the pnpm store, the toolcache) in a state that makes
+later jobs of the same repository pass without doing their work. The images set
+`ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh`, so the runner runs that script before the first
+step of every job and shows its output in the job log. The script is a dispatcher: it runs every
+`/opt/garm/hooks/job-started.d/*.sh` in name order, each as `bash <file>` under a timeout (30 s by default,
+`GARM_JOB_HOOKS_TIMEOUT` in seconds), and then decides what the job does. The hook files are root-owned `0755`,
+so a job cannot replace them. The step costs a few milliseconds when nothing is wrong.
+
+The shipped check is `10-pnpm-store.sh`. It reads the store from `pnpm_config_store_dir` (else
+`npm_config_store_dir`), does nothing if that is unset or not a directory, and reports damage if the store holds a
+0-byte pnpm binary, the state that `pnpm/action-setup` before v6.1.0 can leave behind
+([`package-store-installs.md`](../docs/package-store-installs.md#pnpm-switching-its-own-version-pnpm-11-before-1122)).
+
+**What happens on damage: `GARM_JOB_HOOKS`.**
+
+| Value | Effect |
+|---|---|
+| `fail` (default; also unset or empty) | After all checks have run, the hook exits 1. "Set up runner" fails, no step runs, and the job is red. |
+| `warn` | The annotations are printed and the job runs. |
+| `off` | No check runs. |
+
+An unknown value acts as `fail` and prints a warning that names the value, so a typo cannot switch the checks off
+quietly. A pool sets the value through `extra_specs.extra_env` after the operator lists `GARM_JOB_HOOKS` in
+`[extra_specs].allowed_env` ([config reference](../docs/config-reference.md#ceilings-the-extra_env-allowlist-and-the-hard-reserved-set)).
+
+**The drop-in contract.** A check is a file named `NN-name.sh` in `job-started.d/`, run as
+`bash --noprofile --norc <file>` as the runner user, with the job's environment.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | Nothing wrong, or nothing to check. |
+| `10` | Damage detected. The check has already printed an annotation, for example `::error title=...::<what is wrong, why it matters, how to fix it>`, on one line. |
+| anything else, or a timeout | The check itself malfunctioned. The dispatcher prints a `::warning::` that names the check, ignores the result and continues, so a buggy check cannot fail every job. |
+
+The runner executes the dispatcher as `bash --noprofile --norc -e -o pipefail <file>` and ignores its shebang. The
+dispatcher guards its own commands for that. A check should stay read-only, cheap and silent when nothing is
+wrong, and should treat a missing directory as "nothing to check". Keep every check's output to what the
+developer reading the job log needs.
+
+**Adding a check in a derived image.** Copy a file into the directory, root-owned and not writable by the runner
+user, and leave the rest of the hook in place:
+
+```dockerfile
+FROM ghcr.io/tzuh-hsu/garm-runner-resolute@sha256:...
+COPY --chmod=0755 20-my-check.sh /opt/garm/hooks/job-started.d/20-my-check.sh
+```
+
+**Replacing the hook.** The path in `ACTIONS_RUNNER_HOOK_JOB_STARTED` must end in `.sh`, `.ps1` or `.js`. A value in
+the container's environment (an `ENV` line in a derived image, or a name the operator allowlists in
+`extra_env`) replaces ours, and then neither the dispatcher nor the pnpm check runs, unless your hook calls them.
+An image built from another base does not carry the hook until it copies `common/hooks/` and sets the variable.
+
 ## Build
 
 The build context is this directory, so both Dockerfiles can copy the shared entrypoint from `common/`:
