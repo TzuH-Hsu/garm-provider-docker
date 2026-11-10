@@ -82,7 +82,22 @@ var (
 	}
 )
 
+// settableGarmEnv are the GARM_-prefixed names a pool may set even though the
+// GARM_ prefix is reserved, and they match exactly and case-sensitively, because
+// the reader of each is a script that looks the name up verbatim. They still
+// need the operator's allowed_env entry.
+//
+// GARM_JOB_HOOKS (fail, warn or off) is the runner image's job-started hook
+// mode. The hook runs as the runner user, after the privilege drop, and matches
+// the value against fixed words without arithmetic or eval, so none of the
+// reasons that reserve GARM_CRED_WAIT_SECONDS (a root-run Bash arithmetic read)
+// apply to it.
+var settableGarmEnv = []string{"GARM_JOB_HOOKS"}
+
 func reservedEnvName(name string) bool {
+	if slices.Contains(settableGarmEnv, name) {
+		return false
+	}
 	upper := strings.ToUpper(strings.TrimSpace(name))
 	for _, p := range reservedEnvPrefixes {
 		if strings.HasPrefix(upper, p) {

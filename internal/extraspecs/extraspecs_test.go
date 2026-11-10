@@ -426,6 +426,62 @@ func TestParseRejectsHardReservedEvenIfAllowlisted(t *testing.T) {
 	}
 }
 
+// GARM_JOB_HOOKS is the one GARM_-prefixed name a pool may set: it is the
+// runner image's job-started hook mode (fail, warn, off), read by a script that
+// runs as the runner user and does no arithmetic or eval with it. It still
+// needs the operator's allowlist. Only the exact spelling is exempt, because
+// the script reads that exact name; every other GARM_ name stays reserved.
+func TestParseAcceptsGarmJobHooks(t *testing.T) {
+	for _, mode := range []string{"fail", "warn", "off"} {
+		raw := json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "` + mode + `"}}`)
+		s, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("Parse GARM_JOB_HOOKS=%s: %v", mode, err)
+		}
+		if s.ExtraEnv["GARM_JOB_HOOKS"] != mode {
+			t.Errorf("ExtraEnv = %v, want GARM_JOB_HOOKS=%s", s.ExtraEnv, mode)
+		}
+	}
+}
+
+func TestParseKeepsOtherGarmNamesReservedBesideGarmJobHooks(t *testing.T) {
+	for _, name := range []string{
+		"garm_job_hooks", "Garm_Job_Hooks", // the script reads the exact name only
+		"GARM_JOB_HOOKS_TIMEOUT", "GARM_JOB_HOOKS_DIR", // near misses
+		"GARM_DIAG_DIR", "GARM_CRED_WAIT_SECONDS", "GARM_EXTERNALS_SEEDED_MARKER",
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"extra_env": map[string]string{name: "x"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Parse(raw); err == nil {
+				t.Fatalf("Parse %q = nil error, want reject", name)
+			}
+		})
+	}
+}
+
+func TestResolveGarmJobHooksNeedsTheAllowlist(t *testing.T) {
+	specs, err := Parse(json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if _, err := specs.Resolve(testConfig()); err == nil {
+		t.Fatal("Resolve of GARM_JOB_HOOKS without allowed_env = nil error, want fail-closed reject")
+	}
+
+	cfg := testConfig()
+	cfg.ExtraSpecs = config.ExtraSpecsPolicy{AllowedEnv: []string{"GARM_JOB_HOOKS"}}
+	res, err := specs.Resolve(cfg)
+	if err != nil {
+		t.Fatalf("Resolve with GARM_JOB_HOOKS allowlisted: %v", err)
+	}
+	if res.ExtraEnv["GARM_JOB_HOOKS"] != "warn" {
+		t.Errorf("ExtraEnv = %v, want GARM_JOB_HOOKS=warn", res.ExtraEnv)
+	}
+}
+
 // --- published schema is valid, parseable JSON ------------------------------
 
 func TestSchemaJSONIsValidParseableSchema(t *testing.T) {

@@ -171,7 +171,7 @@
         "allowed_env": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
+          "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_* (except GARM_JOB_HOOKS), ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
         }
       }
     },

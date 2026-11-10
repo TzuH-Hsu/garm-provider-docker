@@ -266,6 +266,45 @@ func TestCreateInstanceExtraEnvMergedProviderWins(t *testing.T) {
 	}
 }
 
+// TestCreateInstanceGarmJobHooksReachesTheRunner: GARM_JOB_HOOKS, the runner
+// image's job-started hook mode, is the one GARM_-prefixed name a pool can set.
+// It reaches the container when the operator allowlists it, and is rejected
+// before any Docker operation when the operator has not.
+func TestCreateInstanceGarmJobHooksReachesTheRunner(t *testing.T) {
+	cfg := config.Config{
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeNone,
+		AllowedDindModes: []string{config.DindModeNone},
+		Network:          config.Network{EnableJobNetwork: true, Internal: false},
+		ExtraSpecs:       config.ExtraSpecsPolicy{AllowedEnv: []string{"GARM_JOB_HOOKS"}},
+	}
+	p, fake := providerWithConfig(t, cfg)
+
+	srv := newJITMetadataServer(t)
+	defer srv.Close()
+
+	b := jitBootstrap(srv.URL)
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`)
+
+	inst, err := p.CreateInstance(context.Background(), b)
+	if err != nil {
+		t.Fatalf("CreateInstance with allowlisted GARM_JOB_HOOKS: %v", err)
+	}
+	if env := inspectRunner(t, fake, inst.Name).Config.Env; !hasEnv(env, "GARM_JOB_HOOKS=warn") {
+		t.Errorf("runner env missing GARM_JOB_HOOKS=warn: %v", env)
+	}
+
+	// Not allowlisted: rejected like any other extra env, with nothing allocated.
+	p2, fake2 := newTestProvider(t)
+	b2 := jitBootstrap("https://metadata.invalid/")
+	b2.ExtraSpecs = json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`)
+	if _, err := p2.CreateInstance(context.Background(), b2); err == nil {
+		t.Fatal("CreateInstance with a non-allowlisted GARM_JOB_HOOKS = nil error, want fail-closed reject")
+	}
+	assertNoResources(t, p2, fake2)
+}
+
 // TestCreateInstanceExtraRunnerLabelsAppendedNonJIT: extra_specs.runner_labels
 // are appended to RUNNER_LABELS in non-JIT mode.
 func TestCreateInstanceExtraRunnerLabelsAppendedNonJIT(t *testing.T) {
