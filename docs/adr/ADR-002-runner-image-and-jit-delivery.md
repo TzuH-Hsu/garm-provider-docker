@@ -242,10 +242,7 @@ passed. The hook shows the reason in the job that is affected. It runs inside th
 accident detection and not a security boundary: a hostile job can already write to its repository's caches
 ([ADR-003](ADR-003-cache-keying-and-lifecycle.md)).
 
-Failing is the default because a false green is worse than a red job, and it changes what a job runs, so the
-`GARM_JOB_HOOKS=warn` and `off` opt-outs exist. `GARM_JOB_HOOKS` is the one `GARM_` name that `extra_specs` may
-set ([ADR-005](ADR-005-config-and-extra-specs-schema.md)), by exact name and with the operator allowlist; the
-other `GARM_` names stay reserved because the entrypoint reads some of them as root.
+Failing is the default because a false green is worse than a red job, and it changes what a job runs, so `warn` and `off` exist. The mode is a typed provider setting, `job_hooks` in the config with a per-pool override in `extra_specs`, validated like `dind_mode` but with no `allowed_*` ceiling, because turning a check off grants no privilege. The provider resolves it (pool, then config, then `fail`) and sets `GARM_JOB_HOOKS` in the runner container itself, like `GARM_DIAG_DIR`. It is not an `extra_env` exemption: the `GARM_` prefix stays fully reserved ([ADR-005](ADR-005-config-and-extra-specs-schema.md)), so a typo cannot silently disable the checks and the operator allowlist does not need to learn about it. The dispatcher still treats an unset or unknown value as `fail`, which covers an image that is run without the provider or sets the variable itself. The per-check timeout is a constant (30 s), not a setting.
 
 ### Updates
 

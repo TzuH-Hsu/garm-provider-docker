@@ -424,14 +424,27 @@ func TestDispatcherOrder(t *testing.T) {
 	}
 }
 
+// The per-check limit is a constant in the script (no environment knob), so
+// this test shortens it in its own copy of the dispatcher.
 func TestDispatcherTimeout(t *testing.T) {
 	requireTimeout(t)
 	d, dropins := stage(t)
+
+	src, err := os.ReadFile(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const shipped = "readonly CHECK_TIMEOUT_SECONDS=30\n"
+	if strings.Count(string(src), shipped) != 1 {
+		t.Fatalf("the dispatcher no longer declares %q", strings.TrimSpace(shipped))
+	}
+	mustWrite(t, d, strings.Replace(string(src), shipped, "readonly CHECK_TIMEOUT_SECONDS=1\n", 1))
+
 	addCheck(t, dropins, "10-hang.sh", "echo started\nsleep 60\n")
 	addCheck(t, dropins, "20-ok.sh", passing)
 
 	start := time.Now()
-	r := runHook(t, d, map[string]string{"GARM_JOB_HOOKS_TIMEOUT": "1"})
+	r := runHook(t, d, nil)
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Errorf("a hanging check held the hook for %s", elapsed)
 	}
@@ -440,19 +453,15 @@ func TestDispatcherTimeout(t *testing.T) {
 	r.mustNotHave(t, "::error")
 }
 
-func TestDispatcherInvalidTimeoutFallsBackToDefault(t *testing.T) {
-	requireTimeout(t)
-	for _, v := range []string{"abc", "0", "-5", "1.5", "$(touch /tmp/garm-hook-pwned)"} {
-		t.Run(v, func(t *testing.T) {
-			d, dropins := stage(t)
-			addCheck(t, dropins, "10-ok.sh", passing)
-			r := runHook(t, d, map[string]string{"GARM_JOB_HOOKS_TIMEOUT": v})
-			r.wantCode(t, 0)
-			r.mustHave(t, "ran ")
-		})
+// There is no environment variable that changes the limit.
+func TestDispatcherHasNoTimeoutKnob(t *testing.T) {
+	d, _ := stage(t)
+	src, err := os.ReadFile(d)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat("/tmp/garm-hook-pwned"); err == nil {
-		t.Error("the timeout value was evaluated by the shell")
+	if strings.Contains(string(src), "GARM_JOB_HOOKS_TIMEOUT") {
+		t.Error("the dispatcher still reads GARM_JOB_HOOKS_TIMEOUT")
 	}
 }
 

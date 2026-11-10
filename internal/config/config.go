@@ -46,6 +46,11 @@ type Config struct {
 	// relaxing one image's pinning does not relax the other's.
 	AllowUnpinnedDindImage bool `toml:"allow_unpinned_dind_image"`
 
+	// JobHooks is the default job-hook mode: what the runner image's job-started
+	// hook does when a check finds damage (fail, warn or off). A pool's
+	// extra_specs.job_hooks overrides it. Empty means JobHooksFail.
+	JobHooks string `toml:"job_hooks"`
+
 	// StorageDriver is always passed to the sidecar's dockerd, never
 	// autodetected: autodetection is unreliable inside the sidecar on some host
 	// filesystems.
@@ -77,6 +82,7 @@ func Load(path string) (Config, error) {
 		DockerHost:       defaultDockerHost,
 		DindMode:         DindModeNone,
 		AllowedDindModes: append([]string(nil), defaultAllowedDindModes...),
+		JobHooks:         JobHooksFail,
 		StorageDriver:    defaultStorageDriver,
 		Network: Network{
 			EnableJobNetwork: true,
@@ -111,6 +117,9 @@ func (c Config) Validate() error {
 	}
 
 	if err := c.validateDindMode(); err != nil {
+		return err
+	}
+	if err := c.validateJobHooks(); err != nil {
 		return err
 	}
 	if err := c.validateStorageDriver(); err != nil {

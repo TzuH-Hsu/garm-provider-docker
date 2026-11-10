@@ -72,6 +72,7 @@ Always set by the provider:
 | `npm_config_cache_dir`, `pnpm_config_cache_dir` | `<pnpm store path>/metadata-cache`, set exactly when the two store variables are. See [`package-store-installs.md`](../docs/package-store-installs.md#the-pnpm-metadata-cache). |
 | `GARM_DIAG_DIR` | Set when a diagnostic-logs volume is mounted, so the entrypoint owns that directory before dropping privileges. |
 | `GARM_EXTERNALS_SEEDED_MARKER` | Set only when the shared externals volume is mounted. The entrypoint waits for this marker before it starts the runner. |
+| `GARM_JOB_HOOKS` | Always set: `fail`, `warn` or `off`, from the `job_hooks` setting. Read by the [job-started hook](#job-started-hook), not by the entrypoint. |
 
 With npm 11, the `npm_config_` names make every npm or npx call print a harmless "Unknown env config" warning.
 
@@ -171,8 +172,8 @@ A job can leave a directory that the provider persists (the pnpm store, the tool
 later jobs of the same repository pass without doing their work. The images set
 `ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh`, so the runner runs that script before the first
 step of every job and shows its output in the job log. The script is a dispatcher: it runs every
-`/opt/garm/hooks/job-started.d/*.sh` in name order, each as `bash <file>` under a timeout (30 s by default,
-`GARM_JOB_HOOKS_TIMEOUT` in seconds), and then decides what the job does. The hook files are root-owned `0755`,
+`/opt/garm/hooks/job-started.d/*.sh` in name order, each as `bash <file>` under a 30 second timeout, and then decides what the job
+does. The hook files are root-owned `0755`,
 so a job cannot replace them. The step costs a few milliseconds when nothing is wrong.
 
 The shipped check is `10-pnpm-store.sh`. It reads the store from `pnpm_config_store_dir` (else
@@ -180,7 +181,7 @@ The shipped check is `10-pnpm-store.sh`. It reads the store from `pnpm_config_st
 0-byte pnpm binary, the state that `pnpm/action-setup` before v6.1.0 can leave behind
 ([`package-store-installs.md`](../docs/package-store-installs.md#pnpm-switching-its-own-version-pnpm-11-before-1122)).
 
-**What happens on damage: `GARM_JOB_HOOKS`.**
+**What happens on damage: `GARM_JOB_HOOKS`.** The provider sets this variable on every runner from the `job_hooks` setting (provider config, overridable per pool in `extra_specs`; [config reference](../docs/config-reference.md#job-hooks-job_hooks)).
 
 | Value | Effect |
 |---|---|
@@ -188,9 +189,7 @@ The shipped check is `10-pnpm-store.sh`. It reads the store from `pnpm_config_st
 | `warn` | The annotations are printed and the job runs. |
 | `off` | No check runs. |
 
-An unknown value acts as `fail` and prints a warning that names the value, so a typo cannot switch the checks off
-quietly. A pool sets the value through `extra_specs.extra_env` after the operator lists `GARM_JOB_HOOKS` in
-`[extra_specs].allowed_env` ([config reference](../docs/config-reference.md#ceilings-the-extra_env-allowlist-and-the-hard-reserved-set)).
+An unknown value acts as `fail` and prints a warning that names the value, so a typo cannot switch the checks off quietly. An image built on these, or a runner started without the provider, can set `GARM_JOB_HOOKS` itself (for example with an `ENV` line) and gets the same behaviour. `extra_env` cannot set it, because the `GARM_` prefix is reserved.
 
 **The drop-in contract.** A check is a file named `NN-name.sh` in `job-started.d/`, run as
 `bash --noprofile --norc <file>` as the runner user, with the job's environment.

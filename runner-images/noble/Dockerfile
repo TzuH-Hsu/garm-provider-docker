@@ -120,8 +120,8 @@ COPY --chmod=0755 common/entrypoint.sh /entrypoint.sh
 # 0-byte pnpm binary instead of letting it pass green without running
 # anything. Root-owned and not writable by the runner user, so a job cannot
 # replace a hook. The path must end in .sh. A value set in the container's
-# environment replaces this one; GARM_JOB_HOOKS=fail|warn|off tunes it
-# (runner-images/README.md).
+# environment replaces this one. The provider sets GARM_JOB_HOOKS (fail, warn or
+# off) from its job_hooks setting (runner-images/README.md).
 COPY --chmod=0755 common/hooks/job-started.sh /opt/garm/hooks/job-started.sh
 COPY --chmod=0755 common/hooks/job-started.d/ /opt/garm/hooks/job-started.d/
 ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh

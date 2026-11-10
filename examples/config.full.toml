@@ -70,6 +70,13 @@ allow_unpinned_dind_image = false
 # "vfs" is the slower, more compatible fallback.
 storage_driver = "overlay2"
 
+# What the runner image's job-started hook does when a check finds damage,
+# such as a 0-byte pnpm binary in a repository's persistent pnpm store.
+# "fail" stops the job before its first step, "warn" prints the finding and
+# runs the job, "off" skips the checks. A pool can override it with
+# extra_specs.job_hooks. Default: "fail".
+job_hooks = "fail"
+
 # Docker Hub pull-through mirrors for the DinD sidecar's dockerd, emitted as
 # one --registry-mirror=<url> flag each. Each entry is a bare origin: an
 # http or https URL with a host and optional port, no path, query, fragment
@@ -156,10 +163,8 @@ insecure_registries = ["registry.lan.example:5001"]
   # Allowlist of environment-variable names a pool's extra_specs.extra_env
   # may set on the runner container. Default: empty, so a pool can inject no
   # extra environment until you list names here. Hard-reserved names
-  # (RUNNER_*, DOCKER_*, GARM_* except GARM_JOB_HOOKS, RUN_AS_ROOT, PATH,
-  # LD_*, ...) are rejected even if listed. GARM_JOB_HOOKS (fail, warn or off)
-  # sets what the runner image's job-started hook does when it finds damage.
-  # See docs/config-reference.md for the full set.
+  # (RUNNER_*, DOCKER_*, GARM_*, RUN_AS_ROOT, PATH, LD_*, ...) are rejected
+  # even if listed. See docs/config-reference.md for the full set.
   allowed_env = ["MY_CI_FLAG", "TZ"]
 
 # [logging]

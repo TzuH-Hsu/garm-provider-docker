@@ -22,10 +22,11 @@ Earlier versions are described on the
   the repository's pnpm cache volume; see `docs/package-store-installs.md`.
   Other checks can be added as files in `/opt/garm/hooks/job-started.d/` of a
   derived image. The hook needs a runner image built from this change.
-- `GARM_JOB_HOOKS` (`fail`, the default, `warn` or `off`) sets what the hook
-  does when a check finds damage. It is the one `GARM_` name that a pool's
-  `extra_specs.extra_env` may set, and it still needs an entry in
-  `[extra_specs].allowed_env`.
+- `job_hooks` (`fail`, the default, `warn` or `off`) sets what the hook does
+  when a check finds damage. It is a top-level key of the provider config and
+  can be overridden per pool in `extra_specs`. The provider passes the result
+  to the runner as `GARM_JOB_HOOKS`. Use `warn` or `off` to keep jobs running
+  while a damaged store is replaced.
 
 ## [0.2.11] - 2026-11-09
 

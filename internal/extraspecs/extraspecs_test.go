@@ -426,59 +426,110 @@ func TestParseRejectsHardReservedEvenIfAllowlisted(t *testing.T) {
 	}
 }
 
-// GARM_JOB_HOOKS is the one GARM_-prefixed name a pool may set: it is the
-// runner image's job-started hook mode (fail, warn, off), read by a script that
-// runs as the runner user and does no arithmetic or eval with it. It still
-// needs the operator's allowlist. Only the exact spelling is exempt, because
-// the script reads that exact name; every other GARM_ name stays reserved.
-func TestParseAcceptsGarmJobHooks(t *testing.T) {
-	for _, mode := range []string{"fail", "warn", "off"} {
-		raw := json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "` + mode + `"}}`)
-		s, err := Parse(raw)
-		if err != nil {
-			t.Fatalf("Parse GARM_JOB_HOOKS=%s: %v", mode, err)
-		}
-		if s.ExtraEnv["GARM_JOB_HOOKS"] != mode {
-			t.Errorf("ExtraEnv = %v, want GARM_JOB_HOOKS=%s", s.ExtraEnv, mode)
-		}
-	}
-}
-
-func TestParseKeepsOtherGarmNamesReservedBesideGarmJobHooks(t *testing.T) {
+// GARM_* is reserved for extra_env without exceptions. GARM_JOB_HOOKS, the
+// runner image's job-hook mode, is set by the provider from the typed job_hooks
+// setting, so a pool cannot reach it through extra_env, even if the operator
+// allowlists the name.
+func TestParseRejectsGarmJobHooksInExtraEnv(t *testing.T) {
 	for _, name := range []string{
-		"garm_job_hooks", "Garm_Job_Hooks", // the script reads the exact name only
-		"GARM_JOB_HOOKS_TIMEOUT", "GARM_JOB_HOOKS_DIR", // near misses
+		"GARM_JOB_HOOKS", "garm_job_hooks", "Garm_Job_Hooks", "GARM_JOB_HOOKS_TIMEOUT",
 		"GARM_DIAG_DIR", "GARM_CRED_WAIT_SECONDS", "GARM_EXTERNALS_SEEDED_MARKER",
 	} {
 		t.Run(name, func(t *testing.T) {
-			raw, err := json.Marshal(map[string]any{"extra_env": map[string]string{name: "x"}})
+			raw, err := json.Marshal(map[string]any{"extra_env": map[string]string{name: "warn"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Parse(raw); err == nil {
-				t.Fatalf("Parse %q = nil error, want reject", name)
+			_, err = Parse(raw)
+			if err == nil {
+				t.Fatalf("Parse extra_env %q = nil error, want reject", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error %q should name the rejected variable %q", err, name)
 			}
 		})
 	}
 }
 
-func TestResolveGarmJobHooksNeedsTheAllowlist(t *testing.T) {
-	specs, err := Parse(json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if _, err := specs.Resolve(testConfig()); err == nil {
-		t.Fatal("Resolve of GARM_JOB_HOOKS without allowed_env = nil error, want fail-closed reject")
-	}
+// --- job_hooks (typed pool setting) --------------------------------------------
 
-	cfg := testConfig()
-	cfg.ExtraSpecs = config.ExtraSpecsPolicy{AllowedEnv: []string{"GARM_JOB_HOOKS"}}
-	res, err := specs.Resolve(cfg)
-	if err != nil {
-		t.Fatalf("Resolve with GARM_JOB_HOOKS allowlisted: %v", err)
+func TestParseJobHooks(t *testing.T) {
+	for _, mode := range []string{"fail", "warn", "off"} {
+		s, err := Parse(json.RawMessage(`{"job_hooks": "` + mode + `"}`))
+		if err != nil {
+			t.Fatalf("Parse job_hooks=%s: %v", mode, err)
+		}
+		if s.JobHooks != mode {
+			t.Errorf("JobHooks = %q, want %q", s.JobHooks, mode)
+		}
 	}
-	if res.ExtraEnv["GARM_JOB_HOOKS"] != "warn" {
-		t.Errorf("ExtraEnv = %v, want GARM_JOB_HOOKS=warn", res.ExtraEnv)
+}
+
+func TestParseRejectsInvalidJobHooks(t *testing.T) {
+	for name, raw := range map[string]string{
+		"unknown value": `{"job_hooks": "sometimes"}`,
+		"wrong case":    `{"job_hooks": "WARN"}`,
+		"empty":         `{"job_hooks": ""}`,
+		"boolean":       `{"job_hooks": false}`,
+		"number":        `{"job_hooks": 0}`,
+		"null":          `{"job_hooks": null}`,
+		"array":         `{"job_hooks": ["off"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(json.RawMessage(raw)); err == nil {
+				t.Errorf("Parse(%s) = nil error, want a schema rejection", raw)
+			}
+		})
+	}
+}
+
+func TestSchemaDescribesJobHooksEnum(t *testing.T) {
+	var m struct {
+		Properties map[string]struct {
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(SchemaJSON()), &m); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Properties["job_hooks"].Enum
+	if strings.Join(got, ",") != "fail,warn,off" {
+		t.Errorf("job_hooks enum = %v, want [fail warn off]", got)
+	}
+}
+
+// Resolution order is the pool's value, then the config default, then "fail".
+// There is no ceiling: turning a check off is not a privilege escalation.
+func TestResolveJobHooksPrecedence(t *testing.T) {
+	tests := []struct {
+		name, config, pool, want string
+	}{
+		{"nothing set", "", "", "fail"},
+		{"config default", "warn", "", "warn"},
+		{"pool beats config", "warn", "off", "off"},
+		{"pool restores fail", "off", "fail", "fail"},
+		{"pool without config", "", "warn", "warn"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.JobHooks = tc.config
+			raw := json.RawMessage(`{}`)
+			if tc.pool != "" {
+				raw = json.RawMessage(`{"job_hooks": "` + tc.pool + `"}`)
+			}
+			specs, err := Parse(raw)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			res, err := specs.Resolve(cfg)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if res.JobHooks != tc.want {
+				t.Errorf("Resolved.JobHooks = %q, want %q", res.JobHooks, tc.want)
+			}
+		})
 	}
 }
 

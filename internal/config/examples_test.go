@@ -96,6 +96,9 @@ func TestExampleFullMatchesDocumentedDefaults(t *testing.T) {
 	if cfg.DockerHost != defaultDockerHost {
 		t.Errorf("DockerHost = %q, want default %q", cfg.DockerHost, defaultDockerHost)
 	}
+	if cfg.JobHooks != JobHooksFail {
+		t.Errorf("JobHooks = %q, want default %q", cfg.JobHooks, JobHooksFail)
+	}
 	if cfg.AllowUnpinnedRunnerImage {
 		t.Error("AllowUnpinnedRunnerImage = true, want false (the default)")
 	}

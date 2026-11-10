@@ -213,7 +213,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap params.Bootstra
 	if plan.externalsVolume != "" {
 		externalsSeededMarker = spec.RunnerExternalsSeededMarkerPath
 	}
-	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker, resolved.ExtraRunnerLabels, resolved.ExtraEnv)
+	env, err := buildRunnerEnv(bootstrap, dockerHost, plan.toolcachePath, plan.pnpmPath, plan.diagDir, externalsSeededMarker, resolved.JobHooks, resolved.ExtraRunnerLabels, resolved.ExtraEnv)
 	if err != nil {
 		return guarded(err)
 	}
@@ -411,11 +411,11 @@ func validatePlatform(b params.BootstrapInstance) error {
 }
 
 // buildRunnerEnv computes the runner's environment (ADR-002, Environment). An empty
-// dockerHost, toolCacheDir, pnpmStoreDir, diagDir or externalsSeededMarker omits its
-// variable. extraRunnerLabels only feed RUNNER_LABELS, which is emitted without JIT:
+// dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker or jobHooks omits
+// its variable. extraRunnerLabels only feed RUNNER_LABELS, which is emitted without JIT:
 // with JIT, GARM bakes the labels into the runner configuration. extraEnv is merged
 // last, and provider-injected values win a collision.
-func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker string, extraRunnerLabels []string, extraEnv map[string]string) ([]string, error) {
+func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmStoreDir, diagDir, externalsSeededMarker, jobHooks string, extraRunnerLabels []string, extraEnv map[string]string) ([]string, error) {
 	labels := b.Labels
 	if len(extraRunnerLabels) > 0 {
 		labels = append(append([]string{}, b.Labels...), extraRunnerLabels...)
@@ -446,6 +446,9 @@ func buildRunnerEnv(b params.BootstrapInstance, dockerHost, toolCacheDir, pnpmSt
 	}
 	if externalsSeededMarker != "" {
 		env = append(env, spec.RunnerExternalsSeededMarkerEnv+"="+externalsSeededMarker)
+	}
+	if jobHooks != "" {
+		env = append(env, spec.RunnerJobHooksEnv+"="+jobHooks)
 	}
 	return mergeExtraEnv(env, extraEnv), nil
 }

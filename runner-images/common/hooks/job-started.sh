@@ -20,7 +20,9 @@
 #            timeout). The dispatcher prints a ::warning:: naming the check
 #            and carries on, so a buggy check cannot fail every job.
 #
-# GARM_JOB_HOOKS selects what damage does:
+# GARM_JOB_HOOKS selects what damage does. The provider sets it from the
+# job_hooks setting (provider config, overridable per pool in extra_specs); an
+# image built on this one may also set it directly:
 #   fail   (default) exit 1 after all checks ran: "Set up runner" fails, no
 #          step runs, and the job is red instead of falsely green.
 #   warn   print the detections, exit 0.
@@ -30,14 +32,12 @@
 # typo such as "wran" must not quietly switch them off, and it fails only a
 # job whose state really is damaged.
 #
-# GARM_JOB_HOOKS_TIMEOUT is the per-check limit in seconds (default 30), so a
-# stuck check cannot hold the job. It is read as plain digits and never
-# evaluated.
+# Each check gets CHECK_TIMEOUT_SECONDS, so a stuck check cannot hold the job.
 
 set -u
 
 readonly DAMAGE_EXIT=10
-readonly DEFAULT_TIMEOUT_SECONDS=30
+readonly CHECK_TIMEOUT_SECONDS=30
 readonly KILL_AFTER_SECONDS=5
 
 dropin_dir="${BASH_SOURCE[0]%/*}"
@@ -64,12 +64,6 @@ case "$mode" in
     ;;
 esac
 
-limit="${GARM_JOB_HOOKS_TIMEOUT:-$DEFAULT_TIMEOUT_SECONDS}"
-case "$limit" in
-  '' | *[!0-9]*) limit=$DEFAULT_TIMEOUT_SECONDS ;;
-esac
-[ "$limit" -gt 0 ] 2>/dev/null || limit=$DEFAULT_TIMEOUT_SECONDS
-
 have_timeout=0
 command -v timeout >/dev/null 2>&1 && have_timeout=1
 
@@ -77,7 +71,7 @@ command -v timeout >/dev/null 2>&1 && have_timeout=1
 run_check() {
   rc=0
   if [ "$have_timeout" -eq 1 ]; then
-    timeout --kill-after="$KILL_AFTER_SECONDS" "$limit" bash --noprofile --norc "$1" || rc=$?
+    timeout --kill-after="$KILL_AFTER_SECONDS" "$CHECK_TIMEOUT_SECONDS" bash --noprofile --norc "$1" || rc=$?
   else
     bash --noprofile --norc "$1" || rc=$?
   fi
@@ -95,7 +89,7 @@ while IFS= read -r check; do
     0) ;;
     "$DAMAGE_EXIT") damaged="${damaged:+$damaged, }$name" ;;
     124 | 137)
-      echo "::warning title=Job-started check timed out::$name timed out after ${limit}s and was skipped."
+      echo "::warning title=Job-started check timed out::$name timed out after ${CHECK_TIMEOUT_SECONDS}s and was skipped."
       ;;
     *)
       echo "::warning title=Job-started check malfunctioned::$name exited with status $rc and was ignored."

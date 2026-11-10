@@ -100,6 +100,11 @@
       "type": "boolean",
       "description": "Dev-only escape hatch for dind_image, independent of allow_unpinned_runner_image."
     },
+    "job_hooks": {
+      "type": "string",
+      "enum": ["", "fail", "warn", "off"],
+      "description": "Default job-hook mode: what the runner image's job-started hook does when one of its checks finds damage (ADR-002), such as a 0-byte pnpm binary in the repository's persistent pnpm store. \"fail\" (the default; an empty string means the same) stops the job before its first step, \"warn\" prints the finding and runs the job, \"off\" skips the checks. A pool may override it with extra_specs.job_hooks. No allowed_* ceiling applies. The provider passes the resolved value to the runner as GARM_JOB_HOOKS."
+    },
     "storage_driver": {
       "type": "string",
       "enum": ["overlay2", "vfs"],
@@ -171,7 +176,7 @@
         "allowed_env": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_* (except GARM_JOB_HOOKS), ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
+          "description": "Allowlist of environment-variable NAMES a pool's extra_specs.extra_env may set on the runner container. Defaults to EMPTY (fail-closed: no extra env passes unless the operator opts a name in). Hard-reserved names (RUNNER_*, DOCKER_*, GARM_*, ACTIONS_RUNNER_INPUT_*, JIT_CONFIG_ENABLED, GITHUB_URL, RUN_AS_ROOT, WAIT_FOR_DOCKER_SECONDS, BASH_ENV, ENV, IFS, PATH, LD_*, NODE_OPTIONS) are rejected even if listed here."
         }
       }
     },

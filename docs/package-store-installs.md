@@ -133,11 +133,7 @@ replaced. The check reads the store from `pnpm_config_store_dir` (or `npm_config
 sets only while the persistent store is mounted, and it costs a few milliseconds. It looks for exactly the entry
 that the manual check below does.
 
-To keep jobs running while you fix a store, the operator can set `GARM_JOB_HOOKS` to `warn` (print the annotation
-and run the job) or `off` (do not check) for a pool. The name goes on `[extra_specs].allowed_env`, and the pool's
-`extra_specs` carries `{"extra_env": {"GARM_JOB_HOOKS": "warn"}}`
-([config reference](config-reference.md#ceilings-the-extra_env-allowlist-and-the-hard-reserved-set)). A custom
-runner image has the check only if it is built from these images or copies the hook.
+To keep jobs running while you fix a store, the operator can set `job_hooks = "warn"` (print the annotation and run the job) or `job_hooks = "off"` (do not check) at the top level of the provider config, or for one pool with `{"job_hooks": "warn"}` in its `extra_specs`. The default is `"fail"`. Change it back once the store is replaced ([config reference](config-reference.md#job-hooks-job_hooks)). A custom runner image has the check only if it is built from these images or copies the hook.
 
 **What to do.**
 
