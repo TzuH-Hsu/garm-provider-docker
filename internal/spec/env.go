@@ -23,6 +23,12 @@ const (
 	PnpmCacheDirEnvPnpm = "pnpm_config_cache_dir"
 )
 
+// RunnerJobHooksEnv carries the resolved job-hook mode (fail, warn or off) to the runner
+// image's job-started hook, which reads it. The provider always sets it, from the
+// config's job_hooks and the pool's extra_specs.job_hooks. extra_env cannot set it
+// (GARM_ is reserved), and a custom image that sets it directly still works.
+const RunnerJobHooksEnv = "GARM_JOB_HOOKS"
+
 // PnpmMetadataCacheSubdir holds pnpm's metadata cache, directly under the store mount.
 // It must not be the mount root: `pnpm store prune` removes what it finds under
 // cache-dir, and on pnpm 11 that deleted a whole store (ADR-003). Here it can drop only

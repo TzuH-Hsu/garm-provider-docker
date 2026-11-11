@@ -213,6 +213,40 @@ repository is added. The entrypoint raises the open-file soft limit from 1024 to
 limit, best effort), as hosted runners do. The package list is in
 [`runner-images/README.md`](../../runner-images/README.md).
 
+### Job-started hook
+
+A job can damage a directory that the provider persists across jobs of one repository, and a later job can
+then pass without doing its work. The case seen is a 0-byte `pnpm` binary in the pnpm store, after which every
+`pnpm` command prints nothing and exits 0.
+
+The images therefore set `ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh`. The runner runs that
+script before the first step of every job, as the `runner` user after the privilege drop, and shows its output
+in the job log. It is a dispatcher that runs each `/opt/garm/hooks/job-started.d/*.sh` in name order with a
+per-check timeout. A check exits 0 for fine, 10 for damage with a plain message on stdout, and
+anything else for "the check itself broke", which only warns. The dispatcher, not the check, owns the
+annotation: it captures the message (capped, escaped, never echoed raw) and emits one `::error::` in `fail` mode
+or one `::warning::` in `warn` mode, so a job that goes on never carries a failure-level annotation and a check
+cannot inject a workflow command. `GARM_JOB_HOOKS` decides what damage does:
+`fail` (the default) exits 1, which fails "Set up runner" and skips every step; `warn` continues; `off` skips the
+checks. The hook files are root-owned `0755`, so a job cannot replace them. An operator-set
+`ACTIONS_RUNNER_HOOK_JOB_STARTED` in the container environment replaces ours, and a derived image adds checks by
+adding files.
+
+Runner behaviour the implementation depends on, measured with runner 2.338.0: the path must end in `.sh`
+(otherwise every job fails with "is not a valid path to a script"), the runner ignores the shebang and runs
+`bash --noprofile --norc -e -o pipefail <file>`, `::error::` and `::warning::` become annotations but an
+`::error::` alone does not fail the job (only the exit code does), and the step costs tens of milliseconds.
+
+Why in the runner image and not in the provider: the knowledge of what a damaged pnpm store looks like belongs
+with the tool, and a check for Python or Go state would otherwise become provider code. The provider keeps its
+job of owning containers and volumes. A provider-side check would also write to the provider log on the host,
+which the repository's developers do not read, and it could not see damage before the next job had already
+passed. The hook shows the reason in the job that is affected. It runs inside the job's own container, so it is
+accident detection and not a security boundary: a hostile job can already write to its repository's caches
+([ADR-003](ADR-003-cache-keying-and-lifecycle.md)).
+
+Failing is the default because a false green is worse than a red job, and it changes what a job runs, so `warn` and `off` exist. The mode is a typed provider setting, `job_hooks` in the config with a per-pool override in `extra_specs`, validated like `dind_mode` but with no `allowed_*` ceiling, because turning a check off grants no privilege. The provider resolves it (pool, then config, then `fail`) and sets `GARM_JOB_HOOKS` in the runner container itself, like `GARM_DIAG_DIR`. It is not an `extra_env` exemption: the `GARM_` prefix stays fully reserved ([ADR-005](ADR-005-config-and-extra-specs-schema.md)), so a typo cannot silently disable the checks and the operator allowlist does not need to learn about it. The dispatcher still treats an unset or unknown value as `fail`, which covers an image that is run without the provider or sets the variable itself. The per-check timeout is a constant (30 s), not a setting.
+
 ### Updates
 
 Bumping the base digest or `GH_RUNNER_VERSION` produces a new image digest. The operator then updates the

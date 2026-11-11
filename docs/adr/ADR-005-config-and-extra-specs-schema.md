@@ -59,7 +59,10 @@ managed label set is never settable either.
   operator opts names in. A name outside the list is rejected. Independently, a hard-reserved set is always
   rejected even if allowlisted, case-insensitively: the prefixes `RUNNER_`, `DOCKER_`, `ACTIONS_RUNNER_INPUT_`,
   `GARM_` and `LD_`, and the names `JIT_CONFIG_ENABLED`, `GITHUB_URL`, `RUN_AS_ROOT`, `WAIT_FOR_DOCKER_SECONDS`,
-  `BASH_ENV`, `ENV`, `IFS`, `PATH` and `NODE_OPTIONS`. The reasons: `RUNNER_EPHEMERAL=false` would break the
+  `BASH_ENV`, `ENV`, `IFS`, `PATH` and `NODE_OPTIONS`. There are no exceptions. The runner image's job-started hook reads
+  `GARM_JOB_HOOKS`, but the mode is the typed field `job_hooks` (`fail`, `warn` or `off`; provider config default,
+  `extra_specs` override, no `allowed_*` ceiling), and the provider sets that variable itself
+  ([ADR-002](ADR-002-runner-image-and-jit-delivery.md)). The reasons: `RUNNER_EPHEMERAL=false` would break the
   single-job model that teardown relies on, `DOCKER_HOST` would defeat the socket guarantees of ADR-001,
   `RUN_AS_ROOT=true` would run the job as root, the entrypoint reads `GARM_CRED_WAIT_SECONDS` and
   `WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic where a crafted value is command substitution as root, and the

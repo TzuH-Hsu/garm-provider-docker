@@ -62,6 +62,7 @@ and the `privileged` flag out of this channel: they have no field at all.
 | `runner_memory` | byte-size string (`"4GiB"`, `"512MiB"`, `"2GB"`) | Bounded by the effective configured `runner_memory`. Must be **positive** (a zero value in any form is rejected). **Rejected if it exceeds the ceiling** (reject, not clamp). |
 | `dind_memory` | byte-size string | Bounded by the effective configured `dind_memory`, same rules (positive only, rejected and not clamped). |
 | `storage_driver` | `overlay2` \| `vfs` | Defaults to the configured `storage_driver`. |
+| `job_hooks` | `fail` \| `warn` \| `off` | What the runner image's job-started hook does when a check finds damage. Overrides the configured `job_hooks` for this pool. No ceiling: turning a check off grants no privilege. See [Job hooks](#job-hooks-job_hooks). |
 | `runner_labels` | array of strings | Appended to the runner's labels. **Non-JIT mode only.** With JIT, GARM bakes the label set server-side, so these are inert. |
 | `extra_env` | object of string→string | Extra runner-container env. Governed by an **operator allowlist** and a **hard-reserved** set (see below). |
 
@@ -93,6 +94,19 @@ they are rejected rather than silently ignored.
   - exact `JIT_CONFIG_ENABLED`, `GITHUB_URL`, `RUN_AS_ROOT`, `WAIT_FOR_DOCKER_SECONDS`, `BASH_ENV`, `ENV`, `IFS`, `PATH`, `NODE_OPTIONS`
 
   The provider, the runner-image entrypoint or the interpreter relies on these names. `RUNNER_EPHEMERAL=false` or `DOCKER_HOST=...` would break the single-job teardown model or the DinD socket guarantees. `RUN_AS_ROOT=true` would run the runner and its job as **root**. The entrypoint reads `GARM_CRED_WAIT_SECONDS` and `WAIT_FOR_DOCKER_SECONDS` into Bash arithmetic, where a crafted value is command substitution as root. `BASH_ENV`, `LD_*` and `PATH` are shell and loader hijack vectors. A non-reserved, allowlisted name that collides with another provider-injected variable is dropped in favour of the provider's value: **provider-injected environment always wins**.
+- **`GARM_JOB_HOOKS` is reserved like every other `GARM_` name.** The runner image's job-started hook reads it, but the provider sets it from the typed `job_hooks` setting (next section), so `extra_env` cannot, even if you allowlist the name.
+
+### Job hooks (`job_hooks`)
+
+A job can leave a persistent cache, such as the pnpm store, in a state that makes later jobs of the same repository pass without doing their work. The runner images run a job-started hook that checks for this before the first step of every job (today: a 0-byte `pnpm` binary in a repository's pnpm store, see [`package-store-installs.md`](package-store-installs.md#pnpm-switching-its-own-version-pnpm-11-before-1122)). `job_hooks` chooses what the hook does when a check finds damage:
+
+| Value | Effect |
+|---|---|
+| `fail` (default) | The job fails before its first step, with an error annotation that names the cause and the fix. |
+| `warn` | The finding is printed as a warning annotation (never an error) and the job runs. |
+| `off` | The checks do not run. |
+
+Set the default for every pool with the top-level key `job_hooks` in the provider config, and override it for one pool with `{"job_hooks": "warn"}` in its `extra_specs`. The pool's value wins, then the config's, then `fail`. An unknown value is a config error at load and an `extra_specs` rejection. There is no `allowed_*` ceiling, because a pool that turns a check off gains no privilege and only loses a safety net. The provider always sets the resolved value in the runner container as `GARM_JOB_HOOKS`. Runner images that do not carry the hook ignore it, and a custom image that sets `GARM_JOB_HOOKS` itself gets the same behaviour ([`runner-images/README.md`](../runner-images/README.md#job-started-hook)).
 
 ### Never settable from `extra_specs` (structurally)
 
@@ -118,6 +132,7 @@ This is the exact schema the binary validates against (`internal/extraspecs/sche
     "runner_memory": { "type": "string", "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
     "dind_memory": { "type": "string", "pattern": "^[1-9][0-9]*\\s*(?i:b|kb|mb|gb|kib|mib|gib)?$" },
     "storage_driver": { "type": "string", "enum": ["overlay2", "vfs"] },
+    "job_hooks": { "type": "string", "enum": ["fail", "warn", "off"] },
     "runner_labels": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "extra_env": {
       "type": "object",
@@ -180,6 +195,7 @@ in a real config. `GetConfigJSONSchema` emits the machine-readable schema.
 | `allowed_dind_modes` | `["none"]` | The ceiling for pools. See above. |
 | `dind_image` | unset | Required when `dind_mode` is not `none`, and checked at load whenever it is set. Digest-pinned. |
 | `storage_driver` | `overlay2` | `overlay2` or `vfs`. |
+| `job_hooks` | `fail` | `fail`, `warn` or `off`. What the runner image's job-started hook does when a check finds damage. A pool can override it with `extra_specs.job_hooks`. See [Job hooks](#job-hooks-job_hooks). |
 | `registry_mirrors`, `insecure_registries` | empty | See the next section. |
 | `[resources]` `runner_memory`, `dind_memory` | unset (unlimited) | Byte sizes such as `8GiB` or `512MiB`: a whole number with an optional `B`, `KB`, `MB`, `GB` (decimal) or `KiB`, `MiB`, `GiB` (binary) suffix, in any case. `8GB` and `8GiB` are different sizes, and fractions such as `1.5GiB` are rejected. They are the ceilings for `extra_specs`. There are no CPU or PID limits. |
 | `[network]` `internal` | `false` | Docker's `internal` flag on each job network. `true` gives a job no egress at all. |

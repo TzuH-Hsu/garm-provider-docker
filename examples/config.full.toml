@@ -70,6 +70,13 @@ allow_unpinned_dind_image = false
 # "vfs" is the slower, more compatible fallback.
 storage_driver = "overlay2"
 
+# What the runner image's job-started hook does when a check finds damage,
+# such as a 0-byte pnpm binary in a repository's persistent pnpm store.
+# "fail" stops the job before its first step, "warn" prints the finding and
+# runs the job, "off" skips the checks. A pool can override it with
+# extra_specs.job_hooks. Default: "fail".
+job_hooks = "fail"
+
 # Docker Hub pull-through mirrors for the DinD sidecar's dockerd, emitted as
 # one --registry-mirror=<url> flag each. Each entry is a bare origin: an
 # http or https URL with a host and optional port, no path, query, fragment

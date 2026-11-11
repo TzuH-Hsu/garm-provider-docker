@@ -266,6 +266,92 @@ func TestCreateInstanceExtraEnvMergedProviderWins(t *testing.T) {
 	}
 }
 
+// TestCreateInstanceInjectsResolvedJobHooks: the provider sets GARM_JOB_HOOKS on
+// the runner from the typed job_hooks setting: the pool's value, else the
+// config default, else "fail". It always sets it, so a runner image never has
+// to guess.
+func TestCreateInstanceInjectsResolvedJobHooks(t *testing.T) {
+	tests := []struct {
+		name, configMode, poolSpecs, want string
+	}{
+		{"nothing set", "", `{}`, "fail"},
+		{"config default", "warn", `{}`, "warn"},
+		{"pool overrides config", "warn", `{"job_hooks": "off"}`, "off"},
+		{"pool without config", "", `{"job_hooks": "warn"}`, "warn"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{
+				DockerHost:       "unix:///var/run/docker.sock",
+				RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+				DindMode:         config.DindModeNone,
+				AllowedDindModes: []string{config.DindModeNone},
+				Network:          config.Network{EnableJobNetwork: true, Internal: false},
+				JobHooks:         tc.configMode,
+			}
+			p, fake := providerWithConfig(t, cfg)
+
+			srv := newJITMetadataServer(t)
+			defer srv.Close()
+
+			b := jitBootstrap(srv.URL)
+			b.ExtraSpecs = json.RawMessage(tc.poolSpecs)
+
+			inst, err := p.CreateInstance(context.Background(), b)
+			if err != nil {
+				t.Fatalf("CreateInstance: %v", err)
+			}
+			env := inspectRunner(t, fake, inst.Name).Config.Env
+			if !hasEnv(env, "GARM_JOB_HOOKS="+tc.want) {
+				t.Errorf("runner env missing GARM_JOB_HOOKS=%s: %v", tc.want, env)
+			}
+			count := 0
+			for _, e := range env {
+				if strings.HasPrefix(e, "GARM_JOB_HOOKS=") {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Errorf("GARM_JOB_HOOKS appears %d times in the runner env, want 1: %v", count, env)
+			}
+		})
+	}
+}
+
+// TestCreateInstanceRejectsJobHooksInExtraEnv: GARM_JOB_HOOKS is reserved like
+// every GARM_ name, even when the operator allowlists it. The typed job_hooks
+// setting is the only way to choose the mode.
+func TestCreateInstanceRejectsJobHooksInExtraEnv(t *testing.T) {
+	cfg := config.Config{
+		DockerHost:       "unix:///var/run/docker.sock",
+		RunnerImage:      "ghcr.io/example/runner@sha256:deadbeef",
+		DindMode:         config.DindModeNone,
+		AllowedDindModes: []string{config.DindModeNone},
+		Network:          config.Network{EnableJobNetwork: true, Internal: false},
+		ExtraSpecs:       config.ExtraSpecsPolicy{AllowedEnv: []string{"GARM_JOB_HOOKS"}},
+	}
+	p, fake := providerWithConfig(t, cfg)
+
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"extra_env": {"GARM_JOB_HOOKS": "off"}}`)
+	if _, err := p.CreateInstance(context.Background(), b); err == nil {
+		t.Fatal("CreateInstance with extra_env GARM_JOB_HOOKS = nil error, want reject")
+	}
+	assertNoResources(t, p, fake)
+}
+
+// TestCreateInstanceRejectsInvalidJobHooks: a bad job_hooks is rejected before
+// any Docker operation.
+func TestCreateInstanceRejectsInvalidJobHooks(t *testing.T) {
+	p, fake := newTestProvider(t)
+	b := jitBootstrap("https://metadata.invalid/")
+	b.ExtraSpecs = json.RawMessage(`{"job_hooks": "sometimes"}`)
+	if _, err := p.CreateInstance(context.Background(), b); err == nil {
+		t.Fatal("CreateInstance with an invalid job_hooks = nil error, want reject")
+	}
+	assertNoResources(t, p, fake)
+}
+
 // TestCreateInstanceExtraRunnerLabelsAppendedNonJIT: extra_specs.runner_labels
 // are appended to RUNNER_LABELS in non-JIT mode.
 func TestCreateInstanceExtraRunnerLabelsAppendedNonJIT(t *testing.T) {

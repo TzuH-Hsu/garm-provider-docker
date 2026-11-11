@@ -55,6 +55,11 @@ type ExtraSpecs struct {
 
 	StorageDriver string `json:"storage_driver,omitempty"`
 
+	// JobHooks overrides the config's job_hooks for this pool: what the runner
+	// image's job-started hook does when a check finds damage (fail, warn, off).
+	// It has no ceiling: turning a check off is not a privilege escalation.
+	JobHooks string `json:"job_hooks,omitempty"`
+
 	// RunnerLabels are appended to the runner labels. They take effect without JIT
 	// only.
 	RunnerLabels []string `json:"runner_labels,omitempty"`
@@ -208,6 +213,10 @@ type Resolved struct {
 
 	StorageDriver string
 
+	// JobHooks is the effective job-hook mode: the pool's value, else the
+	// config's, else "fail". It is never empty.
+	JobHooks string
+
 	ExtraRunnerLabels []string
 
 	// ExtraEnv is merged after the provider's own env, so provider values win.
@@ -277,6 +286,7 @@ func (s ExtraSpecs) Resolve(cfg config.Config) (Resolved, error) {
 		RunnerMemoryBytes: runnerMemoryBytes,
 		DindMemoryBytes:   dindMemoryBytes,
 		StorageDriver:     storageDriver,
+		JobHooks:          cfg.EffectiveJobHooks(s.JobHooks),
 		ExtraRunnerLabels: s.RunnerLabels,
 		ExtraEnv:          s.ExtraEnv,
 	}, nil

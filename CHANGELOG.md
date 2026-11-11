@@ -10,6 +10,25 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+### Added
+
+- The runner images now run a job-started hook before the first step of every
+  job. Its first check fails a job whose persistent pnpm store holds a 0-byte
+  `pnpm` binary, the damage that a bootstrap pnpm older than 11.22.0 can leave
+  behind (`pnpm/action-setup` before v6.1.0). Before, every `pnpm` command in
+  such a job printed nothing and exited 0, so install, lint, test and build
+  steps passed without running. Now the job fails at "Set up runner" with an
+  error annotation that names the cause and the fix (a warning annotation when
+  `job_hooks` is `warn`). The operator still has to remove
+  the repository's pnpm cache volume; see `docs/package-store-installs.md`.
+  Other checks can be added as files in `/opt/garm/hooks/job-started.d/` of a
+  derived image. The hook needs a runner image built from this change.
+- `job_hooks` (`fail`, the default, `warn` or `off`) sets what the hook does
+  when a check finds damage. It is a top-level key of the provider config and
+  can be overridden per pool in `extra_specs`. The provider passes the result
+  to the runner as `GARM_JOB_HOOKS`. Use `warn` or `off` to keep jobs running
+  while a damaged store is replaced.
+
 ## [0.2.11] - 2026-11-09
 
 ### Security

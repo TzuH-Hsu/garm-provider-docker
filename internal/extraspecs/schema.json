@@ -31,6 +31,11 @@
       "enum": ["overlay2", "vfs"],
       "description": "The explicit --storage-driver dockerd flag for the DinD sidecar (ADR-001). Defaults to the configured storage_driver when omitted."
     },
+    "job_hooks": {
+      "type": "string",
+      "enum": ["fail", "warn", "off"],
+      "description": "What the runner image's job-started hook does when one of its checks finds damage (ADR-002), such as a 0-byte pnpm binary in the repository's persistent pnpm store: \"fail\" stops the job before its first step, \"warn\" prints the finding and runs the job, \"off\" skips the checks. Overrides the provider config's job_hooks (default \"fail\"). There is no allowed_* ceiling: turning a check off grants no privilege. The provider passes the resolved value to the runner as GARM_JOB_HOOKS; extra_env cannot set it."
+    },
     "runner_labels": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

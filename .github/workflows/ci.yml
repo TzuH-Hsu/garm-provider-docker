@@ -73,7 +73,7 @@ jobs:
         run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
 
       - name: shellcheck
-        run: shellcheck runner-images/common/entrypoint.sh scripts/*.sh
+        run: shellcheck runner-images/common/entrypoint.sh runner-images/common/hooks/*.sh runner-images/common/hooks/job-started.d/*.sh scripts/*.sh
 
   # Not part of the required `build` check: a new advisory can turn this red
   # on a pull request that did not cause it. Fails only on an advisory whose
