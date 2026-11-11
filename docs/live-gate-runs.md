@@ -3,11 +3,13 @@
 Each section below records one run of the [live gate](live-gate.md), newest
 first. A record says what that run covered and nothing more, and it is not
 rewritten when the gate changes, so read it with the revision of the script it
-ran. The script was named `scripts/demo-m0.sh` at every commit recorded here, so
-use that path to read it, for example `git show 92d6c85:scripts/demo-m0.sh`.
+ran. The script is `scripts/live-gate.sh` from 950607f on and was
+`scripts/demo-m0.sh` at every earlier commit recorded here, so use the path of
+that commit to read it, for example `git show 92d6c85:scripts/demo-m0.sh`.
 
 | Run | Date | Runner image | `verify`, `none` | `verify`, `--dind` | `verify`, `--pool --non-jit` | `postjob` | Script at |
 |---|---|---|---|---|---|---|---|
+| [`feat/job-started-hooks` at 85c5542](#featjob-started-hooks-at-85c5542-2026-11-10), local provider build with Go 1.27.3 and runner image built from the branch | 2026-11-10 | Ubuntu 26.04, not digest-pinned | 28 PASS | not run | not run | not run | 85c5542 |
 | [`main` at 950607f](#main-at-950607f-2026-11-09), local provider build with Go 1.27.3 and runner image built from the checkout | 2026-11-09 | Ubuntu 26.04, not digest-pinned | 28 PASS | 59 PASS, with mirror | 30 PASS | all PASS | 950607f |
 | [`main` at 4146fa1](#main-at-4146fa1-2026-11-07), local build with Go 1.27.3 | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | not run | all PASS | 4146fa1 |
 | [`main` at 0540477](#main-at-0540477-2026-11-07), local build, the code for `v0.2.9` | 2026-11-07 | Ubuntu 26.04 | 28 PASS | 59 PASS, with mirror | not run | all PASS | 0540477 |
@@ -34,10 +36,84 @@ compare only between runs of the same revision:
   first that dispatches through a pool. Older rows never ran
   `--pool --non-jit`, because the gate had no such variant, so their cell in
   that column reads "not run".
+- 85c5542 is the head of the job-started hook change, merged as df1d0fc with
+  the same tree. That run used the script only for its preflight and the
+  `none` `verify` of one runner. The job-hook cases were dispatched by hand,
+  so they are not part of the script's `verify` counts. No published release
+  asset or image was run at 85c5542.
 - The Ubuntu 24.04 image has not been gated since `v0.2.3`.
 
 After the records come the [known upstream issue](#known-upstream-issue) they
 refer to and [what is still unverified](#still-unverified).
+
+## `feat/job-started-hooks` at 85c5542, 2026-11-10
+
+The job-started hook from #37 has been run end to end against a live GARM with
+a build of the branch at `85c55429e39ff66082fb670552b1aaf953399f46` (merged as
+df1d0fc, whose tree is the same), on the Ubuntu 26.04 image, on 2026-11-10.
+This run covers the hook dispatcher, the pnpm store check, the `job_hooks`
+setting and its `extra_specs` override, on scale sets and on a non-JIT pool.
+The Ubuntu 24.04 image was not part of this run.
+
+The script ran in source mode (`--from-source`) for its preflight and for
+`verify` of the first runner only. Every other case was a job of a small
+workflow in the test repository, dispatched by hand to the scale set or pool
+the case needed. To damage the store, a 0-byte file named `pnpm` was placed in
+the repository's pnpm cache volume at the path the check looks for, while no
+container mounted the volume.
+
+**Environment**
+
+- GARM v0.2.1; provider `interface_version` v0.1.0. Two scale sets (no
+  webhook), one without `extra_specs` and one with `{"job_hooks":"warn"}`, and
+  a pool with min-idle 1 and max 1 on a separate `[[provider]]` entry with
+  `disable_jit_config = true`.
+- Docker Engine 29.9.3, amd64, Ubuntu 26.04 host, kernel 7.0.
+- Provider: a local build of the branch at 85c5542 from a clean tree, using
+  the flags in `release.yml` and Go 1.27.3, whose `GetVersion` reports
+  `v0.2.11-5-g85c5542`, sha256
+  `f3179a6985a4e8bcbea4c71545f12db3ea73f3ff8f80eca0f801284f263bf59a`. The
+  provider config did not set `job_hooks`, so the default `fail` applied
+  wherever `extra_specs` did not set it.
+- Runner image: built locally from the branch (`--runner-image resolute`,
+  Ubuntu 26.04). It is not digest-pinned, because source mode sets
+  `allow_unpinned_runner_image=true`. No published image was run.
+- The test repository's pnpm store is mounted at `/opt/pnpm-store`.
+
+**Results**
+
+| Case | Runs on | Store | Result |
+|---|---|---|---|
+| `job_hooks` unset (default `fail`) | scale set | healthy | job succeeded; the hook ran in `Set up runner` and passed; no annotations; `verify` 28 PASS, 0 FAIL, 0 WARN |
+| Default mode | scale set | 0-byte `pnpm` planted | job failed at `Set up runner` and every later step was skipped; two error annotations, `Job-started check failed: pnpm-store` (naming the planted path and linking the docs) and `Job stopped by a job-started check`, besides the runner's own `Process completed with exit code 1.`; no warning |
+| `extra_specs` `{"job_hooks":"warn"}` | scale set | same damaged store | job succeeded and ran all its steps; exactly one annotation, the warning `Job-started check found damage: pnpm-store`; no error |
+| Default mode, non-JIT | pool | same damaged store | `JIT_CONFIG_ENABLED=false` in the runner; job failed at `Set up runner` with the same two error annotations |
+| Default mode | scale set | planted file removed | job succeeded; no annotations |
+| Default mode | scale set | the whole pnpm cache volume removed | job succeeded; the provider recreated the volume under the same name, with cache kind `pnpm` |
+| Runner environment (`docker inspect`) | the runners of the healthy, `warn` and non-JIT cases | n/a | `GARM_JOB_HOOKS` carried the resolved value (`fail` on the default scale set and on the pool, `warn` on the other scale set); `ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/garm/hooks/job-started.sh`; `pnpm_config_store_dir` and `npm_config_store_dir` set to `/opt/pnpm-store` |
+
+- **In the image, without GARM.** Run directly in the built image against the
+  damaged store, the hook exited 1 with the two error annotations under
+  `fail`, exited 0 with the one warning under `warn`, and exited 0 with no
+  output under `off`. An unknown value (`wran`) printed an
+  `Unknown GARM_JOB_HOOKS value` warning and then behaved as `fail`. Against a
+  healthy store under `fail`, it exited 0 with no output.
+- **`extra_specs` validation.** Called by hand, `ValidatePoolInfo` accepted
+  `fail`, `warn` and `off`, and rejected `bogus`, `WARN`, an empty string and
+  `null`. GARM v0.2.1 on interface v0.1.0 does not call it, as
+  [Interface versions](how-it-works.md#interface-versions) says: a scale set
+  with `{"job_hooks":"bogus"}` was created without an error. It was deleted
+  before any runner started, so what such a pool does when it creates a
+  runner is not covered.
+- **Non-JIT cleanup.** As at 950607f, the pool replaced its runner after the
+  job. Disabling the pool, setting min-idle to 0 and `garm-cli runner rm`
+  removed the replacement from GARM, but its GitHub registration stayed
+  (idle) until it was deleted through the GitHub API.
+- **Teardown.** The scale sets, the pool, the locally built runner image and
+  the externals cache volume keyed on that image were removed by name. No
+  managed container, network or job volume was left behind, and the test
+  repository had no runner registered. The repository's pnpm cache volume
+  existed before the run and was kept.
 
 ## `main` at 950607f, 2026-11-09
 
@@ -562,5 +638,13 @@ race and the stall entirely once it is in a release.
 - A published runner image that has the #85 entrypoint change. The `950607f`
   run used an image built locally from the checkout.
 - An arm64 host.
+- The job-started hook on the Ubuntu 24.04 image, which copies the same hook
+  files but was not built or run at 85c5542.
+- `job_hooks` set in the provider config rather than in `extra_specs`, and
+  `off` through GARM (it ran only directly in the image).
+- A pnpm store damaged by a real pnpm run rather than a planted file, the hook
+  under the DinD modes, and a published runner image that carries the hook.
+- What a pool with an invalid `job_hooks` does when it creates a runner on
+  GARM v0.2.1, which does not call `ValidatePoolInfo`.
 - Webhook-driven pool dispatch, and a pool on a JIT provider entry. The pool at
   950607f was non-JIT, ran one idle runner and received no webhook.
