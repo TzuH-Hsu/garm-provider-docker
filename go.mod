@@ -7,7 +7,7 @@ go 1.25.0
 // current standard library fixes. CI fails if the Dockerfile's golang tag
 // differs, or if the go line changes (scripts/check-go-version.sh). Renovate
 // bumps the toolchain line and the tag together; it never touches the go line.
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/BurntSushi/toml v1.6.0
