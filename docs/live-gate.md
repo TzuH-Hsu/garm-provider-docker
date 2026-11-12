@@ -827,6 +827,10 @@ It does **not** exercise:
   carries none) — schema validation and the operator-ceiling/allowlist
   behavior are covered by this repo's own unit and integration tests
   (`internal/extraspecs`, `internal/verify`), not by this gate.
+- The runner images' job-started hook and the `job_hooks` setting. `verify`
+  does not damage a store or read job annotations; the hook's own end-to-end
+  run is recorded under
+  [`feat/job-started-hooks` at 85c5542](live-gate-runs.md#featjob-started-hooks-at-85c5542-2026-11-10).
 
 ## Troubleshooting
 
