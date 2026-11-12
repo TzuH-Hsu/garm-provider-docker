@@ -21,7 +21,7 @@
 # (scripts/check-go-version.sh). Renovate bumps both together; Dependabot
 # ignores the tag and only refreshes its digest. By hand, change both and use
 # the multi-arch index digest, not a per-platform one (see CONTRIBUTING.md).
-FROM --platform=$BUILDPLATFORM golang:1.27.3@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c AS builder
 
 WORKDIR /src
 
