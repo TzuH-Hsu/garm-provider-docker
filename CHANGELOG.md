@@ -10,6 +10,24 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-11-16
+
+### Security
+
+- Release binaries and the provider image are now built with Go 1.27.4, which
+  fixes GO-2026-6859, a crash of HTTP/1 servers in `net/http`. `govulncheck`
+  reports it as reachable from this code, but the provider runs no HTTP
+  server.
+
+### Changed
+
+- Jobs whose repository's pnpm store is already damaged now fail instead of
+  passing without doing their work, because `job_hooks` defaults to `fail`
+  (see Added). A job that fails this way after the upgrade was most likely
+  passing falsely before. To keep such jobs running while you remove the
+  repository's pnpm cache volume, set `job_hooks = "warn"` in the provider
+  config, or `{"job_hooks": "warn"}` in the pool's `extra_specs`.
+
 ### Added
 
 - The runner images now run a job-started hook before the first step of every
@@ -117,7 +135,8 @@ Earlier versions are described on the
   output was previously discarded.
 - A runner that never started no longer produces an exit report on delete.
 
-[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.11...HEAD
+[Unreleased]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/TzuH-Hsu/garm-provider-docker/compare/v0.2.8...v0.2.9

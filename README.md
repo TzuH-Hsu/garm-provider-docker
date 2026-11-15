@@ -175,6 +175,7 @@ provider for my own private repositories, on the first row's setup.
 | `linux/arm64` | Published, not tested end to end |
 | `sysbox-runc` | Unit tests only |
 | Pool with non-JIT runners (`disable_jit_config`), no webhook | Live-tested on a local build of the v0.2.11 code and a locally built runner image; GARM lists the runner as `pending` for its whole life |
+| Job-started hook and `job_hooks` (`fail` and `warn` through `extra_specs`), Ubuntu 26.04 image, scale sets and a non-JIT pool | Live-tested on a local build of the change before the Go 1.27.4 update, with a locally built runner image |
 | Pools with webhooks, `interface_version` v0.1.1 with GARM | Not tested end to end |
 
 ## Compatibility
