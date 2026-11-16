@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/topology"
@@ -239,7 +240,7 @@ func (p *Provider) reapLeakedHelpers(ctx context.Context) {
 		if !helperReapable(c.State, age, known) {
 			continue
 		}
-		if err := p.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		if err := p.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
 			slog.WarnContext(ctx, "cache GC: failed to reap leaked helper (continuing)", "resource", "container", "container_id", c.ID, "error", err)
 			continue
 		}
@@ -316,7 +317,7 @@ func (p *Provider) runHelperContainer(ctx context.Context, cfg *container.Config
 	defer func() {
 		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
-		if rerr := p.cli.ContainerRemove(rmCtx, created.ID, container.RemoveOptions{Force: true}); rerr != nil && !errdefs.IsNotFound(rerr) {
+		if rerr := p.cli.ContainerRemove(rmCtx, created.ID, container.RemoveOptions{Force: true}); rerr != nil && !cerrdefs.IsNotFound(rerr) {
 			slog.WarnContext(rmCtx, "failed to remove helper container (continuing)", "resource", "container", "container_name", name, "error", rerr)
 		}
 	}()

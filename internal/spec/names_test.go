@@ -109,15 +109,16 @@ func TestVolumeNamesAreGenerationUnique(t *testing.T) {
 		}
 	}
 	// The stable claim-marker network, by contrast, must be identical across
-	// generations of the same instance (it is the dedup primitive).
-	if JobNetworkName(instanceName) != JobNetworkName(instanceName) {
-		t.Fatal("JobNetworkName is unexpectedly non-deterministic")
+	// generations of the same instance (it is the dedup primitive), so its
+	// name is pinned to the instance name alone.
+	if got, want := JobNetworkName(instanceName), "job-1-net"; got != want {
+		t.Fatalf("JobNetworkName(%q) = %q, want %q", instanceName, got, want)
 	}
 }
 
 // TestValidateDerivedName is the derived-name length/charset hardening guard:
 // a name at or under the 255-byte limit and matching Docker's
-// [a-zA-Z0-9][a-zA-Z0-9_.-]* grammar is accepted; anything else is rejected
+// [a-zA-Z0-9][a-zA-Z0-9_.-]+ grammar is accepted; anything else is rejected
 // with a clear, specific error rather than being handed to the daemon to
 // reject opaquely.
 func TestValidateDerivedName(t *testing.T) {

@@ -8,7 +8,6 @@ import (
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
 	"github.com/cloudbase/garm-provider-common/params"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 
@@ -514,8 +513,8 @@ func TestRemoveAllInstancesSurfacesRemoveErrorButDoesNotFailFast(t *testing.T) {
 }
 
 func TestAddressesFromInspect(t *testing.T) {
-	c := types.ContainerJSON{
-		NetworkSettings: &types.NetworkSettings{
+	c := container.InspectResponse{
+		NetworkSettings: &container.NetworkSettings{
 			Networks: map[string]*network.EndpointSettings{
 				"bridge": {IPAddress: "172.17.0.2"},
 				"empty":  {IPAddress: ""},
@@ -532,7 +531,7 @@ func TestAddressesFromInspect(t *testing.T) {
 	}
 
 	// No network settings -> no addresses.
-	if got := addressesFromInspect(types.ContainerJSON{}); got != nil {
+	if got := addressesFromInspect(container.InspectResponse{}); got != nil {
 		t.Errorf("addresses = %v, want nil for a container with no network settings", got)
 	}
 }

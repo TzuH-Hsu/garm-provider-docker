@@ -16,8 +16,9 @@ import (
 	"testing"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
@@ -163,7 +164,7 @@ func TestLiveContainerLogsNoneDriverIsNotImplemented(t *testing.T) {
 		_ = rc.Close()
 	}
 	t.Logf("ContainerLogs with log driver none: %v", err)
-	if err == nil || !errdefs.IsNotImplemented(err) {
+	if err == nil || !cerrdefs.IsNotImplemented(err) {
 		t.Fatalf("ContainerLogs error = %v, want errdefs.NotImplemented", err)
 	}
 }
@@ -176,7 +177,7 @@ func TestLiveContainerTopOfStoppedContainerIsConflict(t *testing.T) {
 	time.Sleep(time.Second)
 	_, err := p.cli.ContainerTop(context.Background(), id, nil)
 	t.Logf("ContainerTop of a stopped container: %v", err)
-	if !errdefs.IsConflict(err) {
+	if !cerrdefs.IsConflict(err) {
 		t.Fatalf("ContainerTop error = %v, want errdefs.Conflict", err)
 	}
 }

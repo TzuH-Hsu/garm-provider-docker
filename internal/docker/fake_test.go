@@ -8,11 +8,12 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/errdefs"
 )
 
 // TestFakeClientContainerCreateRejectsLongSyntaxTmpfsUID checks that the fake
@@ -144,8 +145,8 @@ func TestFakeClientContainerLifecycle(t *testing.T) {
 		t.Fatalf("ContainerRemove returned unexpected error: %v", err)
 	}
 
-	if _, err := f.ContainerInspect(ctx, created.ID); !errdefs.IsNotFound(err) {
-		t.Fatalf("ContainerInspect after remove: err = %v, want errdefs.IsNotFound", err)
+	if _, err := f.ContainerInspect(ctx, created.ID); !cerrdefs.IsNotFound(err) {
+		t.Fatalf("ContainerInspect after remove: err = %v, want cerrdefs.IsNotFound", err)
 	}
 }
 
@@ -153,14 +154,14 @@ func TestFakeClientNotFoundErrors(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
 
-	if _, err := f.ContainerInspect(ctx, "does-not-exist"); !errdefs.IsNotFound(err) {
-		t.Errorf("ContainerInspect: err = %v, want errdefs.IsNotFound", err)
+	if _, err := f.ContainerInspect(ctx, "does-not-exist"); !cerrdefs.IsNotFound(err) {
+		t.Errorf("ContainerInspect: err = %v, want cerrdefs.IsNotFound", err)
 	}
-	if err := f.ContainerStart(ctx, "does-not-exist", container.StartOptions{}); !errdefs.IsNotFound(err) {
-		t.Errorf("ContainerStart: err = %v, want errdefs.IsNotFound", err)
+	if err := f.ContainerStart(ctx, "does-not-exist", container.StartOptions{}); !cerrdefs.IsNotFound(err) {
+		t.Errorf("ContainerStart: err = %v, want cerrdefs.IsNotFound", err)
 	}
-	if err := f.ContainerRemove(ctx, "does-not-exist", container.RemoveOptions{}); !errdefs.IsNotFound(err) {
-		t.Errorf("ContainerRemove: err = %v, want errdefs.IsNotFound", err)
+	if err := f.ContainerRemove(ctx, "does-not-exist", container.RemoveOptions{}); !cerrdefs.IsNotFound(err) {
+		t.Errorf("ContainerRemove: err = %v, want cerrdefs.IsNotFound", err)
 	}
 }
 
@@ -195,7 +196,7 @@ func TestFakeClientContainerStopAndSetState(t *testing.T) {
 	}
 
 	// Stop on a missing container is NotFound.
-	if err := f.ContainerStop(ctx, "nope", container.StopOptions{}); !errdefs.IsNotFound(err) {
+	if err := f.ContainerStop(ctx, "nope", container.StopOptions{}); !cerrdefs.IsNotFound(err) {
 		t.Errorf("ContainerStop(missing): err = %v, want NotFound", err)
 	}
 }
@@ -205,7 +206,7 @@ func TestFakeClientImageInspectAndPull(t *testing.T) {
 	ctx := context.Background()
 
 	// Absent image -> NotFound.
-	if _, _, err := f.ImageInspectWithRaw(ctx, "ghcr.io/example/runner:latest"); !errdefs.IsNotFound(err) {
+	if _, _, err := f.ImageInspectWithRaw(ctx, "ghcr.io/example/runner:latest"); !cerrdefs.IsNotFound(err) {
 		t.Fatalf("ImageInspectWithRaw on absent image: err = %v, want NotFound", err)
 	}
 
@@ -225,7 +226,7 @@ func TestFakeClientImageInspectAndPull(t *testing.T) {
 	if _, err := f2.ImagePull(ctx, "ghcr.io/example/x:1", image.PullOptions{}); err == nil {
 		t.Fatal("expected ImagePull to fail when PullErr is set")
 	}
-	if _, _, err := f2.ImageInspectWithRaw(ctx, "ghcr.io/example/x:1"); !errdefs.IsNotFound(err) {
+	if _, _, err := f2.ImageInspectWithRaw(ctx, "ghcr.io/example/x:1"); !cerrdefs.IsNotFound(err) {
 		t.Fatalf("image should remain absent after failed pull: err = %v", err)
 	}
 }
@@ -296,7 +297,7 @@ func TestFakeClientExecStream(t *testing.T) {
 }
 
 // TestFakeClientContainerCreateNameConflict checks that a second create with an
-// in-use name is rejected with an errdefs.IsConflict error and no second
+// in-use name is rejected with a cerrdefs.IsConflict error and no second
 // container is recorded.
 func TestFakeClientContainerCreateNameConflict(t *testing.T) {
 	f := NewFakeClient()
@@ -310,8 +311,8 @@ func TestFakeClientContainerCreateNameConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a name-conflict error on the second create, got nil")
 	}
-	if !errdefs.IsConflict(err) {
-		t.Errorf("second create err = %v, want errdefs.IsConflict", err)
+	if !cerrdefs.IsConflict(err) {
+		t.Errorf("second create err = %v, want cerrdefs.IsConflict", err)
 	}
 
 	// Only the first container exists.

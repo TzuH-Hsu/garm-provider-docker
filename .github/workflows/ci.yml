@@ -56,6 +56,14 @@ jobs:
       - name: go vet ./...
         run: go vet ./...
 
+      # Part of the required `build` check rather than a job of its own, so it
+      # gates merges without a ruleset change. Settings live in .golangci.yml.
+      # Pinned and run with `go run`, like govulncheck: the module checksum
+      # database verifies the source, and go.mod's toolchain builds it. Bump
+      # the version by hand, here and in CONTRIBUTING.md.
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+
       - name: gofmt -l (fail if any file is unformatted)
         run: |
           unformatted="$(gofmt -l .)"

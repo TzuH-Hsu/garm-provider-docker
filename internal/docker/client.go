@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -17,7 +16,7 @@ import (
 // Client is the slice of the moby SDK this provider depends on. Every signature but
 // ExecStream and ExecOutput is copied from the SDK, so the *client.Client embedded in
 // mobyClient provides the rest with no wrapper. A call that
-// takes a container, network or volume ID or name returns an errdefs.IsNotFound error
+// takes a container, network or volume ID or name returns a cerrdefs.IsNotFound error
 // when nothing matches, except where noted.
 type Client interface {
 	// ImagePull pulls refStr, honoring options such as registry auth. The caller must
@@ -25,10 +24,10 @@ type Client interface {
 	ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error)
 
 	// ImageInspectWithRaw inspects a local image by reference. It returns an
-	// errdefs.IsNotFound error when the image is not present, which is how CreateInstance
+	// cerrdefs.IsNotFound error when the image is not present, which is how CreateInstance
 	// decides whether to pull (ADR-002). The raw bytes are unused; they keep the SDK
 	// signature.
-	ImageInspectWithRaw(ctx context.Context, imageID string) (types.ImageInspect, []byte, error)
+	ImageInspectWithRaw(ctx context.Context, imageID string) (image.InspectResponse, []byte, error)
 
 	// ContainerCreate creates (but does not start) a container.
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
@@ -40,14 +39,14 @@ type Client interface {
 	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
 
 	// ContainerInspect returns the full state of one container, found by ID or name.
-	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
+	ContainerInspect(ctx context.Context, containerID string) (container.InspectResponse, error)
 
 	// ContainerRemove removes a container, found by ID or name.
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 
 	// ContainerList lists containers matching options.Filters. The provider looks up every
 	// managed resource with a "label" filter (ADR-004).
-	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 
 	// ContainerWait blocks until the container reaches condition. The exit status arrives
 	// on the response channel and a failure on the error channel, as in the SDK. The
@@ -90,7 +89,7 @@ type Client interface {
 	// readiness when the logs cannot be read.
 	ContainerTop(ctx context.Context, containerID string, arguments []string) (container.TopResponse, error)
 
-	// NetworkCreate creates a labeled bridge network. It returns an errdefs.IsConflict
+	// NetworkCreate creates a labeled bridge network. It returns a cerrdefs.IsConflict
 	// error when the name is in use: since API 1.44 the daemon always rejects a duplicate
 	// network name. ADR-004 uses the first network created for an allocation as its
 	// claim marker.

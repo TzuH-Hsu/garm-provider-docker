@@ -5,8 +5,9 @@ import (
 	"log/slog"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -90,7 +91,7 @@ func (p *Provider) runCacheGCThrottled(ctx context.Context) {
 func (p *Provider) claimRound(ctx context.Context, st throttleStamp) bool {
 	image := p.cfg.EffectiveRunnerImage("")
 	if _, _, err := p.cli.ImageInspectWithRaw(ctx, image); err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return true
 		}
 		slog.WarnContext(ctx, "throttle: failed to inspect the runner image; skipping this pass",
@@ -108,7 +109,7 @@ func (p *Provider) claimRound(ctx context.Context, st throttleStamp) bool {
 func (p *Provider) claimStamp(ctx context.Context, st throttleStamp, image string) bool {
 	existing, err := p.cli.ContainerInspect(ctx, st.name)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return p.createStamp(ctx, st, image)
 		}
 		slog.WarnContext(ctx, "throttle: failed to inspect the stamp; skipping this pass",
@@ -131,8 +132,8 @@ func (p *Provider) claimStamp(ctx context.Context, st throttleStamp, image strin
 		return false
 	}
 	// Remove by ID, not name, so a slow peer cannot delete the winner's fresh stamp.
-	if err := p.cli.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-		if errdefs.IsConflict(err) {
+	if err := p.cli.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+		if cerrdefs.IsConflict(err) {
 			// "removal of container ... is already in progress": a peer found the same
 			// stamp expired and owns this round, so losing the claim is not a warning.
 			slog.DebugContext(ctx, "throttle: a peer is replacing the stamp; skipping this pass",
@@ -161,7 +162,7 @@ func (p *Provider) claimStamp(ctx context.Context, st throttleStamp, image strin
 func (p *Provider) createStamp(ctx context.Context, st throttleStamp, image string) bool {
 	cfg, hostCfg := spec.BuildStampContainer(image, p.ownedHelperLabels(st.role))
 	if _, err := p.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, st.name); err != nil {
-		if !errdefs.IsConflict(err) {
+		if !cerrdefs.IsConflict(err) {
 			slog.WarnContext(ctx, "throttle: failed to create the stamp; skipping this pass",
 				"pass", st.what, "resource", "container", "container_name", st.name, "error", err)
 		}

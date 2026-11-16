@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -310,14 +309,14 @@ func (f *FakeClient) ImagePull(_ context.Context, refStr string, _ image.PullOpt
 // NotFound. The ID is a "sha256:<hex>" derived from the ref, stable per ref and
 // different across refs, like the real content-addressed ID. Config.Labels comes
 // from ImageLabels.
-func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (types.ImageInspect, []byte, error) {
+func (f *FakeClient) ImageInspectWithRaw(_ context.Context, imageID string) (image.InspectResponse, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if !f.PresentImages[imageID] {
-		return types.ImageInspect{}, nil, notFoundf("image %s not found", imageID)
+		return image.InspectResponse{}, nil, notFoundf("image %s not found", imageID)
 	}
-	insp := types.ImageInspect{ID: fakeImageID(imageID)}
+	insp := image.InspectResponse{ID: fakeImageID(imageID)}
 	if labels, ok := f.ImageLabels[imageID]; ok {
 		insp.Config = &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{Labels: maps.Clone(labels)}}
 	}
@@ -701,16 +700,16 @@ func (f *FakeClient) SetExitCode(containerID string, exitCode int) {
 }
 
 // ContainerInspect returns the recorded state of containerID.
-func (f *FakeClient) ContainerInspect(_ context.Context, containerID string) (types.ContainerJSON, error) {
+func (f *FakeClient) ContainerInspect(_ context.Context, containerID string) (container.InspectResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.InspectErr != nil {
-		return types.ContainerJSON{}, f.InspectErr
+		return container.InspectResponse{}, f.InspectErr
 	}
 	c := f.find(containerID)
 	if c == nil {
-		return types.ContainerJSON{}, notFoundf("container %s not found", containerID)
+		return container.InspectResponse{}, notFoundf("container %s not found", containerID)
 	}
 	return c.toContainerJSON(), nil
 }
@@ -734,11 +733,11 @@ func (f *FakeClient) ContainerRemove(_ context.Context, containerID string, _ co
 }
 
 // ContainerList returns the containers matching the "label" filter in options.Filters.
-func (f *FakeClient) ContainerList(_ context.Context, options container.ListOptions) ([]types.Container, error) {
+func (f *FakeClient) ContainerList(_ context.Context, options container.ListOptions) ([]container.Summary, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	var out []types.Container
+	var out []container.Summary
 	for _, c := range f.containers {
 		if !options.Filters.MatchKVList("label", c.labels) {
 			continue
@@ -961,8 +960,8 @@ func (f *FakeClient) VolumeList(_ context.Context, options volume.ListOptions) (
 	return volume.ListResponse{Volumes: out}, nil
 }
 
-func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
-	state := &types.ContainerState{
+func (c *fakeContainer) toContainerJSON() container.InspectResponse {
+	state := &container.State{
 		Status:    c.state,
 		Running:   c.state == "running",
 		Dead:      c.state == "dead",
@@ -973,7 +972,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 	if !c.finishedAt.IsZero() {
 		state.FinishedAt = c.finishedAt.UTC().Format(time.RFC3339Nano)
 	}
-	base := &types.ContainerJSONBase{
+	base := &container.ContainerJSONBase{
 		ID:    c.id,
 		Name:  "/" + c.name,
 		State: state,
@@ -989,7 +988,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 		base.HostConfig.NetworkMode = container.NetworkMode(c.networkMode)
 	}
 
-	cj := types.ContainerJSON{
+	cj := container.InspectResponse{
 		ContainerJSONBase: base,
 		Config: &container.Config{
 			Image:  c.image,
@@ -1003,7 +1002,7 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 	// A user-defined network is reported under NetworkSettings.Networks with a fixed
 	// private IP; built-in modes are not.
 	if isUserDefinedNetwork(c.networkMode) {
-		cj.NetworkSettings = &types.NetworkSettings{
+		cj.NetworkSettings = &container.NetworkSettings{
 			Networks: map[string]*network.EndpointSettings{
 				c.networkMode: {IPAddress: "10.240.0.2"},
 			},
@@ -1013,13 +1012,13 @@ func (c *fakeContainer) toContainerJSON() types.ContainerJSON {
 }
 
 // mountPoints converts the recorded mounts to the .Mounts that ContainerInspect reports.
-func (c *fakeContainer) mountPoints() []types.MountPoint {
+func (c *fakeContainer) mountPoints() []container.MountPoint {
 	if len(c.mounts) == 0 {
 		return nil
 	}
-	out := make([]types.MountPoint, 0, len(c.mounts))
+	out := make([]container.MountPoint, 0, len(c.mounts))
 	for _, m := range c.mounts {
-		out = append(out, types.MountPoint{
+		out = append(out, container.MountPoint{
 			Type:        m.Type,
 			Name:        m.Source, // for a named volume, Source is the volume name
 			Destination: m.Target,
@@ -1075,8 +1074,8 @@ func joinedNetnsOwner(mode string) (string, bool) {
 	return ref, true
 }
 
-func (c *fakeContainer) toContainerSummary() types.Container {
-	return types.Container{
+func (c *fakeContainer) toContainerSummary() container.Summary {
+	return container.Summary{
 		ID:     c.id,
 		Names:  []string{"/" + c.name},
 		Image:  c.image,
@@ -1094,13 +1093,13 @@ func cloneLabels(labels map[string]string) map[string]string {
 	return out
 }
 
-// notFoundf builds an error satisfying errdefs.IsNotFound, as the SDK returns for a
+// notFoundf builds an error satisfying cerrdefs.IsNotFound, as the SDK returns for a
 // daemon 404.
 func notFoundf(format string, a ...any) error {
 	return errdefs.NotFound(fmt.Errorf(format, a...))
 }
 
-// conflictf builds an error satisfying errdefs.IsConflict, as the SDK returns for a
+// conflictf builds an error satisfying cerrdefs.IsConflict, as the SDK returns for a
 // daemon 409.
 func conflictf(format string, a ...any) error {
 	return errdefs.Conflict(fmt.Errorf(format, a...))

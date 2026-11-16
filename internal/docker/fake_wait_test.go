@@ -5,10 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/strslice"
-	"github.com/docker/docker/errdefs"
 )
 
 // waitResult drains the two ContainerWait channels once, returning the status
@@ -88,7 +89,7 @@ func TestFakeContainerWaitErrors(t *testing.T) {
 
 	f.BatchWaitErr = nil
 	sc2, ec2 := f.ContainerWait(ctx, "does-not-exist", container.WaitConditionNotRunning)
-	if _, err := waitResult(t, sc2, ec2); !errdefs.IsNotFound(err) {
+	if _, err := waitResult(t, sc2, ec2); !cerrdefs.IsNotFound(err) {
 		t.Errorf("wait on a missing container = %v, want NotFound", err)
 	}
 }

@@ -12,6 +12,7 @@ toolchain go1.27.4
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/cloudbase/garm-provider-common v0.1.9
+	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0
 	// Pinned to v28.5.2+incompatible: this module path never adopted a
 	// /vN import path, so the Go module proxy caps github.com/docker/docker
@@ -19,12 +20,12 @@ require (
 	// terminal version reachable on this path; there is no further bump
 	// available here.
 	//
-	// v28.5.2 is also the last release carrying the back-compat shims
-	// this repo depends on: types.ContainerJSON and friends are
-	// deprecated type aliases whose godoc reads "Deprecated: use
-	// container.InspectResponse. It will be removed in the next
-	// release." Moving past this point is a real migration, not a
-	// routine bump.
+	// v28.5.2 still carries deprecated aliases such as types.ContainerJSON
+	// and the errdefs.Is* predicates. The code uses the names their
+	// deprecation notices point to (container.InspectResponse,
+	// github.com/containerd/errdefs) instead. Moving past this point is
+	// still a real migration, not a routine bump, because the client
+	// import path changes.
 	//
 	// Upstream split the client into separately-versioned modules:
 	// github.com/moby/moby/client, github.com/moby/moby/api (which
@@ -43,7 +44,6 @@ require (
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/docker/go-connections v0.5.0 // indirect

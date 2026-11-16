@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
@@ -26,7 +27,7 @@ func TestFakeContainerStatsOneShot(t *testing.T) {
 	f := NewFakeClient()
 	ctx := context.Background()
 
-	if _, err := f.ContainerStatsOneShot(ctx, "nope"); !errdefs.IsNotFound(err) {
+	if _, err := f.ContainerStatsOneShot(ctx, "nope"); !cerrdefs.IsNotFound(err) {
 		t.Fatalf("missing container err = %v, want NotFound", err)
 	}
 
@@ -98,7 +99,7 @@ func TestFakeStatsOfJoinedNetns(t *testing.T) {
 	if err := f.ContainerStop(ctx, owner, container.StopOptions{}); err != nil {
 		t.Fatalf("ContainerStop: %v", err)
 	}
-	if _, err := read(); !errdefs.IsInvalidParameter(err) {
+	if _, err := read(); !cerrdefs.IsInvalidArgument(err) {
 		t.Fatalf("owner stopped: err = %v, want InvalidParameter", err)
 	}
 	if err := f.ContainerRemove(ctx, owner, container.RemoveOptions{Force: true}); err != nil {
@@ -115,7 +116,7 @@ func TestFakeExecOutput(t *testing.T) {
 	ctx := context.Background()
 	f.ExecOutputText, f.ExecOutputExit = "hello\n", 7
 
-	if _, _, err := f.ExecOutput(ctx, "nope", []string{"true"}); !errdefs.IsNotFound(err) {
+	if _, _, err := f.ExecOutput(ctx, "nope", []string{"true"}); !cerrdefs.IsNotFound(err) {
 		t.Fatalf("missing container err = %v, want NotFound", err)
 	}
 

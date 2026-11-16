@@ -7,8 +7,9 @@ import (
 	"log/slog"
 	"strings"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -97,7 +98,7 @@ func (p *Provider) createAndStartRunner(ctx context.Context, cfg *container.Conf
 		return id, err
 	}
 	if id != "" {
-		if rerr := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); rerr != nil && !errdefs.IsNotFound(rerr) {
+		if rerr := p.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); rerr != nil && !cerrdefs.IsNotFound(rerr) {
 			return id, errors.Join(err, fmt.Errorf("failed to remove runner container %s before retrying without the IPv6 sysctl: %w", id, rerr))
 		}
 	}
