@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/cloudbase/garm-provider-common/params"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 
@@ -64,20 +64,20 @@ func cacheBootstrap(name, repoURL, metadataURL string) params.BootstrapInstance 
 	}
 }
 
-func mountAt(c types.ContainerJSON, dest string) (types.MountPoint, bool) {
+func mountAt(c container.InspectResponse, dest string) (container.MountPoint, bool) {
 	for _, m := range c.Mounts {
 		if m.Destination == dest {
 			return m, true
 		}
 	}
-	return types.MountPoint{}, false
+	return container.MountPoint{}, false
 }
 
-func envHas(c types.ContainerJSON, kv string) bool {
+func envHas(c container.InspectResponse, kv string) bool {
 	return c.Config != nil && slices.Contains(c.Config.Env, kv)
 }
 
-func envHasPrefix(c types.ContainerJSON, prefix string) bool {
+func envHasPrefix(c container.InspectResponse, prefix string) bool {
 	if c.Config == nil {
 		return false
 	}
@@ -415,7 +415,7 @@ func TestCreateInstanceCacheHitAcrossAllocationsSurvivesDelete(t *testing.T) {
 	// Both runners mount the SAME cache volume names.
 	c1 := inspectRunner(t, fake, "job-1")
 	c2 := inspectRunner(t, fake, "job-2")
-	for _, c := range []types.ContainerJSON{c1, c2} {
+	for _, c := range []container.InspectResponse{c1, c2} {
 		if m, ok := mountAt(c, "/opt/hostedtoolcache"); !ok || m.Name != toolName {
 			t.Errorf("job did not mount the shared toolcache %q (got %+v)", toolName, m)
 		}

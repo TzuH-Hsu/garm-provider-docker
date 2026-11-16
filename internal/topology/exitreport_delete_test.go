@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/errdefs"
@@ -55,7 +54,7 @@ func (s *spyClient) NetworkList(ctx context.Context, opts network.ListOptions) (
 	return s.FakeClient.NetworkList(ctx, opts)
 }
 
-func (s *spyClient) ContainerInspect(ctx context.Context, id string) (types.ContainerJSON, error) {
+func (s *spyClient) ContainerInspect(ctx context.Context, id string) (container.InspectResponse, error) {
 	s.inspects++
 	return s.FakeClient.ContainerInspect(ctx, id)
 }

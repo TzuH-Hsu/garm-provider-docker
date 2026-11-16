@@ -55,7 +55,7 @@ func TestRepoKeyShape(t *testing.T) {
 				t.Errorf("RepoKey(%q) hash suffix = %q (%d chars), want %d", tt.repoURL, hash, len(hash), repoKeyHashLen)
 			}
 			for _, r := range hash {
-				if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 					t.Errorf("RepoKey(%q) hash suffix %q is not lowercase hex", tt.repoURL, hash)
 					break
 				}

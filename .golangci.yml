@@ -1,0 +1,30 @@
+version: "2"
+
+run:
+  # Lint the live-daemon suite too, so it cannot drift from the code it tests.
+  build-tags:
+    - dockerverify
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  settings:
+    staticcheck:
+      checks:
+        # golangci-lint's default set, plus one exclusion.
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # Keep explicit selectors through embedded fields, such as
+        # HostConfig.Resources.Memory: they match the Docker API's own layout
+        # and show which embedded value handles a call.
+        - -QF1008
+  exclusions:
+    # Unchecked Close, print and Setenv errors, where there is nothing useful
+    # to do with the error.
+    presets:
+      - std-error-handling

@@ -7,9 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/docker/docker/api/types"
-
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
+	"github.com/docker/docker/api/types/container"
 )
 
 // dindIOReportTimeout bounds one sidecar's IO report as a whole. The report is a
@@ -45,7 +44,7 @@ type dindIOReporter struct {
 // the allocation has no DinD sidecar, so a non-DinD teardown does no extra
 // Docker calls. The runner's repository is read here, before any container is
 // stopped.
-func (m *Manager) newDindIOReporter(ctx context.Context, list []types.Container, scope *teardownScope) *dindIOReporter {
+func (m *Manager) newDindIOReporter(ctx context.Context, list []container.Summary, scope *teardownScope) *dindIOReporter {
 	if !scope.reportOnDelete || !hasRole(list, spec.RoleDind) {
 		return nil
 	}
@@ -54,7 +53,7 @@ func (m *Manager) newDindIOReporter(ctx context.Context, list []types.Container,
 	return r
 }
 
-func hasRole(list []types.Container, role string) bool {
+func hasRole(list []container.Summary, role string) bool {
 	for _, c := range list {
 		if c.Labels[spec.LabelRole] == role {
 			return true
@@ -67,7 +66,7 @@ func hasRole(list []types.Container, role string) bool {
 // its environment, or "" if it cannot: the runner is gone, the inspect fails, or the
 // runner uses JIT, where the provider sets none of RUNNER_ORG, RUNNER_REPO and
 // RUNNER_ENTERPRISE.
-func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container) string {
+func (r *dindIOReporter) runnerRepo(ctx context.Context, list []container.Summary) string {
 	for _, c := range list {
 		if c.Labels[spec.LabelRole] != spec.RoleRunner {
 			continue
@@ -87,7 +86,7 @@ func (r *dindIOReporter) runnerRepo(ctx context.Context, list []types.Container)
 // teardown remove. It is a no-op on a nil reporter. It must run before any container
 // stops: the stats fallback depends on the runner when the sidecar shares its network
 // namespace. A failed removal check is left to the removal loop to report.
-func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, scope *teardownScope) {
+func (r *dindIOReporter) reportAll(ctx context.Context, list []container.Summary, scope *teardownScope) {
 	if r == nil {
 		return
 	}
@@ -105,7 +104,7 @@ func (r *dindIOReporter) reportAll(ctx context.Context, list []types.Container, 
 // report logs the IO line for the DinD sidecar c. The image probe runs last, on what is
 // left of the budget, so a stalled probe costs only the image fields. Those are logged
 // even when the written bytes are unknown.
-func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
+func (r *dindIOReporter) report(ctx context.Context, c container.Summary) {
 	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
 
@@ -127,7 +126,7 @@ func (r *dindIOReporter) report(ctx context.Context, c types.Container) {
 // identity builds the log attributes that name the allocation. It errors when
 // the sidecar is gone or not running: a stopped sidecar's cgroup, and the
 // counters in it, no longer exist, so there is nothing to measure.
-func (r *dindIOReporter) identity(ctx context.Context, c types.Container) ([]any, error) {
+func (r *dindIOReporter) identity(ctx context.Context, c container.Summary) ([]any, error) {
 	info, err := r.m.cli.ContainerInspect(ctx, c.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect sidecar: %w", err)

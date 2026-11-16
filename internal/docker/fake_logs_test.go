@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
@@ -100,7 +101,7 @@ func TestFakeContainerLogsStreamSelection(t *testing.T) {
 	if _, err := f.ContainerLogs(context.Background(), id, container.LogsOptions{}); err == nil {
 		t.Fatal("ContainerLogs with neither stream selected succeeded; the daemon rejects it")
 	}
-	if _, err := f.ContainerLogs(context.Background(), "missing", container.LogsOptions{ShowStdout: true}); !errdefs.IsNotFound(err) {
+	if _, err := f.ContainerLogs(context.Background(), "missing", container.LogsOptions{ShowStdout: true}); !cerrdefs.IsNotFound(err) {
 		t.Fatalf("ContainerLogs of a missing container error = %v, want NotFound", err)
 	}
 }
@@ -195,7 +196,7 @@ func TestFakeContainerLogsNoneDriverIsNotImplemented(t *testing.T) {
 		_ = rc.Close()
 		t.Fatal("ContainerLogs returned a stream for a container using the none log driver")
 	}
-	if !errdefs.IsNotImplemented(err) || !strings.Contains(err.Error(), "does not support reading") {
+	if !cerrdefs.IsNotImplemented(err) || !strings.Contains(err.Error(), "does not support reading") {
 		t.Fatalf("ContainerLogs error = %v, want NotImplemented \"configured logging driver does not support reading\"", err)
 	}
 }
@@ -217,10 +218,10 @@ func TestFakeContainerTop(t *testing.T) {
 	}
 
 	f.SetState(id, "exited", false)
-	if _, err := f.ContainerTop(context.Background(), id, nil); !errdefs.IsConflict(err) {
+	if _, err := f.ContainerTop(context.Background(), id, nil); !cerrdefs.IsConflict(err) {
 		t.Errorf("ContainerTop of a stopped container error = %v, want Conflict", err)
 	}
-	if _, err := f.ContainerTop(context.Background(), "missing", nil); !errdefs.IsNotFound(err) {
+	if _, err := f.ContainerTop(context.Background(), "missing", nil); !cerrdefs.IsNotFound(err) {
 		t.Errorf("ContainerTop of a missing container error = %v, want NotFound", err)
 	}
 }

@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
@@ -63,8 +63,8 @@ var runnerProgressLine = regexp.MustCompile(`(?:^|: )(Listening for Jobs|Running
 // exitedRunner is a runner container a report describes: its list summary and
 // its inspect (for the sweep, the one it aged the runner with).
 type exitedRunner struct {
-	summary types.Container
-	info    types.ContainerJSON
+	summary container.Summary
+	info    container.InspectResponse
 }
 
 // runnerTail is what a report keeps of a runner's log: the screened lines, how
@@ -83,7 +83,7 @@ type runnerTail struct {
 // tail, screened so no credential reaches the log. When the logs cannot be read the
 // line is at warn with the reason in place of the tail. It is log-only and bounded by
 // exitReportTimeout.
-func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, containers []types.Container) {
+func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, containers []container.Summary) {
 	ctx, cancel := context.WithTimeout(ctx, exitReportTimeout)
 	defer cancel()
 
@@ -100,7 +100,7 @@ func (m *Manager) reportExitedRunner(ctx context.Context, r exitedRunner, contai
 // state and logs with it. GARM deletes an instance as soon as its job's completed
 // message arrives, well inside the sweep's exited-runner grace, so a runner that
 // crashed mid-job reaches this path and never the sweep's line.
-func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Container, scope *teardownScope) {
+func (m *Manager) reportStoppedRunners(ctx context.Context, list []container.Summary, scope *teardownScope) {
 	if !scope.reportOnDelete {
 		return
 	}
@@ -127,9 +127,9 @@ func (m *Manager) reportStoppedRunners(ctx context.Context, list []types.Contain
 // reportStoppedRunner logs the delete line for the runner c. The list summary has
 // neither the exit details nor the TTY flag the log read needs, so it inspects first. A
 // completed job with a clean exit logs at debug, anything else at warn.
-func (m *Manager) reportStoppedRunner(ctx context.Context, c types.Container, list []types.Container) {
+func (m *Manager) reportStoppedRunner(ctx context.Context, c container.Summary, list []container.Summary) {
 	info, err := m.cli.ContainerInspect(ctx, c.ID)
-	if errdefs.IsNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		slog.DebugContext(ctx, "teardown: runner already gone, not reported", "instance", c.Labels[spec.LabelInstanceName])
 		return
 	}
@@ -154,14 +154,14 @@ func (m *Manager) reportStoppedRunner(ctx context.Context, c types.Container, li
 
 // isNormalRunnerEnd reports whether a stopped runner ended the way an ephemeral
 // runner should: its job completed and it exited cleanly.
-func isNormalRunnerEnd(st *types.ContainerState, phase string) bool {
+func isNormalRunnerEnd(st *container.State, phase string) bool {
 	return st != nil && st.ExitCode == 0 && !st.OOMKilled && phase == phaseJobCompleted
 }
 
 // exitReportAttrs builds the fields the sweep's line and the delete line share.
 // When the logs cannot be read it returns the error too, with the reason in
 // place of the tail and the phase unknown.
-func (m *Manager) exitReportAttrs(ctx context.Context, r exitedRunner, containers []types.Container) ([]any, string, error) {
+func (m *Manager) exitReportAttrs(ctx context.Context, r exitedRunner, containers []container.Summary) ([]any, string, error) {
 	attrs := []any{
 		"instance", r.summary.Labels[spec.LabelInstanceName],
 		"pool", r.summary.Labels[spec.LabelPoolID],
@@ -219,7 +219,7 @@ func classifyRunnerPhase(rawLines []string, truncated bool) string {
 // exitStateAttrs returns the exit details of a stopped container, each key
 // prefixed with prefix. The daemon's own State.Error, when set, is screened
 // like a log line.
-func exitStateAttrs(prefix string, st *types.ContainerState) []any {
+func exitStateAttrs(prefix string, st *container.State) []any {
 	if st == nil {
 		return []any{prefix + "state", "unknown"}
 	}
@@ -239,7 +239,7 @@ func exitStateAttrs(prefix string, st *types.ContainerState) []any {
 // dindExitAttrs returns the exit details of the allocation's DinD sidecar when
 // it has stopped too, only "dind_state" while it still runs, and nothing for
 // an allocation without one.
-func (m *Manager) dindExitAttrs(ctx context.Context, containers []types.Container) []any {
+func (m *Manager) dindExitAttrs(ctx context.Context, containers []container.Summary) []any {
 	for _, c := range containers {
 		if !spec.MatchesPredicate(c.Labels, m.controllerID) || c.Labels[spec.LabelRole] != spec.RoleDind {
 			continue

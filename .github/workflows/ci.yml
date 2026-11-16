@@ -56,6 +56,17 @@ jobs:
       - name: go vet ./...
         run: go vet ./...
 
+      # Part of the required `build` check rather than a job of its own, so it
+      # gates merges without a ruleset change. Settings live in .golangci.yml.
+      # The action installs golangci-lint's own release binary, as the
+      # golangci-lint docs recommend, and caches lint results between runs.
+      # Dependabot bumps the action; bump `version` by hand, here and in
+      # CONTRIBUTING.md.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
       - name: gofmt -l (fail if any file is unformatted)
         run: |
           unformatted="$(gofmt -l .)"

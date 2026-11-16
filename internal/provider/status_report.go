@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/logging"
@@ -180,7 +181,7 @@ func (p *Provider) waitRunnerListening(ctx context.Context, containerID string, 
 func (p *Provider) confirmRunning(ctx context.Context, containerID string) (bool, error) {
 	info, err := p.cli.ContainerInspect(ctx, containerID)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return false, errRunnerStopped
 		}
 		return false, fmt.Errorf("inspecting the runner container: %w", err)
@@ -203,7 +204,7 @@ func (p *Provider) waitListenerProcess(ctx context.Context, containerID string) 
 	for {
 		top, err := p.cli.ContainerTop(ctx, containerID, nil)
 		switch {
-		case err != nil && (errdefs.IsNotFound(err) || errdefs.IsConflict(err)):
+		case err != nil && (cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err)):
 			// The daemon answers 409 Conflict for top on a stopped container
 			// and 404 once it is removed.
 			return false, errRunnerStopped

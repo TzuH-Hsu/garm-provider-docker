@@ -4,11 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
+	"github.com/docker/docker/api/types/container"
 )
 
 // TestCreateInstanceDinDExternalsMount covers the externals volume a container
@@ -101,7 +100,7 @@ func TestCreateInstanceDinDExternalsMount(t *testing.T) {
 }
 
 // assertReadOnlyMount asserts a read-only named-volume mount of source at dest.
-func assertReadOnlyMount(t *testing.T, mounts []types.MountPoint, source, dest string) {
+func assertReadOnlyMount(t *testing.T, mounts []container.MountPoint, source, dest string) {
 	t.Helper()
 	for _, m := range mounts {
 		if m.Name == source && m.Destination == dest {
@@ -115,7 +114,7 @@ func assertReadOnlyMount(t *testing.T, mounts []types.MountPoint, source, dest s
 }
 
 // assertNoMountAt asserts nothing is mounted at dest.
-func assertNoMountAt(t *testing.T, mounts []types.MountPoint, dest string) {
+func assertNoMountAt(t *testing.T, mounts []container.MountPoint, dest string) {
 	t.Helper()
 	for _, m := range mounts {
 		if m.Destination == dest {

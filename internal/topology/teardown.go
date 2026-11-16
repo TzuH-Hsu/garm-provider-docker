@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"sort"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -150,7 +151,7 @@ func (m *Manager) removeContainers(ctx context.Context, f filters.Args, scope *t
 		// Best-effort graceful stop; the forced remove reaps a still-running container
 		// regardless.
 		_ = m.cli.ContainerStop(ctx, c.ID, container.StopOptions{})
-		if err := m.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
+		if err := m.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !cerrdefs.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("failed to remove container %s: %w", c.ID, err))
 		}
 	}
@@ -176,7 +177,7 @@ func (m *Manager) removeNetworks(ctx context.Context, f filters.Args, scope *tea
 			continue
 		}
 		found = true
-		if err := m.cli.NetworkRemove(ctx, n.ID); err != nil && !errdefs.IsNotFound(err) {
+		if err := m.cli.NetworkRemove(ctx, n.ID); err != nil && !cerrdefs.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("failed to remove network %s: %w", n.ID, err))
 		}
 	}
@@ -205,7 +206,7 @@ func (m *Manager) removeVolumes(ctx context.Context, f filters.Args, scope *tear
 			continue
 		}
 		found = true
-		if err := m.cli.VolumeRemove(ctx, v.Name, true); err != nil && !errdefs.IsNotFound(err) {
+		if err := m.cli.VolumeRemove(ctx, v.Name, true); err != nil && !cerrdefs.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("failed to remove volume %s: %w", v.Name, err))
 		}
 	}

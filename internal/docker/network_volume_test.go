@@ -4,10 +4,11 @@ import (
 	"context"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 )
 
 func TestFakeClientNetworkCreateAndList(t *testing.T) {
@@ -86,8 +87,8 @@ func TestFakeClientNetworkCreateDuplicateNameConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("second NetworkCreate with a duplicate name succeeded, want a Conflict error")
 	}
-	if !errdefs.IsConflict(err) {
-		t.Errorf("NetworkCreate duplicate-name error = %v, want errdefs.IsConflict", err)
+	if !cerrdefs.IsConflict(err) {
+		t.Errorf("NetworkCreate duplicate-name error = %v, want cerrdefs.IsConflict", err)
 	}
 
 	// The original network must be untouched: still exactly one network,
@@ -127,13 +128,13 @@ func TestFakeClientNetworkRemove(t *testing.T) {
 	}
 
 	// Callers tolerate removing an already-gone network through
-	// errdefs.IsNotFound (ADR-004), so the fake must return that shape.
+	// cerrdefs.IsNotFound (ADR-004), so the fake must return that shape.
 	err = f.NetworkRemove(ctx, created.ID)
 	if err == nil {
 		t.Fatal("NetworkRemove of an already-removed network succeeded, want a NotFound error")
 	}
-	if !errdefs.IsNotFound(err) {
-		t.Errorf("NetworkRemove error = %v, want errdefs.IsNotFound", err)
+	if !cerrdefs.IsNotFound(err) {
+		t.Errorf("NetworkRemove error = %v, want cerrdefs.IsNotFound", err)
 	}
 }
 
@@ -144,8 +145,8 @@ func TestFakeClientNetworkRemoveNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("NetworkRemove of a nonexistent network succeeded, want a NotFound error")
 	}
-	if !errdefs.IsNotFound(err) {
-		t.Errorf("NetworkRemove error = %v, want errdefs.IsNotFound", err)
+	if !cerrdefs.IsNotFound(err) {
+		t.Errorf("NetworkRemove error = %v, want cerrdefs.IsNotFound", err)
 	}
 }
 
@@ -280,8 +281,8 @@ func TestFakeClientVolumeRemove(t *testing.T) {
 	if err == nil {
 		t.Fatal("VolumeRemove of an already-removed volume succeeded, want a NotFound error")
 	}
-	if !errdefs.IsNotFound(err) {
-		t.Errorf("VolumeRemove error = %v, want errdefs.IsNotFound", err)
+	if !cerrdefs.IsNotFound(err) {
+		t.Errorf("VolumeRemove error = %v, want cerrdefs.IsNotFound", err)
 	}
 }
 
@@ -292,7 +293,7 @@ func TestFakeClientVolumeRemoveNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("VolumeRemove of a nonexistent volume succeeded, want a NotFound error")
 	}
-	if !errdefs.IsNotFound(err) {
-		t.Errorf("VolumeRemove error = %v, want errdefs.IsNotFound", err)
+	if !cerrdefs.IsNotFound(err) {
+		t.Errorf("VolumeRemove error = %v, want cerrdefs.IsNotFound", err)
 	}
 }

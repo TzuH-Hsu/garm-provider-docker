@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -158,24 +158,24 @@ func isActiveRunnerState(state string) bool {
 // runnerFinishedAt returns a runner's inspect and State.FinishedAt. The bool is false
 // when the runner is already gone or the time is absent, zero or unparseable. Any other
 // inspect failure is returned as an error.
-func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (types.ContainerJSON, time.Time, bool, error) {
+func (m *Manager) runnerFinishedAt(ctx context.Context, containerID string) (container.InspectResponse, time.Time, bool, error) {
 	inspected, err := m.cli.ContainerInspect(ctx, containerID)
-	if errdefs.IsNotFound(err) {
-		return types.ContainerJSON{}, time.Time{}, false, nil
+	if cerrdefs.IsNotFound(err) {
+		return container.InspectResponse{}, time.Time{}, false, nil
 	}
 	if err != nil {
-		return types.ContainerJSON{}, time.Time{}, false, err
+		return container.InspectResponse{}, time.Time{}, false, err
 	}
 	if inspected.State == nil {
-		return types.ContainerJSON{}, time.Time{}, false, nil
+		return container.InspectResponse{}, time.Time{}, false, nil
 	}
 	raw := inspected.State.FinishedAt
 	if raw == "" {
-		return types.ContainerJSON{}, time.Time{}, false, nil
+		return container.InspectResponse{}, time.Time{}, false, nil
 	}
 	t, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil || t.IsZero() || t.Year() <= 1 {
-		return types.ContainerJSON{}, time.Time{}, false, nil
+		return container.InspectResponse{}, time.Time{}, false, nil
 	}
 	return inspected, t, true, nil
 }

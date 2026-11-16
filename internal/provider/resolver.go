@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"strings"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	"github.com/cloudbase/garm-provider-common/params"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -21,37 +21,37 @@ import (
 // instance-name label, with no inspect-by-ID fallback (ADR-004, Identity), and a
 // container that fails the ownership check counts as not found, so a mutating caller
 // never gets a foreign one.
-func (p *Provider) resolve(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
+func (p *Provider) resolve(ctx context.Context, instanceID string) (container.InspectResponse, bool, error) {
 	return p.resolveByOwnedLabel(ctx, instanceID)
 }
 
 // resolveByOwnedLabel returns the first owned runner under the instance-name label,
 // skipping a candidate that a concurrent delete has removed.
-func (p *Provider) resolveByOwnedLabel(ctx context.Context, instanceID string) (types.ContainerJSON, bool, error) {
+func (p *Provider) resolveByOwnedLabel(ctx context.Context, instanceID string) (container.InspectResponse, bool, error) {
 	list, err := p.cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: p.managedRunnerByInstanceNameFilter(instanceID),
 	})
 	if err != nil {
-		return types.ContainerJSON{}, false, fmt.Errorf("failed to list containers for %q: %w", instanceID, err)
+		return container.InspectResponse{}, false, fmt.Errorf("failed to list containers for %q: %w", instanceID, err)
 	}
 	for _, c := range list {
 		inspected, err := p.cli.ContainerInspect(ctx, c.ID)
 		if err != nil {
-			if errdefs.IsNotFound(err) {
+			if cerrdefs.IsNotFound(err) {
 				continue // raced with a concurrent delete; try the next candidate
 			}
-			return types.ContainerJSON{}, false, fmt.Errorf("failed to inspect %q: %w", c.ID, err)
+			return container.InspectResponse{}, false, fmt.Errorf("failed to inspect %q: %w", c.ID, err)
 		}
 		if p.ownsRunner(inspected) {
 			return inspected, true, nil
 		}
 	}
-	return types.ContainerJSON{}, false, nil
+	return container.InspectResponse{}, false, nil
 }
 
 // ownsRunner reports whether c carries this controller's managed-runner labels.
-func (p *Provider) ownsRunner(c types.ContainerJSON) bool {
+func (p *Provider) ownsRunner(c container.InspectResponse) bool {
 	if c.Config == nil {
 		return false
 	}
@@ -106,7 +106,7 @@ func notFoundError(instanceID string) error {
 // the instance name, as CreateInstance returned it, so GARM never stores a container ID
 // (ADR-004, Identity). ProviderFault comes only from c.State, never c.Config, so it
 // cannot carry a credential.
-func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
+func toProviderInstance(c container.InspectResponse) params.ProviderInstance {
 	labels := map[string]string{}
 	if c.Config != nil {
 		labels = c.Config.Labels
@@ -139,7 +139,7 @@ func toProviderInstance(c types.ContainerJSON) params.ProviderInstance {
 
 // containerFaultMessage describes a container whose status mapped to InstanceError.
 // state is non-nil.
-func containerFaultMessage(state *types.ContainerState) string {
+func containerFaultMessage(state *container.State) string {
 	switch {
 	case state.OOMKilled:
 		return fmt.Sprintf("container was killed for out-of-memory (exit_code=%d, finished_at=%s)", state.ExitCode, state.FinishedAt)
@@ -157,7 +157,7 @@ func containerFaultMessage(state *types.ContainerState) string {
 // toProviderInstanceFromSummary maps a list summary to a ProviderInstance without
 // another inspect. A summary has no OOM flag, so only GetInstance reports an OOM-killed
 // container as an error. ProviderFault is the summary's own Status text.
-func toProviderInstanceFromSummary(c types.Container) params.ProviderInstance {
+func toProviderInstanceFromSummary(c container.Summary) params.ProviderInstance {
 	name := c.Labels[spec.LabelInstanceName]
 	if name == "" && len(c.Names) > 0 {
 		name = strings.TrimPrefix(c.Names[0], "/")
@@ -179,7 +179,7 @@ func toProviderInstanceFromSummary(c types.Container) params.ProviderInstance {
 
 // addressesFromInspect returns the container's per-network IPv4 addresses, reported to
 // GARM as private.
-func addressesFromInspect(c types.ContainerJSON) []params.Address {
+func addressesFromInspect(c container.InspectResponse) []params.Address {
 	if c.NetworkSettings == nil {
 		return nil
 	}

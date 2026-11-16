@@ -9,7 +9,6 @@ import (
 
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	execcommon "github.com/cloudbase/garm-provider-common/execution/common"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
@@ -609,7 +608,7 @@ func TestVerifyRunning(t *testing.T) {
 
 // assertContainerMount asserts a named-volume mount with the given source
 // (volume name) and destination exists among an inspected container's mounts.
-func assertContainerMount(t *testing.T, mounts []types.MountPoint, source, dest string) {
+func assertContainerMount(t *testing.T, mounts []container.MountPoint, source, dest string) {
 	t.Helper()
 	for _, m := range mounts {
 		if m.Name == source && m.Destination == dest {
@@ -622,7 +621,7 @@ func assertContainerMount(t *testing.T, mounts []types.MountPoint, source, dest 
 // assertNoHostSocketMount asserts nothing binds the host Docker socket into the
 // container (ADR-001 red line): no mount references /var/run/docker.sock as its
 // source/name or destination.
-func assertNoHostSocketMount(t *testing.T, mounts []types.MountPoint) {
+func assertNoHostSocketMount(t *testing.T, mounts []container.MountPoint) {
 	t.Helper()
 	for _, m := range mounts {
 		if strings.Contains(m.Name, "docker.sock") || strings.Contains(m.Destination, "docker.sock") || strings.Contains(string(m.Source), "docker.sock") {

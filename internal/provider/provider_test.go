@@ -4,12 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/docker"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/version"
+	"github.com/docker/docker/api/types/container"
 )
 
 // inspectRunner inspects the runner container CreateInstance built for
@@ -17,7 +16,7 @@ import (
 // instance's provider_id is the instance NAME, not the container ID, so tests
 // that want the actual runner container inspect it by its derived Docker name
 // rather than by provider_id.
-func inspectRunner(t *testing.T, fake *docker.FakeClient, instanceName string) types.ContainerJSON {
+func inspectRunner(t *testing.T, fake *docker.FakeClient, instanceName string) container.InspectResponse {
 	t.Helper()
 	c, err := fake.ContainerInspect(context.Background(), spec.RunnerContainerName(instanceName))
 	if err != nil {

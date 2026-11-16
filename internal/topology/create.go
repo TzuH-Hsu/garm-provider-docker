@@ -7,10 +7,11 @@ import (
 	"log/slog"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	gErrors "github.com/cloudbase/garm-provider-common/errors"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/spec"
 )
@@ -44,7 +45,7 @@ func (m *Manager) CreateClaimNetwork(ctx context.Context, identity spec.Allocati
 		return resp.ID, nil, nil
 	}
 
-	if errdefs.IsConflict(cerr) {
+	if cerrdefs.IsConflict(cerr) {
 		ours, cerr2 := m.existingClaimIsOurs(ctx, name, instanceName)
 		if cerr2 != nil {
 			return "", nil, cerr2
@@ -103,7 +104,7 @@ func (m *Manager) bestEffortRemoveOwnNetwork(ctx context.Context, nonce string) 
 		if n.Labels[spec.LabelCreateNonce] != nonce {
 			continue
 		}
-		if rerr := m.cli.NetworkRemove(ctx, n.ID); rerr != nil && !errdefs.IsNotFound(rerr) {
+		if rerr := m.cli.NetworkRemove(ctx, n.ID); rerr != nil && !cerrdefs.IsNotFound(rerr) {
 			errs = append(errs, fmt.Errorf("failed to remove leaked network %s: %w", n.ID, rerr))
 		}
 	}
@@ -158,7 +159,7 @@ func (m *Manager) createFreshVolume(ctx context.Context, kind, name string, labe
 	}
 
 	// It is ours: remove and recreate so no prior job's content survives.
-	if err := m.cli.VolumeRemove(ctx, name, true); err != nil && !errdefs.IsNotFound(err) {
+	if err := m.cli.VolumeRemove(ctx, name, true); err != nil && !cerrdefs.IsNotFound(err) {
 		return fmt.Errorf("stale %s volume %q could not be removed for replacement: %w", kind, name, err)
 	}
 	recreated, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})

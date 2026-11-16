@@ -14,10 +14,11 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/config"
 	"github.com/TzuH-Hsu/garm-provider-docker/internal/extraspecs"
@@ -328,7 +329,7 @@ func (p *Provider) revalidateReferencedCaches(ctx context.Context, plan cachePla
 func (p *Provider) bestEffortRemoveContainer(ctx context.Context, id string) {
 	rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
-	if err := p.cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+	if err := p.cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
 		slog.WarnContext(rmCtx, "cache-revalidation rollback: failed to remove runner container (continuing)",
 			"resource", "container", "container_id", id, "error", err)
 	}
@@ -347,7 +348,7 @@ func withReadyMarker(files []metadata.CredentialFileContent) []metadata.Credenti
 func (p *Provider) ensureImage(ctx context.Context, imageRef string) error {
 	if _, _, err := p.cli.ImageInspectWithRaw(ctx, imageRef); err == nil {
 		return nil // already present
-	} else if !errdefs.IsNotFound(err) {
+	} else if !cerrdefs.IsNotFound(err) {
 		return fmt.Errorf("failed to inspect image %q: %w", imageRef, err)
 	}
 

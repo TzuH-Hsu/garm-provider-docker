@@ -6,8 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 )
 
 // createJoiner creates (but does not start) a container that joins the
@@ -30,7 +31,7 @@ func TestFakeJoinedNetnsStartsOnlyWithRunningOwner(t *testing.T) {
 		f := NewFakeClient()
 		id := createJoiner(t, f, "job-1-dind", "no-such-runner")
 		err := f.ContainerStart(ctx, id, container.StartOptions{})
-		if err == nil || !errdefs.IsNotFound(err) || !strings.Contains(err.Error(), "No such container: no-such-runner") {
+		if err == nil || !cerrdefs.IsNotFound(err) || !strings.Contains(err.Error(), "No such container: no-such-runner") {
 			t.Fatalf("ContainerStart = %v, want a NotFound naming the missing owner", err)
 		}
 	})

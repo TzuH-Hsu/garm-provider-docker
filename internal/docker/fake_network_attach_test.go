@@ -4,11 +4,12 @@ import (
 	"context"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
 )
 
 // createAttachedRunner creates a running container attached to netName and
@@ -107,11 +108,11 @@ func TestFakeNetworkRemoveActiveEndpoints(t *testing.T) {
 	if err == nil {
 		t.Fatal("NetworkRemove of an in-use network succeeded, want an active-endpoints error")
 	}
-	if errdefs.IsNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		t.Errorf("NetworkRemove error = %v, want an active-endpoints (forbidden) error, not NotFound", err)
 	}
-	if !errdefs.IsForbidden(err) {
-		t.Errorf("NetworkRemove error = %v, want errdefs.IsForbidden (active endpoints)", err)
+	if !cerrdefs.IsPermissionDenied(err) {
+		t.Errorf("NetworkRemove error = %v, want cerrdefs.IsPermissionDenied (active endpoints)", err)
 	}
 
 	// After the container is removed, the network removes cleanly (by name too).
@@ -134,8 +135,8 @@ func TestFakeVolumeRemoveRejectsInUse(t *testing.T) {
 	// Referenced by a running container → rejected (even with force).
 	if err := f.VolumeRemove(ctx, "job-1-workspace", true); err == nil {
 		t.Fatal("VolumeRemove of an in-use volume succeeded, want a Conflict (volume in use)")
-	} else if !errdefs.IsConflict(err) {
-		t.Errorf("VolumeRemove in-use error = %v, want errdefs.IsConflict", err)
+	} else if !cerrdefs.IsConflict(err) {
+		t.Errorf("VolumeRemove in-use error = %v, want cerrdefs.IsConflict", err)
 	}
 
 	// Stop it — still referenced (stopped counts too) → still rejected.
