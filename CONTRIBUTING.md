@@ -33,12 +33,13 @@ These are the checks CI runs on every pull request:
 ```sh
 gofmt -l .
 go vet ./...
-go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+golangci-lint run ./...
 go test ./... -race -count=1
 ```
 
-`.golangci.yml` holds the lint settings. An installed golangci-lint of the same
-version gives the same result.
+CI runs golangci-lint v2.15.0 with the settings in `.golangci.yml`. Install the
+same version from its
+[release binaries](https://golangci-lint.run/docs/welcome/install/local/).
 
 The live suite creates real containers, networks and volumes, so it needs a
 Docker daemon. Run it on a machine you can spare, not on a host that serves
