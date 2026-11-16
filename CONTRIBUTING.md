@@ -15,7 +15,7 @@ GARM rather than in this provider.
 
 ## Set up
 
-You need Go 1.25.0 or newer. The `toolchain` line in [`go.mod`](go.mod) names
+You need Go 1.26.0 or newer. The `toolchain` line in [`go.mod`](go.mod) names
 the Go release that builds the published binaries, and the `go` command
 downloads it on first use when your installed Go is older. Docker is needed
 only for the live test suite.

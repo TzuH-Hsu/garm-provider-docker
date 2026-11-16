@@ -1,6 +1,6 @@
 module github.com/TzuH-Hsu/garm-provider-docker
 
-go 1.25.0
+go 1.26.0
 
 // The go line stays the language version this module is written for. The
 // toolchain line is the Go that builds and tests it, so release binaries carry
