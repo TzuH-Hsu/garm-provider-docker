@@ -10,6 +10,13 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+### Added
+
+- Release binaries come with a signed SLSA build provenance attestation. It is
+  stored in GitHub's attestation store and also attached to the release as
+  `garm-provider-docker_<version>.sigstore.json`. Check a binary with
+  `gh attestation verify <file> --repo TzuH-Hsu/garm-provider-docker`.
+
 ### Changed
 
 - Building from source now needs Go 1.26.0 or newer. The `go` line in `go.mod`

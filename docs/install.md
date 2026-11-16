@@ -7,6 +7,8 @@ Each `vX.Y.Z` tag publishes:
 
 - static `linux/amd64` and `linux/arm64` binaries with a `SHA256SUMS` file, on
   the [releases page](https://github.com/TzuH-Hsu/garm-provider-docker/releases)
+- a signed build provenance attestation for those binaries, attached as
+  `garm-provider-docker_<tag>.sigstore.json`. Older releases have none.
 - `ghcr.io/tzuh-hsu/garm-provider-docker`, which carries the binary
 - `ghcr.io/tzuh-hsu/garm-runner-noble` (Ubuntu 24.04) and
   `ghcr.io/tzuh-hsu/garm-runner-resolute` (Ubuntu 26.04)
