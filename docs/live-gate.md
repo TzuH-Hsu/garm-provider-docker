@@ -111,7 +111,7 @@ act. On macOS, or to test uncommitted changes, add `--from-source`.
      creates real containers and, in the `--dind` variant, a privileged
      sidecar, so a production host remains a deliberate choice.
    - **`--from-source` additionally needs a Go toolchain** (`go.mod` sets
-     `go 1.25.0` and `toolchain go1.27.3`; the `go` command downloads that
+     `go 1.26.0` and `toolchain go1.27.4`; the `go` command downloads that
      toolchain on first use if yours is older) to build the provider binary,
      and builds the runner image locally
      (`docker build -f runner-images/noble/Dockerfile runner-images`, or

@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # Change this together with the `go` line in go.mod, as a deliberate decision.
-readonly EXPECTED_GO_LINE="1.25.0"
+readonly EXPECTED_GO_LINE="1.26.0"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"

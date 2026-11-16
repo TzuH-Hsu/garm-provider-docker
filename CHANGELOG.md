@@ -10,6 +10,22 @@ Earlier versions are described on the
 
 ## [Unreleased]
 
+### Changed
+
+- Building from source now needs Go 1.26.0 or newer. The `go` line in `go.mod`
+  moves from `1.25.0` to `1.26.0`, because module updates (starting with the
+  OpenTelemetry SDK that the Docker client pulls in) require it, and Go 1.25
+  no longer receives security fixes. Release binaries were already built with
+  Go 1.27.4 and still are.
+- The `go` line also sets the binary's `GODEBUG` defaults, so the provider now
+  runs with the Go 1.26 defaults. The one an operator may notice is
+  `urlstrictcolons`: a URL whose IPv6 host is not in brackets, such as
+  `http://::1:3128`, no longer parses. That applies to the provider config, to
+  the URLs GARM passes in, and to the `HTTP_PROXY` and `HTTPS_PROXY` values the
+  status watcher uses. Write the address in brackets: `http://[::1]:3128`. The
+  provider's TLS connections to GARM also offer two more post-quantum key
+  exchanges (`tlssecpmlkem`).
+
 ## [0.2.12] - 2026-11-16
 
 ### Security
