@@ -265,7 +265,7 @@ func TestPruneDiagVolumeAbortsOnForeignIdentity(t *testing.T) {
 	// The different-repo (foreign-identity) replacement SURVIVES — never deleted.
 	v, ok := volByName(t, fake, diagName)
 	if !ok {
-		t.Fatalf("the different-repo diag volume %q was DELETED — never touch an unprovable volume (B2)", diagName)
+		t.Fatalf("the different-repo diag volume %q was DELETED — never touch an unprovable volume", diagName)
 	}
 	if v.Labels[spec.LabelRepoURLDigest] != otherID.RepoURLDigest {
 		t.Errorf("the surviving diag volume is not the foreign replacement (repo-url-digest=%q)", v.Labels[spec.LabelRepoURLDigest])
@@ -319,7 +319,7 @@ func TestRunCacheGCPrunesDiagVolume(t *testing.T) {
 	}
 	// The helper joins the "none" network, not the default bridge.
 	if !pruneNetIsNone {
-		t.Error("diag-prune helper NetworkMode is not none (L9)")
+		t.Error("diag-prune helper NetworkMode is not none")
 	}
 	for _, want := range []string{"find", "-mmin +", "-delete"} {
 		if !strings.Contains(pruneScript, want) {
@@ -363,7 +363,7 @@ func TestPruneDiagVolumePinThenValidatePreservesAutoCreatedAndNoWedge(t *testing
 	// The unlabeled auto-created replacement is PRESERVED (never deleted).
 	v, ok := volByName(t, fake, diagName)
 	if !ok {
-		t.Fatalf("the unlabeled auto-created diag volume %q was DELETED — never delete a volume we cannot prove is ours (B2)", diagName)
+		t.Fatalf("the unlabeled auto-created diag volume %q was DELETED — never delete a volume we cannot prove is ours", diagName)
 	}
 	if v.Labels[spec.LabelCache] == "true" {
 		t.Errorf("the auto-created diag volume unexpectedly carries cache=true: %v", v.Labels)

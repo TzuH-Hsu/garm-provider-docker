@@ -236,18 +236,18 @@ func TestEnsureCacheVolumeUnlabeledSquatterDoesNotWedge(t *testing.T) {
 
 	res, err := m.EnsureCacheVolume(ctx, name, cacheIdentity().ToolcacheLabels("1", time.Now()))
 	if err != nil {
-		t.Fatalf("[B3] an unlabeled deterministic-named volume WEDGED creation: %v", err)
+		t.Fatalf("an unlabeled deterministic-named volume WEDGED creation: %v", err)
 	}
 	if res.Name == name {
-		t.Fatalf("[B3] EnsureCacheVolume adopted the unlabeled squatter %q instead of reconciling", name)
+		t.Fatalf("EnsureCacheVolume adopted the unlabeled squatter %q instead of reconciling", name)
 	}
 	// The unlabeled volume is left as cruft (not deleted).
 	if _, ok := rawVolumeLabels(t, fake, name); !ok {
-		t.Errorf("[B3] the unlabeled volume %q was deleted — cruft must be left, not deleted", name)
+		t.Errorf("the unlabeled volume %q was deleted — cruft must be left, not deleted", name)
 	}
 	// A cache for our identity now exists (creation is not wedged).
 	if _, ok := cacheVolumeByName(t, fake, res.Name); !ok {
-		t.Errorf("[B3] no cache was created after reconciling around the unlabeled squatter")
+		t.Errorf("no cache was created after reconciling around the unlabeled squatter")
 	}
 }
 
