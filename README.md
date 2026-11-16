@@ -96,6 +96,15 @@ sudo install -D -m 0755 "garm-provider-docker_${VERSION}_linux_amd64" \
   /opt/garm/providers.d/garm-provider-docker
 ```
 
+Releases that include a `.sigstore.json` file also carry signed build
+provenance. With the [GitHub CLI](https://cli.github.com/), check that a binary
+was built by this repository's release workflow:
+
+```sh
+gh attestation verify "garm-provider-docker_${VERSION}_linux_amd64" \
+  --repo TzuH-Hsu/garm-provider-docker
+```
+
 **2. Write the provider config.** A pinned runner image is the only required
 setting. Everything else has a default.
 

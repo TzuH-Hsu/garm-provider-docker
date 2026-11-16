@@ -5,7 +5,8 @@
 # The release gate is `event_name == 'push' && ref_type == 'tag'`, not
 # `ref_type` alone: `workflow_dispatch` accepts a tag as `--ref`
 # (`gh workflow run --ref v1.2.3`), which sets ref_type=tag without a push.
-# `contents: write` is scoped to the publish job as a second guard.
+# `contents: write` is scoped to the publish job as a second guard, as are the
+# `id-token` and `attestations` scopes that sign the build provenance.
 #
 # Tag names are not shell-safe. Values derived from them go into `run:` steps
 # via `env:` or $GITHUB_REF_NAME as quoted variables, never via `${{ }}`.
@@ -101,15 +102,20 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # The only job with `contents: write`.
+  # The only job with `contents: write`, `id-token: write` or
+  # `attestations: write`.
   publish:
-    name: checksum and publish
+    name: checksum, attest and publish
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
       contents: write
+      # Mint the OIDC token that Sigstore turns into a signing certificate.
+      id-token: write
+      # Store the attestation in the repository's attestation store.
+      attestations: write
     steps:
       - name: Download all binary artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -123,6 +129,24 @@ jobs:
           ls -la
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+
+      # One signed SLSA build provenance attestation covering every binary in
+      # SHA256SUMS. `gh attestation verify` checks a binary against it.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # The release also carries the Sigstore bundle, so it can be verified
+      # without the attestations API, and so tools that look for signature
+      # files on the release (such as OpenSSF Scorecard) find one. It is not
+      # in SHA256SUMS: the bundle is the signature over those hashes.
+      - name: Add the attestation bundle to the release files
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          VERSION: ${{ github.ref_name }}
+        run: cp -- "${BUNDLE}" "dist/garm-provider-docker_${VERSION}.sigstore.json"
 
       # A tag with a hyphen (e.g. `v0.2.0-rc.1`) becomes a pre-release draft.
       # `:latest` moves only once it is a full release (see images.yml), so an
