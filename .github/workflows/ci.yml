@@ -50,6 +50,11 @@ jobs:
           go version
           scripts/check-go-version.sh
 
+      # Fails on private work-tracking codes (see the script header) in any
+      # tracked file. Comments should link an issue or ADR instead.
+      - name: Check for internal tracking codes
+        run: scripts/check-codenames.sh
+
       - name: go build ./...
         run: go build ./...
 

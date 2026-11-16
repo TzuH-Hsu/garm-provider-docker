@@ -496,10 +496,10 @@ func unsetEnv(t *testing.T, key string) {
 
 // setV010Env reproduces what GARM v0.2.1's v0.1.0 wrapper
 // (runner/providers/v0.1.0/external.go) sends: GARM_INTERFACE_VERSION=v0.1.0
-// (L54), GARM_COMMAND, GARM_CONTROLLER_ID, GARM_PROVIDER_CONFIG_FILE, and
+// (line 54), GARM_COMMAND, GARM_CONTROLLER_ID, GARM_PROVIDER_CONFIG_FILE, and
 // never GARM_POOL_EXTRASPECS. GARM_POOL_ID is sent only for CreateInstance
-// (L78) and ListInstances (L205); Delete/Get/Start/Stop carry
-// GARM_INSTANCE_ID and no pool ID at all (L127-135, L155-163).
+// (line 78) and ListInstances (line 205); Delete/Get/Start/Stop carry
+// GARM_INSTANCE_ID and no pool ID at all (lines 127-135 and 155-163).
 func setV010Env(t *testing.T, command execcommon.ExecutionCommand, poolID, instanceID string) {
 	t.Helper()
 	setBaseEnv(t, command)

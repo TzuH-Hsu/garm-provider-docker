@@ -182,7 +182,7 @@ func TestCreateInstanceFailsClosedWhenExternalsEvictedDuringCreate(t *testing.T)
 	extName := spec.ExternalsVolumeName(strings.TrimPrefix(insp.ID, "sha256:"))
 	ev, ok := volByName(t, fake, extName)
 	if !ok {
-		t.Fatalf("the unlabeled auto-created externals volume %q was DELETED — the provider must never delete a volume it cannot prove is ours (B2)", extName)
+		t.Fatalf("the unlabeled auto-created externals volume %q was DELETED — the provider must never delete a volume it cannot prove is ours", extName)
 	}
 	if ev.Labels[spec.LabelCache] == "true" {
 		t.Errorf("the auto-created externals volume unexpectedly carries cache=true: %v", ev.Labels)
@@ -232,7 +232,7 @@ func TestRevalidateReferencedCachesClassification(t *testing.T) {
 	}
 	uv, ok := volByName(t, fake, warmName)
 	if !ok {
-		t.Fatalf("the unlabeled replacement %q was DELETED — never delete a volume we cannot prove is ours (B2)", warmName)
+		t.Fatalf("the unlabeled replacement %q was DELETED — never delete a volume we cannot prove is ours", warmName)
 	}
 	if uv.Labels[spec.LabelCache] == "true" {
 		t.Errorf("the unlabeled replacement unexpectedly carries cache=true: %v", uv.Labels)

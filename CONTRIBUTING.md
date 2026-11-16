@@ -35,7 +35,12 @@ gofmt -l .
 go vet ./...
 golangci-lint run ./...
 go test ./... -race -count=1
+scripts/check-codenames.sh
 ```
+
+`scripts/check-codenames.sh` rejects short internal tracking codes, such as a
+letter and a number standing for a work item, in comments and docs. Explain the
+reason in words, or link an issue or ADR.
 
 CI runs golangci-lint v2.15.0 with the settings in `.golangci.yml`. Install the
 same version from its
