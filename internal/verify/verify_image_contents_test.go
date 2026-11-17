@@ -24,6 +24,7 @@ package verify
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -67,7 +68,8 @@ func verifyJobStartedHooks(t *testing.T, tag string) {
 	const hook = "/opt/garm/hooks/job-started.sh"
 
 	env := dockerOut(t, "image", "inspect", tag, "-f", "{{range .Config.Env}}{{println .}}{{end}}")
-	if !strings.Contains(env, "ACTIONS_RUNNER_HOOK_JOB_STARTED="+hook+"\n") {
+	// dockerOut trims the output, so match whole lines: the variable may be last.
+	if !slices.Contains(lines(env), "ACTIONS_RUNNER_HOOK_JOB_STARTED="+hook) {
 		t.Errorf("image env lacks ACTIONS_RUNNER_HOOK_JOB_STARTED=%s:\n%s", hook, env)
 	}
 
