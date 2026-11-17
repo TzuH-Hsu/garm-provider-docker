@@ -47,7 +47,7 @@ func TestVerifyCacheHit(t *testing.T) {
 	assertForeignPresent(t, canaries[1])
 	volsBefore := volumeSet(t)
 
-	imageTag := "garm-m2w1-verify-sleep:latest"
+	imageTag := "garm-cache-hit-verify-sleep:latest"
 	buildSleepImage(t, imageTag)
 
 	// The toolcache and pnpm volumes are keyed on the runner image's OS key (ADR-003).
@@ -109,12 +109,12 @@ allow_org_shared = false
 
 	// Job A: create. The caches are provisioned and mounted, the env is set, and a
 	// marker is written.
-	bA := cacheBootstrapPayload("m2w1-job-a", repoURL, srv.URL, caBundle)
+	bA := cacheBootstrapPayload("cache-hit-job-a", repoURL, srv.URL, caBundle)
 	stdout, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bA)
 	if code != 0 {
 		t.Fatalf("job A CreateInstance exit=%d, want 0; stdout=%s", code, stdout)
 	}
-	runnerA := "m2w1-job-a"
+	runnerA := "cache-hit-job-a"
 
 	// (a) The toolcache and pnpm volumes exist with the ADR-003 cache labels and no
 	// instance-name label, which is what excludes them from teardown.
@@ -168,11 +168,11 @@ allow_org_shared = false
 	t.Logf("[delete] job A allocation torn down; both cache volumes survived")
 
 	// Job B: the same repo_url gets the same cache volumes, and job A's marker is visible.
-	bB := cacheBootstrapPayload("m2w1-job-b", repoURL, srv.URL, caBundle)
+	bB := cacheBootstrapPayload("cache-hit-job-b", repoURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bB); code != 0 {
 		t.Fatalf("job B CreateInstance exit=%d, want 0", code)
 	}
-	runnerB := "m2w1-job-b"
+	runnerB := "cache-hit-job-b"
 
 	if src := mountSource(t, runnerB, "/opt/hostedtoolcache"); src != toolVol {
 		t.Errorf("job B toolcache mount source = %q, want the SAME volume %q as job A", src, toolVol)
@@ -209,21 +209,23 @@ allow_org_shared = false
 		"-v", pnpmVol+":/opt/pnpm-store",
 		"node:20-alpine", "sh", "-c",
 		"corepack enable && corepack prepare pnpm@9.15.9 --activate >/dev/null 2>&1 && pnpm config get store-dir")
+	// dockerTry merges stderr, where `docker run` reports pulling an uncached image.
+	storeDir := lastLine(pnpmOut)
 	switch {
 	case pnpmErr != nil:
 		t.Logf("[pnpm-e2e] best-effort store-dir check skipped (corepack/network): %v\n%s", pnpmErr, pnpmOut)
-	case strings.TrimSpace(pnpmOut) != "/opt/pnpm-store":
-		t.Errorf("[pnpm-e2e] pnpm config get store-dir = %q on the provider's pnpm volume, want /opt/pnpm-store", strings.TrimSpace(pnpmOut))
+	case storeDir != "/opt/pnpm-store":
+		t.Errorf("[pnpm-e2e] pnpm config get store-dir = %q on the provider's pnpm volume, want /opt/pnpm-store", storeDir)
 	default:
 		t.Logf("[pnpm-e2e] pnpm honors the provider's store: `pnpm config get store-dir` = /opt/pnpm-store on the provider-created volume %s", pnpmVol)
 	}
 
 	// Org scope: a single-segment repo_url gets no persistent cache by default.
-	bOrg := cacheBootstrapPayload("m2w1-job-org", orgURL, srv.URL, caBundle)
+	bOrg := cacheBootstrapPayload("cache-hit-job-org", orgURL, srv.URL, caBundle)
 	if _, code := runProvider(t, bin, configFile, controllerID, "CreateInstance", "", &bOrg); code != 0 {
 		t.Fatalf("job org CreateInstance exit=%d, want 0", code)
 	}
-	runnerOrg := "m2w1-job-org"
+	runnerOrg := "cache-hit-job-org"
 	if _, err := dockerTry("volume", "inspect", orgToolVol); err == nil {
 		t.Errorf("org-scoped pool created a persistent toolcache volume %q without allow_org_shared", orgToolVol)
 	}
